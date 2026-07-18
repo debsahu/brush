@@ -477,6 +477,12 @@ impl ActiveAppearance {
 }
 
 fn validate_config(config: &AppearanceConfig, num_views: usize) -> Result<(), String> {
+    if config.bilagrid && config.ppisp {
+        return Err(
+            "bilateral-grid and PPISP are alternative appearance models; enable only one"
+                .to_owned(),
+        );
+    }
     let (gx, gy, guidance) = config.bilagrid_dims;
     if config.bilagrid && [gx, gy, guidance].iter().any(|dim| *dim < 2) {
         return Err(format!(
@@ -590,5 +596,21 @@ mod tests {
             ..AppearanceConfig::default()
         };
         assert!(validate_config(&config, 2).is_err());
+    }
+
+    #[test]
+    fn rejects_stacked_appearance_models() {
+        let config = AppearanceConfig {
+            bilagrid: true,
+            ppisp: true,
+            ..AppearanceConfig::default()
+        };
+        assert_eq!(
+            validate_config(&config, 2),
+            Err(
+                "bilateral-grid and PPISP are alternative appearance models; enable only one"
+                    .to_owned()
+            )
+        );
     }
 }

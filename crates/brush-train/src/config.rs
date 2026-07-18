@@ -130,8 +130,14 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options")]
     pub random_init_scene_scale: Option<f32>,
 
-    /// Enable per-view affine bilateral grids (BilaRF-style).
-    #[arg(long, help_heading = "Appearance options", default_value = "false")]
+    /// Enable per-view affine bilateral grids (BilaRF-style). Mutually exclusive
+    /// with PPISP.
+    #[arg(
+        long,
+        help_heading = "Appearance options",
+        default_value = "false",
+        conflicts_with = "ppisp"
+    )]
     #[serde(default)]
     pub bilateral_grid: bool,
 
@@ -173,8 +179,14 @@ pub struct TrainConfig {
 
     /// Enable PPISP appearance compensation: per-frame exposure + color
     /// homography and per-camera vignetting + tone curve (physically
-    /// plausible ISP model), applied to the render before the loss.
-    #[arg(long, help_heading = "Appearance options", default_value = "false")]
+    /// plausible ISP model), applied to the render before the loss. Mutually
+    /// exclusive with the bilateral grid.
+    #[arg(
+        long,
+        help_heading = "Appearance options",
+        default_value = "false",
+        conflicts_with = "bilateral_grid"
+    )]
     #[serde(default)]
     pub ppisp: bool,
 
@@ -227,4 +239,17 @@ fn default_ppisp_lr() -> f64 {
 
 fn default_ppisp_reg_scale() -> f32 {
     1.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_rejects_stacked_appearance_models() {
+        let error = TrainConfig::try_parse_from(["brush", "--bilateral-grid", "--ppisp"])
+            .err()
+            .expect("stacked appearance flags must conflict");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 }

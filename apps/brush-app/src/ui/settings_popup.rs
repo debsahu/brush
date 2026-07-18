@@ -223,10 +223,24 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
 
     ui.collapsing("Appearance compensation", |ui| {
         let tc = &mut args.train_config;
-        ui.add_enabled(
-            enabled,
-            egui::Checkbox::new(&mut tc.bilateral_grid, "Per-view affine bilateral grid"),
-        );
+        let mut appearance_mode = match (tc.bilateral_grid, tc.ppisp) {
+            (true, false) => 1,
+            (false, true) => 2,
+            _ => 0,
+        };
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.radio_value(&mut appearance_mode, 0, "None");
+            ui.radio_value(&mut appearance_mode, 1, "Per-view affine bilateral grid");
+            ui.radio_value(
+                &mut appearance_mode,
+                2,
+                "PPISP (exposure / color / vignetting / tone curve)",
+            );
+        });
+        if enabled {
+            tc.bilateral_grid = appearance_mode == 1;
+            tc.ppisp = appearance_mode == 2;
+        }
         if tc.bilateral_grid {
             slider(
                 ui,
@@ -245,13 +259,6 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
                 enabled,
             );
         }
-        ui.add_enabled(
-            enabled,
-            egui::Checkbox::new(
-                &mut tc.ppisp,
-                "PPISP (exposure / color / vignetting / tone curve)",
-            ),
-        );
         if tc.ppisp {
             slider(
                 ui,

@@ -14,7 +14,7 @@ The growth path got a real overhaul: longer-edge split, "uni" noise, and a fix f
 
 #### Appearance compensation (bilateral grid and PPISP)
 
-Training can now learn per-view photometric corrections so exposure, white-balance, and vignetting variation between input images is not baked into the splats. `--bilateral-grid` enables per-view affine grids and `--ppisp` enables NVIDIA's full per-frame/per-camera PPISP model. Both use CubeCL kernels with custom autodiff in the new `brush-appearance` crate; corrections apply to the rendered image before the loss and remain training-only, so exported splats keep canonical colors. The grid uses sparse per-view optimizer state with bounded allocation, and `--train-on-eval` lets evaluation apply learned corrections for evaluation views retained in training.
+Training can now learn per-view photometric corrections so exposure, white-balance, and vignetting variation between input images is not baked into the splats. `--bilateral-grid` enables per-view affine grids and `--ppisp` enables NVIDIA's full per-frame/per-camera PPISP model; they are alternative, mutually exclusive modes. Both use CubeCL kernels with custom autodiff in the new `brush-appearance` crate; corrections apply to the rendered image before the loss and remain training-only, so exported splats keep canonical colors. The grid uses sparse per-view optimizer state with bounded allocation, and `--train-on-eval` lets evaluation apply learned corrections for evaluation views retained in training.
 
 #### Mip-Splatting
 
