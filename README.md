@@ -56,9 +56,9 @@ cargo run --release --features native-msl
 
 The same feature is available on `brush-cli` and `brush-c`. On non-Metal backends it continues to use WGSL. The compiler choice applies to the whole binary, so compare WGSL and MSL with separate builds.
 
-On Apple Silicon, one runtime preset requests all five retained native-MSL
-training optimizations. Compile native MSL into the binary once, then enable the
-preset when launching it:
+On Apple Silicon, one runtime preset requests all six retained native-MSL
+training optimizations. Compile native MSL into the binary once, then enable
+the preset when launching it:
 
 ```sh
 cargo build --release --features native-msl
@@ -72,6 +72,7 @@ The preset is equivalent to setting these individual options to `1`:
 - `BRUSH_NATIVE_MSL_COALESCED_SH_GRAD`
 - `BRUSH_NATIVE_MSL_SAVED_LOSS_PARTIALS`
 - `BRUSH_NATIVE_MSL_SPARSE_SH_ADAM`
+- `BRUSH_NATIVE_MSL_FINE_RASTER_TILES`
 
 Each option remains subject to its compile-time, tensor-shape, and device
 capability checks; unsupported cases retain the existing implementation. An
@@ -88,6 +89,32 @@ Only `1` and case-insensitive `true` enable a switch. `0`, case-insensitive
 `false`, or an unrecognized explicit value disable it. The preset and all
 individual options are off by default, and have no effect unless the required
 native-MSL build and platform gates are present.
+
+The preset selects the 16x8 training rasterizer on Apple Silicon native-MSL
+builds. It replaces the 16x16 tile geometry for the forward, map, raster, and
+backward training passes as one unit; product rendering entry points continue
+to use 16x16 tiles. The standalone option remains available without the rest
+of the preset:
+
+```sh
+BRUSH_NATIVE_MSL_FINE_RASTER_TILES=1 cargo run --release --features native-msl
+```
+
+Fine tiles alone retain bounds checks in raster backward; the full preset also
+requests `BRUSH_NATIVE_MSL_UNCHECKED_RASTER_BWD` and uses the same
+host-validated unchecked launch contract as 16x16. To isolate the old geometry
+or work around a device-specific issue, explicitly disable fine tiles while
+retaining the rest of the preset:
+
+```sh
+BRUSH_NATIVE_MSL_PRESET=1 \
+BRUSH_NATIVE_MSL_FINE_RASTER_TILES=0 \
+./target/release/brush
+```
+
+The 16x8 performance, memory, gradient, six-run 15k quality, and 30k stability
+gates are recorded in the
+[fine-tile results](docs/performance/egg-raster-fine-tile-results.md).
 
 Native-MSL builds also expose an experimental, off-by-default raster-backward path without generated buffer bounds checks. It relies on the renderer's tile/range invariants and requires native float atomics (otherwise it falls back to the checked path), so use it for controlled benchmarking and soaks rather than production builds:
 
@@ -200,6 +227,32 @@ implementation.
 Pass `--skip-refine-weight` to benchmark the late phase after high-gradient
 densification stops. Production training selects that path automatically at
 `--growth-stop-iter`; visibility and screen-radius refinement stats remain enabled.
+
+To inspect raster workload shape without changing any GPU kernel, build the
+replay with the diagnostics-only `raster-census` feature. The first untimed
+warmup cycle reads back the existing projected splats, intersection list, and
+tile offsets. It reports exact tile occupancy and backward atomic fan-in plus a
+deterministic CPU replay of the requested number of tiles:
+
+```sh
+cargo run --release -p brush-bench-test \
+  --bin brush-checkpoint-replay --features native-msl,raster-census -- \
+  --dataset /path/to/dataset \
+  --ply /path/to/checkpoint.ply \
+  --max-resolution 1920 \
+  --views 4 \
+  --warmup-steps 4 \
+  --steps-per-sample 4 \
+  --samples 1 \
+  --raster-census-tiles 256
+```
+
+Each view emits one `BRUSH_RASTER_CENSUS` JSON record. Census readbacks are
+synchronous and deliberately excluded from normal builds; do not use a census
+run for timing. Capture CubeCL timestamp profiles in a separate ordinary replay
+without the `raster-census` feature. The
+[egg raster workload census](docs/performance/egg-raster-workload-census.md)
+records the measurements that selected the first fine-tile candidate.
 
 For post-hoc quality evaluation, render the held-out dataset views from an
 exported PLY with the standalone evaluator. Alpha interpretation is required so

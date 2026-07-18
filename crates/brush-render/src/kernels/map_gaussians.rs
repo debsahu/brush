@@ -20,6 +20,8 @@ pub fn map_gaussians_to_intersect_kernel(
     tile_bw: u32,
     tile_bh: u32,
     num_visible: u32,
+    #[comptime] tile_width: u32,
+    #[comptime] tile_height: u32,
 ) {
     let compact_gid = ABSOLUTE_POS as u32;
     if compact_gid >= num_visible {
@@ -30,7 +32,16 @@ pub fn map_gaussians_to_intersect_kernel(
 
     let power_threshold = f32::ln(opac * 255.0f32);
     let (ex, ey) = compute_bbox_extent(conic, power_threshold);
-    let bb = get_tile_bbox(xy_x, xy_y, ex, ey, tile_bw, tile_bh);
+    let bb = get_tile_bbox(
+        xy_x,
+        xy_y,
+        ex,
+        ey,
+        tile_bw,
+        tile_bh,
+        tile_width,
+        tile_height,
+    );
 
     // Inclusive prefix sum: use cum[compact_gid - 1] as base (or 0 for first).
     // Index with `max(compact_gid, 1) - 1` so the read is always in-bounds.
@@ -55,7 +66,7 @@ pub fn map_gaussians_to_intersect_kernel(
     while ty < bb.max_y && num_tiles_hit < pf_count {
         let mut tx = bb.min_x;
         while tx < bb.max_x && num_tiles_hit < pf_count {
-            let rect = tile_rect(tx, ty);
+            let rect = tile_rect(tx, ty, tile_width, tile_height);
             if will_primitive_contribute(rect, xy_x, xy_y, conic, power_threshold) {
                 let tile_id = tx + ty * tile_bw;
                 let isect_id = base_isect_id + num_tiles_hit;

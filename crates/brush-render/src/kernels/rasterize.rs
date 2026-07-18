@@ -1,6 +1,6 @@
 //! Tile-based gaussian rasterizer.
 //!
-//! One workgroup of `TILE_SIZE` threads per tile, each thread processes a
+//! One workgroup of `tile_width * tile_height` threads per tile, each thread processes a
 //! single pixel. Threads cooperate to load splats into a workgroup-shared
 //! `local_batch` then iterate splats across all pixels.
 //!
@@ -16,8 +16,8 @@ use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
 
 use super::helpers::{
-    ALPHA_CUTOFF_MID, PROJECTED_LANES, PROJECTED_LANES_USIZE, TILE_SIZE, TILE_WIDTH,
-    alpha_cutoff_weight, calc_sigma, map_1d_to_2d,
+    ALPHA_CUTOFF_MID, PROJECTED_LANES, PROJECTED_LANES_USIZE, alpha_cutoff_weight, calc_sigma,
+    map_1d_to_2d,
 };
 use super::types::{RasterizeUniforms, Sym2};
 
@@ -34,23 +34,26 @@ pub fn rasterize_kernel(
     u: RasterizeUniforms,
     #[comptime] bwd_info: bool,
     #[comptime] smooth_cutoff: bool,
+    #[comptime] tile_width: u32,
+    #[comptime] tile_height: u32,
 ) {
+    let tile_size = comptime![tile_width * tile_height];
     let global_id = ABSOLUTE_POS as u32;
-    let (pix_x, pix_y) = map_1d_to_2d(global_id, u.tile_bw);
+    let (pix_x, pix_y) = map_1d_to_2d(global_id, u.tile_bw, tile_width, tile_height);
     let pix_id = pix_x + pix_y * u.img_w;
     let pixel_coord_x = pix_x as f32 + 0.5f32;
     let pixel_coord_y = pix_y as f32 + 0.5f32;
-    let tile_loc_x = pix_x / TILE_WIDTH;
-    let tile_loc_y = pix_y / TILE_WIDTH;
+    let tile_loc_x = pix_x / tile_width;
+    let tile_loc_y = pix_y / tile_height;
     let tile_id = tile_loc_x + tile_loc_y * u.tile_bw;
     let inside = pix_x < u.img_w && pix_y < u.img_h;
 
     // Workgroup-shared splat batch + bookkeeping. The bwd-only `load_gid`
     // gets a comptime-tiny size when `bwd_info=false` so we don't pay
-    // 1 KiB of static shared mem on the forward-only variant.
-    let mut local_batch = Shared::new_slice((TILE_SIZE * PROJECTED_LANES) as usize);
+    // up to 1 KiB of static shared mem on the forward-only variant.
+    let mut local_batch = Shared::new_slice((tile_size * PROJECTED_LANES) as usize);
     let mut load_gid =
-        Shared::new_slice(comptime![if bwd_info { TILE_SIZE } else { 1u32 }] as usize);
+        Shared::new_slice(comptime![if bwd_info { tile_size } else { 1u32 }] as usize);
     let num_done_atomic = Shared::<[Atomic<u32>]>::new_slice(1usize);
     let max_useful_isect = Shared::<[Atomic<u32>]>::new_slice(1usize);
     let mut range = Shared::new_slice(2usize);
@@ -87,10 +90,10 @@ pub fn rasterize_kernel(
     while batch_start < range_hi {
         // Doubles as the sync between previous iter's local_batch reads
         // and this iter's overwrites.
-        if workgroup_uniform_load_atomic(&num_done_atomic[0]) >= TILE_SIZE {
+        if workgroup_uniform_load_atomic(&num_done_atomic[0]) >= tile_size {
             break;
         }
-        let remaining = min(TILE_SIZE, range_hi - batch_start);
+        let remaining = min(tile_size, range_hi - batch_start);
         let load_isect_id = batch_start + local_idx;
         let mut compact_gid = 0u32;
         if local_idx < remaining {
@@ -154,7 +157,7 @@ pub fn rasterize_kernel(
         if !was_done && done {
             Atomic::fetch_add(&num_done_atomic[0], 1u32);
         }
-        batch_start += TILE_SIZE;
+        batch_start += tile_size;
     }
 
     if inside {

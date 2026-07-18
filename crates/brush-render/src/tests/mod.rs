@@ -13,6 +13,8 @@ use burn::tensor::{Distribution, Tensor};
 use glam::Vec3;
 use wasm_bindgen_test::wasm_bindgen_test;
 
+mod raster_oracle;
+
 #[cfg(target_family = "wasm")]
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 

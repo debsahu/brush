@@ -7,7 +7,7 @@ use camera::Camera;
 use clap::ValueEnum;
 use glam::Vec3;
 
-use crate::gaussian_splats::SplatRenderMode;
+use crate::gaussian_splats::{Rasterizer, SplatRenderMode};
 pub use crate::gaussian_splats::{Splats, TextureMode, render_splats};
 pub use crate::render_aux::{RenderAux, RenderAuxInner, RenderOutput};
 
@@ -21,6 +21,10 @@ pub mod shaders;
 
 #[doc(hidden)]
 pub mod native_msl;
+
+#[cfg(feature = "raster-census")]
+#[doc(hidden)]
+pub mod raster_census;
 
 pub mod sh;
 
@@ -78,6 +82,25 @@ pub trait SplatOps: Backend {
         render_mode: SplatRenderMode,
         background: Vec3,
         pass: gaussian_splats::RasterPass,
+    ) -> impl Future<Output = RenderOutput<Self>>;
+}
+
+/// Internal extension used to exercise alternate rasterizer layouts without
+/// changing the stable [`SplatOps`] API.
+#[doc(hidden)]
+#[burn::backend::backend_extension(Wgpu)]
+pub trait SplatRasterizerOps: SplatOps {
+    #[allow(clippy::too_many_arguments)]
+    fn render_with_rasterizer(
+        camera: &Camera,
+        img_size: glam::UVec2,
+        transforms: FloatTensor<Self>,
+        sh_coeffs: FloatTensor<Self>,
+        raw_opacities: FloatTensor<Self>,
+        render_mode: SplatRenderMode,
+        background: Vec3,
+        pass: gaussian_splats::RasterPass,
+        rasterizer: Rasterizer,
     ) -> impl Future<Output = RenderOutput<Self>>;
 }
 

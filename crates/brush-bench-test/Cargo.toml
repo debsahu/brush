@@ -12,6 +12,7 @@ native-msl = [
     "brush-render-bwd/native-msl",
     "brush-train/native-msl",
 ]
+raster-census = ["brush-render/raster-census"]
 
 [dependencies]
 brush-render.path = "../brush-render"

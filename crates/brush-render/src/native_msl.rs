@@ -9,6 +9,7 @@ pub const FUSED_SH_ADAM_ENV: &str = "BRUSH_NATIVE_MSL_FUSED_SH_ADAM";
 pub const COALESCED_SH_GRAD_ENV: &str = "BRUSH_NATIVE_MSL_COALESCED_SH_GRAD";
 pub const SAVED_LOSS_PARTIALS_ENV: &str = "BRUSH_NATIVE_MSL_SAVED_LOSS_PARTIALS";
 pub const SPARSE_SH_ADAM_ENV: &str = "BRUSH_NATIVE_MSL_SPARSE_SH_ADAM";
+pub const FINE_RASTER_TILES_ENV: &str = "BRUSH_NATIVE_MSL_FINE_RASTER_TILES";
 
 #[cfg(any(not(target_family = "wasm"), test))]
 fn parse_bool(value: &str) -> Option<bool> {
@@ -65,6 +66,31 @@ pub fn option_requested(option_env: &str) -> bool {
 
 #[cfg(target_family = "wasm")]
 pub const fn option_requested(_option_env: &str) -> bool {
+    false
+}
+
+/// Whether the 16x8 training rasterizer was requested.
+///
+/// An explicit [`FINE_RASTER_TILES_ENV`] value wins over [`PRESET_ENV`], like
+/// the other native-MSL options. Compile-time and platform gates still keep
+/// this training-only specialization on supported Apple Silicon builds.
+#[cfg(all(
+    feature = "native-msl",
+    target_os = "macos",
+    target_arch = "aarch64",
+    not(target_family = "wasm")
+))]
+pub fn fine_raster_tiles_requested() -> bool {
+    option_requested(FINE_RASTER_TILES_ENV)
+}
+
+#[cfg(not(all(
+    feature = "native-msl",
+    target_os = "macos",
+    target_arch = "aarch64",
+    not(target_family = "wasm")
+)))]
+pub const fn fine_raster_tiles_requested() -> bool {
     false
 }
 

@@ -155,11 +155,14 @@ jobs:
           grep -q 'saved_partials: Some(' "$CUBECL_DEBUG_LOG"
           grep -q 'SparseShAdamKernel' "$CUBECL_DEBUG_LOG"
           awk '
-            /\[START_KERNEL_COMPILATION\]/ { block = 1; raster = 0; unchecked = 0 }
+            /\[START_KERNEL_COMPILATION\]/ {
+              block = 1; raster = 0; unchecked = 0; fine_tiles = 0
+            }
             block && /RasterizeBackwardsKernel/ { raster = 1 }
             block && /mode: Unchecked/ { unchecked = 1 }
+            block && /tile_height: 8,/ { fine_tiles = 1 }
             /\[END_KERNEL_COMPILATION\]/ {
-              if (raster && unchecked) found = 1
+              if (raster && unchecked && fine_tiles) found = 1
               block = 0
             }
             END { exit found ? 0 : 1 }
