@@ -6,9 +6,9 @@ use brush_render::burn_glue::{
     wrap_wgpu_int,
 };
 use brush_render::{
-    SplatOps,
+    SplatOps, SplatRasterizerOps,
     camera::Camera,
-    gaussian_splats::{SplatRenderMode, Splats, fold_min_scale},
+    gaussian_splats::{Rasterizer, SplatRenderMode, Splats, fold_min_scale},
     sh::sh_coeffs_for_degree,
     shaders::helpers::ProjectUniforms,
 };
@@ -33,6 +33,20 @@ use burn_fusion::{
 };
 use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
 use glam::Vec3;
+
+fn training_rasterizer() -> Rasterizer {
+    use std::sync::OnceLock;
+
+    static SELECTED: OnceLock<Rasterizer> = OnceLock::new();
+    *SELECTED.get_or_init(|| {
+        if brush_render::native_msl::fine_raster_tiles_requested() {
+            tracing::info!("16x8 training raster tiles enabled");
+            Rasterizer::Candidate
+        } else {
+            Rasterizer::Legacy
+        }
+    })
+}
 
 /// Intermediate gradients from the rasterize backward pass.
 ///
@@ -168,6 +182,7 @@ pub(crate) struct ForwardRasterBackward<B: Backend> {
     background: Vec3,
     img_size: glam::UVec2,
     v_output: FloatTensor<B>,
+    rasterizer: Rasterizer,
     smooth_cutoff: bool,
     compute_refine_weight: bool,
 }
@@ -182,6 +197,7 @@ impl<B: Backend> ForwardRasterBackward<B> {
         background: Vec3,
         img_size: glam::UVec2,
         v_output: FloatTensor<B>,
+        rasterizer: Rasterizer,
         smooth_cutoff: bool,
         compute_refine_weight: bool,
     ) -> Self {
@@ -193,6 +209,7 @@ impl<B: Backend> ForwardRasterBackward<B> {
             background,
             img_size,
             v_output,
+            rasterizer,
             smooth_cutoff,
             compute_refine_weight,
         }
@@ -209,6 +226,7 @@ impl<B: Backend> ForwardRasterBackward<B> {
         Vec3,
         glam::UVec2,
         FloatTensor<B>,
+        Rasterizer,
         bool,
         bool,
     ) {
@@ -220,6 +238,7 @@ impl<B: Backend> ForwardRasterBackward<B> {
             self.background,
             self.img_size,
             self.v_output,
+            self.rasterizer,
             self.smooth_cutoff,
             self.compute_refine_weight,
         )
@@ -250,6 +269,7 @@ struct GaussianBackwardState<B: Backend> {
 
     render_mode: SplatRenderMode,
     pass: brush_render::gaussian_splats::RasterPass,
+    rasterizer: Rasterizer,
     background: Vec3,
     img_size: glam::UVec2,
 }
@@ -293,6 +313,7 @@ impl<B: Backend + InternalSplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackw
             state.background,
             state.img_size,
             v_output,
+            state.rasterizer,
             state.pass.smooth_cutoff(),
             compute_refine_weight,
         ));
@@ -469,6 +490,7 @@ pub async fn render_splats_with_refine_weight(
         img_size,
         background,
         brush_render::gaussian_splats::RasterPass::Backward,
+        Rasterizer::Legacy,
         compute_refine_weight,
         false,
     )
@@ -503,6 +525,7 @@ pub async fn render_splats_for_training(
         img_size,
         background,
         brush_render::gaussian_splats::RasterPass::Backward,
+        training_rasterizer(),
         compute_refine_weight,
         defer_sh_grad,
     )
@@ -520,8 +543,30 @@ pub async fn render_splats_with_pass(
     background: Vec3,
     pass: brush_render::gaussian_splats::RasterPass,
 ) -> SplatOutputDiff {
+    render_splats_with_pass_and_rasterizer(
+        splats,
+        camera,
+        img_size,
+        background,
+        pass,
+        Rasterizer::Legacy,
+    )
+    .await
+}
+
+/// Selector-aware differentiable render entry point for internal rasterizer
+/// parity tests. Product code should use [`render_splats_with_pass`].
+#[doc(hidden)]
+pub async fn render_splats_with_pass_and_rasterizer(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    pass: brush_render::gaussian_splats::RasterPass,
+    rasterizer: Rasterizer,
+) -> SplatOutputDiff {
     render_splats_with_pass_and_refine_weight(
-        splats, camera, img_size, background, pass, true, false,
+        splats, camera, img_size, background, pass, rasterizer, true, false,
     )
     .await
     .into_public()
@@ -533,6 +578,7 @@ async fn render_splats_with_pass_and_refine_weight(
     img_size: glam::UVec2,
     background: Vec3,
     pass: brush_render::gaussian_splats::RasterPass,
+    rasterizer: Rasterizer,
     compute_refine_weight: bool,
     defer_sh_grad: bool,
 ) -> TrainingSplatOutputDiff {
@@ -600,7 +646,7 @@ async fn render_splats_with_pass_and_refine_weight(
         pass.bwd_info(),
         "render_splats_with_pass requires a Backward variant"
     );
-    let output = <MainBackend as SplatOps>::render(
+    let output = <MainBackend as SplatRasterizerOps>::render_with_rasterizer(
         camera,
         img_size,
         transforms_inner.clone(),
@@ -609,6 +655,7 @@ async fn render_splats_with_pass_and_refine_weight(
         render_mode,
         background,
         pass,
+        rasterizer,
     )
     .await;
 
@@ -637,6 +684,7 @@ async fn render_splats_with_pass_and_refine_weight(
                 compact_gid_from_isect: output.compact_gid_from_isect,
                 render_mode,
                 pass,
+                rasterizer,
                 global_from_compact_gid: output.global_from_compact_gid,
                 background,
                 img_size,
@@ -668,6 +716,7 @@ fn rasterize_bwd_fusion(
     background: Vec3,
     img_size: glam::UVec2,
     v_output: FloatTensor<Fusion<MainBackendBase>>,
+    rasterizer: Rasterizer,
     smooth_cutoff: bool,
     compute_refine_weight: bool,
     trusted_forward: bool,
@@ -677,6 +726,7 @@ fn rasterize_bwd_fusion(
         desc: CustomOpIr,
         background: Vec3,
         img_size: glam::UVec2,
+        rasterizer: Rasterizer,
         smooth_cutoff: bool,
         compute_refine_weight: bool,
         trusted_forward: bool,
@@ -706,6 +756,7 @@ fn rasterize_bwd_fusion(
                         self.background,
                         self.img_size,
                         h.get_float_tensor::<MainBackendBase>(v_output),
+                        self.rasterizer,
                         self.smooth_cutoff,
                         self.compute_refine_weight,
                     ),
@@ -758,6 +809,7 @@ fn rasterize_bwd_fusion(
                 desc,
                 background,
                 img_size,
+                rasterizer,
                 smooth_cutoff,
                 compute_refine_weight,
                 trusted_forward,
@@ -788,6 +840,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
             background,
             img_size,
             v_output,
+            Rasterizer::Legacy,
             smooth_cutoff,
             true,
             false,
@@ -814,6 +867,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
             background,
             img_size,
             v_output,
+            Rasterizer::Legacy,
             smooth_cutoff,
             compute_refine_weight,
             false,
@@ -1055,6 +1109,7 @@ impl InternalSplatBwdOps for Fusion<MainBackendBase> {
             background,
             img_size,
             v_output,
+            rasterizer,
             smooth_cutoff,
             compute_refine_weight,
         ) = input.into_parts();
@@ -1066,6 +1121,7 @@ impl InternalSplatBwdOps for Fusion<MainBackendBase> {
             background,
             img_size,
             v_output,
+            rasterizer,
             smooth_cutoff,
             compute_refine_weight,
             true,

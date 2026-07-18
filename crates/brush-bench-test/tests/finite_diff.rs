@@ -11,7 +11,7 @@
 //! away from f16 quantization limits) so central differences are
 //! second-order accurate.
 
-use brush_render::gaussian_splats::RasterPass;
+use brush_render::gaussian_splats::{RasterPass, Rasterizer};
 use brush_render::{
     camera::Camera,
     gaussian_splats::{SplatRenderMode, Splats},
@@ -22,7 +22,10 @@ use brush_render::{
 };
 #[cfg(not(target_family = "wasm"))]
 use brush_render_bwd::render_splats_for_training;
-use brush_render_bwd::{render_splats_with_pass, render_splats_with_refine_weight};
+use brush_render_bwd::{
+    render_splats_with_pass, render_splats_with_pass_and_rasterizer,
+    render_splats_with_refine_weight,
+};
 
 /// Finite-diff tests need the C^1 cutoff so analytical and numerical
 /// agree at typical eps; production paths use the hard step.
@@ -233,6 +236,95 @@ async fn disabling_refine_weight_preserves_model_gradients_and_aux() {
     assert_close("opacity", &opacity_off, &opacity_on);
     assert_close("visibility", &visible_off, &visible_on);
     assert_close("max radius", &radius_off, &radius_on);
+}
+
+#[tokio::test]
+async fn candidate_selector_preserves_forward_backward_and_aux() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let scene = base_scene();
+    let camera = std_cam();
+    let img_size = glam::uvec2(35, 29);
+    let background = Vec3::new(0.11, 0.07, 0.19);
+
+    for pass in [RasterPass::Backward, PASS] {
+        let legacy_splats = build_splats(&scene, &device);
+        let legacy = render_splats_with_pass_and_rasterizer(
+            legacy_splats.clone(),
+            &camera,
+            img_size,
+            background,
+            pass,
+            Rasterizer::Legacy,
+        )
+        .await;
+        let legacy_image = read_vec(legacy.img.clone()).await;
+        let legacy_visible = read_vec(legacy.visible.clone()).await;
+        let legacy_radius = read_vec(legacy.max_radius.clone()).await;
+        let legacy_grads = legacy.img.mean().backward();
+        let legacy_transforms =
+            read_vec(legacy_splats.transforms.grad(&legacy_grads).unwrap()).await;
+        let legacy_sh = read_vec(legacy_splats.sh_coeffs.grad(&legacy_grads).unwrap()).await;
+        let legacy_opacity =
+            read_vec(legacy_splats.raw_opacities.grad(&legacy_grads).unwrap()).await;
+
+        let candidate_splats = build_splats(&scene, &device);
+        let candidate = render_splats_with_pass_and_rasterizer(
+            candidate_splats.clone(),
+            &camera,
+            img_size,
+            background,
+            pass,
+            Rasterizer::Candidate,
+        )
+        .await;
+        let candidate_image = read_vec(candidate.img.clone()).await;
+        let candidate_visible = read_vec(candidate.visible.clone()).await;
+        let candidate_radius = read_vec(candidate.max_radius.clone()).await;
+        let candidate_grads = candidate.img.mean().backward();
+        let candidate_transforms =
+            read_vec(candidate_splats.transforms.grad(&candidate_grads).unwrap()).await;
+        let candidate_sh =
+            read_vec(candidate_splats.sh_coeffs.grad(&candidate_grads).unwrap()).await;
+        let candidate_opacity = read_vec(
+            candidate_splats
+                .raw_opacities
+                .grad(&candidate_grads)
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(
+            candidate.num_visible, legacy.num_visible,
+            "{pass:?} visible count"
+        );
+        assert_close(
+            &format!("{pass:?} selector image"),
+            &candidate_image,
+            &legacy_image,
+        );
+        assert_close(
+            &format!("{pass:?} selector visibility"),
+            &candidate_visible,
+            &legacy_visible,
+        );
+        assert_close(
+            &format!("{pass:?} selector max radius"),
+            &candidate_radius,
+            &legacy_radius,
+        );
+        assert_close(
+            &format!("{pass:?} selector transforms"),
+            &candidate_transforms,
+            &legacy_transforms,
+        );
+        assert_close(&format!("{pass:?} selector SH"), &candidate_sh, &legacy_sh);
+        assert_close(
+            &format!("{pass:?} selector opacity"),
+            &candidate_opacity,
+            &legacy_opacity,
+        );
+    }
 }
 
 #[cfg(all(

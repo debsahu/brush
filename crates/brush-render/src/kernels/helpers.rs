@@ -62,15 +62,22 @@ pub fn compact_bits_16(v: u32) -> u32 {
 }
 
 /// Decode a tile-internal Morton id to (px, py) coordinates within the image.
+/// The supported 16x16 and 16x8 layouts are exact prefixes of this Morton map.
 #[cube]
-pub fn map_1d_to_2d(id: u32, tiles_per_row: u32) -> (u32, u32) {
-    let tile_id = id / TILE_SIZE;
-    let within = id % TILE_SIZE;
+pub fn map_1d_to_2d(
+    id: u32,
+    tiles_per_row: u32,
+    #[comptime] tile_width: u32,
+    #[comptime] tile_height: u32,
+) -> (u32, u32) {
+    let tile_size = comptime![tile_width * tile_height];
+    let tile_id = id / tile_size;
+    let within = id % tile_size;
     let tile_x = tile_id % tiles_per_row;
     let tile_y = tile_id / tiles_per_row;
     let mx = compact_bits_16(within);
     let my = compact_bits_16(within >> 1u32);
-    (tile_x * TILE_WIDTH + mx, tile_y * TILE_WIDTH + my)
+    (tile_x * tile_width + mx, tile_y * tile_height + my)
 }
 
 /// Splat half-extent along x / y from the packed conic. Returns
@@ -90,14 +97,19 @@ pub fn compute_bbox_extent(conic: Sym2, power_threshold: f32) -> (f32, f32) {
 }
 
 #[cube]
-pub fn tile_rect(tx: u32, ty: u32) -> PixelRect {
-    let min_x = (tx * TILE_WIDTH) as f32;
-    let min_y = (ty * TILE_WIDTH) as f32;
+pub fn tile_rect(
+    tx: u32,
+    ty: u32,
+    #[comptime] tile_width: u32,
+    #[comptime] tile_height: u32,
+) -> PixelRect {
+    let min_x = (tx * tile_width) as f32;
+    let min_y = (ty * tile_height) as f32;
     PixelRect {
         min_x,
         min_y,
-        max_x: min_x + TILE_WIDTH as f32,
-        max_y: min_y + TILE_WIDTH as f32,
+        max_x: min_x + tile_width as f32,
+        max_y: min_y + tile_height as f32,
     }
 }
 
@@ -123,13 +135,16 @@ pub fn get_tile_bbox(
     pix_ey: f32,
     tile_bw: u32,
     tile_bh: u32,
+    #[comptime] tile_width: u32,
+    #[comptime] tile_height: u32,
 ) -> TileBbox {
-    let tw = TILE_WIDTH as f32;
+    let tw = tile_width as f32;
+    let th = tile_height as f32;
     get_bbox(
         pix_cx / tw,
-        pix_cy / tw,
+        pix_cy / th,
         pix_ex / tw,
-        pix_ey / tw,
+        pix_ey / th,
         tile_bw,
         tile_bh,
     )
@@ -202,6 +217,8 @@ pub fn count_contributing_tiles(
     xy_y: f32,
     conic: Sym2,
     power_threshold: f32,
+    #[comptime] tile_width: u32,
+    #[comptime] tile_height: u32,
 ) -> u32 {
     // Keep the row/column counters explicit: flattening this loop makes the
     // shader pay a dynamic integer division and remainder for every tile.
@@ -210,7 +227,7 @@ pub fn count_contributing_tiles(
     while ty < bb.max_y {
         let mut tx = bb.min_x;
         while tx < bb.max_x {
-            let rect = tile_rect(tx, ty);
+            let rect = tile_rect(tx, ty, tile_width, tile_height);
             if will_primitive_contribute(rect, xy_x, xy_y, conic, power_threshold) {
                 num_tiles_hit += 1u32;
             }

@@ -1124,6 +1124,7 @@ dependencies = [
  "glam",
  "log",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "wasm-bindgen-test",

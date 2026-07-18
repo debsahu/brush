@@ -1,5 +1,5 @@
 use brush_cube::{MainBackendBase, calc_cube_count_1d, create_tensor};
-use brush_render::gaussian_splats::SplatRenderMode;
+use brush_render::gaussian_splats::{Rasterizer, SplatRenderMode};
 use brush_render::kernels::types::RasterizeUniformsLaunch;
 use brush_render::sh::sh_coeffs_for_degree;
 use burn::backend::TensorMetadata;
@@ -96,6 +96,7 @@ fn rasterize_bwd_impl(
     background: Vec3,
     img_size: glam::UVec2,
     v_output: FloatTensor<MainBackendBase>,
+    rasterizer: Rasterizer,
     smooth_cutoff: bool,
     compute_refine_weight: bool,
     trusted_forward: bool,
@@ -111,13 +112,25 @@ fn rasterize_bwd_impl(
     let v_combined =
         MainBackendBase::float_zeros([num_visible, 10].into(), &device, FloatDType::F32);
 
+    let tile_width = rasterizer.tile_width();
+    let tile_height = rasterizer.tile_height();
     let tile_bounds = uvec2(
-        img_size
-            .x
-            .div_ceil(brush_render::shaders::helpers::TILE_WIDTH),
-        img_size
-            .y
-            .div_ceil(brush_render::shaders::helpers::TILE_WIDTH),
+        img_size.x.div_ceil(tile_width),
+        img_size.y.div_ceil(tile_height),
+    );
+    let tile_offset_shape = tile_offsets.shape();
+    assert_eq!(tile_offset_shape.rank(), 3, "tile offsets must be rank 3");
+    assert_eq!(
+        tile_offset_shape[0], tile_bounds.y as usize,
+        "tile-offset height must match the selected rasterizer"
+    );
+    assert_eq!(
+        tile_offset_shape[1], tile_bounds.x as usize,
+        "tile-offset width must match the selected rasterizer"
+    );
+    assert_eq!(
+        tile_offset_shape[2], 2,
+        "tile offsets must store one start/end pair per tile"
     );
 
     let hard_floats = client
@@ -143,13 +156,11 @@ fn rasterize_bwd_impl(
         if use_unchecked {
             // SAFETY: `trusted_forward` is only reachable through the opaque
             // `ForwardRasterBackward` produced by this crate's private autodiff bridge. The
-            // forward pass guarantees two ordered offsets per launched tile, with range_hi <=
-            // compact_gid_from_isect.len(); every compact ID is below the projected/v_combined
-            // row count; projected rows have the fixed splat stride; and contiguous
-            // output/v_output buffers both contain exactly img_w * img_h * 4 values. Image and
-            // partial-batch accesses are guarded in the kernel, host tensor sizes fit its
-            // u32/usize index arithmetic, and all loops are bounded by those finite tile ranges.
-            // This path uses native float atomics, not the CAS retry loop.
+            // selected rasterizer's tile-offset shape is asserted above, and the forward pass
+            // guarantees ordered offsets bounded by the intersection buffer, valid compact IDs,
+            // fixed projected rows, and exact contiguous image/output sizes. Image and partial
+            // batch accesses remain guarded in the kernel. This path uses native float atomics,
+            // not the CAS retry loop.
             unsafe {
                 rasterize_backwards_kernel::launch_unchecked::<HfAtomicAdd, WgpuRuntime>(
                     &client,
@@ -164,6 +175,8 @@ fn rasterize_bwd_impl(
                     uniforms,
                     smooth_cutoff,
                     compute_refine_weight,
+                    tile_width,
+                    tile_height,
                 );
             }
         } else if hard_floats {
@@ -180,6 +193,8 @@ fn rasterize_bwd_impl(
                 uniforms,
                 smooth_cutoff,
                 compute_refine_weight,
+                tile_width,
+                tile_height,
             );
         } else {
             // Keep bounds checks for the CAS fallback: its weak-CAS retry loop does not meet
@@ -197,6 +212,8 @@ fn rasterize_bwd_impl(
                 uniforms,
                 smooth_cutoff,
                 compute_refine_weight,
+                tile_width,
+                tile_height,
             );
         }
     });
@@ -224,6 +241,7 @@ impl SplatBwdOps for MainBackendBase {
             background,
             img_size,
             v_output,
+            Rasterizer::Legacy,
             smooth_cutoff,
             true,
             false,
@@ -250,6 +268,7 @@ impl SplatBwdOps for MainBackendBase {
             background,
             img_size,
             v_output,
+            Rasterizer::Legacy,
             smooth_cutoff,
             compute_refine_weight,
             false,
@@ -474,6 +493,7 @@ impl InternalSplatBwdOps for MainBackendBase {
             background,
             img_size,
             v_output,
+            rasterizer,
             smooth_cutoff,
             compute_refine_weight,
         ) = input.into_parts();
@@ -485,6 +505,7 @@ impl InternalSplatBwdOps for MainBackendBase {
             background,
             img_size,
             v_output,
+            rasterizer,
             smooth_cutoff,
             compute_refine_weight,
             true,

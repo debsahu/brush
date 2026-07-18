@@ -72,6 +72,12 @@ mod native {
         /// Skip the refinement-only raster gradient statistic for late-phase A/B timing.
         #[arg(long)]
         skip_refine_weight: bool,
+
+        /// Analyze this many deterministic tiles per selected view during the first untimed
+        /// warmup cycle. Requires the `raster-census` Cargo feature and invalidates warmup timing.
+        #[cfg(feature = "raster-census")]
+        #[arg(long, value_name = "TILES")]
+        raster_census_tiles: Option<usize>,
     }
 
     fn validate_args(args: &Args) -> Result<()> {
@@ -92,6 +98,10 @@ mod native {
         }
         if args.eval_split_every == Some(0) {
             bail!("--eval-split-every must be at least 1");
+        }
+        #[cfg(feature = "raster-census")]
+        if args.raster_census_tiles == Some(0) {
+            bail!("--raster-census-tiles must be at least 1");
         }
         Ok(())
     }
@@ -246,6 +256,11 @@ mod native {
         let mut trainer = SplatTrainer::new(&config, &device, bounds);
 
         let compute_refine_weight = !args.skip_refine_weight;
+        #[cfg(feature = "raster-census")]
+        if let Some(sample_tiles) = args.raster_census_tiles {
+            brush_render::raster_census::request(batches.len(), sample_tiles)
+                .map_err(anyhow::Error::msg)?;
+        }
         let _ = run_steps(
             &mut trainer,
             &mut splats,
@@ -314,6 +329,7 @@ mod native {
         let sparse_sh_adam_requested = brush_render::native_msl::option_requested(
             brush_render::native_msl::SPARSE_SH_ADAM_ENV,
         );
+        let fine_raster_tiles_requested = brush_render::native_msl::fine_raster_tiles_requested();
 
         println!("checkpoint: {}", args.ply.display());
         println!("dataset: {}", args.dataset.display());
@@ -321,7 +337,7 @@ mod native {
         println!("views: {} ({})", batches.len(), view_labels.join(", "));
         println!("refinement weight: {compute_refine_weight}");
         println!(
-            "compiler: {compiler} | native MSL preset requested: {preset_requested} | unchecked raster requested: {unchecked_raster_requested} | fused SH Adam requested: {fused_sh_adam_requested} | coalesced SH grad requested: {coalesced_sh_grad_requested} | saved loss partials requested: {saved_loss_partials_requested} | sparse SH Adam requested: {sparse_sh_adam_requested} | seed: {}",
+            "compiler: {compiler} | native MSL preset requested: {preset_requested} | unchecked raster requested: {unchecked_raster_requested} | fused SH Adam requested: {fused_sh_adam_requested} | coalesced SH grad requested: {coalesced_sh_grad_requested} | saved loss partials requested: {saved_loss_partials_requested} | sparse SH Adam requested: {sparse_sh_adam_requested} | fine raster tiles requested: {fine_raster_tiles_requested} | seed: {}",
             args.seed
         );
         println!(
@@ -334,7 +350,7 @@ mod native {
         );
         println!("final loss: {final_loss:.9}");
         println!(
-            "BRUSH_REPLAY_RESULT compiler={compiler} native_msl_preset_requested={preset_requested} unchecked_raster_requested={unchecked_raster_requested} fused_sh_adam_requested={fused_sh_adam_requested} coalesced_sh_grad_requested={coalesced_sh_grad_requested} saved_loss_partials_requested={saved_loss_partials_requested} sparse_sh_adam_requested={sparse_sh_adam_requested} compute_refine_weight={compute_refine_weight} seed={} splats={splat_count} views={} view_set={} samples={} steps_per_sample={} warmup_steps={} median_ms={median:.6} p95_ms={p95:.6} mean_ms={mean:.6} min_ms={min:.6} max_ms={max:.6} steps_per_s={:.6} final_loss={final_loss:.9}",
+            "BRUSH_REPLAY_RESULT compiler={compiler} native_msl_preset_requested={preset_requested} unchecked_raster_requested={unchecked_raster_requested} fused_sh_adam_requested={fused_sh_adam_requested} coalesced_sh_grad_requested={coalesced_sh_grad_requested} saved_loss_partials_requested={saved_loss_partials_requested} sparse_sh_adam_requested={sparse_sh_adam_requested} fine_raster_tiles_requested={fine_raster_tiles_requested} compute_refine_weight={compute_refine_weight} seed={} splats={splat_count} views={} view_set={} samples={} steps_per_sample={} warmup_steps={} median_ms={median:.6} p95_ms={p95:.6} mean_ms={mean:.6} min_ms={min:.6} max_ms={max:.6} steps_per_s={:.6} final_loss={final_loss:.9}",
             args.seed,
             batches.len(),
             view_labels.join(","),

@@ -9,7 +9,7 @@ use glam::Vec3;
 use tracing::trace_span;
 
 use crate::{
-    RenderAux, SplatOps,
+    RenderAux, SplatRasterizerOps,
     camera::Camera,
     sh::{sh_coeffs_for_degree, sh_degree_from_coeffs},
 };
@@ -44,6 +44,41 @@ impl RasterPass {
     }
     pub const fn smooth_cutoff(self) -> bool {
         matches!(self, Self::BackwardSmoothCutoff)
+    }
+}
+
+/// Internal rasterizer implementation selector.
+///
+/// Product rendering entry points always use [`Rasterizer::Legacy`]. The
+/// differentiable training path may select [`Rasterizer::Candidate`] through
+/// the native-MSL runtime controls. Keeping this value explicit lets tests
+/// compare both paths in one process and makes forward/backward tile geometry
+/// impossible to infer inconsistently.
+#[doc(hidden)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
+pub enum Rasterizer {
+    #[default]
+    Legacy,
+    Candidate,
+}
+
+impl Rasterizer {
+    pub const fn tile_width(self) -> u32 {
+        match self {
+            Self::Legacy => crate::shaders::helpers::TILE_WIDTH,
+            Self::Candidate => crate::shaders::helpers::FINE_TILE_WIDTH,
+        }
+    }
+
+    pub const fn tile_height(self) -> u32 {
+        match self {
+            Self::Legacy => crate::shaders::helpers::TILE_WIDTH,
+            Self::Candidate => crate::shaders::helpers::FINE_TILE_HEIGHT,
+        }
+    }
+
+    pub const fn tile_size(self) -> u32 {
+        self.tile_width() * self.tile_height()
     }
 }
 
@@ -370,6 +405,33 @@ pub async fn render_splats(
     splat_scale: Option<f32>,
     texture_mode: TextureMode,
 ) -> (Tensor<3>, RenderAux) {
+    render_splats_with_rasterizer(
+        splats,
+        camera,
+        img_size,
+        background,
+        splat_scale,
+        texture_mode,
+        Rasterizer::Legacy,
+    )
+    .await
+}
+
+/// Selector-aware render entry point for internal rasterizer parity tests.
+///
+/// Product code should use [`render_splats`], which always selects the proven
+/// legacy implementation.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn render_splats_with_rasterizer(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    splat_scale: Option<f32>,
+    texture_mode: TextureMode,
+    rasterizer: Rasterizer,
+) -> (Tensor<3>, RenderAux) {
     splats.clone().validate_values().await;
 
     let sh_coeffs = splats.sh_coeffs.into_value();
@@ -411,7 +473,7 @@ pub async fn render_splats(
     // Route through the `#[backend_extension]`-generated `Dispatch` impl: it
     // unwraps these dispatch primitives to the Wgpu backend, runs the render,
     // and re-wraps the `RenderOutput` via its `ExtensionType` derive.
-    let output = <Dispatch as SplatOps>::render(
+    let output = <Dispatch as SplatRasterizerOps>::render_with_rasterizer(
         camera,
         img_size,
         transforms.into_dispatch(),
@@ -420,6 +482,7 @@ pub async fn render_splats(
         render_mode,
         background,
         pass,
+        rasterizer,
     )
     .await;
 

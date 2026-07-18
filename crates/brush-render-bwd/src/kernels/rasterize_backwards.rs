@@ -17,8 +17,7 @@ use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
 
 use brush_render::kernels::helpers::{
-    ALPHA_CUTOFF_MID, TILE_SIZE, TILE_WIDTH, alpha_cutoff_weight, alpha_cutoff_weight_deriv,
-    read_projected_splat,
+    ALPHA_CUTOFF_MID, alpha_cutoff_weight, alpha_cutoff_weight_deriv, read_projected_splat,
 };
 use brush_render::kernels::types::{RasterizeUniforms, Splat, Sym2};
 
@@ -72,16 +71,27 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
     u: RasterizeUniforms,
     #[comptime] smooth_cutoff: bool,
     #[comptime] compute_refine_weight: bool,
+    #[comptime] tile_width: u32,
+    #[comptime] tile_height: u32,
 ) {
-    let (tile_id, tile_origin_x, tile_origin_y) = tile_origin(u.tile_bw);
+    let tile_size = comptime![tile_width * tile_height];
+    let (tile_id, tile_origin_x, tile_origin_y) = tile_origin(u.tile_bw, tile_width, tile_height);
     // Only `pix_state` lives in shared memory — it gets read-modify-
     // written each iteration (alpha decay) so threads need to see each
     // other's writes. The other per-pixel inputs (`v_output`, the alpha
     // pre-roll) are read-only post-init and L1-cached, so we re-derive
     // them inline in the inner loop. Smaller shared footprint → more
     // workgroup occupancy on Apple.
-    let mut pix_state = Shared::new_slice((TILE_SIZE * 4u32) as usize);
-    load_pixel_state(output, u, tile_origin_x, tile_origin_y, &mut pix_state);
+    let mut pix_state = Shared::new_slice((tile_size * 4u32) as usize);
+    load_pixel_state(
+        output,
+        u,
+        tile_origin_x,
+        tile_origin_y,
+        &mut pix_state,
+        tile_width,
+        tile_height,
+    );
     let (range_lo, range_hi) = load_range(tile_offsets, tile_id);
     let num_splats_in_tile = range_hi - range_lo;
     let rounds = (num_splats_in_tile + SPLAT_BATCH - 1u32) / SPLAT_BATCH;
@@ -108,6 +118,8 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
             u,
             smooth_cutoff,
             compute_refine_weight,
+            tile_width,
+            tile_height,
         );
         if splat_active {
             let base = (compact_gid * 10u32) as usize;
@@ -129,10 +141,14 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
 }
 
 #[cube]
-fn tile_origin(tile_bw: u32) -> (u32, u32, u32) {
+fn tile_origin(
+    tile_bw: u32,
+    #[comptime] tile_width: u32,
+    #[comptime] tile_height: u32,
+) -> (u32, u32, u32) {
     let tile_id = CUBE_POS as u32;
-    let tile_origin_x = (tile_id % tile_bw) * TILE_WIDTH;
-    let tile_origin_y = (tile_id / tile_bw) * TILE_WIDTH;
+    let tile_origin_x = (tile_id % tile_bw) * tile_width;
+    let tile_origin_y = (tile_id / tile_bw) * tile_height;
     (tile_id, tile_origin_x, tile_origin_y)
 }
 
@@ -162,14 +178,17 @@ fn load_pixel_state(
     tile_origin_x: u32,
     tile_origin_y: u32,
     pix_state: &mut Shared<[f32]>,
+    #[comptime] tile_width: u32,
+    #[comptime] tile_height: u32,
 ) {
-    let pixels_per_load = (TILE_SIZE + SPLAT_BATCH - 1u32) / SPLAT_BATCH;
+    let tile_size = comptime![tile_width * tile_height];
+    let pixels_per_load = (tile_size + SPLAT_BATCH - 1u32) / SPLAT_BATCH;
     let mut p = 0u32;
     while p < pixels_per_load {
         let pix_rank = UNIT_POS + p * SPLAT_BATCH;
-        if pix_rank < TILE_SIZE {
-            let pix_x = tile_origin_x + pix_rank % TILE_WIDTH;
-            let pix_y = tile_origin_y + pix_rank / TILE_WIDTH;
+        if pix_rank < tile_size {
+            let pix_x = tile_origin_x + pix_rank % tile_width;
+            let pix_y = tile_origin_y + pix_rank / tile_width;
             let inside = pix_x < u.img_w && pix_y < u.img_h;
             let s = (pix_rank * 4u32) as usize;
             if inside {
@@ -230,7 +249,10 @@ fn accumulate_grads_for_batch(
     u: RasterizeUniforms,
     #[comptime] smooth_cutoff: bool,
     #[comptime] compute_refine_weight: bool,
+    #[comptime] tile_width: u32,
+    #[comptime] tile_height: u32,
 ) -> SplatGrad {
+    let tile_size = comptime![tile_width * tile_height];
     let conic = Sym2 {
         c00: splat.conic_x,
         c01: splat.conic_y,
@@ -241,13 +263,13 @@ fn accumulate_grads_for_batch(
     let clamped_b = max(splat.color_b, 0.0f32);
 
     let num_splats_this_batch = min(SPLAT_BATCH, num_splats_in_tile - batch_idx * SPLAT_BATCH);
-    let total_iters = num_splats_this_batch + TILE_SIZE - 1u32;
+    let total_iters = num_splats_this_batch + tile_size - 1u32;
 
     let mut grad = zero_grad();
 
     let mut i = 0u32;
     while i < total_iters {
-        let active_iter = splat_active && i >= UNIT_POS && (i - UNIT_POS) < TILE_SIZE;
+        let active_iter = splat_active && i >= UNIT_POS && (i - UNIT_POS) < tile_size;
 
         if active_iter {
             let pixel_rank = i - UNIT_POS;
@@ -258,8 +280,8 @@ fn accumulate_grads_for_batch(
             let state_w = pix_state[s + 3];
 
             if state_w > 1.0e-4f32 {
-                let pix_x = tile_origin_x + pixel_rank % TILE_WIDTH;
-                let pix_y = tile_origin_y + pixel_rank / TILE_WIDTH;
+                let pix_x = tile_origin_x + pixel_rank % tile_width;
+                let pix_y = tile_origin_y + pixel_rank / tile_width;
                 let pixel_coord_x = pix_x as f32 + 0.5f32;
                 let pixel_coord_y = pix_y as f32 + 0.5f32;
                 let dx = splat.xy_x - pixel_coord_x;
