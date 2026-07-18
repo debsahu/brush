@@ -129,6 +129,64 @@ pub struct TrainConfig {
     /// estimated from the camera spacing (with a 1m minimum).
     #[arg(long, help_heading = "Training options")]
     pub random_init_scene_scale: Option<f32>,
+
+    /// Enable per-view affine bilateral grids (BilaRF-style).
+    #[arg(long, help_heading = "Appearance options", default_value = "false")]
+    #[serde(default)]
+    pub bilateral_grid: bool,
+
+    /// Bilateral grid dimensions as `x,y,guidance`.
+    #[arg(
+        long,
+        help_heading = "Appearance options",
+        default_value = "16,16,8",
+        value_delimiter = ',',
+        num_args = 3,
+        value_parser = clap::value_parser!(u32).range(2..)
+    )]
+    #[serde(default = "default_bilagrid_dims")]
+    pub bilagrid_dims: Vec<u32>,
+
+    /// Weight of the bilateral grid's total-variation regularizer.
+    #[arg(long, help_heading = "Appearance options", default_value = "10.0")]
+    #[serde(default = "default_bilagrid_tv_weight")]
+    pub bilagrid_tv_weight: f32,
+
+    /// Learning rate for the bilateral grids.
+    #[arg(long, help_heading = "Appearance options", default_value = "2e-3")]
+    #[serde(default = "default_bilagrid_lr")]
+    pub bilagrid_lr: f64,
+
+    /// Adam betas for the per-view grid updates as `b1,b2`. The sparse
+    /// updates are dense-Adam equivalent (moments decay over the gap
+    /// between a view's visits), so the horizons are in global steps and
+    /// the defaults match the reference implementations.
+    #[arg(
+        long,
+        help_heading = "Appearance options",
+        default_value = "0.9,0.999",
+        value_delimiter = ',',
+        num_args = 2
+    )]
+    #[serde(default = "default_bilagrid_betas")]
+    pub bilagrid_betas: Vec<f64>,
+
+    /// Enable PPISP appearance compensation: per-frame exposure + color
+    /// homography and per-camera vignetting + tone curve (physically
+    /// plausible ISP model), applied to the render before the loss.
+    #[arg(long, help_heading = "Appearance options", default_value = "false")]
+    #[serde(default)]
+    pub ppisp: bool,
+
+    /// Learning rate for the PPISP parameters.
+    #[arg(long, help_heading = "Appearance options", default_value = "2e-3")]
+    #[serde(default = "default_ppisp_lr")]
+    pub ppisp_lr: f64,
+
+    /// Scale on all PPISP parameter-regularization terms.
+    #[arg(long, help_heading = "Appearance options", default_value = "1.0")]
+    #[serde(default = "default_ppisp_reg_scale")]
+    pub ppisp_reg_scale: f32,
 }
 
 impl Default for TrainConfig {
@@ -141,4 +199,32 @@ impl TrainConfig {
     pub fn total_iters(&self) -> u32 {
         self.total_train_iters + self.lod_levels * self.lod_refine_steps
     }
+
+    pub fn appearance_enabled(&self) -> bool {
+        self.bilateral_grid || self.ppisp
+    }
+}
+
+fn default_bilagrid_dims() -> Vec<u32> {
+    vec![16, 16, 8]
+}
+
+fn default_bilagrid_tv_weight() -> f32 {
+    10.0
+}
+
+fn default_bilagrid_lr() -> f64 {
+    2e-3
+}
+
+fn default_bilagrid_betas() -> Vec<f64> {
+    vec![0.9, 0.999]
+}
+
+fn default_ppisp_lr() -> f64 {
+    2e-3
+}
+
+fn default_ppisp_reg_scale() -> f32 {
+    1.0
 }

@@ -28,6 +28,19 @@ It also supports masking images:
 - Images with transparency. This will force the final splat to match the transparency of the input.
 - A folder of images called 'masks'. This ignores parts of the image that are masked out.
 
+### Appearance compensation
+
+For captures with varying exposure, white balance, or lens vignetting between images, Brush can learn per-view photometric corrections during training so the variation isn't baked into the splats. The corrections only apply while training — exported splats keep canonical colors and render unmodified.
+
+- `--bilateral-grid` learns a per-view affine color grid using [gsplat's](https://github.com/nerfstudio-project/gsplat) Apache-2.0 bilateral-grid semantics.
+- `--ppisp` enables the full [NVIDIA PPISP](https://research.nvidia.com/labs/sil/projects/ppisp/) model: per-frame exposure and color plus per-camera vignetting and tone curves.
+
+Tunables: `--bilagrid-dims x,y,guidance`, `--bilagrid-tv-weight`, `--bilagrid-lr`, `--bilagrid-betas b1,b2`, `--ppisp-lr`, `--ppisp-reg-scale`.
+
+By default evaluation compares the raw, uncorrected render against ground truth — on appearance-varying captures that mostly measures the offset between the splats and the average appearance. Pass `--train-on-eval` to keep eval views in the training set; eval then applies each view's learned correction, which is the more meaningful comparison for these models.
+
+Appearance parameters are training-only and are not stored in PLY checkpoints or used for novel-view rendering. Resuming at a non-zero iteration with appearance compensation is rejected to avoid silently resetting them.
+
 ## Viewer
 Brush also works well as a splat viewer, including on the web. It can load .ply & .compressed.ply files. You can stream in data from a URL (for a web app, simply append `?url=`).
 

@@ -221,6 +221,57 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
         );
     });
 
+    ui.collapsing("Appearance compensation", |ui| {
+        let tc = &mut args.train_config;
+        ui.add_enabled(
+            enabled,
+            egui::Checkbox::new(&mut tc.bilateral_grid, "Per-view affine bilateral grid"),
+        );
+        if tc.bilateral_grid {
+            slider(
+                ui,
+                &mut tc.bilagrid_tv_weight,
+                0.0..=50.0,
+                "TV regularizer weight",
+                false,
+                enabled,
+            );
+            slider(
+                ui,
+                &mut tc.bilagrid_lr,
+                1e-4..=1e-2,
+                "Grid learning rate",
+                true,
+                enabled,
+            );
+        }
+        ui.add_enabled(
+            enabled,
+            egui::Checkbox::new(
+                &mut tc.ppisp,
+                "PPISP (exposure / color / vignetting / tone curve)",
+            ),
+        );
+        if tc.ppisp {
+            slider(
+                ui,
+                &mut tc.ppisp_lr,
+                1e-4..=1e-2,
+                "PPISP learning rate",
+                true,
+                enabled,
+            );
+            slider(
+                ui,
+                &mut tc.ppisp_reg_scale,
+                0.0..=5.0,
+                "Regularization scale",
+                false,
+                enabled,
+            );
+        }
+    });
+
     {
         let tc = &mut args.train_config;
         let lod_label = if tc.lod_levels == 1 {
@@ -323,6 +374,13 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
                 .clamping(egui::SliderClamping::Never)
                 .prefix("1 out of ")
                 .suffix(" frames"),
+        );
+        ui.add_enabled(
+            enabled,
+            egui::Checkbox::new(
+                &mut args.load_config.train_on_eval,
+                "Keep eval views in training (apply learned appearance at eval)",
+            ),
         );
     }
 

@@ -9,6 +9,7 @@ use crate::{
     splat_init::bounds_from_pos,
     stats::RefineRecord,
 };
+use brush_appearance::{AppearanceConfig, AppearanceTrainState};
 use brush_dataset::scene::SceneBatch;
 use brush_loss::{ImageLossConfig, image_loss};
 use brush_render::gaussian_splats::Splats;
@@ -41,11 +42,8 @@ const MIN_OPACITY: f32 = 1.0 / 255.0;
 /// against a fixed target instead of chasing a moving floor.
 const MIN_SCALE_FREEZE_FRAC: f32 = 0.9;
 
-/// Mip-Splatting 3D-filter strength (the paper's `s`): each splat gets a frozen
-/// per-splat world-space scale floor `f = sqrt(MIN_SCALE_FACTOR) · pixel size at
-/// the nearest observing camera`, i.e. a ~0.32px std-dev floor. Folded into
-/// scales/opacity at render (and baked at export), never optimized. Fundamental
-/// to well-behaved splats, so not a tunable.
+/// Mip-Splatting 3D-filter strength. This is intentionally fixed: changing it
+/// alters the learned/exported representation rather than just training speed.
 const MIN_SCALE_FACTOR: f32 = 0.1;
 
 type OptimizerType = OptimizerAdaptor<AdamScaled, Splats>;
@@ -55,6 +53,9 @@ pub struct SplatTrainer {
     sched_mean: ExponentialLrScheduler,
     refine_record: Option<RefineRecord>,
     optim: Option<OptimizerType>,
+    /// Optional per-view appearance compensation (bilateral grid / PPISP).
+    /// Lives on the inner backend between steps, like the splats.
+    appearance: Option<AppearanceTrainState>,
     ssim_enabled: bool,
     bounds: BoundingBox,
     step_count: u32,
@@ -137,6 +138,7 @@ impl SplatTrainer {
             config,
             sched_mean: lr_mean.init().expect("Mean lr schedule must be valid."),
             optim: None,
+            appearance: None,
             refine_record: None,
             ssim_enabled,
             bounds,
@@ -148,10 +150,84 @@ impl SplatTrainer {
         }
     }
 
-    /// Supply per-train-view (world center, focal-px at native res) to enable
-    /// the Mip-Splatting 3D filter (gated on `config.min_scale_factor > 0`).
+    /// Supply per-train-view (world center, focal-px at native res) for the
+    /// Mip-Splatting 3D filter.
     pub fn set_view_cams(&mut self, view_cams: Vec<(glam::Vec3, f32)>) {
         self.view_cams = view_cams;
+    }
+
+    /// Set up per-view appearance compensation (bilateral grid and/or PPISP,
+    /// gated on the train config). `camera_indices` maps each training view
+    /// to a physical-camera group for PPISP's per-camera params; same length
+    /// and order as the scene's view list.
+    pub fn init_appearance(
+        &mut self,
+        camera_indices: Vec<u32>,
+        start_iter: u32,
+        device: &Device,
+    ) -> anyhow::Result<()> {
+        if !self.config.appearance_enabled() {
+            self.appearance = None;
+            return Ok(());
+        }
+        anyhow::ensure!(
+            start_iter == 0,
+            "appearance parameters are not stored in PLY checkpoints; resume with --start-iter is unsupported when --bilateral-grid or --ppisp is enabled"
+        );
+        let [grid_x, grid_y, guidance] = self.config.bilagrid_dims.as_slice() else {
+            anyhow::bail!("bilagrid-dims must contain exactly `x,y,guidance`");
+        };
+        let [beta1, beta2] = self.config.bilagrid_betas.as_slice() else {
+            anyhow::bail!("bilagrid-betas must contain exactly `b1,b2`");
+        };
+        let config = AppearanceConfig {
+            bilagrid: self.config.bilateral_grid,
+            bilagrid_dims: (*grid_x as usize, *grid_y as usize, *guidance as usize),
+            bilagrid_tv_weight: self.config.bilagrid_tv_weight,
+            bilagrid_lr: self.config.bilagrid_lr,
+            bilagrid_betas: (*beta1, *beta2),
+            ppisp: self.config.ppisp,
+            ppisp_lr: self.config.ppisp_lr,
+            ppisp_reg_scale: self.config.ppisp_reg_scale,
+        };
+        self.appearance =
+            AppearanceTrainState::new(config, camera_indices, self.config.total_iters(), device)
+                .map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    /// Whether appearance compensation is active.
+    pub fn has_appearance(&self) -> bool {
+        self.appearance.is_some()
+    }
+
+    /// Move appearance parameters and optimizer state into a replacement
+    /// trainer (used at LOD boundaries).
+    pub fn take_appearance(&mut self) -> Option<AppearanceTrainState> {
+        self.appearance.take()
+    }
+
+    pub fn set_appearance(&mut self, appearance: Option<AppearanceTrainState>) {
+        self.appearance = appearance;
+    }
+
+    /// Magnitude summary of the learned appearance parameters (`None` when
+    /// appearance compensation is disabled).
+    pub async fn appearance_stats(&self) -> Option<String> {
+        match &self.appearance {
+            Some(state) => state.stats().await,
+            None => None,
+        }
+    }
+
+    /// Forward-only appearance correction for an eval render of *training*
+    /// view `view_idx` (`--train-on-eval`). `img` is `[H, W, 3|4]` on the
+    /// inner backend; returns it unchanged when appearance is disabled.
+    pub fn appearance_eval_correction(&self, img: Tensor<3>, view_idx: usize) -> Tensor<3> {
+        match &self.appearance {
+            Some(state) => state.apply_eval(img, view_idx),
+            None => img,
+        }
     }
 
     pub async fn step(&mut self, batch: SceneBatch, splats: Splats) -> (Splats, TrainStepStats) {
@@ -184,6 +260,13 @@ impl SplatTrainer {
 
         let median_scale = self.bounds.median_size();
 
+        // Lift the active view's appearance params onto the autodiff graph
+        // for this step.
+        let active_appearance = self
+            .appearance
+            .as_mut()
+            .map(|state| state.begin_step(batch.view_index));
+
         let (mut grads, visible, num_visible, loss_inner) = {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
@@ -192,7 +275,14 @@ impl SplatTrainer {
                 .instrument(trace_span!("Forward"))
                 .await;
 
-            let pred_image = diff_out.img;
+            // Per-view appearance compensation (PPISP then bilateral grid)
+            // happens on the rendered image, before any loss term sees it —
+            // the splats themselves learn appearance-free colors. Alpha
+            // passes through untouched.
+            let pred_image = match &active_appearance {
+                Some(active) => active.apply(diff_out.img),
+                None => diff_out.img,
+            };
             let refine_weight_holder = diff_out.refine_weight_holder;
             let visible = diff_out.visible;
             let max_radius = diff_out.max_radius;
@@ -251,6 +341,13 @@ impl SplatTrainer {
                         pred_image.clone().slice(s![.., .., 0..3]).unsqueeze_dim(0),
                         gt_rgb_diff.unsqueeze_dim(0),
                     ) * self.config.lpips_loss_weight;
+            }
+
+            // Appearance regularisers (bilagrid TV, PPISP param priors).
+            if let Some(active) = &active_appearance
+                && let Some(reg) = active.reg_loss()
+            {
+                loss = loss + reg;
             }
 
             // Strip the autodiff graph off the loss so consumers can read the
@@ -362,6 +459,15 @@ impl SplatTrainer {
             });
             splats
         });
+
+        // Appearance optimizer step: the active view's bilateral grid gets a
+        // sparse Adam update and the PPISP params a dense one, each on its
+        // own warmup + exp-decay LR schedule.
+        if let (Some(state), Some(active)) = (self.appearance.as_mut(), active_appearance) {
+            trace_span!("Appearance step").in_scope(|| {
+                state.end_step(active, &mut grads);
+            });
+        }
 
         // Add random noise. Only do this in the growth phase, otherwise
         // let the splats settle in without noise, not much point in exploring regions anymore.

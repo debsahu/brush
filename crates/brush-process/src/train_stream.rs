@@ -8,6 +8,7 @@ use crate::{
 use anyhow::Context;
 use brush_dataset::{load_dataset, scene::Scene, scene_loader::SceneLoader};
 use brush_render::gaussian_splats::{SplatRenderMode, Splats};
+use brush_render::kernels::camera_model::CameraModel;
 use brush_rerun::visualize_tools::VisualizeTools;
 use brush_train::{
     RandomSplatsConfig, create_random_splats,
@@ -22,7 +23,7 @@ use burn::module::AutodiffModule;
 use burn_cubecl::cubecl::Runtime;
 use burn_wgpu::{AutoCompiler, WgpuRuntime};
 use rand::SeedableRng;
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 #[allow(unused)]
 use std::path::Path;
@@ -170,6 +171,26 @@ pub(crate) async fn train_stream(
 
     let mut eval_scene = dataset.eval;
 
+    // With `--train-on-eval`, eval views are also training views and carry
+    // learned per-view appearance corrections — map each eval view to its
+    // train index (by image path) so eval can apply them.
+    let train_indices: HashMap<_, _> = dataset
+        .train
+        .views
+        .iter()
+        .enumerate()
+        .map(|(index, view)| (view.image.path().to_path_buf(), index))
+        .collect();
+    let eval_train_indices: Vec<Option<usize>> = eval_scene
+        .as_ref()
+        .map(|eval| {
+            eval.views
+                .iter()
+                .map(|view| train_indices.get(view.image.path()).copied())
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut train_duration = Duration::from_secs(0);
     let mut dataloader = SceneLoader::new(&dataset.train, 42, &train_stream_config.load_config);
     let bounds = get_splat_bounds(init_splats.clone(), BOUND_PERCENTILE).await;
@@ -185,6 +206,23 @@ pub(crate) async fn train_stream(
 
     let mut trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
     trainer.set_view_cams(view_cams.clone());
+
+    // Per-view appearance compensation (bilateral grid / PPISP). PPISP's
+    // per-camera params (vignetting, tone curve) are shared across views
+    // taken by the same physical camera, so group views by intrinsics.
+    let camera_indices = if train_stream_config.train_config.appearance_enabled() {
+        camera_groups(&dataset.train)
+    } else {
+        Vec::new()
+    };
+    trainer.init_appearance(camera_indices.clone(), process_config.start_iter, &device)?;
+    if trainer.has_appearance() {
+        let num_cams = camera_indices.iter().copied().max().unwrap_or(0) + 1;
+        log::info!(
+            "Appearance compensation enabled ({} views, {num_cams} camera group(s))",
+            camera_indices.len()
+        );
+    }
 
     // Get the dataset name from the base path (if available) for interpolation.
     let dataset_name = vfs
@@ -279,9 +317,11 @@ pub(crate) async fn train_stream(
                 SceneLoader::new(&dataset.train, 42, &train_stream_config.load_config)
             };
 
+            let appearance = trainer.take_appearance();
             let bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
             trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
             trainer.set_view_cams(view_cams.clone());
+            trainer.set_appearance(appearance);
 
             log::info!(
                 "LOD {current_lod}/{lod_levels}: Training for {lod_refine_steps} steps (image scale {:.0}%)",
@@ -360,6 +400,8 @@ pub(crate) async fn train_stream(
                 &device,
                 emitter,
                 &visualize,
+                &trainer,
+                &eval_train_indices,
                 splats.clone(),
                 iter,
                 eval_scene,
@@ -371,6 +413,10 @@ pub(crate) async fn train_stream(
 
             if let Err(error) = eval {
                 emitter.emit(ProcessMessage::Warning { error }).await;
+            }
+
+            if let Some(stats) = trainer.appearance_stats().await {
+                log::info!("Appearance at iter {iter}: {stats}");
             }
         }
 
@@ -502,10 +548,79 @@ pub(crate) async fn train_stream(
     Ok(())
 }
 
+/// Group training views by camera intrinsics (fov + principal point +
+/// camera model). Views shot by the same physical camera share PPISP's
+/// per-camera vignetting and tone-curve parameters.
+fn camera_groups(scene: &Scene) -> Vec<u32> {
+    let mut groups = HashMap::new();
+    scene
+        .views
+        .iter()
+        .map(|view| {
+            let cam = &view.camera;
+            let key = (
+                cam.fov_x.to_bits(),
+                cam.fov_y.to_bits(),
+                cam.center_uv.x.to_bits(),
+                cam.center_uv.y.to_bits(),
+                camera_model_key(cam.camera_model),
+            );
+            let next = groups.len() as u32;
+            *groups.entry(key).or_insert(next)
+        })
+        .collect()
+}
+
+fn camera_model_key(model: CameraModel) -> [u32; 9] {
+    let mut key = [0; 9];
+    match model {
+        CameraModel::Pinhole => {}
+        CameraModel::KannalaBrandt4(params) => {
+            key[0] = 1;
+            key[1..5].copy_from_slice(&[
+                params.k1.to_bits(),
+                params.k2.to_bits(),
+                params.k3.to_bits(),
+                params.k4.to_bits(),
+            ]);
+        }
+        CameraModel::RadialTangential8(params) => {
+            key[0] = 2;
+            key[1..9].copy_from_slice(&[
+                params.k1.to_bits(),
+                params.k2.to_bits(),
+                params.k3.to_bits(),
+                params.k4.to_bits(),
+                params.k5.to_bits(),
+                params.k6.to_bits(),
+                params.p1.to_bits(),
+                params.p2.to_bits(),
+            ]);
+        }
+        CameraModel::ThinPrismFisheye(params) => {
+            key[0] = 3;
+            key[1..9].copy_from_slice(&[
+                params.kb4.k1.to_bits(),
+                params.kb4.k2.to_bits(),
+                params.kb4.k3.to_bits(),
+                params.kb4.k4.to_bits(),
+                params.p1.to_bits(),
+                params.p2.to_bits(),
+                params.sx1.to_bits(),
+                params.sy1.to_bits(),
+            ]);
+        }
+    }
+    key
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_eval(
     device: &burn::tensor::Device,
     emitter: &Emitter,
     visualize: &VisualizeTools,
+    trainer: &SplatTrainer,
+    eval_train_indices: &[Option<usize>],
     splats: Splats,
     iter: u32,
     eval_scene: &Scene,
@@ -525,12 +640,21 @@ async fn run_eval(
         brush_async::yield_now().await;
 
         let eval_img = view.image.load().await?;
+        // Only views that exist in the training set have learned per-view
+        // corrections to apply.
+        let train_idx = eval_train_indices.get(i).copied().flatten();
+        let correction = train_idx.filter(|_| trainer.has_appearance()).map(|idx| {
+            move |img: burn::tensor::Tensor<3>| trainer.appearance_eval_correction(img, idx)
+        });
         let sample = eval_stats(
             splats.clone(),
             &view.camera,
             eval_img,
             view.image.alpha_mode(),
             device,
+            correction
+                .as_ref()
+                .map(|f| f as &(dyn Fn(burn::tensor::Tensor<3>) -> burn::tensor::Tensor<3> + Sync)),
         )
         .await
         .context("Failed to run eval for sample.")?;

@@ -14,6 +14,7 @@ use brush_render::kernels::camera_model::kannala_brandt_4::KannalaBrandt4Params;
 use brush_render::kernels::camera_model::radial_tangential_8::RadialTangential8Params;
 use brush_serde::load_splat_from_ply;
 use brush_vfs::BrushVfs;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
@@ -347,6 +348,9 @@ async fn read_dataset_inner(
         if let Some(eval_period) = load_args.eval_split_every {
             // Include extra eval images only when the dataset doesn't have them.
             if i % eval_period == 0 && val_views.is_none() {
+                if load_args.train_on_eval {
+                    train_views.push(view.clone());
+                }
                 eval_views.push(view);
             } else {
                 train_views.push(view);
@@ -357,6 +361,18 @@ async fn read_dataset_inner(
     }
 
     if let Some(val_views) = val_views {
+        if load_args.train_on_eval {
+            let mut train_paths: HashSet<_> = train_views
+                .iter()
+                .map(|view| view.image.path().to_path_buf())
+                .collect();
+            train_views.extend(
+                val_views
+                    .iter()
+                    .filter(|view| train_paths.insert(view.image.path().to_path_buf()))
+                    .cloned(),
+            );
+        }
         eval_views.extend(val_views);
     }
 
