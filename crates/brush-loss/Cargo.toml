@@ -5,6 +5,9 @@ version.workspace = true
 readme.workspace = true
 license.workspace = true
 
+[features]
+native-msl = ["brush-render/native-msl"]
+
 [dependencies]
 brush-render.path = "../brush-render"
 brush-cube.path = "../brush-cube"
@@ -14,6 +17,7 @@ burn-cubecl.workspace = true
 burn-fusion.workspace = true
 burn-ir.workspace = true
 glam.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 brush-cube = { path = "../brush-cube" }

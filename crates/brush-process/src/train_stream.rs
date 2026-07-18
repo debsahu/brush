@@ -301,7 +301,10 @@ pub(crate) async fn train_stream(
         // `step` immediately replaces `splats` with the returned value, so we
         // can move it here instead of cloning every iteration.
         let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(splats);
-        let (new_diff_splats, stats) = trainer.step(batch, diff_splats).await;
+        let compute_refine_weight = trainer.refinement_weight_needed(iter);
+        let (new_diff_splats, stats) = trainer
+            .step_with_refine_weight(batch, diff_splats, compute_refine_weight)
+            .await;
         splats = new_diff_splats.valid();
 
         // Phase-local iteration for refine gating

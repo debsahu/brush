@@ -19,6 +19,7 @@ path = "src/bin.rs"
 [features]
 tracy = ["dep:tracing-subscriber", "dep:tracing-tracy"]
 debug-validation = ["brush-render/debug-validation", "brush-process/debug-validation"]
+native-msl = ["brush-render/native-msl", "brush-process/native-msl"]
 
 [dependencies]
 # Brush deps.

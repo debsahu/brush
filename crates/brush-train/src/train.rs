@@ -13,7 +13,7 @@ use brush_dataset::scene::SceneBatch;
 use brush_loss::{ImageLossConfig, image_loss};
 use brush_render::gaussian_splats::Splats;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
-use brush_render_bwd::render_splats;
+use brush_render_bwd::{DeferredShGrad, render_splats_for_training};
 use burn::{
     backend::wgpu::{AutoCompiler, WgpuDevice, WgpuRuntime},
     lr_scheduler::{
@@ -23,8 +23,8 @@ use burn::{
     module::{AutodiffModule, ParamId},
     optim::{GradientsParams, Optimizer, adaptor::OptimizerAdaptor, record::AdaptorRecord},
     tensor::{
-        Bool, Device, Distribution, IndexingUpdateOp, Int, Tensor, TensorData, activation::sigmoid,
-        s,
+        Bool, Device, Distribution, Gradients, IndexingUpdateOp, Int, Tensor, TensorData,
+        activation::sigmoid, s,
     },
 };
 
@@ -50,6 +50,64 @@ const MIN_SCALE_FACTOR: f32 = 0.1;
 
 type OptimizerType = OptimizerAdaptor<AdamScaled, Splats>;
 
+#[cfg(all(
+    feature = "native-msl",
+    target_os = "macos",
+    target_arch = "aarch64",
+    not(target_family = "wasm")
+))]
+fn sparse_sh_adam_requested() -> bool {
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled = brush_render::native_msl::option_requested(
+            brush_render::native_msl::SPARSE_SH_ADAM_ENV,
+        );
+        if enabled {
+            tracing::warn!("experimental sparse native-MSL SH Adam enabled");
+        }
+        enabled
+    })
+}
+
+#[cfg(all(
+    feature = "native-msl",
+    target_os = "macos",
+    target_arch = "aarch64",
+    not(target_family = "wasm")
+))]
+fn can_defer_sh_grad(optimizer: &OptimizerType, splats: &Splats) -> bool {
+    if !sparse_sh_adam_requested()
+        || cfg!(feature = "debug-validation")
+        || optimizer.has_gradient_clipping()
+        || !splats.sh_coeffs.val().is_require_grad()
+        || splats.sh_coeffs.val().is_distributed()
+    {
+        return false;
+    }
+    use brush_render::burn_glue::detach_autodiff;
+    let param = detach_autodiff(splats.sh_coeffs.val());
+    if !crate::sh_adam::sparse_sh_adam_supported(&param) {
+        return false;
+    }
+    let Some(record) = optimizer.to_record().remove(&splats.sh_coeffs.id) else {
+        return false;
+    };
+    let state: AdamState<3> = record.into_state();
+    optimizer.optim().sparse_sh_compatible(&param, &state)
+}
+
+#[cfg(not(all(
+    feature = "native-msl",
+    target_os = "macos",
+    target_arch = "aarch64",
+    not(target_family = "wasm")
+)))]
+fn can_defer_sh_grad(_optimizer: &OptimizerType, _splats: &Splats) -> bool {
+    false
+}
+
 pub struct SplatTrainer {
     config: TrainConfig,
     sched_mean: ExponentialLrScheduler,
@@ -73,6 +131,80 @@ fn inv_sigmoid(x: Tensor<1>) -> Tensor<1> {
 
 fn create_optimizer_from_config() -> OptimizerType {
     AdamScaledConfig::new().with_epsilon(1e-15).init()
+}
+
+#[cfg(all(
+    feature = "native-msl",
+    target_os = "macos",
+    target_arch = "aarch64",
+    not(target_family = "wasm")
+))]
+fn step_sh_coeffs(
+    optimizer: &mut OptimizerType,
+    mut splats: Splats,
+    grads: &mut Gradients,
+    deferred: Option<DeferredShGrad>,
+    learning_rate: f64,
+) -> Splats {
+    let Some(deferred) = deferred else {
+        let grad_coeff = GradientsParams::from_params(grads, &splats, &[splats.sh_coeffs.id]);
+        return optimizer.step(learning_rate, splats, grad_coeff);
+    };
+
+    use brush_render::burn_glue::{detach_autodiff, lift_to_autodiff};
+    let param_id = splats.sh_coeffs.id;
+    let param = detach_autodiff(splats.sh_coeffs.val());
+    let mut record = optimizer.to_record();
+    let state: AdamState<3> = record
+        .remove(&param_id)
+        .expect("deferred SH gradient requires initialized optimizer state")
+        .into_state();
+    assert!(
+        optimizer.optim().sparse_sh_compatible(&param, &state),
+        "deferred SH optimizer state changed after render preflight"
+    );
+    assert!(
+        crate::sh_adam::sparse_sh_adam_supported(&param),
+        "deferred SH device support changed after render preflight"
+    );
+
+    let (param, state) = optimizer.optim().step_sparse_sh(
+        learning_rate,
+        param,
+        deferred.render_transforms,
+        deferred.global_from_compact_gid,
+        detach_autodiff(deferred.compact_grads),
+        deferred.project_uniforms,
+        state,
+    );
+    splats.sh_coeffs = splats
+        .sh_coeffs
+        .map(|_| lift_to_autodiff(param).require_grad());
+    record.insert(param_id, AdaptorRecord::from_state(state));
+    *optimizer = create_optimizer_from_config().load_record(record);
+    splats
+}
+
+#[cfg(not(all(
+    feature = "native-msl",
+    target_os = "macos",
+    target_arch = "aarch64",
+    not(target_family = "wasm")
+)))]
+fn step_sh_coeffs(
+    optimizer: &mut OptimizerType,
+    splats: Splats,
+    grads: &mut Gradients,
+    deferred: Option<DeferredShGrad>,
+    learning_rate: f64,
+) -> Splats {
+    debug_assert!(
+        deferred.is_none(),
+        "non-native builds must never request deferred SH gradients"
+    );
+    drop(deferred);
+    let grad_coeff = GradientsParams::from_params(grads, &splats, &[splats.sh_coeffs.id]);
+    optimizer.step(learning_rate, splats, grad_coeff)
 }
 
 /// Per-splat world-space scale floor for the Mip-Splatting 3D filter:
@@ -155,6 +287,24 @@ impl SplatTrainer {
     }
 
     pub async fn step(&mut self, batch: SceneBatch, splats: Splats) -> (Splats, TrainStepStats) {
+        self.step_with_refine_weight(batch, splats, true).await
+    }
+
+    /// Whether the refinement-only gradient statistic is still consumed by
+    /// high-gradient densification at `global_iter`.
+    pub fn refinement_weight_needed(&self, global_iter: u32) -> bool {
+        global_iter < self.config.growth_stop_iter
+    }
+
+    /// Run one training step, optionally omitting the refinement-only raster
+    /// gradient statistic. Model gradients, visibility, and screen-radius
+    /// bookkeeping are always preserved.
+    pub async fn step_with_refine_weight(
+        &mut self,
+        batch: SceneBatch,
+        splats: Splats,
+        compute_refine_weight: bool,
+    ) -> (Splats, TrainStepStats) {
         let mut splats = splats;
 
         // Track max SH degree from the first splats we see.
@@ -183,17 +333,32 @@ impl SplatTrainer {
         let background = sample_background_color(base_bg, self.config.background_noise_strength);
 
         let median_scale = self.bounds.median_size();
+        // The first optimizer step stays dense so Adam can initialize its
+        // moments. Later steps defer only after the existing state and device
+        // have passed every sparse-path compatibility check.
+        let defer_sh_grad = self
+            .optim
+            .as_ref()
+            .is_some_and(|optimizer| can_defer_sh_grad(optimizer, &splats));
 
-        let (mut grads, visible, num_visible, loss_inner) = {
+        let (mut grads, visible, num_visible, loss_inner, deferred_sh_grad) = {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
             let render_input = splats.clone();
-            let diff_out = render_splats(render_input, &camera, img_size, background)
-                .instrument(trace_span!("Forward"))
-                .await;
+            let diff_out = render_splats_for_training(
+                render_input,
+                &camera,
+                img_size,
+                background,
+                compute_refine_weight,
+                defer_sh_grad,
+            )
+            .instrument(trace_span!("Forward"))
+            .await;
 
             let pred_image = diff_out.img;
             let refine_weight_holder = diff_out.refine_weight_holder;
+            let deferred_sh_grad = diff_out.deferred_sh_grad;
             let visible = diff_out.visible;
             let max_radius = diff_out.max_radius;
 
@@ -258,6 +423,12 @@ impl SplatTrainer {
             let loss_inner = loss.clone().inner();
             let mut grads = splats.bwd_validate(loss).await;
 
+            let deferred_sh_grad = deferred_sh_grad.map(|handle| {
+                handle
+                    .take(&mut grads)
+                    .expect("deferred SH gradient holder was not populated")
+            });
+
             trace_span!("Housekeeping").in_scope(|| {
                 // Refine state accumulates on the inner (non-autodiff) device
                 // so we can mix it with `.inner()`-stripped gradients/aux
@@ -265,20 +436,36 @@ impl SplatTrainer {
                 // the residual `checkpointing` flag that bare `.inner()`
                 // leaves behind (see `brush_render::burn_glue`).
                 use brush_render::burn_glue::detach_autodiff;
-                let refine_weight = refine_weight_holder
-                    .grad_remove(&mut grads)
-                    .expect("XY gradients need to be calculated.");
                 let device = splats.device().inner();
                 let record = self
                     .refine_record
                     .get_or_insert_with(|| RefineRecord::new(splats.num_splats(), &device));
                 // `visible` / `max_radius` already arrive on the inner backend;
-                // only the freshly-extracted `refine_weight` gradient needs the
-                // autodiff stripped off.
-                record.gather_stats(detach_autodiff(refine_weight), visible.clone(), max_radius);
+                // only a freshly-extracted `refine_weight` gradient needs the
+                // autodiff stripped off. Once growth stops, it is no longer
+                // consumed, but visibility and screen size still feed pruning
+                // and oversized-splat splitting.
+                if compute_refine_weight {
+                    let refine_weight = refine_weight_holder
+                        .grad_remove(&mut grads)
+                        .expect("XY gradients need to be calculated.");
+                    record.gather_stats(
+                        detach_autodiff(refine_weight),
+                        visible.clone(),
+                        max_radius,
+                    );
+                } else {
+                    record.gather_aux_stats(visible.clone(), max_radius);
+                }
             });
 
-            (grads, visible, diff_out.num_visible, loss_inner)
+            (
+                grads,
+                visible,
+                diff_out.num_visible,
+                loss_inner,
+                deferred_sh_grad,
+            )
         };
 
         // OptimizerAdaptor strips autodiff before calling SimpleOptimizer::step,
@@ -351,9 +538,13 @@ impl SplatTrainer {
                 optimizer.step(1.0, splats, grad_transforms)
             });
             splats = trace_span!("SH Coeffs step").in_scope(|| {
-                let grad_coeff =
-                    GradientsParams::from_params(&mut grads, &splats, &[splats.sh_coeffs.id]);
-                optimizer.step(self.config.lr_coeffs_dc, splats, grad_coeff)
+                step_sh_coeffs(
+                    optimizer,
+                    splats,
+                    &mut grads,
+                    deferred_sh_grad,
+                    self.config.lr_coeffs_dc,
+                )
             });
             splats = trace_span!("Opacity step").in_scope(|| {
                 let grad_opac =

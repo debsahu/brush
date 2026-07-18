@@ -190,12 +190,11 @@ pub fn compensate_cov2d(c: Sym2, #[comptime] mip_splatting: bool) -> (Sym2, f32)
     (blurred, filter_comp)
 }
 
-/// Walk the tiles in `bb` in linearised mod/div order and count those
-/// that pass `will_primitive_contribute`. Shared between
-/// `project_forward` and `map_gaussians_to_intersect` so both dispatches
-/// run *byte-identical* loop bodies. Drift between the two counts would
-/// leave uninitialised slots in `compact_gid_from_isect`; map_gaussians
-/// pads with a sentinel `tile_id` defensively in case it still happens.
+/// Walk the tiles in `bb` in row-major order and count those that pass
+/// `will_primitive_contribute`. `project_forward` uses this to
+/// reserve the per-splat intersection budget. The map pass uses the same
+/// predicate while writing, clamps to that budget, and sentinel-pads any
+/// shortfall caused by compiler drift.
 #[cube]
 pub fn count_contributing_tiles(
     bb: TileBbox,
@@ -204,16 +203,20 @@ pub fn count_contributing_tiles(
     conic: Sym2,
     power_threshold: f32,
 ) -> u32 {
-    let bb_w = bb.max_x - bb.min_x;
-    let num_tiles_bbox = (bb.max_y - bb.min_y) * bb_w;
+    // Keep the row/column counters explicit: flattening this loop makes the
+    // shader pay a dynamic integer division and remainder for every tile.
     let mut num_tiles_hit = 0u32;
-    for tile_idx in 0u32..num_tiles_bbox {
-        let tx = (tile_idx % bb_w) + bb.min_x;
-        let ty = (tile_idx / bb_w) + bb.min_y;
-        let rect = tile_rect(tx, ty);
-        if will_primitive_contribute(rect, xy_x, xy_y, conic, power_threshold) {
-            num_tiles_hit += 1u32;
+    let mut ty = bb.min_y;
+    while ty < bb.max_y {
+        let mut tx = bb.min_x;
+        while tx < bb.max_x {
+            let rect = tile_rect(tx, ty);
+            if will_primitive_contribute(rect, xy_x, xy_y, conic, power_threshold) {
+                num_tiles_hit += 1u32;
+            }
+            tx += 1u32;
         }
+        ty += 1u32;
     }
     num_tiles_hit
 }

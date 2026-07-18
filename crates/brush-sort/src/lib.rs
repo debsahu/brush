@@ -151,6 +151,79 @@ mod tests {
     }
 
     #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn sort_is_stable_for_every_pass_count_and_preserves_inputs() {
+        const LEN: usize = 4_099;
+        const SORTING_BITS: [u32; 11] = [0, 4, 8, 12, 13, 14, 15, 16, 20, 28, 32];
+
+        // Repeat full-width keys while distributing their bits across the u32
+        // range. Unique values make equal-key stability observable.
+        let keys_inp: Vec<u32> = (0..LEN)
+            .map(|i| {
+                let group = ((i * 73) % 1_021) as u32;
+                group.wrapping_mul(0x9E37_79B9).rotate_left(7) ^ 0xA5A5_5A5A
+            })
+            .collect();
+        let values_inp: Vec<u32> = (0..LEN as u32).collect();
+        let device = brush_cube::test_helpers::test_device().await;
+
+        for sorting_bits in SORTING_BITS {
+            let effective_bits = sorting_bits.div_ceil(4) * 4;
+            let mask = if effective_bits == 32 {
+                u32::MAX
+            } else {
+                (1u32 << effective_bits) - 1
+            };
+            let mut expected_indices: Vec<_> = (0..LEN).collect();
+            expected_indices.sort_by_key(|&i| keys_inp[i] & mask);
+            let expected_keys: Vec<_> = expected_indices.iter().map(|&i| keys_inp[i]).collect();
+            let expected_values: Vec<_> = expected_indices.iter().map(|&i| values_inp[i]).collect();
+
+            let keys = create_tensor_from_slice(&keys_inp, &device, DType::I32);
+            let values = create_tensor_from_slice(&values_inp, &device, DType::I32);
+            let original_keys = keys.clone();
+            let original_values = values.clone();
+            let (ret_keys, ret_values) = radix_argsort(keys, values, sorting_bits);
+            let ret_keys: Vec<u32> = read_i32(ret_keys)
+                .await
+                .into_iter()
+                .map(|key| key as u32)
+                .collect();
+            let ret_values: Vec<u32> = read_i32(ret_values)
+                .await
+                .into_iter()
+                .map(|value| value as u32)
+                .collect();
+
+            assert_eq!(
+                ret_keys, expected_keys,
+                "keys differ at {sorting_bits} bits"
+            );
+            assert_eq!(
+                ret_values, expected_values,
+                "sort is unstable at {sorting_bits} bits"
+            );
+            assert_eq!(
+                read_i32(original_keys)
+                    .await
+                    .into_iter()
+                    .map(|key| key as u32)
+                    .collect::<Vec<_>>(),
+                keys_inp,
+                "input keys mutated at {sorting_bits} bits"
+            );
+            assert_eq!(
+                read_i32(original_values)
+                    .await
+                    .into_iter()
+                    .map(|value| value as u32)
+                    .collect::<Vec<_>>(),
+                values_inp,
+                "input values mutated at {sorting_bits} bits"
+            );
+        }
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
     async fn test_sorting() {
         let device = brush_cube::test_helpers::test_device().await;
 

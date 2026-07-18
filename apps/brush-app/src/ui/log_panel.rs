@@ -121,7 +121,7 @@ impl AppPane for LogPanel {
 
         Frame::new()
             .fill(Color32::from_rgb(14, 16, 22))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(36, 40, 50)))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(36, 40, 50)))
             .corner_radius(CornerRadius::same(4))
             .inner_margin(Margin::symmetric(8, 6))
             .show(ui, |ui| {

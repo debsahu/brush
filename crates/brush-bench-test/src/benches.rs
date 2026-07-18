@@ -1,18 +1,14 @@
 use brush_dataset::scene::SceneBatch;
 use brush_render::{
     AlphaMode, TextureMode,
-    bounding_box::BoundingBox,
     camera::Camera,
     gaussian_splats::{SplatRenderMode, Splats},
     kernels::camera_model::CameraModel::Pinhole,
     render_splats,
 };
 use brush_render_bwd::render_splats as render_splats_diff;
-use brush_train::{config::TrainConfig, train::SplatTrainer};
-use burn::{
-    module::AutodiffModule,
-    tensor::{Device, TensorData},
-};
+use brush_train::train::SplatTrainer;
+use burn::tensor::{Device, TensorData};
 use glam::{Quat, Vec3};
 use rand::{RngExt, SeedableRng};
 
@@ -151,19 +147,13 @@ fn bench_camera() -> Camera {
     )
 }
 
-/// Run forward rendering loop. Generates splats once, then renders `iters` times.
-pub async fn run_forward_render(
-    device: &Device,
-    splat_count: usize,
-    resolution: (u32, u32),
-    iters: u32,
-) {
-    let splats = gen_splats(device, splat_count).valid();
-    let camera = bench_camera();
+/// Render `iters` frames with pre-built splats. The hot loop only — callers
+/// own setup, so benches can keep splat generation out of the timed body.
+async fn forward_iters(splats: &Splats, camera: &Camera, resolution: (u32, u32), iters: u32) {
     for _ in 0..iters {
         let _ = render_splats(
             splats.clone(),
-            &camera,
+            camera,
             glam::uvec2(resolution.0, resolution.1),
             Vec3::ZERO,
             None,
@@ -173,19 +163,12 @@ pub async fn run_forward_render(
     }
 }
 
-/// Run backward rendering loop. Generates splats once, then renders+backward `iters` times.
-pub async fn run_backward_render(
-    device: &Device,
-    splat_count: usize,
-    resolution: (u32, u32),
-    iters: u32,
-) {
-    let splats = gen_splats(device, splat_count);
-    let camera = bench_camera();
+/// Render + backward `iters` times with pre-built splats. Hot loop only.
+async fn backward_iters(splats: &Splats, camera: &Camera, resolution: (u32, u32), iters: u32) {
     for _ in 0..iters {
         let diff_out = render_splats_diff(
             splats.clone(),
-            &camera,
+            camera,
             glam::uvec2(resolution.0, resolution.1),
             Vec3::ZERO,
         )
@@ -194,62 +177,68 @@ pub async fn run_backward_render(
     }
 }
 
-/// Run training loop. Generates splats once, then trains `iters` steps.
-pub async fn run_training_steps(
-    device: &Device,
-    splat_count: usize,
-    resolution: (u32, u32),
+/// Run `iters` training steps against pre-built batches. `splats` is an
+/// `Option` because `trainer.step` consumes and returns the splats, and
+/// benches call this from an `FnMut` closure where moving out of a captured
+/// variable needs a `take`. `step_offset` keeps the batch alternation going
+/// across repeated calls.
+async fn training_iters(
+    trainer: &mut SplatTrainer,
+    splats: &mut Option<Splats>,
+    batches: &[SceneBatch],
+    step_offset: usize,
     iters: u32,
 ) {
-    let batch1 = generate_training_batch(resolution, Vec3::new(0.0, 0.0, 5.0));
-    let batch2 = generate_training_batch(resolution, Vec3::new(2.0, 0.0, 5.0));
-    let batches = [batch1, batch2];
-    let config = TrainConfig::default();
-    let mut splats = gen_splats(device, splat_count);
-    let mut trainer = SplatTrainer::new(
-        &config,
-        device,
-        BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
-    );
-    for step in 0..iters {
-        let batch = batches[step as usize % batches.len()].clone();
-        let (new_splats, _) = trainer.step(batch, splats).await;
-        splats = new_splats;
+    for i in 0..iters as usize {
+        let batch = batches[(step_offset + i) % batches.len()].clone();
+        let cur_splats = splats.take().expect("splats always put back");
+        let (new_splats, _) = trainer.step(batch, cur_splats).await;
+        *splats = Some(new_splats);
     }
-    assert!(splats.num_splats() > 0, "Failed smoke test");
 }
 
+// Every bench below keeps setup (splat/GT generation, trainer init) outside
+// the timed closure and runs one untimed warmup pass first, so samples
+// measure steady-state GPU work rather than pipeline compilation, autotune,
+// or CPU-side data generation.
 #[cfg(not(target_family = "wasm"))]
 #[divan::bench_group(max_time = 1)]
 mod forward_rendering {
     const RESOLUTIONS: [(u32, u32); 4] = [(1024, 1024), (1920, 1080), (2560, 1440), (3200, 1800)];
     const SPLAT_COUNTS: [usize; 3] = [500_000, 1_000_000, 2_500_000];
 
+    use burn::module::AutodiffModule;
     use burn::{backend::wgpu::WgpuDevice, prelude::Device};
     use burn_cubecl::cubecl::future::block_on;
 
-    use crate::benches::{ITERS_PER_SYNC, run_forward_render};
+    use crate::benches::{ITERS_PER_SYNC, bench_camera, forward_iters, gen_splats};
+
+    fn bench_forward(bencher: divan::Bencher, splat_count: usize, resolution: (u32, u32)) {
+        let device = Device::from(WgpuDevice::default()).autodiff();
+        let splats = gen_splats(&device, splat_count).valid();
+        let camera = bench_camera();
+        block_on(async {
+            forward_iters(&splats, &camera, resolution, ITERS_PER_SYNC).await;
+            device.sync().expect("Failed to sync");
+        });
+        bencher
+            .counter(divan::counter::ItemsCount::new(ITERS_PER_SYNC))
+            .bench_local(move || {
+                block_on(async {
+                    forward_iters(&splats, &camera, resolution, ITERS_PER_SYNC).await;
+                    device.sync().expect("Failed to sync");
+                });
+            });
+    }
 
     #[divan::bench(args = SPLAT_COUNTS)]
     fn render_1080p(bencher: divan::Bencher, splat_count: usize) {
-        let device = Device::from(WgpuDevice::default()).autodiff();
-        bencher.bench_local(move || {
-            block_on(async {
-                run_forward_render(&device, splat_count, (1920, 1080), ITERS_PER_SYNC).await;
-                device.sync().expect("Failed to sync");
-            });
-        });
+        bench_forward(bencher, splat_count, (1920, 1080));
     }
 
     #[divan::bench(args = RESOLUTIONS)]
-    fn render_2m_splats(bencher: divan::Bencher, (width, height): (u32, u32)) {
-        let device = Device::from(WgpuDevice::default()).autodiff();
-        bencher.bench_local(move || {
-            block_on(async {
-                run_forward_render(&device, 2_000_000, (width, height), ITERS_PER_SYNC).await;
-                device.sync().expect("Failed to sync");
-            });
-        });
+    fn render_2m_splats(bencher: divan::Bencher, resolution: (u32, u32)) {
+        bench_forward(bencher, 2_000_000, resolution);
     }
 }
 
@@ -261,61 +250,162 @@ mod backward_rendering {
     use burn::{backend::wgpu::WgpuDevice, prelude::Device};
     use burn_cubecl::cubecl::future::block_on;
 
-    use crate::benches::{ITERS_PER_SYNC, run_backward_render};
+    use crate::benches::{ITERS_PER_SYNC, backward_iters, bench_camera, gen_splats};
+
+    fn bench_backward(bencher: divan::Bencher, splat_count: usize, resolution: (u32, u32)) {
+        let device = Device::from(WgpuDevice::default()).autodiff();
+        let splats = gen_splats(&device, splat_count);
+        let camera = bench_camera();
+        block_on(async {
+            backward_iters(&splats, &camera, resolution, ITERS_PER_SYNC).await;
+            device.sync().expect("Failed to sync");
+        });
+        bencher
+            .counter(divan::counter::ItemsCount::new(ITERS_PER_SYNC))
+            .bench_local(move || {
+                block_on(async {
+                    backward_iters(&splats, &camera, resolution, ITERS_PER_SYNC).await;
+                    device.sync().expect("Failed to sync");
+                });
+            });
+    }
 
     #[divan::bench(args = [1_000_000, 2_000_000, 5_000_000])]
     fn render_grad_1080p(bencher: divan::Bencher, splat_count: usize) {
-        let device = Device::from(WgpuDevice::default()).autodiff();
-        bencher.bench_local(move || {
-            block_on(async {
-                run_backward_render(&device, splat_count, (1920, 1080), ITERS_PER_SYNC).await;
-                device.sync().expect("Failed to sync");
-            });
-        });
+        bench_backward(bencher, splat_count, (1920, 1080));
     }
 
     #[divan::bench(args = RESOLUTIONS)]
-    fn render_grad_2m_splats(bencher: divan::Bencher, (width, height): (u32, u32)) {
-        let device = Device::from(WgpuDevice::default()).autodiff();
-        bencher.bench_local(move || {
-            block_on(async {
-                run_backward_render(&device, 2_000_000, (width, height), ITERS_PER_SYNC).await;
-                device.sync().expect("Failed to sync");
-            });
-        });
+    fn render_grad_2m_splats(bencher: divan::Bencher, resolution: (u32, u32)) {
+        bench_backward(bencher, 2_000_000, resolution);
     }
 }
 
 #[cfg(not(target_family = "wasm"))]
-#[divan::bench_group(max_time = 4)]
+// Canonical A/B runs must not override Divan's sample count, sample size, or
+// minimum time; doing so changes the evolving training-step window.
+#[divan::bench_group(sample_count = 10, sample_size = 1)]
 mod training {
     const SPLAT_COUNTS: [usize; 3] = [500_000, 1_000_000, 2_500_000];
 
     use burn::{backend::wgpu::WgpuDevice, prelude::Device};
     use burn_cubecl::cubecl::future::block_on;
+    use glam::Vec3;
 
-    use crate::benches::{ITERS_PER_SYNC, run_training_steps};
+    use crate::benches::{
+        ITERS_PER_SYNC, SEED, gen_splats, generate_training_batch, training_iters,
+    };
+    use brush_render::bounding_box::BoundingBox;
+    use brush_train::{config::TrainConfig, train::SplatTrainer};
 
     #[divan::bench(args = SPLAT_COUNTS)]
-    fn train_steps(splat_count: usize) {
+    fn train_steps(bencher: divan::Bencher, splat_count: usize) {
         let device = Device::from(WgpuDevice::default()).autodiff();
+        let batches = [
+            generate_training_batch((1920, 1080), Vec3::new(0.0, 0.0, 5.0)),
+            generate_training_batch((1920, 1080), Vec3::new(2.0, 0.0, 5.0)),
+        ];
+        // CPU background noise uses an unseeded thread RNG. Disable it in the
+        // regression bench so separate builds follow the same input sequence.
+        let config = TrainConfig {
+            background_noise_strength: 0.0,
+            ..TrainConfig::default()
+        };
+        let mut trainer = SplatTrainer::new(
+            &config,
+            &device,
+            BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
+        );
+        let mut splats = Some(gen_splats(&device, splat_count));
+        // Seed CubeCL's RNG used by tensor noise. With one sample iteration
+        // and a fixed sample count, every build consumes the same call window.
+        device.seed(SEED);
+        // Warmup also initializes the optimizer state (first-step lazy init).
         block_on(async {
-            run_training_steps(&device, splat_count, (1920, 1080), ITERS_PER_SYNC).await;
+            training_iters(&mut trainer, &mut splats, &batches, 0, ITERS_PER_SYNC).await;
             device.sync().expect("Failed to sync");
         });
+        // Splats keep evolving across the fixed ten-sample window (no refine
+        // runs, so the count stays fixed); batch cadence carries via `step`.
+        let mut step = ITERS_PER_SYNC as usize;
+        bencher
+            .counter(divan::counter::ItemsCount::new(ITERS_PER_SYNC))
+            .bench_local(move || {
+                block_on(async {
+                    training_iters(&mut trainer, &mut splats, &batches, step, ITERS_PER_SYNC).await;
+                    step += ITERS_PER_SYNC as usize;
+                    device.sync().expect("Failed to sync");
+                });
+            });
     }
 }
 
+// The bench target compiles this module under `cfg(test)` too, but with
+// `harness = false` nothing collects `#[test]` fns — so everything here is
+// "dead" in that build. Allow it rather than fight the target quirk.
 #[cfg(test)]
+#[allow(dead_code, unused_imports)]
 mod tests {
-    #[allow(unused_imports)]
-    use crate::benches::{
-        ITERS_PER_SYNC, run_backward_render, run_forward_render, run_training_steps,
-    };
+    use brush_render::bounding_box::BoundingBox;
+    use brush_train::{config::TrainConfig, train::SplatTrainer};
+    use burn::{module::AutodiffModule, tensor::Device};
+    use glam::Vec3;
     use wasm_bindgen_test::wasm_bindgen_test;
+
+    use crate::benches::{
+        ITERS_PER_SYNC, backward_iters, bench_camera, forward_iters, gen_splats,
+        generate_training_batch, training_iters,
+    };
 
     #[cfg(target_family = "wasm")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    /// Run forward rendering loop. Generates splats once, then renders `iters` times.
+    async fn run_forward_render(
+        device: &Device,
+        splat_count: usize,
+        resolution: (u32, u32),
+        iters: u32,
+    ) {
+        let splats = gen_splats(device, splat_count).valid();
+        let camera = bench_camera();
+        forward_iters(&splats, &camera, resolution, iters).await;
+    }
+
+    /// Run backward rendering loop. Generates splats once, then renders+backward `iters` times.
+    async fn run_backward_render(
+        device: &Device,
+        splat_count: usize,
+        resolution: (u32, u32),
+        iters: u32,
+    ) {
+        let splats = gen_splats(device, splat_count);
+        let camera = bench_camera();
+        backward_iters(&splats, &camera, resolution, iters).await;
+    }
+
+    /// Run training loop. Generates splats once, then trains `iters` steps.
+    async fn run_training_steps(
+        device: &Device,
+        splat_count: usize,
+        resolution: (u32, u32),
+        iters: u32,
+    ) {
+        let batches = [
+            generate_training_batch(resolution, Vec3::new(0.0, 0.0, 5.0)),
+            generate_training_batch(resolution, Vec3::new(2.0, 0.0, 5.0)),
+        ];
+        let config = TrainConfig::default();
+        let mut trainer = SplatTrainer::new(
+            &config,
+            device,
+            BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
+        );
+        let mut splats = Some(gen_splats(device, splat_count));
+        training_iters(&mut trainer, &mut splats, &batches, 0, iters).await;
+        let splats = splats.expect("splats always put back");
+        assert!(splats.num_splats() > 0, "Failed smoke test");
+    }
 
     #[wasm_bindgen_test(unsupported = tokio::test)]
     async fn test_fwd_render() {
