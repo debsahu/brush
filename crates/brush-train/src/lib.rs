@@ -6,8 +6,6 @@ pub mod lod;
 pub mod msg;
 pub mod train;
 
-pub use lpips::WASSERSTEIN_MIN_IMAGE_SIZE;
-
 mod adam_scaled;
 mod multinomial;
 mod quat_vec;

@@ -11,9 +11,7 @@ use brush_render::gaussian_splats::{SplatRenderMode, Splats};
 use brush_render::kernels::camera_model::CameraModel;
 use brush_rerun::visualize_tools::VisualizeTools;
 use brush_train::{
-    RandomSplatsConfig, WASSERSTEIN_MIN_IMAGE_SIZE,
-    config::TrainConfig,
-    create_random_splats,
+    RandomSplatsConfig, create_random_splats,
     eval::eval_stats,
     lod::{compute_pup_scores, decimate_to_count},
     msg::RefineStats,
@@ -25,72 +23,13 @@ use burn::module::AutodiffModule;
 use burn_cubecl::cubecl::Runtime;
 use burn_wgpu::{AutoCompiler, WgpuRuntime};
 use rand::SeedableRng;
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
+
+#[allow(unused)]
+use std::path::Path;
 
 use tracing::{Instrument, trace_span};
 use web_time::{Duration, Instant};
-
-fn ensure_wd_r_image_size(
-    path: &Path,
-    width: u32,
-    height: u32,
-    lod_level: u32,
-    image_scale: f32,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        width as usize >= WASSERSTEIN_MIN_IMAGE_SIZE
-            && height as usize >= WASSERSTEIN_MIN_IMAGE_SIZE,
-        "WD-R requires every training image to be at least {WASSERSTEIN_MIN_IMAGE_SIZE}x{WASSERSTEIN_MIN_IMAGE_SIZE}; {} would be {width}x{height} at LOD {lod_level} (image scale {:.1}%). Increase --max-resolution, reduce --lod-levels, or increase --lod-image-scale",
-        path.display(),
-        image_scale * 100.0,
-    );
-    Ok(())
-}
-
-async fn validate_wd_r_training_images(
-    scene: &Scene,
-    config: &TrainConfig,
-    start_iter: u32,
-) -> anyhow::Result<()> {
-    if !wd_r_can_activate(config, start_iter) {
-        return Ok(());
-    }
-
-    // LOD image scales only decrease, so validating the final configured level
-    // also proves that every earlier WD-R-active phase is large enough.
-    let lod_level = if config.lod_refine_steps > 0 {
-        config.lod_levels
-    } else {
-        0
-    };
-    let image_scale = if lod_level > 0 && config.lod_image_scale < 100 {
-        (config.lod_image_scale as f32 / 100.0).powi(lod_level as i32)
-    } else {
-        1.0
-    };
-    let scaled_scene = scene.clone().with_image_scale(image_scale);
-
-    for view in scaled_scene.views.iter() {
-        let path = view.image.path();
-        let (width, height) = view
-            .image
-            .output_dimensions()
-            .await
-            .with_context(|| format!("reading image dimensions for {}", path.display()))?;
-        ensure_wd_r_image_size(path, width, height, lod_level, image_scale)?;
-    }
-
-    Ok(())
-}
-
-fn wd_r_can_activate(config: &TrainConfig, start_iter: u32) -> bool {
-    let total_iters = config.total_iters();
-    config.wd_r_gamma > 0.0 && config.wd_r_warmup_iters < total_iters && start_iter < total_iters
-}
 
 #[allow(clippy::large_stack_frames)]
 pub(crate) async fn train_stream(
@@ -100,18 +39,6 @@ pub(crate) async fn train_stream(
     slot: SlotSender<Splats>,
 ) -> anyhow::Result<()> {
     log::info!("Start of training stream");
-
-    train_stream_config
-        .train_config
-        .validate()
-        .map_err(anyhow::Error::msg)?;
-
-    #[cfg(target_family = "wasm")]
-    anyhow::ensure!(
-        train_stream_config.train_config.wd_r_gamma == 0.0
-            && train_stream_config.train_config.lpips_loss_weight <= 0.0,
-        "perceptual training is currently supported only by native builds"
-    );
 
     let visualize = VisualizeTools::new(train_stream_config.rerun_config.rerun_enabled).await;
 
@@ -148,24 +75,6 @@ pub(crate) async fn train_stream(
     }
 
     let dataset = load_result.dataset;
-
-    anyhow::ensure!(
-        !wd_r_can_activate(
-            &train_stream_config.train_config,
-            train_stream_config.process_config.start_iter,
-        ) || !dataset
-            .train
-            .views
-            .iter()
-            .any(|view| view.image.alpha_mode() == brush_render::AlphaMode::Masked),
-        "WD-R does not yet define feature-space semantics for masked-alpha training; use opaque or transparent-composited inputs"
-    );
-    validate_wd_r_training_images(
-        &dataset.train,
-        &train_stream_config.train_config,
-        train_stream_config.process_config.start_iter,
-    )
-    .await?;
 
     log::info!("Log scene to rerun");
     if let Err(error) = visualize.log_scene(
@@ -295,7 +204,7 @@ pub(crate) async fn train_stream(
         view_cams.push((view.camera.position, focal));
     }
 
-    let mut trainer = SplatTrainer::try_new(&train_stream_config.train_config, &device, bounds)?;
+    let mut trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
     trainer.set_view_cams(view_cams.clone());
 
     // Per-view appearance compensation (bilateral grid / PPISP). PPISP's
@@ -410,7 +319,7 @@ pub(crate) async fn train_stream(
 
             let appearance = trainer.take_appearance();
             let bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
-            trainer = SplatTrainer::try_new(&train_stream_config.train_config, &device, bounds)?;
+            trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
             trainer.set_view_cams(view_cams.clone());
             trainer.set_appearance(appearance);
 
@@ -434,7 +343,7 @@ pub(crate) async fn train_stream(
         let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(splats);
         let compute_refine_weight = trainer.refinement_weight_needed(iter);
         let (new_diff_splats, stats) = trainer
-            .step_with_refine_weight_at(iter, batch, diff_splats, compute_refine_weight)
+            .step_with_refine_weight(batch, diff_splats, compute_refine_weight)
             .await;
         splats = new_diff_splats.valid();
 
@@ -810,40 +719,4 @@ async fn export_checkpoint(
         .await
         .context(format!("Failed to export ply {export_path:?}"))?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wd_r_image_size_preflight_rejects_short_dimensions() {
-        let error = ensure_wd_r_image_size(Path::new("portrait.png"), 120, 60, 0, 1.0)
-            .expect_err("short image dimension must be rejected");
-        let message = error.to_string();
-        assert!(message.contains("portrait.png"));
-        assert!(message.contains("120x60"));
-        assert!(message.contains("61x61"));
-
-        ensure_wd_r_image_size(Path::new("minimum.png"), 61, 61, 2, 0.25)
-            .expect("minimum supported dimensions must pass");
-    }
-
-    #[test]
-    fn wd_r_activation_gate_ignores_unreachable_objective() {
-        let config = TrainConfig {
-            wd_r_gamma: 0.028,
-            wd_r_warmup_iters: 30_000,
-            ..TrainConfig::default()
-        };
-
-        assert!(!wd_r_can_activate(&config, 0));
-
-        let config = TrainConfig {
-            wd_r_warmup_iters: 29_999,
-            ..config
-        };
-        assert!(wd_r_can_activate(&config, 0));
-        assert!(!wd_r_can_activate(&config, config.total_iters()));
-    }
 }

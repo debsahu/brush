@@ -89,34 +89,8 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Refine options", default_value = "0.1")]
     pub match_alpha_weight: f32,
 
-    /// Weight of the optional additive LPIPS loss.
-    #[arg(
-        long,
-        help_heading = "Training options",
-        default_value = "0.0",
-        conflicts_with = "wd_r_gamma"
-    )]
+    #[arg(long, help_heading = "Refine options", default_value = "0.0")]
     pub lpips_loss_weight: f32,
-
-    /// Global scale gamma for the WD-R perceptual objective. Zero disables WD-R.
-    ///
-    /// After the warm-up, RGB reconstruction becomes
-    /// `gamma * (WD + (1 / 0.09) * original_rgb_loss)`. Alpha and appearance
-    /// regularizers remain outside this scale.
-    #[arg(
-        long,
-        help_heading = "Training options",
-        default_value = "0.0",
-        value_parser = parse_non_negative_f32,
-        conflicts_with = "lpips_loss_weight"
-    )]
-    #[serde(default)]
-    pub wd_r_gamma: f32,
-
-    /// Global training iteration at which WD-R replaces the warm-up RGB loss.
-    #[arg(long, help_heading = "Training options", default_value = "3000")]
-    #[serde(default = "default_wd_r_warmup_iters")]
-    pub wd_r_warmup_iters: u32,
 
     /// Base background color (R,G,B) used during training.
     #[arg(
@@ -241,21 +215,6 @@ impl TrainConfig {
     pub fn appearance_enabled(&self) -> bool {
         self.bilateral_grid || self.ppisp
     }
-
-    pub fn wd_r_enabled_at(&self, global_iter: u32) -> bool {
-        self.wd_r_gamma > 0.0 && global_iter >= self.wd_r_warmup_iters
-    }
-
-    /// Validate invariants that clap cannot enforce for serde, UI, or library callers.
-    pub fn validate(&self) -> Result<(), String> {
-        if !self.wd_r_gamma.is_finite() || self.wd_r_gamma < 0.0 {
-            return Err("WD-R gamma must be finite and non-negative".to_owned());
-        }
-        if self.lpips_loss_weight > 0.0 && self.wd_r_gamma > 0.0 {
-            return Err("LPIPS and WD-R cannot be enabled together".to_owned());
-        }
-        Ok(())
-    }
 }
 
 fn default_bilagrid_dims() -> Vec<u32> {
@@ -282,21 +241,6 @@ fn default_ppisp_reg_scale() -> f32 {
     1.0
 }
 
-fn default_wd_r_warmup_iters() -> u32 {
-    3000
-}
-
-fn parse_non_negative_f32(value: &str) -> Result<f32, String> {
-    let parsed = value
-        .parse::<f32>()
-        .map_err(|error| format!("invalid floating-point value: {error}"))?;
-    if parsed.is_finite() && parsed >= 0.0 {
-        Ok(parsed)
-    } else {
-        Err("value must be finite and non-negative".to_owned())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,61 +251,5 @@ mod tests {
             .err()
             .expect("stacked appearance flags must conflict");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn cli_rejects_lpips_with_wd_r() {
-        let error = TrainConfig::try_parse_from([
-            "brush",
-            "--lpips-loss-weight",
-            "0.1",
-            "--wd-r-gamma",
-            "0.028",
-        ])
-        .err()
-        .expect("LPIPS and WD-R must not be stacked implicitly");
-        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn wd_r_defaults_off_with_paper_warmup() {
-        let config = TrainConfig::default();
-        assert_eq!(config.wd_r_gamma, 0.0);
-        assert_eq!(config.wd_r_warmup_iters, 3000);
-    }
-
-    #[test]
-    fn wd_r_switches_on_at_global_warmup_boundary() {
-        let config = TrainConfig {
-            wd_r_gamma: 0.028,
-            wd_r_warmup_iters: 3000,
-            ..TrainConfig::default()
-        };
-        assert!(!config.wd_r_enabled_at(2999));
-        assert!(config.wd_r_enabled_at(3000));
-    }
-
-    #[test]
-    fn cli_rejects_invalid_wd_r_gamma() {
-        for argument in ["--wd-r-gamma=-0.1", "--wd-r-gamma=NaN", "--wd-r-gamma=inf"] {
-            let error = TrainConfig::try_parse_from(["brush", argument])
-                .err()
-                .expect("invalid WD-R gamma must be rejected");
-            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-        }
-    }
-
-    #[test]
-    fn validation_rejects_non_cli_perceptual_conflicts() {
-        let config = TrainConfig {
-            lpips_loss_weight: 0.1,
-            wd_r_gamma: 0.028,
-            ..TrainConfig::default()
-        };
-
-        assert_eq!(
-            config.validate().expect_err("stacked modes must fail"),
-            "LPIPS and WD-R cannot be enabled together"
-        );
     }
 }

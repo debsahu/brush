@@ -10,17 +10,13 @@ mod native {
     use std::sync::Arc;
 
     use anyhow::{Context, Result, bail};
-    use brush_dataset::{config::LoadDatasetConfig, load_dataset, scene::view_to_sample_image};
+    use brush_dataset::{config::LoadDatasetConfig, load_dataset};
     use brush_render::{AlphaMode, gaussian_splats::SplatRenderMode};
     use brush_serde::load_splat_from_ply;
     use brush_train::eval::eval_stats;
     use brush_vfs::BrushVfs;
-    use burn::{
-        prelude::Device,
-        tensor::{Tensor, TensorData},
-    };
+    use burn::prelude::Device;
     use clap::Parser;
-    use lpips::{LPIPS_MIN_IMAGE_SIZE, LpipsModel, load_vgg_lpips};
     use serde_json::json;
 
     #[derive(Debug, Parser)]
@@ -50,11 +46,6 @@ mod native {
         /// Optional directory for rendered evaluation PNG images.
         #[arg(long)]
         save_dir: Option<PathBuf>,
-
-        /// Also report full-frame VGG LPIPS at the evaluation resolution (lower
-        /// is better). GT alpha is composited onto black before inference.
-        #[arg(long, default_value_t = false)]
-        lpips: bool,
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -65,7 +56,6 @@ mod native {
         height: u32,
         psnr: f64,
         ssim: f64,
-        lpips_vgg: Option<f64>,
     }
 
     fn validate_args(args: &Args) -> Result<()> {
@@ -78,7 +68,7 @@ mod native {
         Ok(())
     }
 
-    fn averages(metrics: &[ViewMetric]) -> Option<(f64, f64, Option<f64>)> {
+    fn averages(metrics: &[ViewMetric]) -> Option<(f64, f64)> {
         if metrics.is_empty() {
             return None;
         }
@@ -86,22 +76,15 @@ mod native {
             (psnr + metric.psnr, ssim + metric.ssim)
         });
         let count = metrics.len() as f64;
-        let lpips_vgg = metrics
-            .iter()
-            .try_fold(0.0, |sum, metric| metric.lpips_vgg.map(|value| sum + value))
-            .map(|sum| sum / count);
-        Some((psnr / count, ssim / count, lpips_vgg))
+        Some((psnr / count, ssim / count))
     }
 
-    fn validate_metric_values(psnr: f64, ssim: f64, lpips_vgg: Option<f64>) -> Result<()> {
+    fn validate_metric_values(psnr: f64, ssim: f64) -> Result<()> {
         if psnr.is_nan() || psnr == f64::NEG_INFINITY {
             bail!("PSNR is not a valid finite value or positive infinity");
         }
         if !ssim.is_finite() {
             bail!("SSIM is not finite");
-        }
-        if lpips_vgg.is_some_and(|value| !value.is_finite()) {
-            bail!("VGG LPIPS is not finite");
         }
         Ok(())
     }
@@ -133,7 +116,6 @@ mod native {
             "height": metric.height,
             "psnr": metric_value_json(metric.psnr),
             "ssim": metric_value_json(metric.ssim),
-            "lpips_vgg": metric.lpips_vgg.map(metric_value_json),
         })
     }
 
@@ -176,7 +158,6 @@ mod native {
         let device = Device::from(brush_process::burn_init_setup().await);
         let checkpoint = load_checkpoint(&args.ply, &device).await?;
         let splat_count = checkpoint.num_splats();
-        let lpips_model = args.lpips.then(|| load_vgg_lpips(&device));
 
         let dataset_vfs = Arc::new(
             BrushVfs::from_path(&args.dataset)
@@ -250,8 +231,7 @@ mod native {
                 .await
                 .with_context(|| format!("failed to read SSIM for {image_name}"))?
                 as f64;
-            let lpips_vgg = calculate_lpips(&sample, lpips_model.as_ref(), &image_name).await?;
-            validate_metric_values(psnr, ssim, lpips_vgg)
+            validate_metric_values(psnr, ssim)
                 .with_context(|| format!("invalid metrics for {image_name}"))?;
 
             if let Some(save_dir) = &args.save_dir {
@@ -269,13 +249,12 @@ mod native {
                 height,
                 psnr,
                 ssim,
-                lpips_vgg,
             };
             println!("BRUSH_EVAL_VIEW {}", metric_json(&metric));
             metrics.push(metric);
         }
 
-        let (avg_psnr, avg_ssim, avg_lpips_vgg) =
+        let (avg_psnr, avg_ssim) =
             averages(&metrics).context("dataset produced no held-out evaluation metrics")?;
         let compiler = if cfg!(all(feature = "native-msl", target_os = "macos")) {
             "native-msl"
@@ -297,10 +276,6 @@ mod native {
                 "alpha_mode": alpha_mode_name(args.alpha_mode),
                 "avg_psnr": metric_value_json(avg_psnr),
                 "avg_ssim": metric_value_json(avg_ssim),
-                "avg_lpips_vgg": avg_lpips_vgg.map(metric_value_json),
-                "lpips_variant": args.lpips.then_some("vgg"),
-                "lpips_policy": args.lpips.then_some("full-frame-at-eval-resolution"),
-                "lpips_alpha_mode": args.lpips.then_some("gt-black-composited"),
                 "warnings": warnings,
                 "per_view": per_view,
             })
@@ -309,79 +284,14 @@ mod native {
         Ok(())
     }
 
-    async fn calculate_lpips(
-        sample: &brush_train::eval::EvalSample,
-        model: Option<&LpipsModel>,
-        image_name: &str,
-    ) -> Result<Option<f64>> {
-        let Some(model) = model else {
-            return Ok(None);
-        };
-        let [height, width, channels] = sample.rendered.dims();
-        validate_lpips_view(width, height, channels, image_name)?;
-
-        // Rendered RGB already uses a black background. Composite GT alpha onto
-        // black to avoid scoring arbitrary hidden RGB in masked source images.
-        // Unlike historical bake-off scripts, this metric intentionally stays
-        // at the caller's evaluation resolution and does not mask the render.
-        let target = lpips_target_image(&sample.gt_img);
-        let (target_width, target_height) = target.dimensions();
-        if target_width as usize != width || target_height as usize != height {
-            bail!(
-                "VGG LPIPS render/target dimensions differ for {image_name}: {width}x{height} versus {target_width}x{target_height}"
-            );
-        }
-        let target = Tensor::<4>::from_data(
-            TensorData::new(
-                target.into_vec(),
-                [1, target_height as usize, target_width as usize, 3],
-            ),
-            &sample.rendered.device(),
-        );
-
-        let value = model
-            // `eval_stats` preserves out-of-gamut float values for its legacy
-            // metrics, while LPIPS is defined on RGB normalized to [0, 1].
-            .lpips(
-                sample.rendered.clone().clamp(0.0, 1.0).unsqueeze_dim(0),
-                target,
-            )
-            .into_scalar_async::<f32>()
-            .await
-            .with_context(|| format!("failed to read VGG LPIPS for {image_name}"))?;
-        Ok(Some(value as f64))
-    }
-
-    fn validate_lpips_view(
-        width: usize,
-        height: usize,
-        channels: usize,
-        image_name: &str,
-    ) -> Result<()> {
-        if height < LPIPS_MIN_IMAGE_SIZE || width < LPIPS_MIN_IMAGE_SIZE {
-            bail!(
-                "VGG LPIPS requires images of at least {LPIPS_MIN_IMAGE_SIZE}x{LPIPS_MIN_IMAGE_SIZE}; {image_name} is {width}x{height}"
-            );
-        }
-        if channels != 3 {
-            bail!("VGG LPIPS requires RGB renders; {image_name} has {channels} channels");
-        }
-        Ok(())
-    }
-
-    fn lpips_target_image(gt_img: &image::DynamicImage) -> image::Rgb32FImage {
-        view_to_sample_image(gt_img.clone(), AlphaMode::Transparent).to_rgb32f()
-    }
-
     #[cfg(test)]
     mod tests {
         use super::{
-            Args, ViewMetric, averages, lpips_target_image, metric_value_json, render_file_name,
-            validate_args, validate_lpips_view, validate_metric_values,
+            Args, ViewMetric, averages, metric_value_json, render_file_name, validate_args,
+            validate_metric_values,
         };
         use brush_render::AlphaMode;
         use clap::Parser;
-        use image::{DynamicImage, RgbaImage};
         use std::path::PathBuf;
 
         fn args() -> Args {
@@ -406,7 +316,6 @@ mod native {
             assert_eq!(args.eval_split_every, 20);
             assert_eq!(args.alpha_mode, AlphaMode::Masked);
             assert_eq!(args.save_dir, None);
-            assert!(!args.lpips);
             validate_args(&args).expect("defaults are valid");
         }
 
@@ -451,7 +360,6 @@ mod native {
                     height: 1,
                     psnr: 20.0,
                     ssim: 0.8,
-                    lpips_vgg: Some(0.4),
                 },
                 ViewMetric {
                     index: 1,
@@ -460,29 +368,18 @@ mod native {
                     height: 2,
                     psnr: 30.0,
                     ssim: 1.0,
-                    lpips_vgg: Some(0.2),
                 },
             ];
-            let (psnr, ssim, lpips_vgg) = averages(&metrics).expect("non-empty metrics");
-            assert_eq!(psnr, 25.0);
-            assert!((ssim - 0.9).abs() < 1e-12);
-            assert!((lpips_vgg.expect("enabled LPIPS") - 0.3).abs() < 1e-12);
+            assert_eq!(averages(&metrics), Some((25.0, 0.9)));
             assert_eq!(averages(&[]), None);
-
-            let metrics_without_lpips = metrics.map(|metric| ViewMetric {
-                lpips_vgg: None,
-                ..metric
-            });
-            assert_eq!(averages(&metrics_without_lpips), Some((25.0, 0.9, None)));
         }
 
         #[test]
         fn machine_output_preserves_positive_infinite_psnr() {
             assert_eq!(metric_value_json(f64::INFINITY), serde_json::json!("inf"));
-            validate_metric_values(f64::INFINITY, 1.0, Some(0.0)).expect("perfect PSNR is valid");
-            assert!(validate_metric_values(f64::NAN, 1.0, None).is_err());
-            assert!(validate_metric_values(20.0, f64::NAN, None).is_err());
-            assert!(validate_metric_values(20.0, 1.0, Some(f64::NAN)).is_err());
+            validate_metric_values(f64::INFINITY, 1.0).expect("perfect PSNR is valid");
+            assert!(validate_metric_values(f64::NAN, 1.0).is_err());
+            assert!(validate_metric_values(20.0, f64::NAN).is_err());
         }
 
         #[test]
@@ -492,20 +389,6 @@ mod native {
                 "0003_nested name.png"
             );
             assert_eq!(render_file_name(4, ""), "0004_view_0004.png");
-        }
-
-        #[test]
-        fn lpips_validates_shape_and_black_composites_alpha() {
-            validate_lpips_view(400, 300, 3, "opaque.jpg").expect("valid RGB shape");
-            assert!(validate_lpips_view(15, 16, 3, "tiny.jpg").is_err());
-
-            let rgba =
-                RgbaImage::from_raw(1, 1, vec![200, 100, 50, 128]).expect("valid RGBA image");
-            let target = lpips_target_image(&DynamicImage::ImageRgba8(rgba));
-            let pixel = target.get_pixel(0, 0).0;
-            assert!((pixel[0] - 100.0 / 255.0).abs() < 1e-6);
-            assert!((pixel[1] - 50.0 / 255.0).abs() < 1e-6);
-            assert!((pixel[2] - 25.0 / 255.0).abs() < 1e-6);
         }
     }
 }

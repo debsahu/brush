@@ -43,22 +43,6 @@ By default evaluation compares the raw, uncorrected render against ground truth 
 
 Appearance parameters are training-only and are not stored in PLY checkpoints or used for novel-view rendering. Resuming at a non-zero iteration with appearance compensation is rejected to avoid silently resetting them.
 
-### WD-R perceptual training
-
-Native builds can opt into the WD-R objective from [Drop-In Perceptual Optimization for 3D Gaussian Splatting](https://apple.github.io/ml-perceptual-3dgs/):
-
-```sh
-BRUSH_NATIVE_MSL_PRESET=1 cargo run --release --features native-msl -- /path/to/dataset \
-  --wd-r-gamma 0.028 \
-  --wd-r-warmup-iters 3000
-```
-
-WD-R is off by default. During warm-up Brush uses its normal RGB L1/SSIM loss. Afterwards it uses `gamma * (WD + (1 / 0.09) * original_rgb_loss)` while keeping alpha and appearance regularizers outside that scale. The implementation fixes the paper settings to a three-scale VGG16 feature pyramid and `sigma = 4`; `--wd-r-gamma` must still be calibrated against a same-configuration baseline because it changes gradient-driven splat growth. WD-R and the additive `--lpips-loss-weight` option are mutually exclusive.
-
-The initial implementation intentionally rejects masked-alpha inputs because the paper does not define feature-space mask semantics. Opaque and transparent-composited inputs are supported. Every effective training image must remain at least 61 pixels on both sides, including cumulative LOD scaling; invalid configurations are rejected before training. WD-R materially increases training memory and runtime; on memory-constrained Apple Silicon, compare the native-MSL preset with `BRUSH_NATIVE_MSL_SAVED_LOSS_PARTIALS=0`.
-
-The [macOS checkpoint-replay pilot](docs/performance/wd-r-macos-replay-pilot.md) records the measured 400 px and 800 px overhead and the retained exact pyramid optimization. The follow-up [Tanks & Temples quality pilot](docs/performance/wd-r-tandt-400-quality-pilot.md) records the fixed-capacity LPIPS, PSNR, SSIM, runtime, and memory result.
-
 ## Viewer
 Brush also works well as a splat viewer, including on the web. It can load .ply & .compressed.ply files. You can stream in data from a URL (for a web app, simply append `?url=`).
 
@@ -259,13 +243,6 @@ Pass `--skip-refine-weight` to benchmark the late phase after high-gradient
 densification stops. Production training selects that path automatically at
 `--growth-stop-iter`; visibility and screen-radius refinement stats remain enabled.
 
-For a steady-state WD-R replay, add `--wd-r-gamma`, `--wd-r-warmup-iters`, and
-the checkpoint's global `--start-iter`. The replay requires WD-R to be active at
-that starting iteration. Its `--warmup-steps` option remains an untimed pipeline
-and optimizer warm-up; it is separate from the WD-R objective warm-up. Datasets
-with masks must use `--alpha-mode transparent` so both benchmark arms see the
-same composited RGB target.
-
 To inspect raster workload shape without changing any GPU kernel, build the
 replay with the diagnostics-only `raster-census` feature. The first untimed
 warmup cycle reads back the existing projected splats, intersection list, and
@@ -302,15 +279,11 @@ cargo run --release -p brush-bench-test --bin brush-eval-checkpoint --features n
   --ply /path/to/checkpoint.ply \
   --eval-split-every 20 \
   --alpha-mode masked \
-  --lpips \
   --save-dir /path/to/renders
 ```
 
 The evaluator emits one `BRUSH_EVAL_VIEW` JSON record per held-out view and one
-aggregate `BRUSH_EVAL_RESULT` record. `--lpips` is optional and adds VGG LPIPS
-for each view plus the equal-view average. It compares the clamped render with
-ground truth composited onto black at the requested evaluation resolution; it
-does not apply the masked-and-512px policy used by older Egg bake-offs. See the
+aggregate `BRUSH_EVAL_RESULT` record. See the
 [egg 15k upstream-versus-macOS-preset bake-off](docs/performance/egg-15k-upstream-vs-macos-preset.md)
 for the frozen performance and quality baseline used by raster redesign work.
 

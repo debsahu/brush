@@ -46,10 +46,6 @@ const MIN_SCALE_FREEZE_FRAC: f32 = 0.9;
 /// alters the learned/exported representation rather than just training speed.
 const MIN_SCALE_FACTOR: f32 = 0.1;
 
-/// Original RGB-loss regularizer used by WD-R in the paper.
-#[cfg(not(target_family = "wasm"))]
-const WD_R_ORIGINAL_LOSS_WEIGHT: f32 = 1.0 / 0.09;
-
 type OptimizerType = OptimizerAdaptor<AdamScaled, Splats>;
 
 #[cfg(all(
@@ -127,7 +123,7 @@ pub struct SplatTrainer {
     /// the splats (recomputed at each refine), not here.
     view_cams: Vec<(glam::Vec3, f32)>,
     #[cfg(not(target_family = "wasm"))]
-    perceptual_model: Option<lpips::LpipsModel>,
+    lpips: Option<lpips::LpipsModel>,
 }
 
 fn inv_sigmoid(x: Tensor<1>) -> Tensor<1> {
@@ -253,25 +249,8 @@ pub async fn get_splat_bounds(splats: Splats, percentile: f32) -> BoundingBox {
 }
 
 impl SplatTrainer {
-    /// Construct a trainer, panicking when `config` violates a training invariant.
-    /// Prefer [`Self::try_new`] when the configuration comes from a user or file.
-    pub fn new(config: &TrainConfig, device: &Device, bounds: BoundingBox) -> Self {
-        Self::try_new(config, device, bounds).expect("invalid training configuration")
-    }
-
     #[allow(unused_variables)]
-    pub fn try_new(
-        config: &TrainConfig,
-        device: &Device,
-        bounds: BoundingBox,
-    ) -> anyhow::Result<Self> {
-        config.validate().map_err(anyhow::Error::msg)?;
-        #[cfg(target_family = "wasm")]
-        anyhow::ensure!(
-            config.wd_r_gamma == 0.0 && config.lpips_loss_weight <= 0.0,
-            "perceptual training is currently supported only by native builds"
-        );
-
+    pub fn new(config: &TrainConfig, device: &Device, bounds: BoundingBox) -> Self {
         let decay =
             (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_train_iters as f64);
         let lr_mean = ExponentialLrSchedulerConfig::new(config.lr_mean, decay);
@@ -285,19 +264,9 @@ impl SplatTrainer {
         config.growth_stop_iter = config.growth_stop_iter.min(config.total_train_iters);
 
         #[cfg(not(target_family = "wasm"))]
-        let perceptual_model =
-            (config.lpips_loss_weight > 0.0 || config.wd_r_gamma > 0.0).then(|| {
-                // Training keeps splats and the trainer device on Dispatch's
-                // inner backend between steps, then lifts splats explicitly.
-                // VGG participates in that autodiff graph too, so its frozen
-                // weights must use the matching autodiff dispatch variant.
-                // Normalize first so callers that already pass an autodiff
-                // device don't accidentally double-wrap it.
-                let perceptual_device = device.clone().inner().autodiff();
-                lpips::load_vgg_lpips(&perceptual_device)
-            });
+        let lpips = (config.lpips_loss_weight > 0.0).then(|| lpips::load_vgg_lpips(device));
 
-        Ok(Self {
+        Self {
             config,
             sched_mean: lr_mean.init().expect("Mean lr schedule must be valid."),
             optim: None,
@@ -309,8 +278,8 @@ impl SplatTrainer {
             max_sh_degree: 0,
             view_cams: Vec::new(),
             #[cfg(not(target_family = "wasm"))]
-            perceptual_model,
-        })
+            lpips,
+        }
     }
 
     /// Supply per-train-view (world center, focal-px at native res) for the
@@ -394,8 +363,7 @@ impl SplatTrainer {
     }
 
     pub async fn step(&mut self, batch: SceneBatch, splats: Splats) -> (Splats, TrainStepStats) {
-        self.step_with_refine_weight_at(self.step_count, batch, splats, true)
-            .await
+        self.step_with_refine_weight(batch, splats, true).await
     }
 
     /// Whether the refinement-only gradient statistic is still consumed by
@@ -413,25 +381,6 @@ impl SplatTrainer {
         splats: Splats,
         compute_refine_weight: bool,
     ) -> (Splats, TrainStepStats) {
-        self.step_with_refine_weight_at(self.step_count, batch, splats, compute_refine_weight)
-            .await
-    }
-
-    /// Run one training step at an explicit global iteration.
-    ///
-    /// Scheduled objectives must use this value instead of the trainer-local
-    /// step counter because trainers are recreated at LOD boundaries and can
-    /// start from an exported model at a non-zero iteration.
-    pub async fn step_with_refine_weight_at(
-        &mut self,
-        global_iter: u32,
-        batch: SceneBatch,
-        splats: Splats,
-        compute_refine_weight: bool,
-    ) -> (Splats, TrainStepStats) {
-        #[cfg(target_family = "wasm")]
-        let _ = global_iter;
-
         let mut splats = splats;
 
         // Track max SH degree from the first splats we see.
@@ -441,10 +390,6 @@ impl SplatTrainer {
         self.step_count += 1;
 
         let [img_h, img_w] = batch.img_size();
-        assert!(
-            !self.config.wd_r_enabled_at(global_iter) || batch.alpha_mode != AlphaMode::Masked,
-            "WD-R does not support masked-alpha batches"
-        );
         let camera = batch.camera;
 
         let device = splats.device();
@@ -539,57 +484,28 @@ impl SplatTrainer {
             };
             let loss_map = image_loss(pred_for_loss, gt_packed.clone(), cfg);
 
-            let (rgb_loss, alpha_loss) = if do_alpha_match {
+            // `loss` is only reassigned by the LPIPS path below, which is
+            // compiled out on wasm — so `mut` is unused there.
+            #[cfg_attr(target_family = "wasm", allow(unused_mut))]
+            let mut loss = if do_alpha_match {
                 let rgb = loss_map.clone().slice(s![.., .., 0..3]).mean();
                 let alpha = loss_map.slice(s![.., .., 3..4]).mean();
-                (rgb, Some(alpha * self.config.match_alpha_weight))
+                rgb + alpha * self.config.match_alpha_weight
             } else {
-                (loss_map.mean(), None)
+                loss_map.mean()
             };
 
-            let mut loss = rgb_loss.clone();
-
-            // Perceptual losses need an f32 RGB tensor for VGG. Materialising
-            // it here costs ~99 MB at 4K and is skipped during WD-R warm-up.
+            // LPIPS still needs an f32 RGB tensor for VGG. Materialising it
+            // here costs ~99 MB at 4K, only when LPIPS is enabled.
             #[cfg(not(target_family = "wasm"))]
-            if self.config.wd_r_enabled_at(global_iter) {
+            if let Some(lpips) = &self.lpips {
                 let gt_rgb = brush_loss::unpack_gt_rgb(gt_packed.clone(), composite_bg);
-                let gt_rgb_diff = brush_render::burn_glue::lift_to_autodiff(gt_rgb);
-                let wd = trace_span!("WD-R").in_scope(|| {
-                    self.perceptual_model
-                        .as_ref()
-                        .expect("enabled WD-R requires a loaded VGG model")
-                        .wasserstein_distance(
-                            // The float raster can exceed one even though
-                            // individual colors are lower-clamped. VGG's
-                            // perceptual input contract is normalized RGB.
-                            pred_image
-                                .clone()
-                                .slice(s![.., .., 0..3])
-                                .clamp(0.0, 1.0)
-                                .unsqueeze_dim(0),
-                            gt_rgb_diff.unsqueeze_dim(0),
-                        )
-                });
-                loss = (wd + rgb_loss * WD_R_ORIGINAL_LOSS_WEIGHT) * self.config.wd_r_gamma;
-            } else if self.config.wd_r_gamma == 0.0
-                && let Some(perceptual_model) = &self.perceptual_model
-            {
-                let gt_rgb = brush_loss::unpack_gt_rgb(gt_packed.clone(), composite_bg);
-                let gt_rgb_diff = brush_render::burn_glue::lift_to_autodiff(gt_rgb);
+                let gt_rgb_diff: Tensor<3> = Tensor::from_inner(gt_rgb);
                 loss = loss
-                    + perceptual_model.lpips(
-                        pred_image
-                            .clone()
-                            .slice(s![.., .., 0..3])
-                            .clamp(0.0, 1.0)
-                            .unsqueeze_dim(0),
+                    + lpips.lpips(
+                        pred_image.clone().slice(s![.., .., 0..3]).unsqueeze_dim(0),
                         gt_rgb_diff.unsqueeze_dim(0),
                     ) * self.config.lpips_loss_weight;
-            }
-
-            if let Some(alpha_loss) = alpha_loss {
-                loss = loss + alpha_loss;
             }
 
             // Appearance regularisers (bilagrid TV, PPISP param priors).
