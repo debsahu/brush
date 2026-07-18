@@ -32,6 +32,11 @@ ignore = [
     "RUSTSEC-2025-0141",
     # ttf-parser is unmaintained, used transitively by winit.
     "RUSTSEC-2026-0192",
+    # quick-xml is build-only through wayland-scanner. Its current ^0.39
+    # constraint cannot select the fixed 0.41 release; remove these once
+    # wayland-scanner updates its dependency.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 [bans]
