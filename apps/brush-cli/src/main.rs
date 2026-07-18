@@ -5,9 +5,7 @@
 #[cfg(not(target_family = "wasm"))]
 fn main() -> anyhow::Result<()> {
     use brush_cli::{Cli, build_process, run_headless};
-    use clap::Parser;
-
-    let args = Cli::parse().validate()?;
+    let args = Cli::parse_with_value_sources().validate()?;
 
     if args.with_viewer {
         anyhow::bail!(

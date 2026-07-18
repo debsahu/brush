@@ -38,6 +38,8 @@ tokio = { workspace = true, features = ["macros", "rt"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 brush-rerun = { path = "../brush-rerun" }
+image.workspace = true
+lpips = { path = "../lpips" }
 rerun = { workspace = true }
 
 [dev-dependencies]

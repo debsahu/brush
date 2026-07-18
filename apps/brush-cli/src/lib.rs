@@ -4,14 +4,19 @@
 use brush_async::Actor;
 use brush_process::DataSource;
 use brush_process::RunningProcess;
+use brush_process::args_file::PerceptualArgOverrides;
 use brush_process::config::TrainStreamConfig;
 use brush_process::create_process;
 use brush_process::message::ProcessMessage;
 use brush_process::message::TrainMessage;
 
-use clap::{Error, Parser, builder::ArgPredicate, error::ErrorKind};
+use clap::{
+    CommandFactory, Error, FromArgMatches, Parser, builder::ArgPredicate, error::ErrorKind,
+    parser::ValueSource,
+};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
+use std::ffi::OsString;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
@@ -39,9 +44,35 @@ pub struct Cli {
 
     #[clap(flatten)]
     pub train_stream: TrainStreamConfig,
+
+    #[arg(skip)]
+    perceptual_arg_overrides: PerceptualArgOverrides,
 }
 
 impl Cli {
+    pub fn parse_with_value_sources() -> Self {
+        Self::try_parse_from_with_value_sources(std::env::args_os())
+            .unwrap_or_else(|error| error.exit())
+    }
+
+    pub fn try_parse_from_with_value_sources<I, T>(args: I) -> Result<Self, Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let matches = Self::command().try_get_matches_from(args)?;
+        let perceptual_arg_overrides = PerceptualArgOverrides {
+            wd_r_gamma: matches.value_source("wd_r_gamma") == Some(ValueSource::CommandLine),
+            wd_r_warmup_iters: matches.value_source("wd_r_warmup_iters")
+                == Some(ValueSource::CommandLine),
+            lpips_loss_weight: matches.value_source("lpips_loss_weight")
+                == Some(ValueSource::CommandLine),
+        };
+        let mut cli = Self::from_arg_matches(&matches)?;
+        cli.perceptual_arg_overrides = perceptual_arg_overrides;
+        Ok(cli)
+    }
+
     pub fn validate(self) -> Result<Self, Error> {
         if !self.with_viewer && self.source.is_none() {
             return Err(Error::raw(
@@ -58,8 +89,15 @@ impl Cli {
 pub fn build_process(args: &Cli) -> Option<RunningProcess> {
     let source = args.source.clone()?;
     let cli_config = args.train_stream.clone();
+    let perceptual_arg_overrides = args.perceptual_arg_overrides;
     Some(create_process(source, async move |init| {
-        Some(brush_process::args_file::merge_configs(&init, &cli_config))
+        Some(
+            brush_process::args_file::merge_configs_with_perceptual_overrides(
+                &init,
+                &cli_config,
+                perceptual_arg_overrides,
+            ),
+        )
     }))
 }
 
@@ -291,4 +329,36 @@ pub async fn run_cli_ui(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_explicit_zero_perceptual_argument() {
+        let cli = Cli::try_parse_from_with_value_sources([
+            "brush",
+            "scene",
+            "--wd-r-gamma",
+            "0",
+            "--wd-r-warmup-iters",
+            "3000",
+        ])
+        .expect("explicit defaults should parse");
+
+        assert!(cli.perceptual_arg_overrides.wd_r_gamma);
+        assert!(cli.perceptual_arg_overrides.wd_r_warmup_iters);
+        assert_eq!(cli.train_stream.train_config.wd_r_gamma, 0.0);
+        assert_eq!(cli.train_stream.train_config.wd_r_warmup_iters, 3000);
+    }
+
+    #[test]
+    fn distinguishes_omitted_perceptual_argument() {
+        let cli = Cli::try_parse_from_with_value_sources(["brush", "scene"])
+            .expect("default CLI should parse");
+
+        assert!(!cli.perceptual_arg_overrides.wd_r_gamma);
+        assert!(!cli.perceptual_arg_overrides.wd_r_warmup_iters);
+    }
 }

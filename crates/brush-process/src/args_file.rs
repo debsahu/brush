@@ -6,6 +6,13 @@ use tokio::io::AsyncReadExt;
 
 use crate::config::TrainStreamConfig;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PerceptualArgOverrides {
+    pub wd_r_gamma: bool,
+    pub wd_r_warmup_iters: bool,
+    pub lpips_loss_weight: bool,
+}
+
 pub fn split_args_str(content: &str) -> Vec<String> {
     content.split_whitespace().map(|s| s.to_owned()).collect()
 }
@@ -115,7 +122,46 @@ pub fn merge_configs(
     initial_config: &TrainStreamConfig,
     cli_config: &TrainStreamConfig,
 ) -> TrainStreamConfig {
-    let initial_args = config_to_args(initial_config);
+    merge_configs_with_perceptual_overrides(
+        initial_config,
+        cli_config,
+        PerceptualArgOverrides::default(),
+    )
+}
+
+/// Merge configs while preserving whether a perceptual CLI value was supplied.
+///
+/// `TrainStreamConfig` stores Clap defaults as concrete values, so an explicit
+/// `--wd-r-gamma 0` and an explicit default warm-up are otherwise
+/// indistinguishable from omitted flags. The CLI passes these occurrence bits
+/// so either value can replace one inherited from `args.txt`.
+pub fn merge_configs_with_perceptual_overrides(
+    initial_config: &TrainStreamConfig,
+    cli_config: &TrainStreamConfig,
+    overrides: PerceptualArgOverrides,
+) -> TrainStreamConfig {
+    let mut initial_config = initial_config.clone();
+    if overrides.wd_r_gamma {
+        initial_config.train_config.wd_r_gamma = 0.0;
+    }
+    if overrides.wd_r_warmup_iters {
+        initial_config.train_config.wd_r_warmup_iters =
+            TrainStreamConfig::default().train_config.wd_r_warmup_iters;
+    }
+    if overrides.lpips_loss_weight {
+        initial_config.train_config.lpips_loss_weight = 0.0;
+    }
+
+    // A perceptual mode selected by the later CLI/UI source replaces the mode
+    // inherited from args.txt instead of creating an invalid stacked objective.
+    if cli_config.train_config.wd_r_gamma > 0.0 {
+        initial_config.train_config.lpips_loss_weight = 0.0;
+    }
+    if cli_config.train_config.lpips_loss_weight > 0.0 {
+        initial_config.train_config.wd_r_gamma = 0.0;
+    }
+
+    let initial_args = config_to_args(&initial_config);
     let cli_args = config_to_args(cli_config);
 
     // Combine: initial first, then CLI
@@ -192,5 +238,95 @@ mod tests {
         assert_eq!(parsed.model_config.sh_degree, 2);
         assert_eq!(parsed.load_config.max_frames, Some(10));
         assert_eq!(parsed.process_config.seed, 123);
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_wd_r_config_round_trip() {
+        let mut original = TrainStreamConfig::default();
+        original.train_config.wd_r_gamma = 0.028;
+        original.train_config.wd_r_warmup_iters = 4200;
+
+        let args = config_to_args(&original);
+        let args_str = args.join(" ");
+        assert!(args_str.contains("--wd-r-gamma 0.028"));
+        assert!(args_str.contains("--wd-r-warmup-iters 4200"));
+
+        let merged = merge_configs(&original, &TrainStreamConfig::default());
+        assert_eq!(merged.train_config.wd_r_gamma, 0.028);
+        assert_eq!(merged.train_config.wd_r_warmup_iters, 4200);
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_old_serialized_config_gets_wd_r_defaults() {
+        let mut value = serde_json::to_value(TrainStreamConfig::default()).expect("serialize");
+        let object = value.as_object_mut().expect("flattened config object");
+        object.remove("wd-r-gamma");
+        object.remove("wd-r-warmup-iters");
+
+        let parsed: TrainStreamConfig = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed.train_config.wd_r_gamma, 0.0);
+        assert_eq!(parsed.train_config.wd_r_warmup_iters, 3000);
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_later_perceptual_mode_replaces_initial_mode() {
+        let mut initial = TrainStreamConfig::default();
+        initial.train_config.total_train_iters = 1234;
+        initial.train_config.lpips_loss_weight = 0.1;
+        let mut cli = TrainStreamConfig::default();
+        cli.train_config.wd_r_gamma = 0.028;
+
+        let merged = merge_configs(&initial, &cli);
+        assert_eq!(merged.train_config.total_train_iters, 1234);
+        assert_eq!(merged.train_config.lpips_loss_weight, 0.0);
+        assert_eq!(merged.train_config.wd_r_gamma, 0.028);
+
+        initial.train_config.lpips_loss_weight = 0.0;
+        initial.train_config.wd_r_gamma = 0.028;
+        cli.train_config.wd_r_gamma = 0.0;
+        cli.train_config.lpips_loss_weight = 0.1;
+
+        let merged = merge_configs(&initial, &cli);
+        assert_eq!(merged.train_config.total_train_iters, 1234);
+        assert_eq!(merged.train_config.wd_r_gamma, 0.0);
+        assert_eq!(merged.train_config.lpips_loss_weight, 0.1);
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn explicit_zero_disables_inherited_wd_r() {
+        let mut initial = TrainStreamConfig::default();
+        initial.train_config.wd_r_gamma = 0.028;
+
+        let cli = TrainStreamConfig::default();
+        let merged = merge_configs_with_perceptual_overrides(
+            &initial,
+            &cli,
+            PerceptualArgOverrides {
+                wd_r_gamma: true,
+                wd_r_warmup_iters: false,
+                lpips_loss_weight: false,
+            },
+        );
+
+        assert_eq!(merged.train_config.wd_r_gamma, 0.0);
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn explicit_default_resets_inherited_wd_r_warmup() {
+        let mut initial = TrainStreamConfig::default();
+        initial.train_config.wd_r_warmup_iters = 5000;
+
+        let cli = TrainStreamConfig::default();
+        let merged = merge_configs_with_perceptual_overrides(
+            &initial,
+            &cli,
+            PerceptualArgOverrides {
+                wd_r_gamma: false,
+                wd_r_warmup_iters: true,
+                lpips_loss_weight: false,
+            },
+        );
+
+        assert_eq!(merged.train_config.wd_r_warmup_iters, 3000);
     }
 }

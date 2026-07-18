@@ -190,6 +190,40 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
             false,
             enabled,
         );
+        #[cfg(not(target_family = "wasm"))]
+        {
+            slider(
+                ui,
+                &mut tc.wd_r_gamma,
+                0.0..=0.1,
+                "WD-R gamma (0 disables)",
+                false,
+                enabled,
+            );
+            if tc.wd_r_gamma > 0.0 {
+                // WD-R replaces rather than stacks with the older LPIPS mode.
+                tc.lpips_loss_weight = 0.0;
+                slider(
+                    ui,
+                    &mut tc.wd_r_warmup_iters,
+                    0..=10000,
+                    "WD-R warm-up iterations",
+                    false,
+                    enabled,
+                );
+            }
+        }
+        #[cfg(target_family = "wasm")]
+        if tc.wd_r_gamma > 0.0 || tc.lpips_loss_weight > 0.0 {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "Perceptual training is available only in native builds.",
+            );
+            if enabled && ui.button("Disable perceptual loss").clicked() {
+                tc.wd_r_gamma = 0.0;
+                tc.lpips_loss_weight = 0.0;
+            }
+        }
     });
 
     ui.collapsing("Background", |ui| {

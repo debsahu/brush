@@ -19,6 +19,7 @@ mod native {
     use brush_render_bwd::burn_glue::lift_splats_to_autodiff;
     use brush_serde::load_splat_from_ply;
     use brush_train::{
+        WASSERSTEIN_MIN_IMAGE_SIZE,
         config::TrainConfig,
         train::{BOUND_PERCENTILE, SplatTrainer, get_splat_bounds},
     };
@@ -69,6 +70,18 @@ mod native {
         #[arg(long, default_value_t = 42)]
         seed: u64,
 
+        /// Global training iteration represented by the first replay step.
+        #[arg(long, default_value_t = 0)]
+        start_iter: u32,
+
+        /// WD-R objective scale. Zero benchmarks the normal RGB objective.
+        #[arg(long, default_value_t = 0.0)]
+        wd_r_gamma: f32,
+
+        /// Global iteration at which WD-R replaces the warm-up RGB objective.
+        #[arg(long, default_value_t = 3000)]
+        wd_r_warmup_iters: u32,
+
         /// Skip the refinement-only raster gradient statistic for late-phase A/B timing.
         #[arg(long)]
         skip_refine_weight: bool,
@@ -99,6 +112,31 @@ mod native {
         if args.eval_split_every == Some(0) {
             bail!("--eval-split-every must be at least 1");
         }
+        if !args.wd_r_gamma.is_finite() || args.wd_r_gamma < 0.0 {
+            bail!("--wd-r-gamma must be finite and non-negative");
+        }
+        if args.wd_r_gamma > 0.0 && args.alpha_mode == Some(AlphaMode::Masked) {
+            bail!("WD-R does not support --alpha-mode masked; use transparent compositing");
+        }
+        if args.wd_r_gamma > 0.0 && args.start_iter < args.wd_r_warmup_iters {
+            bail!(
+                "WD-R is not active at --start-iter {}; use a value at or above --wd-r-warmup-iters {} for steady-state replay",
+                args.start_iter,
+                args.wd_r_warmup_iters
+            );
+        }
+        let sample_count = u32::try_from(args.samples).context("--samples is too large")?;
+        let timed_steps = args
+            .steps_per_sample
+            .checked_mul(sample_count)
+            .context("timed replay step count overflows u32")?;
+        let replay_steps = args
+            .warmup_steps
+            .checked_add(timed_steps)
+            .context("total replay step count overflows u32")?;
+        args.start_iter
+            .checked_add(replay_steps)
+            .context("global replay iteration overflows u32")?;
         #[cfg(feature = "raster-census")]
         if args.raster_census_tiles == Some(0) {
             bail!("--raster-census-tiles must be at least 1");
@@ -188,17 +226,29 @@ mod native {
         trainer: &mut SplatTrainer,
         splats: &mut Option<brush_render::gaussian_splats::Splats>,
         batches: &[SceneBatch],
-        step_offset: usize,
+        step_offset: u32,
+        start_iter: u32,
         steps: u32,
         compute_refine_weight: bool,
     ) -> Option<Tensor<1>> {
         let mut last_loss = None;
-        for step in 0..steps as usize {
-            let batch = batches[(step_offset + step) % batches.len()].clone();
+        for step in 0..steps {
+            let replay_step = step_offset
+                .checked_add(step)
+                .expect("validated replay step range");
+            let global_iter = start_iter
+                .checked_add(replay_step)
+                .expect("validated global replay iteration range");
+            let batch = batches[replay_step as usize % batches.len()].clone();
             let current = splats.take().expect("replay always restores splats");
             let differentiable = lift_splats_to_autodiff(current);
             let (updated, stats) = trainer
-                .step_with_refine_weight(batch, differentiable, compute_refine_weight)
+                .step_with_refine_weight_at(
+                    global_iter,
+                    batch,
+                    differentiable,
+                    compute_refine_weight,
+                )
                 .await;
             *splats = Some(updated.valid());
             last_loss = Some(stats.loss);
@@ -233,6 +283,24 @@ mod native {
         device.seed(args.seed);
 
         let (batches, view_labels) = load_batches(&args).await?;
+        if args.wd_r_gamma > 0.0 {
+            if batches
+                .iter()
+                .any(|batch| batch.alpha_mode == AlphaMode::Masked)
+            {
+                bail!(
+                    "WD-R resolved a masked-alpha replay view; pass --alpha-mode transparent to composite masks"
+                );
+            }
+            for (batch, label) in batches.iter().zip(&view_labels) {
+                let [height, width] = batch.img_size();
+                if height < WASSERSTEIN_MIN_IMAGE_SIZE || width < WASSERSTEIN_MIN_IMAGE_SIZE {
+                    bail!(
+                        "WD-R requires replay views of at least {WASSERSTEIN_MIN_IMAGE_SIZE}x{WASSERSTEIN_MIN_IMAGE_SIZE}; {label} is {width}x{height}"
+                    );
+                }
+            }
+        }
         if !(args.warmup_steps as usize).is_multiple_of(batches.len()) {
             bail!(
                 "--warmup-steps must be a multiple of the {} selected views",
@@ -251,9 +319,12 @@ mod native {
         let mut splats = Some(checkpoint);
         let config = TrainConfig {
             background_noise_strength: 0.0,
+            wd_r_gamma: args.wd_r_gamma,
+            wd_r_warmup_iters: args.wd_r_warmup_iters,
             ..TrainConfig::default()
         };
-        let mut trainer = SplatTrainer::new(&config, &device, bounds);
+        let mut trainer = SplatTrainer::try_new(&config, &device, bounds)
+            .context("invalid replay training configuration")?;
 
         let compute_refine_weight = !args.skip_refine_weight;
         #[cfg(feature = "raster-census")]
@@ -266,6 +337,7 @@ mod native {
             &mut splats,
             &batches,
             0,
+            args.start_iter,
             args.warmup_steps,
             compute_refine_weight,
         )
@@ -274,7 +346,7 @@ mod native {
 
         let mut sample_ms_per_step = Vec::with_capacity(args.samples);
         let mut final_loss = None;
-        let mut step_offset = args.warmup_steps as usize;
+        let mut step_offset = args.warmup_steps;
         for _ in 0..args.samples {
             let start = Instant::now();
             final_loss = run_steps(
@@ -282,6 +354,7 @@ mod native {
                 &mut splats,
                 &batches,
                 step_offset,
+                args.start_iter,
                 args.steps_per_sample,
                 compute_refine_weight,
             )
@@ -289,7 +362,7 @@ mod native {
             device.sync().context("failed to synchronize sample")?;
             sample_ms_per_step
                 .push(start.elapsed().as_secs_f64() * 1000.0 / f64::from(args.steps_per_sample));
-            step_offset += args.steps_per_sample as usize;
+            step_offset += args.steps_per_sample;
         }
 
         let final_loss = final_loss
@@ -297,6 +370,15 @@ mod native {
             .into_scalar_async::<f32>()
             .await
             .context("failed to read final loss")?;
+        let measured_steps = args
+            .steps_per_sample
+            .checked_mul(u32::try_from(args.samples).expect("validated sample count"))
+            .expect("validated measured step count");
+        let global_end_iter = args
+            .start_iter
+            .checked_add(args.warmup_steps)
+            .and_then(|iter| iter.checked_add(measured_steps))
+            .expect("validated global replay iteration range");
 
         let raw_samples = sample_ms_per_step
             .iter()
@@ -337,6 +419,18 @@ mod native {
         println!("views: {} ({})", batches.len(), view_labels.join(", "));
         println!("refinement weight: {compute_refine_weight}");
         println!(
+            "objective: {} | WD-R gamma: {} | WD-R warm-up: {} | global range: {}..{}",
+            if args.wd_r_gamma > 0.0 {
+                "wd-r"
+            } else {
+                "baseline"
+            },
+            args.wd_r_gamma,
+            args.wd_r_warmup_iters,
+            args.start_iter,
+            global_end_iter,
+        );
+        println!(
             "compiler: {compiler} | native MSL preset requested: {preset_requested} | unchecked raster requested: {unchecked_raster_requested} | fused SH Adam requested: {fused_sh_adam_requested} | coalesced SH grad requested: {coalesced_sh_grad_requested} | saved loss partials requested: {saved_loss_partials_requested} | sparse SH Adam requested: {sparse_sh_adam_requested} | fine raster tiles requested: {fine_raster_tiles_requested} | seed: {}",
             args.seed
         );
@@ -350,8 +444,17 @@ mod native {
         );
         println!("final loss: {final_loss:.9}");
         println!(
-            "BRUSH_REPLAY_RESULT compiler={compiler} native_msl_preset_requested={preset_requested} unchecked_raster_requested={unchecked_raster_requested} fused_sh_adam_requested={fused_sh_adam_requested} coalesced_sh_grad_requested={coalesced_sh_grad_requested} saved_loss_partials_requested={saved_loss_partials_requested} sparse_sh_adam_requested={sparse_sh_adam_requested} fine_raster_tiles_requested={fine_raster_tiles_requested} compute_refine_weight={compute_refine_weight} seed={} splats={splat_count} views={} view_set={} samples={} steps_per_sample={} warmup_steps={} median_ms={median:.6} p95_ms={p95:.6} mean_ms={mean:.6} min_ms={min:.6} max_ms={max:.6} steps_per_s={:.6} final_loss={final_loss:.9}",
+            "BRUSH_REPLAY_RESULT compiler={compiler} native_msl_preset_requested={preset_requested} unchecked_raster_requested={unchecked_raster_requested} fused_sh_adam_requested={fused_sh_adam_requested} coalesced_sh_grad_requested={coalesced_sh_grad_requested} saved_loss_partials_requested={saved_loss_partials_requested} sparse_sh_adam_requested={sparse_sh_adam_requested} fine_raster_tiles_requested={fine_raster_tiles_requested} compute_refine_weight={compute_refine_weight} loss_mode={} seed={} global_iter_start={} timed_global_iter_start={} global_iter_end_exclusive={global_end_iter} wd_r_gamma={} wd_r_warmup_iters={} splats={splat_count} views={} view_set={} samples={} steps_per_sample={} warmup_steps={} median_ms={median:.6} p95_ms={p95:.6} mean_ms={mean:.6} min_ms={min:.6} max_ms={max:.6} steps_per_s={:.6} final_loss={final_loss:.9}",
+            if args.wd_r_gamma > 0.0 {
+                "wd-r"
+            } else {
+                "baseline"
+            },
             args.seed,
+            args.start_iter,
+            args.start_iter + args.warmup_steps,
+            args.wd_r_gamma,
+            args.wd_r_warmup_iters,
             batches.len(),
             view_labels.join(","),
             args.samples,
@@ -368,7 +471,8 @@ mod native {
 
     #[cfg(test)]
     mod tests {
-        use super::{median, percentile};
+        use super::{Args, median, percentile, validate_args};
+        use clap::Parser;
 
         #[test]
         fn percentile_uses_nearest_rank() {
@@ -381,6 +485,63 @@ mod native {
         fn median_averages_the_middle_pair() {
             assert_eq!(median(&[1.0, 2.0, 3.0, 4.0]), 2.5);
             assert_eq!(median(&[1.0, 2.0, 3.0]), 2.0);
+        }
+
+        #[test]
+        fn wd_r_replay_requires_active_global_iteration_and_transparent_masks() {
+            let inactive = Args::try_parse_from([
+                "replay",
+                "--dataset",
+                "dataset",
+                "--ply",
+                "checkpoint.ply",
+                "--wd-r-gamma",
+                "0.028",
+            ])
+            .expect("valid syntax");
+            assert!(
+                validate_args(&inactive)
+                    .expect_err("inactive WD-R must be rejected")
+                    .to_string()
+                    .contains("--start-iter")
+            );
+
+            let masked = Args::try_parse_from([
+                "replay",
+                "--dataset",
+                "dataset",
+                "--ply",
+                "checkpoint.ply",
+                "--wd-r-gamma",
+                "0.028",
+                "--start-iter",
+                "15000",
+                "--alpha-mode",
+                "masked",
+            ])
+            .expect("valid syntax");
+            assert!(
+                validate_args(&masked)
+                    .expect_err("masked WD-R must be rejected")
+                    .to_string()
+                    .contains("transparent")
+            );
+
+            let transparent = Args::try_parse_from([
+                "replay",
+                "--dataset",
+                "dataset",
+                "--ply",
+                "checkpoint.ply",
+                "--wd-r-gamma",
+                "0.028",
+                "--start-iter",
+                "15000",
+                "--alpha-mode",
+                "transparent",
+            ])
+            .expect("valid syntax");
+            validate_args(&transparent).expect("active transparent WD-R must be valid");
         }
     }
 }

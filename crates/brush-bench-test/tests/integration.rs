@@ -12,8 +12,11 @@ use brush_render::{
     gaussian_splats::{SplatRenderMode, Splats},
     kernels::camera_model::CameraModel::Pinhole,
 };
+#[cfg(not(target_family = "wasm"))]
+use brush_render_bwd::burn_glue::lift_splats_to_autodiff;
 use brush_render_bwd::render_splats;
 use brush_train::{config::TrainConfig, train::SplatTrainer};
+#[cfg(not(target_family = "wasm"))]
 use burn::module::AutodiffModule;
 use burn::tensor::{Device, TensorData};
 use glam::{Quat, Vec3};
@@ -198,6 +201,46 @@ async fn test_training_step() {
     let (final_splats, _stats) = trainer.step(batch, splats).await;
 
     assert!(final_splats.num_splats() > 0);
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[tokio::test]
+async fn wd_r_training_step_after_warmup_is_finite() {
+    // Match production: the trainer and persistent splats use the inner
+    // backend, while each training step receives explicitly lifted splats.
+    let device = burn::tensor::Device::from(brush_cube::test_helpers::test_device().await);
+    let batch = generate_test_batch((64, 64));
+    let splats = lift_splats_to_autodiff(generate_test_splats(&device, 100));
+    let config = TrainConfig {
+        background_noise_strength: 0.0,
+        wd_r_gamma: 0.028,
+        wd_r_warmup_iters: 0,
+        ..TrainConfig::default()
+    };
+    let mut trainer = SplatTrainer::new(
+        &config,
+        &device,
+        BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
+    );
+
+    let (final_splats, stats) = trainer
+        .step_with_refine_weight_at(0, batch, splats, false)
+        .await;
+    let loss = stats
+        .loss
+        .into_scalar_async::<f32>()
+        .await
+        .expect("WD-R loss readback");
+    assert!(loss.is_finite(), "WD-R loss was {loss}");
+
+    let means = final_splats
+        .means()
+        .into_data_async()
+        .await
+        .expect("means readback")
+        .into_vec::<f32>()
+        .expect("f32 means");
+    assert!(means.iter().all(|value| value.is_finite()));
 }
 
 #[wasm_bindgen_test(unsupported = test)]

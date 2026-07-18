@@ -9,9 +9,8 @@ mod ui;
 #[allow(clippy::unnecessary_wraps)]
 fn main() -> Result<(), anyhow::Error> {
     use brush_cli::Cli;
-    use clap::Parser;
 
-    let args = Cli::parse().validate()?;
+    let args = Cli::parse_with_value_sources().validate()?;
 
     #[cfg(target_family = "windows")]
     {
