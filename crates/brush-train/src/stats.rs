@@ -49,6 +49,12 @@ impl RefineRecord {
         self.max_screen_size = screen_radius.max_pair(self.max_screen_size.clone());
     }
 
+    pub(crate) fn gather_aux_stats(&mut self, visible: Tensor<1>, screen_radius: Tensor<1>) {
+        let _span = trace_span!("Gather stats").entered();
+        self.vis_weight = self.vis_weight.clone() + visible;
+        self.max_screen_size = screen_radius.max_pair(self.max_screen_size.clone());
+    }
+
     pub(crate) fn vis_mask(&self) -> Tensor<1, Bool> {
         self.vis_weight.clone().greater_elem(0.0)
     }
@@ -59,5 +65,38 @@ impl RefineRecord {
             vis_weight: self.vis_weight.clone().select(0, indices.clone()),
             max_screen_size: self.max_screen_size.select(0, indices),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn values(tensor: Tensor<1>) -> Vec<f32> {
+        tensor
+            .into_data_async()
+            .await
+            .expect("readback")
+            .into_vec::<f32>()
+            .expect("f32 tensor")
+    }
+
+    #[tokio::test]
+    async fn aux_stats_leave_refine_weight_unchanged() {
+        let device: Device = brush_cube::test_helpers::test_device().await.into();
+        let mut record = RefineRecord::new(3, &device);
+        record.gather_stats(
+            Tensor::from_floats([1.0, 2.0, 3.0], &device),
+            Tensor::from_floats([1.0, 0.0, 2.0], &device),
+            Tensor::from_floats([0.1, 0.2, 0.3], &device),
+        );
+        record.gather_aux_stats(
+            Tensor::from_floats([0.5, 1.0, 0.0], &device),
+            Tensor::from_floats([0.2, 0.1, 0.4], &device),
+        );
+
+        assert_eq!(values(record.refine_weight_norm).await, [1.0, 2.0, 3.0]);
+        assert_eq!(values(record.vis_weight).await, [1.5, 1.0, 2.0]);
+        assert_eq!(values(record.max_screen_size).await, [0.2, 0.2, 0.4]);
     }
 }

@@ -16,6 +16,23 @@ use wasm_bindgen_test::wasm_bindgen_test;
 #[cfg(target_family = "wasm")]
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn shader_compiler_matches_native_msl_feature() {
+    use burn_cubecl::cubecl::Runtime;
+    use burn_wgpu::{AutoCompiler, WgpuRuntime};
+
+    let device = brush_cube::test_helpers::test_device().await;
+    let client = WgpuRuntime::<AutoCompiler>::client(&device);
+    let expected = if cfg!(feature = "native-msl") {
+        "wgpu<msl>"
+    } else {
+        "wgpu<wgsl>"
+    };
+
+    assert_eq!(WgpuRuntime::<AutoCompiler>::name(&client), expected);
+}
+
 #[wasm_bindgen_test(unsupported = tokio::test)]
 async fn renders_at_all() {
     // Splats sit at the camera origin so they're culled by the near plane.

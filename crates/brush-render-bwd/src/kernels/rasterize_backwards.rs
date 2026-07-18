@@ -61,7 +61,7 @@ fn zero_grad() -> SplatGrad {
 // appearance-grid backward); re-exported here for the host launch code.
 pub use brush_cube::{AtomicAddF32, CasAtomicAdd, HfAtomicAdd};
 
-#[cube(launch)]
+#[cube(launch, launch_unchecked)]
 pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
     compact_gid_from_isect: &Tensor<u32>,
     tile_offsets: &Tensor<u32>,
@@ -71,6 +71,7 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
     v_splats: &mut Tensor<Atomic<A::Storage>>,
     u: RasterizeUniforms,
     #[comptime] smooth_cutoff: bool,
+    #[comptime] compute_refine_weight: bool,
 ) {
     let (tile_id, tile_origin_x, tile_origin_y) = tile_origin(u.tile_bw);
     // Only `pix_state` lives in shared memory — it gets read-modify-
@@ -106,6 +107,7 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
             v_output,
             u,
             smooth_cutoff,
+            compute_refine_weight,
         );
         if splat_active {
             let base = (compact_gid * 10u32) as usize;
@@ -118,7 +120,9 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
             A::add(&v_splats[base + 6], grad.rgb_g);
             A::add(&v_splats[base + 7], grad.rgb_b);
             A::add(&v_splats[base + 8], grad.alpha);
-            A::add(&v_splats[base + 9], grad.refine);
+            if comptime![compute_refine_weight] {
+                A::add(&v_splats[base + 9], grad.refine);
+            }
         }
         batch_idx += 1u32;
     }
@@ -225,6 +229,7 @@ fn accumulate_grads_for_batch(
     v_output: &Tensor<f32>,
     u: RasterizeUniforms,
     #[comptime] smooth_cutoff: bool,
+    #[comptime] compute_refine_weight: bool,
 ) -> SplatGrad {
     let conic = Sym2 {
         c00: splat.conic_x,
@@ -330,13 +335,15 @@ fn accumulate_grads_for_batch(
                             grad.xy_x += vxy_x;
                             grad.xy_y += vxy_y;
                             grad.alpha += v_alpha * gaussian;
-                            let img_size_x = u.img_w as f32;
-                            let img_size_y = u.img_h as f32;
-                            let len = f32::sqrt(
-                                vxy_x * img_size_x * vxy_x * img_size_x
-                                    + vxy_y * img_size_y * vxy_y * img_size_y,
-                            );
-                            grad.refine += len / max(final_a, 1.0e-5f32);
+                            if comptime![compute_refine_weight] {
+                                let img_size_x = u.img_w as f32;
+                                let img_size_y = u.img_h as f32;
+                                let len = f32::sqrt(
+                                    vxy_x * img_size_x * vxy_x * img_size_x
+                                        + vxy_y * img_size_y * vxy_y * img_size_y,
+                                );
+                                grad.refine += len / max(final_a, 1.0e-5f32);
+                            }
                         }
 
                         pix_state[s] = new_remain_x;

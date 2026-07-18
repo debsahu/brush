@@ -20,7 +20,9 @@ use brush_render::{
         radial_tangential_8::RadialTangential8Params, thin_prism_fisheye::ThinPrismFisheyeParams,
     },
 };
-use brush_render_bwd::render_splats_with_pass;
+#[cfg(not(target_family = "wasm"))]
+use brush_render_bwd::render_splats_for_training;
+use brush_render_bwd::{render_splats_with_pass, render_splats_with_refine_weight};
 
 /// Finite-diff tests need the C^1 cutoff so analytical and numerical
 /// agree at typical eps; production paths use the hard step.
@@ -171,6 +173,187 @@ async fn read_first<const D: usize>(t: Tensor<D>) -> f32 {
         .expect("readback")
         .into_vec::<f32>()
         .expect("vec")[0]
+}
+
+async fn read_vec<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+    t.into_data_async()
+        .await
+        .expect("readback")
+        .into_vec::<f32>()
+        .expect("vec")
+}
+
+fn assert_close(label: &str, actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len(), "{label} length");
+    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+        let tolerance = 2e-5 + 2e-4 * expected.abs();
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{label}[{index}]: actual={actual:e}, expected={expected:e}, tolerance={tolerance:e}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn disabling_refine_weight_preserves_model_gradients_and_aux() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let scene = base_scene();
+    let camera = std_cam();
+    let img_size = glam::uvec2(32, 32);
+
+    let splats_on = build_splats(&scene, &device);
+    let output_on =
+        render_splats_with_refine_weight(splats_on.clone(), &camera, img_size, Vec3::ZERO, true)
+            .await;
+    let visible_on = read_vec(output_on.visible.clone()).await;
+    let radius_on = read_vec(output_on.max_radius.clone()).await;
+    let holder_on = output_on.refine_weight_holder;
+    let grads_on = output_on.img.mean().backward();
+    assert!(holder_on.grad(&grads_on).is_some());
+    let transforms_on = read_vec(splats_on.transforms.grad(&grads_on).unwrap()).await;
+    let sh_on = read_vec(splats_on.sh_coeffs.grad(&grads_on).unwrap()).await;
+    let opacity_on = read_vec(splats_on.raw_opacities.grad(&grads_on).unwrap()).await;
+
+    let splats_off = build_splats(&scene, &device);
+    let output_off =
+        render_splats_with_refine_weight(splats_off.clone(), &camera, img_size, Vec3::ZERO, false)
+            .await;
+    let visible_off = read_vec(output_off.visible.clone()).await;
+    let radius_off = read_vec(output_off.max_radius.clone()).await;
+    let holder_off = output_off.refine_weight_holder;
+    let grads_off = output_off.img.mean().backward();
+    assert!(holder_off.grad(&grads_off).is_none());
+    let transforms_off = read_vec(splats_off.transforms.grad(&grads_off).unwrap()).await;
+    let sh_off = read_vec(splats_off.sh_coeffs.grad(&grads_off).unwrap()).await;
+    let opacity_off = read_vec(splats_off.raw_opacities.grad(&grads_off).unwrap()).await;
+
+    assert_close("transforms", &transforms_off, &transforms_on);
+    assert_close("SH", &sh_off, &sh_on);
+    assert_close("opacity", &opacity_off, &opacity_on);
+    assert_close("visibility", &visible_off, &visible_on);
+    assert_close("max radius", &radius_off, &radius_on);
+}
+
+#[cfg(all(
+    feature = "native-msl",
+    target_os = "macos",
+    target_arch = "aarch64",
+    not(target_family = "wasm")
+))]
+#[tokio::test]
+async fn deferred_sh_bridge_preserves_other_gradients_and_aux() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let scene = base_scene();
+    let camera = std_cam();
+    let img_size = glam::uvec2(32, 32);
+
+    for compute_refine_weight in [false, true] {
+        let dense_splats = build_splats(&scene, &device);
+        let dense = render_splats_with_refine_weight(
+            dense_splats.clone(),
+            &camera,
+            img_size,
+            Vec3::ZERO,
+            compute_refine_weight,
+        )
+        .await;
+        let dense_visible = read_vec(dense.visible.clone()).await;
+        let dense_radius = read_vec(dense.max_radius.clone()).await;
+        let dense_refine_holder = dense.refine_weight_holder;
+        let dense_grads = dense.img.mean().backward();
+        let dense_transforms = read_vec(dense_splats.transforms.grad(&dense_grads).unwrap()).await;
+        let dense_opacity = read_vec(dense_splats.raw_opacities.grad(&dense_grads).unwrap()).await;
+        assert!(dense_splats.sh_coeffs.grad(&dense_grads).is_some());
+
+        let deferred_splats = build_splats(&scene, &device);
+        let deferred = render_splats_for_training(
+            deferred_splats.clone(),
+            &camera,
+            img_size,
+            Vec3::ZERO,
+            compute_refine_weight,
+            true,
+        )
+        .await;
+        let num_visible = deferred.num_visible;
+        let deferred_visible = read_vec(deferred.visible.clone()).await;
+        let deferred_radius = read_vec(deferred.max_radius.clone()).await;
+        let deferred_refine_holder = deferred.refine_weight_holder;
+        let deferred_handle = deferred
+            .deferred_sh_grad
+            .expect("deferred render must return its gradient handle");
+        let mut deferred_grads = deferred.img.mean().backward();
+        let sparse = deferred_handle
+            .take(&mut deferred_grads)
+            .expect("deferred holder gradient");
+        let deferred_transforms =
+            read_vec(deferred_splats.transforms.grad(&deferred_grads).unwrap()).await;
+        let deferred_opacity =
+            read_vec(deferred_splats.raw_opacities.grad(&deferred_grads).unwrap()).await;
+
+        assert!(deferred_splats.sh_coeffs.grad(&deferred_grads).is_none());
+        assert_eq!(
+            sparse.compact_grads.dims(),
+            [num_visible.max(1) as usize, 10]
+        );
+        assert_eq!(sparse.render_transforms.dims(), [scene.raw_opac.len(), 10]);
+        assert!(sparse.global_from_compact_gid.dims()[0] >= num_visible.max(1) as usize);
+        assert_eq!(sparse.project_uniforms.num_visible, num_visible);
+        assert_eq!(
+            sparse.project_uniforms.total_splats as usize,
+            scene.raw_opac.len()
+        );
+        assert!(
+            read_vec(sparse.compact_grads)
+                .await
+                .iter()
+                .all(|v| v.is_finite())
+        );
+
+        assert_close(
+            "deferred transforms",
+            &deferred_transforms,
+            &dense_transforms,
+        );
+        assert_close("deferred opacity", &deferred_opacity, &dense_opacity);
+        assert_close("deferred visibility", &deferred_visible, &dense_visible);
+        assert_close("deferred max radius", &deferred_radius, &dense_radius);
+        if compute_refine_weight {
+            let dense_refine = read_vec(dense_refine_holder.grad(&dense_grads).unwrap()).await;
+            let deferred_refine =
+                read_vec(deferred_refine_holder.grad(&deferred_grads).unwrap()).await;
+            assert_close("deferred refine weight", &deferred_refine, &dense_refine);
+        } else {
+            assert!(dense_refine_holder.grad(&dense_grads).is_none());
+            assert!(deferred_refine_holder.grad(&deferred_grads).is_none());
+        }
+    }
+}
+
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(all(feature = "native-msl", target_os = "macos", target_arch = "aarch64"))
+))]
+#[tokio::test]
+async fn deferred_sh_request_falls_back_to_dense_off_native_msl() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let splats = build_splats(&base_scene(), &device);
+    let output = render_splats_for_training(
+        splats.clone(),
+        &std_cam(),
+        glam::uvec2(32, 32),
+        Vec3::ZERO,
+        false,
+        true,
+    )
+    .await;
+
+    assert!(output.deferred_sh_grad.is_none());
+    let grads = output.img.mean().backward();
+    assert!(splats.sh_coeffs.grad(&grads).is_some());
 }
 
 async fn analytical_at(
@@ -626,7 +809,7 @@ fn random_param(rng: &mut Sm64, n_splats: usize) -> (Lane, usize, usize) {
 /// scene packs higher-than-degree-0 SH in `Scene::sh_dc` — the generic
 /// `perturb` indexes `sh_dc[splat * 3 + comp]`, which is correct for
 /// degree 0 but lands on the wrong coefficient for higher degrees.
-/// Higher-band SH gradients are already covered by `finite_diff_sh_degree2`.
+/// Higher-band SH gradients are covered by `finite_diff_high_band_sh_coefficients`.
 fn random_param_no_sh(rng: &mut Sm64, n_splats: usize) -> (Lane, usize, usize) {
     let lane = match rng.usize_in(0, 4) {
         0 => Lane::Mean,
@@ -1281,7 +1464,7 @@ async fn fuzz_obscure_sh_degree3() {
 
     // Skip ShDc lane: generic perturb assumes 3 floats/splat for sh_dc
     // which is wrong for degree 3 (48 floats/splat). SH coefficient
-    // backward already covered by `finite_diff_sh_degree2`; this fuzz
+    // backward is covered by `finite_diff_high_band_sh_coefficients`; this fuzz
     // exercises means/rots/log_scales/raw_opac under scenes carrying
     // populated higher-band SH.
     let results =
@@ -1384,6 +1567,91 @@ async fn finite_diff_means_through_high_sh_documents_bug() {
     assert!(
         failed.is_empty(),
         "viewdir→mean backward path regressed:\n  {}",
+        failed.join("\n  "),
+    );
+}
+
+/// Exercise coefficient gradients in every SH band, including the degree-4
+/// rows that the coalesced native-MSL materializer writes across three lane
+/// passes. The generic `Lane::ShDc` helper only addresses degree-zero data.
+#[tokio::test]
+async fn finite_diff_high_band_sh_coefficients() {
+    use brush_render::sh::sh_coeffs_for_degree;
+
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let camera = Camera::new(
+        glam::vec3(-0.8, 0.6, -2.0),
+        glam::Quat::IDENTITY,
+        0.9,
+        0.9,
+        glam::vec2(0.5, 0.5),
+        CameraModel::Pinhole,
+    );
+    let img_size = glam::uvec2(48, 48);
+    let degree = 4u32;
+    let num_coeffs = sh_coeffs_for_degree(degree) as usize;
+    let row_len = num_coeffs * 3;
+    let visible_base = row_len;
+    let mut sh = vec![0.0f32; row_len * 2];
+    for channel in 0..3 {
+        sh[visible_base + channel] = 0.25 + channel as f32 * 0.05;
+    }
+    for coeff in 1..num_coeffs {
+        for channel in 0..3 {
+            sh[visible_base + coeff * 3 + channel] = 0.02 * (coeff + channel + 1) as f32;
+        }
+    }
+    let scene = Scene {
+        // Put an offscreen row first so compact splat zero maps to global row
+        // one, while the materializer must explicitly zero global row zero.
+        means: vec![100.0, 100.0, 0.1, 0.4, -0.3, 0.1],
+        rots: vec![0.9, 0.1, 0.05, 0.02, 0.9, 0.1, 0.05, 0.02],
+        log_scales: vec![-0.8, -0.9, -1.0, -0.8, -0.9, -1.0],
+        sh_dc: sh,
+        raw_opac: vec![2.0, 2.0],
+    };
+
+    let (splats, grads) = analytical_grads(&scene, &camera, img_size, &device).await;
+    let analytical = read_vec(splats.sh_coeffs.grad(&grads).expect("SH gradient")).await;
+    assert!(
+        analytical[..row_len].iter().all(|&grad| grad == 0.0),
+        "offscreen SH gradient row must be exactly zero"
+    );
+
+    // Cycle channels while checking every basis, then cover the exact SIMD
+    // pass boundaries and final packed slot.
+    let mut cases = (0..num_coeffs)
+        .map(|coeff| coeff * 3 + coeff % 3)
+        .collect::<Vec<_>>();
+    cases.extend([32, 64, 74]);
+    let epsilon = 3e-2f32;
+    let mut failed = Vec::new();
+
+    for flat in cases {
+        let expected = analytical[visible_base + flat];
+        let mut plus = scene.clone();
+        plus.sh_dc[visible_base + flat] += epsilon;
+        let plus_loss = render_value(&plus, &camera, img_size, &device).await;
+        let mut minus = scene.clone();
+        minus.sh_dc[visible_base + flat] -= epsilon;
+        let minus_loss = render_value(&minus, &camera, img_size, &device).await;
+        let numerical = (plus_loss - minus_loss) / (2.0 * epsilon);
+        let error = (numerical - expected).abs();
+        let scale = expected.abs().max(numerical.abs()).max(1e-8);
+        let tolerance = 2e-5 + 0.04 * scale;
+        if error > tolerance {
+            let coeff = flat / 3;
+            let channel = flat % 3;
+            failed.push(format!(
+                "SH[{coeff},{channel}]: numerical {numerical:.6e} vs analytical {expected:.6e} (|delta|={error:.3e} > {tolerance:.3e})"
+            ));
+        }
+    }
+
+    assert!(
+        failed.is_empty(),
+        "high-band SH coefficient gradients regressed:\n  {}",
         failed.join("\n  "),
     );
 }

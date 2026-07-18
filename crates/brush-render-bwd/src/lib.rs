@@ -3,6 +3,7 @@ mod kernels;
 mod render_bwd;
 
 pub use burn_glue::{
-    RasterizeGrads, SplatBwdOps, SplatGrads, SplatOutputDiff, render_splats,
-    render_splats_with_pass,
+    DeferredShGrad, DeferredShGradHandle, DeferredSplatGrads, RasterizeGrads, SplatBwdOps,
+    SplatGrads, SplatOutputDiff, TrainingSplatOutputDiff, render_splats,
+    render_splats_for_training, render_splats_with_pass, render_splats_with_refine_weight,
 };

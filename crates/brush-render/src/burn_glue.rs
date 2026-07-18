@@ -141,6 +141,14 @@ pub fn detach_autodiff<const D: usize>(t: Tensor<D>) -> Tensor<D> {
         DispatchTensorKind::Autodiff(inner) => *inner,
         other => other,
     };
+    // Hand-rolled render/backward bridges store the concrete autodiff tensor
+    // inside the Wgpu backend variant. Strip that layer too; merely removing
+    // Dispatch's outer bridge leaves `BackendTensor::Autodiff` behind and a
+    // subsequent inner custom op panics when it requests a float primitive.
+    let kind = match kind {
+        wgpu_kind!(BackendTensor::Autodiff(t)) => wgpu_kind!(BackendTensor::Float(t.primitive)),
+        other => other,
+    };
     Tensor::from_dispatch(DispatchTensor {
         kind,
         checkpointing: None,

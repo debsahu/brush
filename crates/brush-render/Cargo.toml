@@ -29,12 +29,11 @@ tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 
 [features]
 debug-validation = []
+native-msl = ["burn-wgpu/metal"]
 
-# Force the WebGPU backend on every platform. We previously used Vulkan
-# on Linux/Windows and Metal on macOS, but both produced random crashes
-# (see #423 / #395 — buffer-destroyed validation errors, ARM/AMD instability).
-# WebGPU runs through wgpu's WGSL frontend everywhere so we avoid the
-# per-backend cubecl codegen divergence.
+# CubeCL emits WGSL by default on every platform. The native-msl feature opts
+# the macOS Metal backend into CubeCL's MSL compiler; other backends still use
+# WGSL.
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 

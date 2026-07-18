@@ -6,7 +6,7 @@ readme.workspace = true
 license.workspace = true
 
 [dependencies]
-burn.workspace = true
+burn = { workspace = true, features = ["wgpu"] }
 burn-cubecl.workspace = true
 burn-wgpu.workspace = true
 bytemuck = { workspace = true, features = ["derive"] }

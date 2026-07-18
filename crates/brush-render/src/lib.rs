@@ -19,6 +19,9 @@ pub mod kernels;
 pub mod render_aux;
 pub mod shaders;
 
+#[doc(hidden)]
+pub mod native_msl;
+
 pub mod sh;
 
 #[cfg(test)]

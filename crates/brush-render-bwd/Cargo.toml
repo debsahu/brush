@@ -7,6 +7,7 @@ license.workspace = true
 
 [features]
 debug-validation = ["brush-render/debug-validation"]
+native-msl = ["brush-render/native-msl"]
 
 [dependencies]
 brush-cube.path = "../brush-cube"

@@ -9,6 +9,9 @@ license.workspace = true
 name = "brush_c"
 crate-type = ["cdylib", "rlib", "staticlib"]
 
+[features]
+native-msl = ["brush-process/native-msl"]
+
 [dependencies]
 brush-process.path = "../../crates/brush-process"
 

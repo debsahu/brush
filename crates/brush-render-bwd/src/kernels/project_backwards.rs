@@ -112,6 +112,7 @@ pub fn project_backwards_kernel(
     #[comptime] mip_splatting: bool,
     #[comptime] sh_degree: u32,
     #[comptime] camera_model: CameraModel,
+    #[comptime] materialize_sh_grad: bool,
 ) {
     let compact_gid = ABSOLUTE_POS as u32;
     if compact_gid >= u.num_visible {
@@ -167,7 +168,9 @@ pub fn project_backwards_kernel(
     let v = u_world.scale(1.0f32 / u_len);
     let coeff_base = global_gid * comptime![num_sh_coeffs(sh_degree) * 3u32];
     let v_color = Vec3A::new(v_color_r, v_color_g, v_color_b);
-    sh_coeffs_to_color_vjp(v_coeffs, coeff_base, sh_degree, v, v_color);
+    if comptime![!materialize_sh_grad] {
+        sh_coeffs_to_color_vjp(v_coeffs, coeff_base, sh_degree, v, v_color);
+    }
     let v_v_sh = sh_color_viewdir_vjp(sh_coeffs, coeff_base, sh_degree, v, v_color);
     let v_dot_vv = v.dot(v_v_sh);
     let v_mean_from_sh = v_v_sh.sub(v.scale(v_dot_vv)).scale(1.0f32 / u_len);

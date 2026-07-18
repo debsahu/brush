@@ -124,12 +124,12 @@ fn draw_pin(
     let stem_bottom = row_top + PIN_STEM;
     ui.painter().line_segment(
         [egui::pos2(x, row_top), egui::pos2(x, stem_bottom)],
-        egui::Stroke::new(1.5, color),
+        egui::Stroke::new(1.5_f32, color),
     );
 
     let circle_center = egui::pos2(x, stem_bottom + radius);
     ui.painter()
-        .circle_stroke(circle_center, radius, egui::Stroke::new(1.5, color));
+        .circle_stroke(circle_center, radius, egui::Stroke::new(1.5_f32, color));
     if filled {
         ui.painter()
             .circle_filled(circle_center, radius * 0.5, color);

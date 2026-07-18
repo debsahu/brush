@@ -9,6 +9,13 @@ pub mod train;
 mod adam_scaled;
 mod multinomial;
 mod quat_vec;
+#[cfg(all(
+    feature = "native-msl",
+    target_os = "macos",
+    target_arch = "aarch64",
+    not(target_family = "wasm")
+))]
+mod sh_adam;
 mod stats;
 
 mod splat_init;
