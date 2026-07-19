@@ -40,7 +40,7 @@ serde_json.workspace = true
 
 wgpu.workspace = true
 
-tokio = { workspace = true, features = ["io-util", "rt"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync"] }
 tokio-stream.workspace = true
 brush-async.path = "../brush-async"
 

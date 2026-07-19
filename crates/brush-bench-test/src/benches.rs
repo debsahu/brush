@@ -306,16 +306,17 @@ mod training {
             generate_training_batch((1920, 1080), Vec3::new(0.0, 0.0, 5.0)),
             generate_training_batch((1920, 1080), Vec3::new(2.0, 0.0, 5.0)),
         ];
-        // CPU background noise uses an unseeded thread RNG. Disable it in the
-        // regression bench so separate builds follow the same input sequence.
+        // Disable background noise so the regression bench measures the same
+        // input sequence without spending time on that augmentation.
         let config = TrainConfig {
             background_noise_strength: 0.0,
             ..TrainConfig::default()
         };
-        let mut trainer = SplatTrainer::new(
+        let mut trainer = SplatTrainer::new_seeded(
             &config,
             &device,
             BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
+            SEED,
         );
         let mut splats = Some(gen_splats(&device, splat_count));
         // Seed CubeCL's RNG used by tensor noise. With one sample iteration
@@ -354,7 +355,7 @@ mod tests {
     use wasm_bindgen_test::wasm_bindgen_test;
 
     use crate::benches::{
-        ITERS_PER_SYNC, backward_iters, bench_camera, forward_iters, gen_splats,
+        ITERS_PER_SYNC, SEED, backward_iters, bench_camera, forward_iters, gen_splats,
         generate_training_batch, training_iters,
     };
 
@@ -397,10 +398,11 @@ mod tests {
             generate_training_batch(resolution, Vec3::new(2.0, 0.0, 5.0)),
         ];
         let config = TrainConfig::default();
-        let mut trainer = SplatTrainer::new(
+        let mut trainer = SplatTrainer::new_seeded(
             &config,
             device,
             BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
+            SEED,
         );
         let mut splats = Some(gen_splats(device, splat_count));
         training_iters(&mut trainer, &mut splats, &batches, 0, iters).await;

@@ -4,7 +4,9 @@ use burn_cubecl::cubecl::frontend::CompilationArg;
 use burn_cubecl::cubecl::frontend::IndexMutExpand;
 use burn_cubecl::cubecl::prelude::*;
 
-pub const THREADS_PER_GROUP: usize = 512;
+// WebGPU only guarantees 256 invocations per workgroup. Keep the baseline
+// within that portable limit so prefix sums also run on constrained adapters.
+pub const THREADS_PER_GROUP: usize = 256;
 
 #[cube]
 fn linear_workgroup_id() -> usize {

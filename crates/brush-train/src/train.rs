@@ -3,6 +3,7 @@ use std::f32::consts::FRAC_1_SQRT_2;
 use crate::{
     adam_scaled::{AdamScaled, AdamScaledConfig, AdamState},
     config::TrainConfig,
+    min_scale::compute_min_scale,
     msg::{RefineStats, TrainStepStats},
     multinomial::multinomial_sample,
     quat_vec::quaternion_vec_multiply,
@@ -16,7 +17,6 @@ use brush_render::gaussian_splats::Splats;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 use brush_render_bwd::{DeferredShGrad, render_splats_for_training};
 use burn::{
-    backend::wgpu::{AutoCompiler, WgpuDevice, WgpuRuntime},
     lr_scheduler::{
         LrScheduler,
         exponential::{ExponentialLrScheduler, ExponentialLrSchedulerConfig},
@@ -29,18 +29,13 @@ use burn::{
     },
 };
 
-use burn_cubecl::cubecl::Runtime;
 use hashbrown::{HashMap, HashSet};
+use rand::SeedableRng;
 use tracing::{Instrument, trace_span};
 
 pub const BOUND_PERCENTILE: f32 = 0.8;
 
 const MIN_OPACITY: f32 = 1.0 / 255.0;
-
-/// Fraction of training after which the Mip-Splatting 3D-filter floor stops
-/// being recomputed and is held frozen (still applied), so splats settle
-/// against a fixed target instead of chasing a moving floor.
-const MIN_SCALE_FREEZE_FRAC: f32 = 0.9;
 
 /// Mip-Splatting 3D-filter strength. This is intentionally fixed: changing it
 /// alters the learned/exported representation rather than just training speed.
@@ -118,6 +113,7 @@ pub struct SplatTrainer {
     bounds: BoundingBox,
     step_count: u32,
     max_sh_degree: u32,
+    rng: rand::rngs::StdRng,
     /// Per-train-view (world center, focal in px at native res) for the
     /// Mip-Splatting 3D filter. Empty disables it. The floor itself lives on
     /// the splats (recomputed at each refine), not here.
@@ -208,35 +204,6 @@ fn step_sh_coeffs(
     optimizer.step(learning_rate, splats, grad_coeff)
 }
 
-/// Per-splat world-space scale floor for the Mip-Splatting 3D filter:
-/// `f_i = sqrt(factor) · min_v(||mean_i - cam_v|| / focal_px_v)`. `means` and
-/// the result are on the inner (non-autodiff) backend; `f` is a frozen
-/// constant. Returns `None` if disabled or there are no cameras.
-fn compute_min_scale(
-    means: &Tensor<2>,
-    view_cams: &[(glam::Vec3, f32)],
-    factor: f32,
-) -> Option<Tensor<1>> {
-    if factor <= 0.0 || view_cams.is_empty() {
-        return None;
-    }
-    let device = means.device();
-    let n = means.dims()[0] as i32;
-
-    let mut min_ratio: Option<Tensor<1>> = None;
-    for (center, focal) in view_cams {
-        let c = Tensor::<1>::from_floats([center.x, center.y, center.z], &device).reshape([1, 3]);
-        let diff = means.clone() - c;
-        let dist = diff.clone().mul(diff).sum_dim(1).sqrt().reshape([n]);
-        let ratio = dist.div_scalar(focal.max(1e-6));
-        min_ratio = Some(match min_ratio {
-            Some(m) => m.min_pair(ratio),
-            None => ratio,
-        });
-    }
-    min_ratio.map(|r| r.mul_scalar(factor.sqrt()))
-}
-
 pub async fn get_splat_bounds(splats: Splats, percentile: f32) -> BoundingBox {
     let means: Vec<f32> = splats
         .means()
@@ -251,6 +218,16 @@ pub async fn get_splat_bounds(splats: Splats, percentile: f32) -> BoundingBox {
 impl SplatTrainer {
     #[allow(unused_variables)]
     pub fn new(config: &TrainConfig, device: &Device, bounds: BoundingBox) -> Self {
+        Self::new_seeded(config, device, bounds, 42)
+    }
+
+    #[allow(unused_variables)]
+    pub fn new_seeded(
+        config: &TrainConfig,
+        device: &Device,
+        bounds: BoundingBox,
+        seed: u64,
+    ) -> Self {
         let decay =
             (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_train_iters as f64);
         let lr_mean = ExponentialLrSchedulerConfig::new(config.lr_mean, decay);
@@ -276,6 +253,7 @@ impl SplatTrainer {
             bounds,
             step_count: 0,
             max_sh_degree: 0,
+            rng: rand::rngs::StdRng::seed_from_u64(seed),
             view_cams: Vec::new(),
             #[cfg(not(target_family = "wasm"))]
             lpips,
@@ -286,6 +264,17 @@ impl SplatTrainer {
     /// Mip-Splatting 3D filter.
     pub fn set_view_cams(&mut self, view_cams: Vec<(glam::Vec3, f32)>) {
         self.view_cams = view_cams;
+    }
+
+    /// Attach the Mip-Splatting scale floor for the trainer's active camera
+    /// resolution. Replaces any existing floor without baking it; callers
+    /// that change splat count must drop or select the old floor first.
+    pub fn apply_min_scale_floor(&self, splats: Splats) -> Splats {
+        let means = splats.means();
+        match compute_min_scale(&means, &self.view_cams, MIN_SCALE_FACTOR) {
+            Some(floor) => splats.with_min_scale(floor),
+            None => splats,
+        }
     }
 
     /// Set up per-view appearance compensation (bilateral grid or PPISP,
@@ -406,7 +395,11 @@ impl SplatTrainer {
         let img_size = glam::uvec2(img_w as u32, img_h as u32);
         let base = &self.config.background_color;
         let base_bg = glam::Vec3::new(base[0], base[1], base[2]);
-        let background = sample_background_color(base_bg, self.config.background_noise_strength);
+        let background = sample_background_color(
+            base_bg,
+            self.config.background_noise_strength,
+            &mut self.rng,
+        );
 
         let median_scale = self.bounds.median_size();
         // The first optimizer step stays dense so Adam can initialize its
@@ -709,15 +702,25 @@ impl SplatTrainer {
     }
 
     pub async fn refine(&mut self, iter: u32, splats: Splats) -> (Splats, RefineStats) {
-        let progress = iter as f32 / self.config.total_train_iters.max(1) as f32;
-        // Refine manipulates the canonical (un-floored) params, so bake the
-        // current 3D-filter floor into them first — split/clone/prune then see
-        // the splat's true scales with no double-apply. A freshly recomputed
-        // floor is attached at the end (below), once positions/count are known.
-        let splats = splats.bake_min_scale();
+        self.refine_for_phase(iter, iter, self.config.total_train_iters, splats)
+            .await
+    }
+
+    /// Refine using a global iteration for densification gates and a separate
+    /// phase-local iteration for schedules that restart in each LOD phase.
+    pub async fn refine_for_phase(
+        &mut self,
+        global_iter: u32,
+        phase_iter: u32,
+        phase_total: u32,
+        splats: Splats,
+    ) -> (Splats, RefineStats) {
+        // Keep the floor auxiliary while prune decisions are made so effective
+        // scales/opacities remain visible. It is cleared immediately before
+        // canonical parameters change and replaced after positions/count are
+        // final; baking here would accumulate the filter at every refinement
+        // and leave Adam moments inconsistent with the rewritten parameters.
         let device = splats.device();
-        // `memory_cleanup` lives on the wgpu client, not on `Device`.
-        let client = WgpuRuntime::<AutoCompiler>::client(&WgpuDevice::default());
 
         let refiner = self
             .refine_record
@@ -727,39 +730,41 @@ impl SplatTrainer {
         // Track how many splats are visually large (the "big-low-α" failure
         // mode). `max_screen_size` is the larger 2D ellipse extent as a
         // fraction of the image dim; area is approximated by its square.
-        let ss_data = refiner
-            .max_screen_size
-            .clone()
-            .into_data_async()
-            .await
-            .expect("Failed to read screen size")
-            .into_vec::<f32>()
-            .expect("Failed to read screen size vec");
-        if !ss_data.is_empty() {
+        if log::log_enabled!(log::Level::Debug) {
+            let ss_data = refiner
+                .max_screen_size
+                .clone()
+                .into_data_async()
+                .await
+                .expect("Failed to read screen size")
+                .into_vec::<f32>()
+                .expect("Failed to read screen size vec");
             let mut sorted: Vec<f32> = ss_data.iter().copied().filter(|v| v.is_finite()).collect();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let n = sorted.len();
-            let pct = |p: f32| sorted[((p * (n - 1) as f32) as usize).min(n - 1)];
-            let n_total = n as f64;
-            let n_gt_025 = ss_data.iter().filter(|v| **v > 0.25).count();
-            let n_gt_010 = ss_data.iter().filter(|v| **v > 0.10).count();
-            let n_gt_005 = ss_data.iter().filter(|v| **v > 0.05).count();
-            let n_area_gt_005 = ss_data.iter().filter(|v| (*v * *v) > 0.05).count();
-            let n_area_gt_010 = ss_data.iter().filter(|v| (*v * *v) > 0.10).count();
-            log::info!(
-                "screen_size iter={} n={} max_dim p50={:.4} p95={:.4} p99={:.4} max={:.4} frac>0.05={:.4} frac>0.10={:.4} frac>0.25={:.4} frac_area>0.05={:.4} frac_area>0.10={:.4}",
-                iter,
-                n,
-                pct(0.5),
-                pct(0.95),
-                pct(0.99),
-                pct(1.0),
-                n_gt_005 as f64 / n_total,
-                n_gt_010 as f64 / n_total,
-                n_gt_025 as f64 / n_total,
-                n_area_gt_005 as f64 / n_total,
-                n_area_gt_010 as f64 / n_total,
-            );
+            if !sorted.is_empty() {
+                sorted.sort_by(|a, b| a.total_cmp(b));
+                let n = sorted.len();
+                let pct = |p: f32| sorted[((p * (n - 1) as f32) as usize).min(n - 1)];
+                let n_total = n as f64;
+                let n_gt_025 = sorted.iter().filter(|v| **v > 0.25).count();
+                let n_gt_010 = sorted.iter().filter(|v| **v > 0.10).count();
+                let n_gt_005 = sorted.iter().filter(|v| **v > 0.05).count();
+                let n_area_gt_005 = sorted.iter().filter(|v| (*v * *v) > 0.05).count();
+                let n_area_gt_010 = sorted.iter().filter(|v| (*v * *v) > 0.10).count();
+                log::debug!(
+                    "screen_size iter={} n={} max_dim p50={:.4} p95={:.4} p99={:.4} max={:.4} frac>0.05={:.4} frac>0.10={:.4} frac>0.25={:.4} frac_area>0.05={:.4} frac_area>0.10={:.4}",
+                    global_iter,
+                    n,
+                    pct(0.5),
+                    pct(0.95),
+                    pct(0.99),
+                    pct(1.0),
+                    n_gt_005 as f64 / n_total,
+                    n_gt_010 as f64 / n_total,
+                    n_gt_025 as f64 / n_total,
+                    n_area_gt_005 as f64 / n_total,
+                    n_area_gt_010 as f64 / n_total,
+                );
+            }
         }
 
         let max_allowed_bounds = self.bounds.extent.max_element() * 100.0;
@@ -832,7 +837,8 @@ impl SplatTrainer {
                 .expect("Failed to get weights")
                 .into_vec::<f32>()
                 .expect("Failed to read weights");
-            let resampled_inds = multinomial_sample(&resampled_weights, pruned_count);
+            let resampled_inds =
+                multinomial_sample(&mut self.rng, &resampled_weights, pruned_count);
             split_inds.extend(resampled_inds);
         }
 
@@ -869,7 +875,7 @@ impl SplatTrainer {
         let num_split_oversized = (split_inds.len() - pre_oversized) as u32;
 
         let pre_high_grad = split_inds.len();
-        if iter < self.config.growth_stop_iter {
+        if global_iter < self.config.growth_stop_iter {
             let above_threshold = refiner.above_threshold(self.config.growth_grad_threshold);
 
             let threshold_count = above_threshold
@@ -901,7 +907,7 @@ impl SplatTrainer {
                     .expect("Failed to get weights")
                     .into_vec::<f32>()
                     .expect("Failed to read weights");
-                let growth_inds = multinomial_sample(&weights, grow_count);
+                let growth_inds = multinomial_sample(&mut self.rng, &weights, grow_count);
                 split_inds.extend(growth_inds);
             }
         }
@@ -911,24 +917,23 @@ impl SplatTrainer {
         // Per-splat max on-screen extent, used by `refine_splats` to cap the
         // split shrink so oversized splats' children land at `split_at_screen_size`.
         let screen_sizes = refiner.max_screen_size.clone();
-        splats = self.refine_splats(&device, record, splats, split_inds, screen_sizes, iter);
+        splats = self.refine_splats(
+            &device,
+            record,
+            splats,
+            split_inds,
+            screen_sizes,
+            phase_iter,
+            phase_total,
+        );
 
         // Update current bounds based on the splats.
         self.bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
-        client.memory_cleanup();
-
         // Recompute the per-splat 3D-filter floor against the new positions/
-        // count and attach it — the floor is part of the splat from here until
-        // the next refine. Past the freeze fraction we stop refreshing and leave
-        // it baked in, so the tail settles against fixed params.
-        if progress < MIN_SCALE_FREEZE_FRAC {
-            // `splats` is already on the inner backend here, so `means()` is too.
-            // No-op when there are no view cameras (e.g. unit tests).
-            let means = splats.means();
-            if let Some(f) = compute_min_scale(&means, &self.view_cams, MIN_SCALE_FACTOR) {
-                splats = splats.with_min_scale(f);
-            }
-        }
+        // count and attach it. Refine must always leave the floor attached:
+        // otherwise the late-training and LOD tails can shrink below it.
+        // `splats` is already on the inner backend here, so `means()` is too.
+        splats = self.apply_min_scale_floor(splats);
 
         let splat_count = splats.num_splats();
 
@@ -952,9 +957,15 @@ impl SplatTrainer {
         mut splats: Splats,
         split_inds: HashSet<i32>,
         screen_sizes: Tensor<1>,
-        iter: u32,
+        phase_iter: u32,
+        phase_total: u32,
     ) -> Splats {
         let refine_count = split_inds.len();
+
+        // From this point on we mutate canonical parameters and may change
+        // cardinality. The old floor is camera-derived auxiliary state; drop
+        // it without folding it into parameters, then recompute it at the end.
+        splats.min_scale = None;
 
         if refine_count > 0 {
             let refine_inds = Tensor::from_data(
@@ -1089,7 +1100,7 @@ impl SplatTrainer {
             );
         }
 
-        let train_t = (iter as f32 / self.config.total_train_iters as f32).clamp(0.0, 1.0);
+        let train_t = (phase_iter as f32 / phase_total.max(1) as f32).clamp(0.0, 1.0);
         let t_shrink_strength = 1.0 - train_t;
         let minus_opac = self.config.opac_decay * t_shrink_strength;
 
@@ -1182,6 +1193,9 @@ async fn prune_points(
         // refiner runs on the inner device — give `keep()` an inner copy.
         use brush_render::burn_glue::detach_autodiff_int;
         let inner_valid_inds = detach_autodiff_int(valid_inds.clone().inner());
+        if let Some(floor) = splats.min_scale.take() {
+            splats.min_scale = Some(floor.select(0, inner_valid_inds.clone()));
+        }
         splats = map_splats_and_opt(
             splats,
             record,
@@ -1198,16 +1212,36 @@ async fn prune_points(
 }
 
 /// Sample a background color: base + uniform noise in [-strength, +strength], clamped to [0, 1].
-fn sample_background_color(base: glam::Vec3, strength: f32) -> glam::Vec3 {
+fn sample_background_color<R: rand::Rng + ?Sized>(
+    base: glam::Vec3,
+    strength: f32,
+    rng: &mut R,
+) -> glam::Vec3 {
     if strength <= 0.0 {
         return base.clamp(glam::Vec3::ZERO, glam::Vec3::ONE);
     }
     use rand::RngExt as _;
-    let mut rng = rand::rng();
     let noise = glam::Vec3::new(
         rng.random_range(-strength..strength),
         rng.random_range(-strength..strength),
         rng.random_range(-strength..strength),
     );
     (base + noise).clamp(glam::Vec3::ZERO, glam::Vec3::ONE)
+}
+
+#[cfg(test)]
+mod seeded_rng_tests {
+    use super::*;
+
+    #[test]
+    fn seeded_background_noise_is_repeatable() {
+        let mut first = rand::rngs::StdRng::seed_from_u64(123);
+        let mut second = rand::rngs::StdRng::seed_from_u64(123);
+        let base = glam::Vec3::splat(0.5);
+
+        assert_eq!(
+            sample_background_color(base, 0.25, &mut first),
+            sample_background_color(base, 0.25, &mut second)
+        );
+    }
 }

@@ -38,26 +38,27 @@ public class MainActivity extends GameActivity {
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        if (requestCode == FilePicker.REQUEST_CODE_PICK_FILE) {
+        if (FilePicker.isFilePickerRequest(requestCode)) {
             int fd = -1;
 
-            try {
-                Uri uri = data.getData();
+            if (resultCode == RESULT_OK && data != null) {
+                try {
+                    Uri uri = data.getData();
 
-                if (uri == null) {
-                    throw new IOException("Failed to open URI");
+                    if (uri == null) {
+                        throw new IOException("Failed to open URI");
+                    }
+                    ParcelFileDescriptor parcelFileDescriptor = getContentResolver()
+                            .openFileDescriptor(uri, "r");
+                    if (parcelFileDescriptor == null) {
+                        throw new IOException("Failed to open ParcelFileDescriptor");
+                    }
+                    // Detach and get the raw file descriptor
+                    fd = parcelFileDescriptor.detachFd();
+                } catch (IOException | SecurityException ignored) {
                 }
-                ParcelFileDescriptor parcelFileDescriptor = getContentResolver()
-                        .openFileDescriptor(uri, "r");
-                if (parcelFileDescriptor == null) {
-                    throw new IOException("Failed to open ParcelFileDescriptor");
-                }
-                // Detach and get the raw file descriptor
-                fd = parcelFileDescriptor.detachFd();
-            } catch (IOException ignored) {
-            } finally {
-                FilePicker.onPicked(requestCode, fd);
             }
+            FilePicker.onPicked(requestCode, fd);
         }
         super.onActivityResult(requestCode, resultCode, data);
     }

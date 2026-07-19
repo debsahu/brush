@@ -72,7 +72,7 @@ fn test_train_and_save_ffi_short() {
         train_and_save(
             dataset_path_cstr.as_ptr(),
             &options,
-            test_progress_callback,
+            Some(test_progress_callback),
             std::ptr::from_mut(&mut callback_state).cast::<c_void>(),
         )
     };
@@ -116,7 +116,7 @@ fn test_train_and_save_ffi_invalid_path() {
         train_and_save(
             dataset_path_cstr.as_ptr(),
             &options,
-            test_progress_callback,
+            Some(test_progress_callback),
             std::ptr::from_mut(&mut callback_state).cast::<c_void>(),
         )
     };
@@ -144,7 +144,7 @@ fn test_train_and_save_ffi_null_options() {
         train_and_save(
             dataset_path_cstr.as_ptr(),
             std::ptr::null(),
-            test_progress_callback,
+            Some(test_progress_callback),
             std::ptr::from_mut(&mut callback_state).cast::<c_void>(),
         )
     };
@@ -174,10 +174,28 @@ fn test_train_and_save_ffi_null_dataset() {
         train_and_save(
             std::ptr::null(),
             &options,
-            test_progress_callback,
+            Some(test_progress_callback),
             std::ptr::null_mut(),
         )
     };
 
     assert!(matches!(status_null_dataset, TrainExitCode::Error));
+}
+
+#[test]
+fn test_train_and_save_ffi_null_callback() {
+    let dataset_path = CString::new("/path/that/does/not/exist/and/should/fail").unwrap();
+    let options = TrainOptions {
+        total_train_steps: 10,
+        refine_every: 5,
+        export_every: 10,
+        max_resolution: 50,
+        output_path: std::ptr::null(),
+    };
+
+    // SAFETY: The path and options are valid. A null callback and user-data pointer are allowed.
+    let status =
+        unsafe { train_and_save(dataset_path.as_ptr(), &options, None, std::ptr::null_mut()) };
+
+    assert!(matches!(status, TrainExitCode::Error));
 }

@@ -95,6 +95,7 @@ if (!('showDirectoryPicker' in window)) {
 
 let app: BrushApp | null = null;
 let training: Training | null = null;
+let trainingPump: Promise<void> | null = null;
 let renderer: PointRenderer | null = null;
 let device: GPUDevice | null = null;
 const viewerWrap = document.getElementById('viewer-wrap') as HTMLDivElement;
@@ -267,6 +268,27 @@ function setTrainingControlsActive(active: boolean) {
   }
 }
 
+async function cancelActiveTraining(logRequest = true) {
+  const t = training;
+  if (!t) return;
+
+  const pump = trainingPump;
+  training = null;
+  t.cancel();
+
+  // If paused, wake the pump so it can observe the cancellation. Explicitly
+  // freeing a wasm-bindgen object while its async method is borrowed throws,
+  // so release it only after the pump (and any pending trainSteps call) exits.
+  setPaused(false);
+  setTrainingControlsActive(false);
+  if (logRequest) log('Cancel requested');
+  try {
+    if (pump) await pump;
+  } finally {
+    t.free();
+  }
+}
+
 trainBtn.on('click', async () => {
   if (!('showDirectoryPicker' in window)) {
     log('Directory picker not available in this browser/context.');
@@ -279,11 +301,8 @@ trainBtn.on('click', async () => {
     const a = await ensureApp();
     log(`Opened folder: ${dir.name}`);
 
-    // Drop any prior run synchronously so its stream is released.
-    training?.free();
-    training = null;
+    await cancelActiveTraining(false);
 
-    let started = false;
     const t = a.startTrainingFromDirectory(dir, async (initialConfig: ConfigDoc) => {
       const finalConfig = await showConfigPopup(initialConfig);
       if (!finalConfig) {
@@ -295,12 +314,21 @@ trainBtn.on('click', async () => {
       }
       viewerWrap.classList.add('active');
       log('Starting training');
-      started = true;
+      setTrainingControlsActive(true);
       return finalConfig;
     });
     training = t;
-    if (started) setTrainingControlsActive(true);
-    await pumpMessages(t);
+    const pump = pumpMessages(t);
+    trainingPump = pump;
+    try {
+      await pump;
+    } finally {
+      if (training === t) {
+        training = null;
+        t.free();
+      }
+      if (trainingPump === pump) trainingPump = null;
+    }
   } catch (e) {
     log(`Failed to start: ${e}`);
     stats.status.text = 'error';
@@ -319,16 +347,10 @@ pauseBtn.on('click', () => {
 });
 
 cancelBtn.on('click', () => {
-  if (!training) return;
-  // Drop the training run — the pump loop will see `trainSteps` return [] on
-  // its next iteration and exit. Any in-flight Burn work is cancelled when
-  // the underlying stream is dropped.
-  training.free();
-  training = null;
-  // If we were paused, kick the pump so it observes the cleared training.
-  setPaused(false);
-  pauseBtn.text = 'Pause';
-  log('Cancel requested');
+  void cancelActiveTraining().catch((e) => {
+    log(`Failed to cancel: ${e}`);
+    stats.status.text = 'error';
+  });
 });
 
 // -------------------------------------------------------------------------------------------
@@ -465,6 +487,7 @@ async function pumpMessages(t: Training) {
       // were paused — drop out so we don't call into a freed wasm object.
       if (training !== t) break;
       const msgs = await t.trainSteps(STEPS_PER_BATCH);
+      if (training !== t) break;
       if (msgs.length === 0) break; // stream exhausted
       for (const msg of msgs) applyMessage(msg);
     }

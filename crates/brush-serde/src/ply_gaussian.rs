@@ -46,10 +46,10 @@ where
             Ok(Some(value))
         }
         fn visit_u8<E>(self, value: u8) -> Result<Option<f32>, E> {
-            Ok(Some(value as f32 / (u8::MAX - 1) as f32))
+            Ok(Some(value as f32 / u8::MAX as f32))
         }
         fn visit_u16<E>(self, value: u16) -> Result<Option<f32>, E> {
-            Ok(Some(value as f32 / (u16::MAX - 1) as f32))
+            Ok(Some(value as f32 / u16::MAX as f32))
         }
     }
     deserializer.deserialize_any(Dequant)
@@ -106,7 +106,7 @@ fn de_quant_sh<'de, D>(deserializer: D) -> Result<f32, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let value = u8::deserialize(deserializer)? as f32 / (u8::MAX - 1) as f32;
+    let value = u8::deserialize(deserializer)? as f32 / u8::MAX as f32;
     Ok((value - 0.5) * 8.0)
 }
 
@@ -120,3 +120,31 @@ pub struct QuantSh {
 
 // Generate the coeffs() method using proc macro
 brush_serde_macros::impl_coeffs!(QuantSh);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::de::value::{Error as ValueError, U8Deserializer, U16Deserializer};
+
+    #[test]
+    fn quantized_colors_normalize_endpoints() {
+        let u8_min = de_quant(U8Deserializer::<ValueError>::new(u8::MIN)).unwrap();
+        let u8_max = de_quant(U8Deserializer::<ValueError>::new(u8::MAX)).unwrap();
+        let u16_min = de_quant(U16Deserializer::<ValueError>::new(u16::MIN)).unwrap();
+        let u16_max = de_quant(U16Deserializer::<ValueError>::new(u16::MAX)).unwrap();
+
+        assert_eq!(u8_min, Some(0.0));
+        assert_eq!(u8_max, Some(1.0));
+        assert_eq!(u16_min, Some(0.0));
+        assert_eq!(u16_max, Some(1.0));
+    }
+
+    #[test]
+    fn quantized_sh_maps_endpoints_to_expected_range() {
+        let min = de_quant_sh(U8Deserializer::<ValueError>::new(u8::MIN)).unwrap();
+        let max = de_quant_sh(U8Deserializer::<ValueError>::new(u8::MAX)).unwrap();
+
+        assert_eq!(min, -4.0);
+        assert_eq!(max, 4.0);
+    }
+}

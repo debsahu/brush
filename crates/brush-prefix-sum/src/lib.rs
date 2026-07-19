@@ -12,6 +12,10 @@ pub fn prefix_sum(input: CubeTensor<WgpuRuntime>) -> CubeTensor<WgpuRuntime> {
     assert!(input.is_contiguous(), "Please ensure input is contiguous");
 
     let num = input.shape()[0];
+    if num == 0 {
+        return input;
+    }
+
     let client = input.client.clone();
     let outputs = create_tensor(input.shape().dims::<1>(), &input.device, input.dtype);
 
@@ -86,6 +90,7 @@ pub fn prefix_sum(input: CubeTensor<WgpuRuntime>) -> CubeTensor<WgpuRuntime> {
 mod tests {
     use crate::prefix_sum;
     use brush_cube::{MainBackendBase, create_tensor_from_slice};
+    use burn::backend::TensorMetadata;
     use burn::backend::ops::IntTensorOps;
     use burn::tensor::DType;
     use burn_wgpu::{CubeTensor, WgpuRuntime};
@@ -111,7 +116,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test(unsupported = tokio::test)]
-    async fn test_512_multiple() {
+    async fn test_workgroup_multiple() {
         const ITERS: usize = 1024;
         let data: Vec<i32> = (0..ITERS).map(|i| 90 + i as i32).collect();
         let device = brush_cube::test_helpers::test_device().await;
@@ -126,6 +131,33 @@ mod tests {
             .collect();
         for (summed, reff) in summed.iter().zip(prefix_sum_ref) {
             assert_eq!(*summed, reff);
+        }
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_empty() {
+        let device = brush_cube::test_helpers::test_device().await;
+        let keys = create_tensor_from_slice::<i32>(&[], &device, DType::I32);
+        let summed = prefix_sum(keys);
+        assert_eq!(summed.shape()[0], 0);
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_workgroup_boundaries() {
+        let device = brush_cube::test_helpers::test_device().await;
+
+        for len in [255usize, 256, 257] {
+            let data: Vec<i32> = (0..len).map(|i| (i % 7) as i32).collect();
+            let keys = create_tensor_from_slice(&data, &device, DType::I32);
+            let summed = read_i32(prefix_sum(keys)).await;
+            let expected: Vec<_> = data
+                .into_iter()
+                .scan(0, |sum, value| {
+                    *sum += value;
+                    Some(*sum)
+                })
+                .collect();
+            assert_eq!(summed, expected, "length {len}");
         }
     }
 

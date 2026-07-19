@@ -7,7 +7,6 @@ use brush_dataset::{
 use brush_process::message::{ProcessMessage, TrainMessage};
 use brush_render::AlphaMode;
 use egui::{Color32, Slider, TextureOptions, pos2};
-use image::GenericImageView;
 use tokio::sync::oneshot;
 
 use brush_async::Actor;
@@ -19,6 +18,8 @@ use crate::ui::{
 };
 
 const TEX_CACHE_LIMIT: usize = 16;
+const PREVIEW_QUEUE_LIMIT: usize = TEX_CACHE_LIMIT;
+const PREVIEW_WORKER_LIMIT: usize = 4;
 
 fn selected_scene(t: ViewType, dataset: &Dataset) -> &Scene {
     match t {
@@ -54,8 +55,10 @@ struct PreviewLoader {
 
 impl PreviewLoader {
     fn new() -> Self {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let (jobs, rx) = async_channel::unbounded::<PreviewJob>();
+        let workers = std::thread::available_parallelism()
+            .map_or(PREVIEW_WORKER_LIMIT, |n| n.get())
+            .min(PREVIEW_WORKER_LIMIT);
+        let (jobs, rx) = async_channel::bounded::<PreviewJob>(PREVIEW_QUEUE_LIMIT);
         let workers = (0..workers)
             .map(|i| {
                 let actor = Actor::new(&format!("dataset-preview-{i}"));
@@ -63,8 +66,16 @@ impl PreviewLoader {
                 actor
                     .run(move || async move {
                         while let Ok(job) = rx.recv().await {
-                            if let Some(tex) =
-                                load_preview(job.view, job.ctx.clone(), job.preview_edge).await
+                            if job.reply.is_closed() {
+                                continue;
+                            }
+                            if let Some(tex) = load_preview(
+                                job.view,
+                                job.ctx.clone(),
+                                job.preview_edge,
+                                &job.reply,
+                            )
+                            .await
                             {
                                 let _ = job.reply.send(tex);
                                 job.ctx.request_repaint();
@@ -132,12 +143,18 @@ impl PreviewLoader {
             return;
         }
         let (reply, rx) = oneshot::channel();
-        let _ = self.jobs.try_send(PreviewJob {
-            view: view.clone(),
-            ctx: ctx.clone(),
-            preview_edge: self.target_res,
-            reply,
-        });
+        if self
+            .jobs
+            .try_send(PreviewJob {
+                view: view.clone(),
+                ctx: ctx.clone(),
+                preview_edge: self.target_res,
+                reply,
+            })
+            .is_err()
+        {
+            return;
+        }
         self.cache
             .push_front((view.image.clone(), LoadState::Pending(rx)));
         if self.cache.len() > TEX_CACHE_LIMIT {
@@ -170,14 +187,28 @@ impl Default for DatasetPanel {
     }
 }
 
-async fn load_preview(view: SceneView, ctx: egui::Context, preview_edge: u32) -> Option<TexHandle> {
+async fn load_preview(
+    view: SceneView,
+    ctx: egui::Context,
+    preview_edge: u32,
+    reply: &oneshot::Sender<TexHandle>,
+) -> Option<TexHandle> {
     // The preview texture is capped to the panel size for GPU/memory reasons,
     // but report the resolution training actually uses (read from the header,
     // no full decode) so the panel doesn't claim a misleadingly small size.
+    if reply.is_closed() {
+        return None;
+    }
+    let train_size = view.image.output_dimensions().await.ok()?;
+    if reply.is_closed() {
+        return None;
+    }
 
     let preview_load = view.image.clone().with_max_resolution(preview_edge);
     let image = preview_load.load().await.ok()?;
-    let train_size = image.dimensions();
+    if reply.is_closed() {
+        return None;
+    }
 
     let has_alpha = image.color().has_alpha();
     let img_size = [image.width() as usize, image.height() as usize];
@@ -188,6 +219,9 @@ async fn load_preview(view: SceneView, ctx: egui::Context, preview_edge: u32) ->
     } else {
         egui::ColorImage::from_rgb(img_size, &image.into_rgb8().into_vec())
     };
+    if reply.is_closed() {
+        return None;
+    }
 
     // Use the full path as the egui texture key: basenames can collide across
     // subdirectories in a dataset.

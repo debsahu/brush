@@ -253,7 +253,7 @@ mod native {
             background_noise_strength: 0.0,
             ..TrainConfig::default()
         };
-        let mut trainer = SplatTrainer::new(&config, &device, bounds);
+        let mut trainer = SplatTrainer::new_seeded(&config, &device, bounds, args.seed);
 
         let compute_refine_weight = !args.skip_refine_weight;
         #[cfg(feature = "raster-census")]

@@ -9,9 +9,7 @@ mod ui;
 #[allow(clippy::unnecessary_wraps)]
 fn main() -> Result<(), anyhow::Error> {
     use brush_cli::Cli;
-    use clap::Parser;
-
-    let args = Cli::parse().validate()?;
+    let args = Cli::parse_with_explicit_fields().validate()?;
 
     #[cfg(target_family = "windows")]
     {
@@ -45,7 +43,7 @@ fn main() -> Result<(), anyhow::Error> {
         .build()
         .expect("Failed to initialize tokio runtime")
         .block_on(async move {
-            let init_process = brush_cli::build_process(&args);
+            let init_process = brush_cli::build_parsed_process(&args);
 
             if args.with_viewer {
                 use crate::ui::app::App;
@@ -84,7 +82,7 @@ fn main() -> Result<(), anyhow::Error> {
                 )?;
             } else {
                 let process = init_process.expect("Must provide a source");
-                brush_cli::run_headless(process, args.train_stream).await?;
+                brush_cli::run_headless(process, args.train_stream.clone()).await?;
             }
 
             anyhow::Result::<(), anyhow::Error>::Ok(())

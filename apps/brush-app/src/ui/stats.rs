@@ -4,7 +4,7 @@ use burn_cubecl::cubecl::Runtime;
 use burn_wgpu::AutoCompiler;
 use burn_wgpu::WgpuRuntime;
 use eframe::egui_wgpu::RenderState;
-use web_time::Duration;
+use web_time::{Duration, Instant};
 use wgpu::AdapterInfo;
 
 use crate::ui::UiMode;
@@ -23,7 +23,18 @@ pub struct StatsPanel {
     sh_degree: u32,
     lod_levels: u32,
     lod_status: Option<(u32, u32)>,
+    memory_stats: Option<MemoryStats>,
+    last_memory_sample: Option<Instant>,
 }
+
+#[derive(Clone, Copy)]
+struct MemoryStats {
+    bytes_in_use: u64,
+    bytes_reserved: u64,
+    number_allocs: u64,
+}
+
+const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 fn bytes_format(bytes: u64) -> String {
     let unit = 1000;
@@ -103,6 +114,8 @@ impl AppPane for StatsPanel {
                 self.sh_degree = 0;
                 self.lod_levels = 0;
                 self.lod_status = None;
+                self.memory_stats = None;
+                self.last_memory_sample = None;
             }
             ProcessMessage::StartLoading { .. } => {
                 self.last_eval = None;
@@ -208,15 +221,27 @@ impl AppPane for StatsPanel {
                 });
             }
 
-            let device = process.burn_device();
-            let client = WgpuRuntime::<AutoCompiler>::client(&device);
-            let memory = client.memory_usage();
+            if self
+                .last_memory_sample
+                .is_none_or(|sample| sample.elapsed() >= MEMORY_SAMPLE_INTERVAL)
+            {
+                self.last_memory_sample = Some(Instant::now());
+                let device = process.burn_device();
+                let client = WgpuRuntime::<AutoCompiler>::client(&device);
+                if let Ok(memory) = client.memory_usage() {
+                    self.memory_stats = Some(MemoryStats {
+                        bytes_in_use: memory.bytes_in_use,
+                        bytes_reserved: memory.bytes_reserved,
+                        number_allocs: memory.number_allocs,
+                    });
+                }
+            }
 
             ui.add_space(10.0);
             ui.heading("GPU");
             ui.separator();
 
-            if let Ok(memory) = memory {
+            if let Some(memory) = self.memory_stats {
                 stats_grid(ui, "memory_stats_grid", |ui, v| {
                     stat_row(ui, "Bytes in use", bytes_format(memory.bytes_in_use), v);
                     stat_row(ui, "Bytes reserved", bytes_format(memory.bytes_reserved), v);

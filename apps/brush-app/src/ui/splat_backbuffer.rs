@@ -12,7 +12,7 @@ use eframe::egui_wgpu::{self, CallbackTrait, wgpu};
 
 #[derive(Clone)]
 struct RenderRequest {
-    splats: Slot<Splats>,
+    splats: Splats,
     ctx: egui::Context,
     state: LastRenderState,
 }
@@ -46,7 +46,7 @@ impl SplatBackbuffer {
             actor,
             async move |req: &RenderRequest| {
                 let (image, _) = render_splats(
-                    req.splats.get(req.state.frame).unwrap(),
+                    req.splats.clone(),
                     &req.state.camera,
                     req.state.img_size,
                     req.state.background,
@@ -73,12 +73,19 @@ impl SplatBackbuffer {
         splat_scale: Option<f32>,
         splats_dirty: bool,
     ) {
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return;
+        }
+
         // Calculate pixel size for rendering
         let ppp = ui.ctx().pixels_per_point();
         let img_size = UVec2::new(
             (rect.width() * ppp).round() as u32,
             (rect.height() * ppp).round() as u32,
         );
+        if img_size.x == 0 || img_size.y == 0 {
+            return;
+        }
 
         // Check if we need to re-render
         let current_state = LastRenderState {
@@ -92,9 +99,9 @@ impl SplatBackbuffer {
         let dirty = splats_dirty
             || self.pipe.last_request().map(|r| r.state) != Some(current_state.clone());
 
-        if dirty && !splats.is_empty() {
+        if dirty && let Some(splats) = splats.get(frame) {
             self.pipe.request(RenderRequest {
-                splats: splats.clone(),
+                splats,
                 ctx: ui.ctx().clone(),
                 state: current_state,
             });

@@ -221,8 +221,8 @@ impl Splats {
     }
 
     /// Attach a per-splat world-space scale floor (see [`Splats::min_scale`]).
-    /// `f` must be `[num_splats]`. Training-only; cleared by refine and never
-    /// serialized.
+    /// `f` must be `[num_splats]`. Training-only; refreshed after cardinality
+    /// changes and never serialized.
     pub fn with_min_scale(mut self, f: Tensor<1>) -> Self {
         self.min_scale = Some(f);
         self

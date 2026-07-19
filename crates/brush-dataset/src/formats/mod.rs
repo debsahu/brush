@@ -4,7 +4,11 @@ use brush_serde::{DeserializeError, SplatMessage, load_splat_from_ply};
 use brush_vfs::BrushVfs;
 use image::ImageError;
 use itertools::{Either, Itertools};
-use std::{path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 pub mod colmap;
 pub mod nerfstudio;
@@ -57,6 +61,8 @@ pub async fn load_dataset(
     vfs: Arc<BrushVfs>,
     load_args: &LoadDatasetConfig,
 ) -> Result<DatasetLoadResult, DatasetError> {
+    load_args.validate().map_err(FormatError::InvalidFormat)?;
+
     let mut dataset = colmap::load_dataset(vfs.clone(), load_args).await;
 
     if dataset.is_none() {
@@ -111,13 +117,105 @@ pub async fn load_dataset(
     })
 }
 
-/// Resolve a bare image name (as stored by colmap / `RealityCapture`, which only
-/// record a filename) to a path in the VFS by brute-force suffix search. Masks
-/// are skipped so an image never resolves to its own mask.
-fn find_image_by_name<'a>(vfs: &'a BrushVfs, name: &str) -> Option<&'a Path> {
-    vfs.files_ending_in(name)
-        .filter(|p| !p.iter().any(|f| f == "masks"))
-        .min()
+/// Paths used by dataset formats, indexed once so resolving every camera does
+/// not repeatedly scan the entire VFS.
+struct DatasetFileIndex {
+    images_by_suffix: HashMap<String, PathBuf>,
+    masks_by_key: HashMap<(String, String), PathBuf>,
+}
+
+impl DatasetFileIndex {
+    fn new(vfs: &BrushVfs) -> Self {
+        let mut images_by_suffix = HashMap::new();
+        let mut masks_by_key = HashMap::new();
+
+        for path in vfs.iter_files() {
+            let components = normalized_components(path);
+            let masks_index = components.iter().position(|part| part == "masks");
+
+            if masks_index.is_none() {
+                for start in 0..components.len() {
+                    insert_min_path(&mut images_by_suffix, components[start..].join("/"), path);
+                }
+            }
+
+            let Some(masks_index) = masks_index else {
+                continue;
+            };
+            let Some(stem) = path.file_stem() else {
+                continue;
+            };
+            let subdirectory = components[masks_index + 1..components.len() - 1].join("/");
+            insert_min_path(
+                &mut masks_by_key,
+                (subdirectory, stem.to_string_lossy().to_lowercase()),
+                path,
+            );
+        }
+
+        Self {
+            images_by_suffix,
+            masks_by_key,
+        }
+    }
+
+    /// Resolve a path suffix as stored by COLMAP or `RealityCapture`. Masks are
+    /// excluded so an image cannot resolve to its own mask.
+    fn find_image_by_name(&self, name: &str) -> Option<&Path> {
+        let key = normalized_components(Path::new(name)).join("/");
+        self.images_by_suffix.get(&key).map(PathBuf::as_path)
+    }
+
+    fn find_mask_path(&self, path: &Path) -> Option<&Path> {
+        let search_name = path.file_name()?.to_string_lossy().to_lowercase();
+        let search_stem = path.file_stem()?.to_string_lossy().to_lowercase();
+        let search_stems = [
+            search_name,
+            search_stem.clone(),
+            format!("{search_stem}.mask"),
+        ];
+        let parent_components = normalized_components(path.parent()?);
+
+        // A mask subdirectory may match any suffix of the image directory.
+        // Select the smallest matching path to keep resolution deterministic.
+        let mut result: Option<&PathBuf> = None;
+        for start in 0..=parent_components.len() {
+            let subdirectory = parent_components[start..].join("/");
+            for stem in &search_stems {
+                if let Some(candidate) =
+                    self.masks_by_key.get(&(subdirectory.clone(), stem.clone()))
+                    && result.is_none_or(|current| candidate < current)
+                {
+                    result = Some(candidate);
+                }
+            }
+        }
+        result.map(PathBuf::as_path)
+    }
+}
+
+fn normalized_components(path: &Path) -> Vec<String> {
+    let mut components = Vec::new();
+    for component in path.to_string_lossy().replace('\\', "/").split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            component => components.push(component.to_lowercase()),
+        }
+    }
+    components
+}
+
+fn insert_min_path<K>(map: &mut HashMap<K, PathBuf>, key: K, path: &Path)
+where
+    K: std::hash::Hash + Eq,
+{
+    let entry = map.entry(key).or_insert_with(|| path.to_path_buf());
+    if path < entry.as_path() {
+        *entry = path.to_path_buf();
+    }
 }
 
 /// Convert an OpenGL/Blender camera-to-world matrix (the nerfstudio
@@ -159,47 +257,6 @@ fn split_eval_every(
     })
 }
 
-fn find_mask_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Option<&'a Path> {
-    let search_name = path.file_name().expect("File must have a name");
-    let search_stem = path.file_stem().expect("File must have a name");
-    let mut search_mask = search_stem.to_owned();
-    search_mask.push(".mask");
-    let search_mask = &search_mask;
-
-    vfs.iter_files().find(|candidate| {
-        // For the target, we don't care about its actual extension. Lets see if either the name or stem matches.
-        let Some(stem) = candidate.file_stem() else {
-            return false;
-        };
-
-        // We have the name of the file a la img.png, and the stem a la img.
-        // We now want to accept any of img.png.*, img.*, img.mask.*.
-        if stem.eq_ignore_ascii_case(search_name)
-            || stem.eq_ignore_ascii_case(search_stem)
-            || stem.eq_ignore_ascii_case(search_mask)
-        {
-            // Find "masks" directory in candidate path
-            let masks_idx = candidate
-                .components()
-                .position(|c| c.as_os_str().eq_ignore_ascii_case("masks"));
-
-            // Check if the image directory path ends with the directory subpath after "masks/"
-            // e.g., masks/foo/bar/bla.png should match images/foo/bar/bla.jpeg
-            masks_idx.is_some_and(|idx| {
-                let candidate_components: Vec<_> = candidate.components().collect();
-
-                // Get directory components only (excluding filename)
-                let path_dir_components: Vec<_> = path.parent().unwrap().components().collect();
-                let mask_dir_subpath =
-                    &candidate_components[idx + 1..candidate_components.len() - 1];
-                path_dir_components.ends_with(mask_dir_subpath)
-            })
-        } else {
-            false
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,8 +270,9 @@ mod tests {
             PathBuf::from("images/img.png"),
             PathBuf::from("masks/img.png"),
         ]);
+        let index = DatasetFileIndex::new(&vfs);
         assert_eq!(
-            find_mask_path(&vfs, Path::new("images/img.png")),
+            index.find_mask_path(Path::new("images/img.png")),
             Some(Path::new("masks/img.png"))
         );
         // Different extensions are ok.
@@ -222,8 +280,9 @@ mod tests {
             PathBuf::from("images/img.jpeg"),
             PathBuf::from("masks/img.png"),
         ]);
+        let index = DatasetFileIndex::new(&vfs);
         assert_eq!(
-            find_mask_path(&vfs, Path::new("images/img.jpeg")),
+            index.find_mask_path(Path::new("images/img.jpeg")),
             Some(Path::new("masks/img.png"))
         );
     }
@@ -235,8 +294,9 @@ mod tests {
             PathBuf::from("images/foo.png"),
             PathBuf::from("masks/foo.png.mask"),
         ]);
+        let index = DatasetFileIndex::new(&vfs);
         assert_eq!(
-            find_mask_path(&vfs, Path::new("images/foo.png")),
+            index.find_mask_path(Path::new("images/foo.png")),
             Some(Path::new("masks/foo.png.mask"))
         );
 
@@ -245,8 +305,9 @@ mod tests {
             PathBuf::from("images/bar.jpeg"),
             PathBuf::from("masks/bar.mask.png"),
         ]);
+        let index = DatasetFileIndex::new(&vfs);
         assert_eq!(
-            find_mask_path(&vfs, Path::new("images/bar.jpeg")),
+            index.find_mask_path(Path::new("images/bar.jpeg")),
             Some(Path::new("masks/bar.mask.png"))
         );
     }
@@ -258,8 +319,9 @@ mod tests {
             PathBuf::from("images/foo/bar/img.png"),
             PathBuf::from("masks/foo/bar/img.png"),
         ]);
+        let index = DatasetFileIndex::new(&vfs);
         assert_eq!(
-            find_mask_path(&vfs, Path::new("images/foo/bar/img.png")),
+            index.find_mask_path(Path::new("images/foo/bar/img.png")),
             Some(Path::new("masks/foo/bar/img.png"))
         );
         // Should not match wrong subpath
@@ -267,7 +329,8 @@ mod tests {
             PathBuf::from("images/baz/img.png"),
             PathBuf::from("masks/foo/img.png"),
         ]);
-        assert_eq!(find_mask_path(&vfs, Path::new("images/baz/img.png")), None);
+        let index = DatasetFileIndex::new(&vfs);
+        assert_eq!(index.find_mask_path(Path::new("images/baz/img.png")), None);
     }
 
     #[wasm_bindgen_test(unsupported = test)]
@@ -276,9 +339,28 @@ mod tests {
             PathBuf::from("images/IMG.PNG"),
             PathBuf::from("masks/img.png"),
         ]);
+        let index = DatasetFileIndex::new(&vfs);
         assert_eq!(
-            find_mask_path(&vfs, Path::new("images/IMG.PNG")),
+            index.find_mask_path(Path::new("images/IMG.PNG")),
             Some(Path::new("masks/img.png"))
+        );
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_indexed_image_suffix_lookup() {
+        let vfs = BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/nested/frame.png"),
+            PathBuf::from("masks/nested/frame.png"),
+        ]);
+        let index = DatasetFileIndex::new(&vfs);
+
+        assert_eq!(
+            index.find_image_by_name("nested/frame.png"),
+            Some(Path::new("images/nested/frame.png"))
+        );
+        assert_eq!(
+            index.find_image_by_name("FRAME.PNG"),
+            Some(Path::new("images/nested/frame.png"))
         );
     }
 }

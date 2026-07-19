@@ -23,7 +23,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-tokio = { workspace = true, features = ["io-util", "fs", "macros"] }
+tokio = { workspace = true, features = ["io-util", "fs", "macros", "time"] }
 
 [dev-dependencies]
 brush-cube = { path = "../brush-cube" }

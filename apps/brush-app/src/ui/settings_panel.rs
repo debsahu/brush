@@ -76,9 +76,12 @@ impl AppPane for SettingsPanel {
             && ui.small_button("Save").clicked()
         {
             let args_path = save_dir.join("args.txt");
-            let args = brush_process::args_file::config_to_args(config);
+            let result = std::fs::write(
+                &args_path,
+                brush_process::args_file::config_to_string(config),
+            );
 
-            match std::fs::write(&args_path, args.join(" ")) {
+            match result {
                 Ok(()) => {
                     self.save_status = Some((
                         format!("Saved to {}", args_path.display()),

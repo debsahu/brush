@@ -130,6 +130,50 @@ async fn analytical_vjp(
         .expect("gradient data")
 }
 
+async fn assert_l1_forward_matches_cpu(
+    pred_data: &[f32],
+    gt_bytes: &[u8],
+    shape: (usize, usize, usize),
+    cfg: ImageLossConfig,
+    device: &Device,
+) {
+    let (h, w, channels) = shape;
+    let pred = Tensor::<1>::from_floats(pred_data, device).reshape([h, w, channels]);
+    let gt = gt_packed_from_bytes(gt_bytes, h, w, device);
+    let actual: Vec<f32> = image_loss(pred, gt, cfg)
+        .into_data_async()
+        .await
+        .expect("L1 map readback")
+        .to_vec()
+        .expect("L1 map data");
+    let background = cfg.composite_bg.unwrap_or(Vec3::ZERO);
+    let background = [background.x, background.y, background.z];
+
+    for pixel in 0..h * w {
+        let alpha = f32::from(gt_bytes[pixel * 4 + 3]) / 255.0;
+        for channel in 0..channels {
+            let gt = if channel == 3 {
+                alpha
+            } else {
+                let base = f32::from(gt_bytes[pixel * 4 + channel]) / 255.0;
+                match cfg.composite_bg {
+                    Some(_) => base + (1.0 - alpha) * background[channel],
+                    None => base,
+                }
+            };
+            let weight = if channel == 3 { 1.0 } else { cfg.l1_weight };
+            let mask = if cfg.mask { alpha } else { 1.0 };
+            let index = pixel * channels + channel;
+            let expected = weight * (pred_data[index] - gt).abs() * mask;
+            assert!(
+                (actual[index] - expected).abs() < 2e-6,
+                "pixel={pixel} channel={channel}: actual={}, expected={expected}",
+                actual[index]
+            );
+        }
+    }
+}
+
 async fn check_vjp_case(
     shape: (usize, usize, usize),
     cfg: ImageLossConfig,
@@ -292,6 +336,76 @@ async fn image_loss_direct_vjp_matches_finite_difference() {
         (33, 35, 3),
         cfg(None, true),
         &[(16, 16, 0), (32, 34, 2)],
+        &device,
+    )
+    .await;
+}
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn l1_only_specialization_matches_finite_difference() {
+    let device = Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let l1_only = ImageLossConfig {
+        l1_weight: 0.73,
+        ssim_weight: 0.0,
+        composite_bg: Some(Vec3::new(0.07, 0.11, 0.19)),
+        mask: true,
+    };
+    check_vjp_case(
+        (7, 9, 4),
+        l1_only,
+        &[(0, 0, 0), (3, 4, 1), (6, 8, 2), (2, 5, 3)],
+        &device,
+    )
+    .await;
+}
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn l1_only_forward_matches_cpu_oracle() {
+    let device = Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let gt = [
+        10, 100, 200, 0, 250, 50, 25, 64, 30, 90, 150, 192, 240, 180, 60, 255,
+    ];
+    let rgb = [0.9, 0.1, 0.4, 0.2, 0.8, 0.5, 0.7, 0.3, 0.05, 0.4, 0.6, 0.95];
+    assert_l1_forward_matches_cpu(
+        &rgb,
+        &gt,
+        (2, 2, 3),
+        ImageLossConfig {
+            l1_weight: 0.73,
+            ssim_weight: 0.0,
+            composite_bg: None,
+            mask: false,
+        },
+        &device,
+    )
+    .await;
+    assert_l1_forward_matches_cpu(
+        &rgb,
+        &gt,
+        (2, 2, 3),
+        ImageLossConfig {
+            l1_weight: 0.41,
+            ssim_weight: 0.0,
+            composite_bg: Some(Vec3::new(0.1, 0.25, 0.8)),
+            mask: true,
+        },
+        &device,
+    )
+    .await;
+
+    let rgba = [
+        0.9, 0.1, 0.4, 0.8, 0.2, 0.8, 0.5, 0.1, 0.7, 0.3, 0.05, 0.9, 0.4, 0.6, 0.95, 0.2,
+    ];
+    assert_l1_forward_matches_cpu(
+        &rgba,
+        &gt,
+        (2, 2, 4),
+        ImageLossConfig {
+            l1_weight: 0.19,
+            ssim_weight: 0.0,
+            composite_bg: None,
+            mask: false,
+        },
         &device,
     )
     .await;

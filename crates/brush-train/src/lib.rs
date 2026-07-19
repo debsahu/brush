@@ -7,6 +7,7 @@ pub mod msg;
 pub mod train;
 
 mod adam_scaled;
+mod min_scale;
 mod multinomial;
 mod quat_vec;
 #[cfg(all(

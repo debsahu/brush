@@ -40,6 +40,8 @@ pub(crate) async fn train_stream(
 ) -> anyhow::Result<()> {
     log::info!("Start of training stream");
 
+    train_stream_config.validate().map_err(anyhow::Error::msg)?;
+
     let visualize = VisualizeTools::new(train_stream_config.rerun_config.rerun_enabled).await;
 
     emitter
@@ -58,7 +60,7 @@ pub(crate) async fn train_stream(
     // burn-dispatch's `from_inner` checkpointing bug.
     let device: burn::tensor::Device = wgpu_device.clone().into();
     device.seed(process_config.seed);
-    let mut rng = rand::rngs::StdRng::from_seed([process_config.seed as u8; 32]);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(process_config.seed);
 
     log::info!("Loading dataset");
     let load_result = load_dataset(vfs.clone(), &train_stream_config.load_config)
@@ -148,10 +150,26 @@ pub(crate) async fn train_stream(
     // If the metadata has an up axis prefer that, otherwise estimate the up direction.
     let up_axis = up_axis.or(Some(estimated_up));
 
+    let bounds = get_splat_bounds(init_splats.clone(), BOUND_PERCENTILE).await;
+    // Use the exact capped/scaled image dimensions consumed by the loader.
+    let view_cams = mip_view_cameras(&dataset.train).await;
+    let mut trainer = SplatTrainer::new_seeded(
+        &train_stream_config.train_config,
+        &device,
+        bounds,
+        process_config.seed,
+    );
+    trainer.set_view_cams(view_cams.clone());
+
     // The trainer owns its working `splats` locally and publishes a
     // clone to the `Slot` after every modification (train
     // step, refine, LOD decimation).
-    let mut splats: Splats = init_splats.clone();
+    let mut splats = trainer.apply_min_scale_floor(init_splats.clone());
+    debug_assert_eq!(
+        splats.min_scale.as_ref().map(|floor| floor.dims()[0]),
+        Some(splats.num_splats() as usize),
+        "initial Mip-Splatting floor must be attached before publication"
+    );
     slot.set(0, splats.clone());
     emitter
         .emit(ProcessMessage::SplatsUpdated {
@@ -166,7 +184,7 @@ pub(crate) async fn train_stream(
     emitter.emit(ProcessMessage::DoneLoading).await;
 
     // Start with memory cleared out.
-    let client = WgpuRuntime::<AutoCompiler>::client(wgpu_device);
+    let client = WgpuRuntime::<AutoCompiler>::client(&wgpu_device);
     client.memory_cleanup();
 
     let mut eval_scene = dataset.eval;
@@ -192,20 +210,11 @@ pub(crate) async fn train_stream(
         .unwrap_or_default();
 
     let mut train_duration = Duration::from_secs(0);
-    let mut dataloader = SceneLoader::new(&dataset.train, 42, &train_stream_config.load_config);
-    let bounds = get_splat_bounds(init_splats.clone(), BOUND_PERCENTILE).await;
-
-    // Per-train-view (world center, focal-px at native res) for the
-    // Mip-Splatting 3D filter (always on).
-    let mut view_cams: Vec<(glam::Vec3, f32)> = Vec::with_capacity(dataset.train.views.len());
-    for view in dataset.train.views.iter() {
-        let (w, h) = view.image.dimensions().await.unwrap_or((1, 1));
-        let focal = view.camera.focal(glam::uvec2(w, h)).x;
-        view_cams.push((view.camera.position, focal));
-    }
-
-    let mut trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
-    trainer.set_view_cams(view_cams.clone());
+    let mut dataloader = SceneLoader::new(
+        &dataset.train,
+        process_config.seed,
+        &train_stream_config.load_config,
+    );
 
     // Per-view appearance compensation (bilateral grid / PPISP). PPISP's
     // per-camera params (vignetting, tone curve) are shared across views
@@ -298,29 +307,49 @@ pub(crate) async fn train_stream(
             let before = splats.num_splats();
             let target_count = (before as f32 * lod_keep_pct as f32 / 100.0).max(1.0) as u32;
 
+            let cumulative_scale = (lod_img_pct as f32 / 100.0).powi(current_lod as i32);
+            let lod_scene = if lod_img_pct < 100 {
+                Some(dataset.train.clone().with_image_scale(cumulative_scale))
+            } else {
+                None
+            };
+            let lod_view_cams = if let Some(scene) = &lod_scene {
+                mip_view_cameras(scene).await
+            } else {
+                view_cams.clone()
+            };
+
             log::info!("LOD {current_lod}/{lod_levels}: Computing sensitivity scores...");
             let scores = compute_pup_scores(splats.clone(), &dataset.train, &device).await;
             splats = decimate_to_count(splats, &scores, target_count).await;
+            // Decimation drops the old-N floor. Attach the target
+            // LOD floor before publishing the splats or running the first
+            // lower-resolution training step.
+            trainer.set_view_cams(lod_view_cams.clone());
+            splats = trainer.apply_min_scale_floor(splats);
             slot.set(0, splats.clone());
 
             let after = splats.num_splats();
             log::info!("LOD {current_lod}/{lod_levels}: {before} -> {after} splats");
 
-            let client = WgpuRuntime::<AutoCompiler>::client(wgpu_device);
+            let client = WgpuRuntime::<AutoCompiler>::client(&wgpu_device);
             client.memory_cleanup();
 
-            let cumulative_scale = (lod_img_pct as f32 / 100.0).powi(current_lod as i32);
-            dataloader = if lod_img_pct < 100 {
-                let lod_scene = dataset.train.clone().with_image_scale(cumulative_scale);
-                SceneLoader::new(&lod_scene, 42, &train_stream_config.load_config)
-            } else {
-                SceneLoader::new(&dataset.train, 42, &train_stream_config.load_config)
-            };
+            dataloader = SceneLoader::new(
+                lod_scene.as_ref().unwrap_or(&dataset.train),
+                process_config.seed,
+                &train_stream_config.load_config,
+            );
 
             let appearance = trainer.take_appearance();
             let bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
-            trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
-            trainer.set_view_cams(view_cams.clone());
+            trainer = SplatTrainer::new_seeded(
+                &train_stream_config.train_config,
+                &device,
+                bounds,
+                process_config.seed,
+            );
+            trainer.set_view_cams(lod_view_cams);
             trainer.set_appearance(appearance);
 
             log::info!(
@@ -365,8 +394,14 @@ pub(crate) async fn train_stream(
             && phase_iter.is_multiple_of(train_stream_config.train_config.refine_every)
             && phase_progress <= 0.95
         {
-            let (new_splats, refine_stats) = trainer.refine(iter, splats).await;
+            let (new_splats, refine_stats) = trainer
+                .refine_for_phase(iter, phase_iter, phase_total, splats)
+                .await;
             splats = new_splats;
+            // Trainer only sees the type-erased tensor device. Cleanup must
+            // use the concrete device registered by the host (including
+            // `Existing(n)` integrations), which remains available here.
+            client.memory_cleanup();
             refine_stats
         } else {
             RefineStats {
@@ -485,7 +520,7 @@ pub(crate) async fn train_stream(
             {
                 visualize.log_memory(
                     iter,
-                    &WgpuRuntime::<AutoCompiler>::client(wgpu_device).memory_usage()?,
+                    &WgpuRuntime::<AutoCompiler>::client(&wgpu_device).memory_usage()?,
                 )?;
             }
 
@@ -549,6 +584,57 @@ pub(crate) async fn train_stream(
         .await;
 
     Ok(())
+}
+
+/// Camera centres and focal lengths in the exact pixel scale consumed by a
+/// scene loader. LOD scenes wrap their images with scaled dimensions, so
+/// recomputing here keeps the Mip-Splatting floor consistent with each phase.
+async fn mip_view_cameras(scene: &Scene) -> Vec<(glam::Vec3, f32)> {
+    let mut cameras = Vec::with_capacity(scene.views.len());
+    for view in scene.views.iter() {
+        let (width, height) = view.image.output_dimensions().await.unwrap_or((1, 1));
+        let focal = view.camera.focal(glam::uvec2(width, height)).x;
+        cameras.push((view.camera.position, focal));
+    }
+    cameras
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use super::*;
+    use brush_dataset::{load_image::LoadImage, scene::SceneView};
+    use brush_render::camera::Camera;
+    use std::{path::Path, sync::Arc};
+
+    #[tokio::test]
+    async fn mip_cameras_use_capped_and_scaled_output_dimensions() {
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lpips");
+        let vfs = Arc::new(
+            BrushVfs::from_path(&fixture_dir)
+                .await
+                .expect("fixture VFS"),
+        );
+        // apple.png is 64x54. A 32px cap followed by 0.5 LOD scale yields
+        // the exact 16x13 dimensions consumed by `LoadImage::load`.
+        let image = LoadImage::new(vfs, "apple.png".into(), None, 32, None).with_scale(0.5);
+        assert_eq!(image.output_dimensions().await.unwrap(), (16, 13));
+        let loaded = image.load().await.expect("fixture decode");
+        assert_eq!((loaded.width(), loaded.height()), (16, 13));
+
+        let camera = Camera::new(
+            glam::Vec3::new(1.0, 2.0, 3.0),
+            glam::Quat::IDENTITY,
+            std::f64::consts::FRAC_PI_2,
+            std::f64::consts::FRAC_PI_2,
+            glam::Vec2::splat(0.5),
+            CameraModel::Pinhole,
+        );
+        let scene = Scene::new(vec![SceneView { image, camera }]);
+        let cameras = mip_view_cameras(&scene).await;
+        assert_eq!(cameras.len(), 1);
+        assert_eq!(cameras[0].0, camera.position);
+        assert!((cameras[0].1 - camera.focal(glam::uvec2(16, 13)).x).abs() < 1e-6);
+    }
 }
 
 /// Group training views by camera intrinsics (fov + principal point +

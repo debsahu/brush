@@ -990,8 +990,21 @@ impl AppPane for ScenePanel {
                 self.start_loading(source, process);
             }
         } else {
-            // Animate frame if we have a multi-frame sequence and not paused
-            if self.frame_count > 1 && !self.paused {
+            let splat_view = process.current_splats();
+            let loaded_frames = splat_view.len();
+            if loaded_frames == 0 {
+                self.frame = 0.0;
+            } else if self.frame as usize >= loaded_frames {
+                self.frame = (loaded_frames - 1) as f32;
+            }
+
+            // Only start playback once every advertised frame is available.
+            // During loading, `frame_count` is the final count while the slot is
+            // populated incrementally.
+            let animation_ready = self.frame_count > 1
+                && loaded_frames >= self.frame_count as usize
+                && !process.is_loading();
+            if animation_ready && !self.paused {
                 // Advance frame by deltatime (30 fps playback)
                 self.frame += delta_time * 30.0;
                 // Loop back to start
@@ -1007,6 +1020,10 @@ impl AppPane for ScenePanel {
 
             let size = ui.available_size();
             let size = glam::uvec2(size.x.round() as u32, size.y.round() as u32);
+            // Collapsed panes and minimized windows can briefly report a zero
+            // extent. Keep camera math finite; the backbuffer itself skips the
+            // zero-sized render request.
+            let camera_size = size.max(glam::UVec2::ONE);
             let (rect, response) = ui.allocate_exact_size(
                 egui::Vec2::new(size.x as f32, size.y as f32),
                 egui::Sense::drag(),
@@ -1029,14 +1046,14 @@ impl AppPane for ScenePanel {
             // fov_to_focal(fov, 2, model) = 1 / projection(half_fov), so the ratio gives projected_x / projected_y.
             let camera_aspect = fov_to_focal(camera.fov_y, 2, &camera.camera_model)
                 / fov_to_focal(camera.fov_x, 2, &camera.camera_model);
-            let viewport_aspect = size.x as f64 / size.y as f64;
+            let viewport_aspect = camera_size.x as f64 / camera_size.y as f64;
 
             if viewport_aspect > camera_aspect {
-                let focal_y = fov_to_focal(camera.fov_y, size.y, &camera.camera_model);
-                camera.fov_x = focal_to_fov(focal_y, size.x, &camera.camera_model);
+                let focal_y = fov_to_focal(camera.fov_y, camera_size.y, &camera.camera_model);
+                camera.fov_x = focal_to_fov(focal_y, camera_size.x, &camera.camera_model);
             } else {
-                let focal_x = fov_to_focal(camera.fov_x, size.x, &camera.camera_model);
-                camera.fov_y = focal_to_fov(focal_x, size.y, &camera.camera_model);
+                let focal_x = fov_to_focal(camera.fov_x, camera_size.x, &camera.camera_model);
+                camera.fov_y = focal_to_fov(focal_x, camera_size.y, &camera.camera_model);
             }
 
             // Render the splats and grid
@@ -1062,7 +1079,7 @@ impl AppPane for ScenePanel {
                     backbuffer.paint(
                         rect,
                         ui,
-                        &process.current_splats(),
+                        &splat_view,
                         &camera,
                         self.frame as usize,
                         settings.background.unwrap_or(Vec3::ZERO),
@@ -1081,7 +1098,7 @@ impl AppPane for ScenePanel {
 
             self.update_and_draw_reference_pose_bars(ui, rect, &camera, delta_time);
 
-            if interactive {
+            if interactive && animation_ready {
                 self.draw_play_pause(ui, rect);
             }
         }

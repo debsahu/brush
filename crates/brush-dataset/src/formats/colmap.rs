@@ -8,7 +8,7 @@ use super::{DatasetLoadResult, FormatError};
 use crate::{
     Dataset,
     config::LoadDatasetConfig,
-    formats::{find_image_by_name, find_mask_path, split_eval_every},
+    formats::{DatasetFileIndex, split_eval_every},
     scene::{LoadImage, SceneView},
 };
 use brush_render::kernels::camera_model::CameraModel;
@@ -161,6 +161,7 @@ async fn load_dataset_inner(
 
         let mut views = Vec::new();
         let mut warnings = Vec::new();
+        let file_index = DatasetFileIndex::new(&vfs);
 
         for img_info in img_info_list
             .iter()
@@ -186,12 +187,12 @@ async fn load_dataset_inner(
             let center_uv =
                 center / glam::vec2(colmap_camera.width as f32, colmap_camera.height as f32);
 
-            let Some(path) = find_image_by_name(&vfs, &img_info.name) else {
+            let Some(path) = file_index.find_image_by_name(&img_info.name) else {
                 warnings.push(format!("Skipped '{}': image file not found", img_info.name));
                 continue;
             };
 
-            let mask_path = find_mask_path(&vfs, path);
+            let mask_path = file_index.find_mask_path(path);
 
             // Convert w2c to c2w.
             let world_to_cam =

@@ -33,6 +33,10 @@ pub fn radix_argsort(
         "Please ensure input keys are contiguous"
     );
 
+    if input_keys.shape()[0] == 0 {
+        return (input_keys, input_values);
+    }
+
     let _span = tracing::trace_span!("Radix sort").entered();
 
     let client = input_keys.client.clone();
@@ -128,6 +132,7 @@ pub fn radix_argsort(
 mod tests {
     use crate::radix_argsort;
     use brush_cube::{MainBackendBase, create_tensor_from_slice};
+    use burn::backend::TensorMetadata;
     use burn::backend::ops::IntTensorOps;
     use burn::tensor::DType;
     use burn_wgpu::{CubeTensor, WgpuRuntime};
@@ -148,6 +153,18 @@ mod tests {
         let mut indices = (0..data.len()).collect::<Vec<_>>();
         indices.sort_by_key(|&i| &data[i]);
         indices
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn empty_sort_returns_empty_inputs() {
+        let device = brush_cube::test_helpers::test_device().await;
+        let keys = create_tensor_from_slice::<i32>(&[], &device, DType::I32);
+        let values = create_tensor_from_slice::<i32>(&[], &device, DType::I32);
+
+        let (keys, values) = radix_argsort(keys, values, 32);
+
+        assert_eq!(keys.shape()[0], 0);
+        assert_eq!(values.shape()[0], 0);
     }
 
     #[wasm_bindgen_test(unsupported = tokio::test)]

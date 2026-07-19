@@ -6,18 +6,33 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "kebab-case")]
 pub struct TrainConfig {
     /// Total number of steps to train for.
-    #[arg(long, help_heading = "Training options", default_value = "30000")]
+    #[arg(
+        long,
+        help_heading = "Training options",
+        default_value = "30000",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
     pub total_train_iters: u32,
 
     #[arg(long, help_heading = "Training options")]
     pub render_mode: Option<SplatRenderMode>,
 
     /// Start learning rate for the mean parameters.
-    #[arg(long, help_heading = "Training options", default_value = "2e-5")]
+    #[arg(
+        long,
+        help_heading = "Training options",
+        default_value = "2e-5",
+        value_parser = parse_learning_rate
+    )]
     pub lr_mean: f64,
 
-    /// Start learning rate for the mean parameters.
-    #[arg(long, help_heading = "Training options", default_value = "2e-7")]
+    /// End learning rate for the mean parameters.
+    #[arg(
+        long,
+        help_heading = "Training options",
+        default_value = "2e-7",
+        value_parser = parse_learning_rate
+    )]
     pub lr_mean_end: f64,
 
     /// How much noise to add to the mean parameters of low opacity gaussians.
@@ -112,15 +127,30 @@ pub struct TrainConfig {
     pub lod_levels: u32,
 
     /// Number of refinement training steps per LOD level.
-    #[arg(long, help_heading = "LOD options", default_value = "5000")]
+    #[arg(
+        long,
+        help_heading = "LOD options",
+        default_value = "5000",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
     pub lod_refine_steps: u32,
 
     /// Percentage of gaussians to keep at each LOD level (1-100).
-    #[arg(long, help_heading = "LOD options", default_value = "50")]
+    #[arg(
+        long,
+        help_heading = "LOD options",
+        default_value = "50",
+        value_parser = clap::value_parser!(u32).range(1..=100)
+    )]
     pub lod_decimation_keep: u32,
 
     /// Percentage to scale source images at each LOD level (1-100).
-    #[arg(long, help_heading = "LOD options", default_value = "50")]
+    #[arg(
+        long,
+        help_heading = "LOD options",
+        default_value = "50",
+        value_parser = clap::value_parser!(u32).range(1..=100)
+    )]
     pub lod_image_scale: u32,
 
     /// Scene scale used for random splat initialization.
@@ -135,7 +165,11 @@ pub struct TrainConfig {
     #[arg(
         long,
         help_heading = "Appearance options",
-        default_value = "false",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = false,
         conflicts_with = "ppisp"
     )]
     #[serde(default)]
@@ -184,7 +218,11 @@ pub struct TrainConfig {
     #[arg(
         long,
         help_heading = "Appearance options",
-        default_value = "false",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = false,
         conflicts_with = "bilateral_grid"
     )]
     #[serde(default)]
@@ -208,6 +246,29 @@ impl Default for TrainConfig {
 }
 
 impl TrainConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.total_train_iters == 0 {
+            return Err("total-train-iters must be greater than zero".to_owned());
+        }
+        for (name, value) in [("lr-mean", self.lr_mean), ("lr-mean-end", self.lr_mean_end)] {
+            if !valid_learning_rate(value) {
+                return Err(format!("{name} must be finite and in the range (0, 1]"));
+            }
+        }
+        if self.lr_mean_end > self.lr_mean {
+            return Err("lr-mean-end must not exceed lr-mean".to_owned());
+        }
+        if self
+            .lod_levels
+            .checked_mul(self.lod_refine_steps)
+            .and_then(|lod_iters| self.total_train_iters.checked_add(lod_iters))
+            .is_none()
+        {
+            return Err("total training and LOD iterations exceed u32::MAX".to_owned());
+        }
+        Ok(())
+    }
+
     pub fn total_iters(&self) -> u32 {
         self.total_train_iters + self.lod_levels * self.lod_refine_steps
     }
@@ -215,6 +276,19 @@ impl TrainConfig {
     pub fn appearance_enabled(&self) -> bool {
         self.bilateral_grid || self.ppisp
     }
+}
+
+fn parse_learning_rate(value: &str) -> Result<f64, String> {
+    let value = value.parse::<f64>().map_err(|error| error.to_string())?;
+    if valid_learning_rate(value) {
+        Ok(value)
+    } else {
+        Err("learning rate must be finite and in the range (0, 1]".to_owned())
+    }
+}
+
+fn valid_learning_rate(value: f64) -> bool {
+    value.is_finite() && value > 0.0 && value <= 1.0
 }
 
 fn default_bilagrid_dims() -> Vec<u32> {
@@ -251,5 +325,62 @@ mod tests {
             .err()
             .expect("stacked appearance flags must conflict");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn cli_rejects_invalid_lod_ranges() {
+        for args in [
+            ["brush", "--lod-refine-steps", "0"],
+            ["brush", "--lod-decimation-keep", "0"],
+            ["brush", "--lod-decimation-keep", "101"],
+            ["brush", "--lod-image-scale", "0"],
+            ["brush", "--lod-image-scale", "101"],
+        ] {
+            assert!(
+                TrainConfig::try_parse_from(args).is_err(),
+                "accepted invalid LOD option: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_rejects_invalid_mean_schedule_values() {
+        for args in [
+            ["brush", "--total-train-iters", "0"],
+            ["brush", "--lr-mean", "0"],
+            ["brush", "--lr-mean", "2"],
+            ["brush", "--lr-mean-end", "0"],
+        ] {
+            assert!(
+                TrainConfig::try_parse_from(args).is_err(),
+                "accepted invalid mean schedule option: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn validation_rejects_invalid_programmatic_mean_schedule() {
+        let mut config = TrainConfig::default();
+        config.total_train_iters = 0;
+        assert!(config.validate().is_err());
+
+        config.total_train_iters = 1;
+        config.lr_mean_end = config.lr_mean * 2.0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn validation_rejects_total_iteration_overflow() {
+        let mut config = TrainConfig::default();
+        config.total_train_iters = u32::MAX;
+        config.lod_levels = 1;
+        config.lod_refine_steps = 1;
+
+        assert_eq!(
+            config.validate(),
+            Err("total training and LOD iterations exceed u32::MAX".to_owned())
+        );
     }
 }

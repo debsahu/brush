@@ -4,10 +4,8 @@
 // this is a lean build of just the training path for quick CLI iteration.
 #[cfg(not(target_family = "wasm"))]
 fn main() -> anyhow::Result<()> {
-    use brush_cli::{Cli, build_process, run_headless};
-    use clap::Parser;
-
-    let args = Cli::parse().validate()?;
+    use brush_cli::{Cli, build_parsed_process, run_headless};
+    let args = Cli::parse_with_explicit_fields().validate()?;
 
     if args.with_viewer {
         anyhow::bail!(
@@ -17,13 +15,13 @@ fn main() -> anyhow::Result<()> {
     }
 
     // `validate` guarantees a source is present when the viewer is off.
-    let process = build_process(&args).expect("source must be present");
+    let process = build_parsed_process(&args).expect("source must be present");
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to initialize tokio runtime")
-        .block_on(run_headless(process, args.train_stream))
+        .block_on(run_headless(process, args.train_stream.clone()))
 }
 
 #[cfg(target_family = "wasm")]

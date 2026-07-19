@@ -225,6 +225,121 @@ mod kernels {
         select(oob, F::cast_from(0.0_f32), partials[idx])
     }
 
+    /// L1-only training/eval specialization. Keeping this separate from the
+    /// SSIM kernel guarantees zero SSIM weight does not allocate shared tiles
+    /// or execute either 11-tap blur.
+    #[allow(clippy::assign_op_pattern)]
+    #[cube(launch)]
+    pub fn image_l1_forward_kernel<F: Float>(
+        pred: &Tensor<F>,
+        gt_packed: &Tensor<u32>,
+        loss_map: &mut Tensor<F>,
+        h: u32,
+        w: u32,
+        l1_weight: f32,
+        bg_r: f32,
+        bg_g: f32,
+        bg_b: f32,
+        #[comptime] composite: bool,
+        #[comptime] mask: bool,
+    ) {
+        let c = CUBE_POS_Z;
+        let pix_y = CUBE_POS_Y * BLOCK_Y + UNIT_POS_Y;
+        let pix_x = CUBE_POS_X * BLOCK_X + UNIT_POS_X;
+        if pix_x >= w || pix_y >= h {
+            terminate!();
+        }
+
+        let idx = (c * h * w + pix_y * w + pix_x) as usize;
+        let (gt_c, gt_a) = read_gt::<F>(gt_packed, c, pix_y, pix_x, false, w);
+        let gt_eff = if c == 3u32 {
+            gt_a
+        } else if composite {
+            let bg_c = if c == 0u32 {
+                F::cast_from(bg_r)
+            } else if c == 1u32 {
+                F::cast_from(bg_g)
+            } else {
+                F::cast_from(bg_b)
+            };
+            gt_c + (F::cast_from(1.0_f32) - gt_a) * bg_c
+        } else {
+            gt_c
+        };
+        let weight = if c == 3u32 {
+            F::cast_from(1.0_f32)
+        } else {
+            F::cast_from(l1_weight)
+        };
+        let mut loss = weight * F::abs(pred[idx] - gt_eff);
+        if mask {
+            loss = loss * gt_a;
+        }
+        loss_map[idx] = loss;
+    }
+
+    /// VJP matching [`image_l1_forward_kernel()`], with one independent thread
+    /// per output element and no shared memory.
+    #[allow(clippy::assign_op_pattern)]
+    #[cube(launch)]
+    pub fn image_l1_backward_kernel<F: Float>(
+        pred: &Tensor<F>,
+        gt_packed: &Tensor<u32>,
+        dl_dmap: &Tensor<F>,
+        dl_dpred: &mut Tensor<F>,
+        h: u32,
+        w: u32,
+        l1_weight: f32,
+        bg_r: f32,
+        bg_g: f32,
+        bg_b: f32,
+        #[comptime] composite: bool,
+        #[comptime] mask: bool,
+    ) {
+        let c = CUBE_POS_Z;
+        let pix_y = CUBE_POS_Y * BLOCK_Y + UNIT_POS_Y;
+        let pix_x = CUBE_POS_X * BLOCK_X + UNIT_POS_X;
+        if pix_x >= w || pix_y >= h {
+            terminate!();
+        }
+
+        let idx = (c * h * w + pix_y * w + pix_x) as usize;
+        let (gt_c, gt_a) = read_gt::<F>(gt_packed, c, pix_y, pix_x, false, w);
+        let gt_eff = if c == 3u32 {
+            gt_a
+        } else if composite {
+            let bg_c = if c == 0u32 {
+                F::cast_from(bg_r)
+            } else if c == 1u32 {
+                F::cast_from(bg_g)
+            } else {
+                F::cast_from(bg_b)
+            };
+            gt_c + (F::cast_from(1.0_f32) - gt_a) * bg_c
+        } else {
+            gt_c
+        };
+        let diff = pred[idx] - gt_eff;
+        let zero = F::cast_from(0.0_f32);
+        let sign = if diff > zero {
+            F::cast_from(1.0_f32)
+        } else if diff < zero {
+            F::cast_from(-1.0_f32)
+        } else {
+            zero
+        };
+        let weight = if c == 3u32 {
+            F::cast_from(1.0_f32)
+        } else {
+            F::cast_from(l1_weight)
+        };
+        let mut chain = dl_dmap[idx];
+        if mask {
+            chain = chain * gt_a;
+        }
+        dl_dpred[idx] = weight * sign * chain;
+    }
+
     /// Forward: produce the L1 + SSIM loss map. When dispatched with `C = 4`,
     /// the workgroup at `c == 3` produces `|pred.a - gt.a|` into the alpha
     /// channel of the loss map — folding the previously-separate alpha-match
@@ -1017,6 +1132,7 @@ fn launch_image_forward_impl<R: CubeRuntime>(
     let dims = pred.shape().as_slice().to_vec();
     assert_eq!(dims.len(), 3, "image_loss expects [C, H, W] pred");
     let (c, h, w) = (dims[0] as u32, dims[1] as u32, dims[2] as u32);
+    assert!(matches!(c, 3 | 4), "image loss expects RGB or RGBA pred");
     let gt_dims = gt_packed.shape().as_slice().to_vec();
     assert_eq!(gt_dims.len(), 2, "image_loss expects [H, W] gt_packed");
     assert_eq!(
@@ -1031,6 +1147,26 @@ fn launch_image_forward_impl<R: CubeRuntime>(
     let composite = cfg.composite_bg.is_some();
     let bg = cfg.composite_bg.unwrap_or(Vec3::ZERO);
     let map = alloc_zeros(&pred);
+    if cfg.ssim_weight == 0.0 && !save_partials {
+        let client = pred.client.clone();
+        kernels::image_l1_forward_kernel::launch::<f32, R>(
+            &client,
+            cube_count_3d(c, h, w),
+            CubeDim::new_2d(kernels::BLOCK_X, kernels::BLOCK_Y),
+            pred.into_tensor_arg(),
+            gt_packed.into_tensor_arg(),
+            map.clone().into_tensor_arg(),
+            h,
+            w,
+            cfg.l1_weight,
+            bg.x,
+            bg.y,
+            bg.z,
+            composite,
+            cfg.mask,
+        );
+        return (map, None);
+    }
     let partials = if save_partials {
         assert!(
             matches!(c, 3 | 4),
@@ -1093,11 +1229,32 @@ fn launch_image_backward_with_tile<R: CubeRuntime>(
     let dims = pred.shape().as_slice().to_vec();
     assert_eq!(dims.len(), 3, "image_loss_backward expects [C, H, W] pred");
     let (c, h, w) = (dims[0] as u32, dims[1] as u32, dims[2] as u32);
+    assert!(matches!(c, 3 | 4), "image loss expects RGB or RGBA pred");
 
     let composite = cfg.composite_bg.is_some();
     let bg = cfg.composite_bg.unwrap_or(Vec3::ZERO);
     let dl_dpred = alloc_zeros(&pred);
     let client = pred.client.clone();
+    if cfg.ssim_weight == 0.0 {
+        kernels::image_l1_backward_kernel::launch::<f32, R>(
+            &client,
+            cube_count_3d(c, h, w),
+            CubeDim::new_2d(kernels::BLOCK_X, kernels::BLOCK_Y),
+            pred.into_tensor_arg(),
+            gt_packed.into_tensor_arg(),
+            dl_dmap.into_tensor_arg(),
+            dl_dpred.clone().into_tensor_arg(),
+            h,
+            w,
+            cfg.l1_weight,
+            bg.x,
+            bg.y,
+            bg.z,
+            composite,
+            cfg.mask,
+        );
+        return dl_dpred;
+    }
     let hardware = &client.properties().hardware;
     let tile = tile_override.unwrap_or_else(|| {
         select_backward_tile(
