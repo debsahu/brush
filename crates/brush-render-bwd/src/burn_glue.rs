@@ -734,6 +734,12 @@ async fn render_splats_with_pass_and_refine_weight(
     }
 }
 
+// Multiple independent compile/runtime render-mode flags for a GPU kernel
+// dispatch function (smooth_cutoff, compute_refine_weight, render_depth,
+// trusted_forward, ...) -- these are orthogonal switches, not related state
+// that would be clearer as an enum, so we allow this alongside the existing
+// too-many-arguments allow rather than force an artificial options struct.
+#[allow(clippy::fn_params_excessive_bools)]
 #[allow(clippy::too_many_arguments)]
 fn rasterize_bwd_fusion(
     out_img: FloatTensor<Fusion<MainBackendBase>>,
@@ -912,7 +918,8 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]    fn project_bwd(
+    #[allow(clippy::too_many_arguments)]
+    fn project_bwd(
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opac: FloatTensor<Self>,
