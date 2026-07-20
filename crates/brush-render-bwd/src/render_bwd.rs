@@ -87,6 +87,12 @@ fn should_launch_unchecked(
     hard_floats && unchecked_requested && trusted_forward
 }
 
+// Multiple independent compile/runtime render-mode flags for a GPU kernel
+// dispatch function (smooth_cutoff, compute_refine_weight, render_depth,
+// trusted_forward, ...) -- these are orthogonal switches, not related state
+// that would be clearer as an enum, so we allow this alongside the existing
+// too-many-arguments allow rather than force an artificial options struct.
+#[allow(clippy::fn_params_excessive_bools)]
 #[allow(clippy::too_many_arguments)]
 fn rasterize_bwd_impl(
     out_img: FloatTensor<MainBackendBase>,
