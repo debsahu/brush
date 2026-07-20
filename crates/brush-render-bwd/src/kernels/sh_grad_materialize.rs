@@ -30,7 +30,11 @@ pub fn build_compact_sh_map_kernel(
         terminate!();
     }
 
-    let grad_base = (compact_gid * 10u32) as usize;
+    // v_combined is the sparse rasterize-backward buffer, stride 11 per
+    // compact splat (5 geom + 3 rgb + alpha + refine + depth). The depth
+    // lane was appended by the DiG/depth merge; the color VJP still lives at
+    // lanes 5..7.
+    let grad_base = (compact_gid * 11u32) as usize;
     let v_color_r = v_combined[grad_base + 5];
     let v_color_g = v_combined[grad_base + 6];
     let v_color_b = v_combined[grad_base + 7];
@@ -83,8 +87,10 @@ pub fn materialize_sh_grad_kernel(
     }
 
     let mut field = 0.0f32;
+    // `transforms` is dense stride 10 (projected mean/cov row); `v_combined`
+    // is the stride-11 rasterize-backward gradient buffer (color VJP at 5..7).
     let transform_base = (global_gid * 10u32) as usize;
-    let grad_base = (compact_gid * 10u32) as usize;
+    let grad_base = (compact_gid * 11u32) as usize;
     if lane == 0u32 {
         field = transforms[transform_base];
     } else if lane == 1u32 {

@@ -50,9 +50,10 @@ fn training_rasterizer() -> Rasterizer {
 
 /// Intermediate gradients from the rasterize backward pass.
 ///
-/// Sparse buffer of shape `[num_visible, 10]`, indexed by `compact_gid`.
-/// Slots 0..8 are projected splat gradients, slot 8 is the raw opacity
-/// gradient, slot 9 is the refinement weight.
+/// Sparse buffer of shape `[num_visible, 11]`, indexed by `compact_gid`.
+/// Slots 0..5 are xy + conic gradients, slots 5..8 the rgb gradient, slot 8
+/// the raw opacity gradient, slot 9 the refinement weight, slot 10 the
+/// expected-depth gradient (zero/unused when `render_depth` is false).
 #[derive(Debug, Clone)]
 pub struct RasterizeGrads<B: Backend> {
     pub v_combined: FloatTensor<B>,
@@ -79,7 +80,7 @@ pub struct DeferredSplatGrads<B: Backend> {
 /// Backward pass trait mirroring [`SplatOps`].
 pub trait SplatBwdOps: SplatOps {
     /// Backward pass for rasterization.
-    /// Returns sparse `v_combined` [`num_visible`, 10] indexed by `compact_gid`.
+    /// Returns sparse `v_combined` [`num_visible`, 11] indexed by `compact_gid`.
     #[allow(clippy::too_many_arguments)]
     fn rasterize_bwd(
         out_img: FloatTensor<Self>,
@@ -123,7 +124,7 @@ pub trait SplatBwdOps: SplatOps {
     }
 
     /// Backward pass for projection.
-    /// Reads sparse `v_combined` [`num_visible`, 9], writes dense outputs (scatter in kernel).
+    /// Reads sparse `v_combined` [`num_visible`, 11], writes dense outputs (scatter in kernel).
     /// `sh_coeffs` is the original (input) SH coefficient tensor — needed
     /// so the kernel can backprop `v_color` through the SH basis to the
     /// view direction and then to the mean.

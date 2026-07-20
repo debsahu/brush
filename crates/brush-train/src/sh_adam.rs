@@ -254,7 +254,11 @@ mod kernel {
         if compact_gid >= num_visible {
             terminate!();
         }
-        let grad_base = (compact_gid * 10u32) as usize;
+        // compact_grads is the rasterize-backward v_combined buffer: stride 11
+        // per compact splat (5 geom + 3 rgb + alpha + refine + depth). The
+        // color VJP lives at lanes 5..7; the depth lane (10) was appended by
+        // the DiG/depth merge.
+        let grad_base = (compact_gid * 11u32) as usize;
         let r = compact_grads[grad_base + 5];
         let g = compact_grads[grad_base + 6];
         let b = compact_grads[grad_base + 7];
@@ -311,7 +315,11 @@ mod kernel {
         if active && has_grad {
             let compact_gid = compact_plus_one - 1u32;
             let transform_base = (global_gid * 10u32) as usize;
-            let grad_base = (compact_gid * 10u32) as usize;
+            // compact_grads is the rasterize-backward v_combined buffer: stride 11
+            // per compact splat (5 geom + 3 rgb + alpha + refine + depth). The
+            // color VJP lives at lanes 5..7; the depth lane (10) was appended by
+            // the DiG/depth merge.
+            let grad_base = (compact_gid * 11u32) as usize;
             let mut field = 0.0f32;
             if lane == 0u32 {
                 field = render_transforms[transform_base];
@@ -725,8 +733,8 @@ impl ShAdamOps for MainBackendBase {
         );
         assert_eq!(
             compact_grads.shape().as_slice().get(1),
-            Some(&10),
-            "compact gradients must have stride 10"
+            Some(&11),
+            "compact gradients must have stride 11"
         );
         assert_eq!(
             render.total_splats as usize, dims[0],
@@ -1327,24 +1335,25 @@ mod tests {
         } else {
             visible_globals.len()
         };
-        let mut compact_values = vec![0.0f32; visible_globals.len() * 10];
+        // compact_grads mirrors the stride-11 rasterize-backward buffer.
+        let mut compact_values = vec![0.0f32; visible_globals.len() * 11];
         if !zero_visible {
             for compact in 0..visible_globals.len() {
-                compact_values[compact * 10 + 5] = 0.003 * (compact as f32 + 1.0);
-                compact_values[compact * 10 + 6] = -0.002 * (compact as f32 + 0.5);
-                compact_values[compact * 10 + 7] = 0.0015 * (compact as f32 + 0.25);
+                compact_values[compact * 11 + 5] = 0.003 * (compact as f32 + 1.0);
+                compact_values[compact * 11 + 6] = -0.002 * (compact as f32 + 0.5);
+                compact_values[compact * 11 + 7] = 0.0015 * (compact as f32 + 0.25);
             }
             // A visible row with exactly zero color gradient must follow the
             // same momentum-decay path as a non-visible row.
-            compact_values[2 * 10 + 5..2 * 10 + 8].fill(0.0);
+            compact_values[2 * 11 + 5..2 * 11 + 8].fill(0.0);
         }
 
         let mut dense_grad = vec![0.0f32; num_values];
         for (compact, &global) in visible_globals.iter().take(num_visible).enumerate() {
             let color = [
-                compact_values[compact * 10 + 5],
-                compact_values[compact * 10 + 6],
-                compact_values[compact * 10 + 7],
+                compact_values[compact * 11 + 5],
+                compact_values[compact * 11 + 6],
+                compact_values[compact * 11 + 7],
             ];
             if color == [0.0; 3] {
                 continue;
@@ -1387,7 +1396,7 @@ mod tests {
         )
         .cast(IntDType::U32);
         let compact: Tensor<2> = Tensor::from_data(
-            TensorData::new(compact_values, [num_visible.max(1), 10]),
+            TensorData::new(compact_values, [num_visible.max(1), 11]),
             &device,
         );
         let moment_1 = Tensor::from_data(
