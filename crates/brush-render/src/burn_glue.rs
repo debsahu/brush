@@ -17,6 +17,7 @@ use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorI
 use burn_wgpu::WgpuRuntime;
 use glam::Vec3;
 
+use crate::gaussian_splats::RasterizationMode;
 use crate::{
     RenderAuxInner, SplatOps, SplatRasterizerOps,
     camera::Camera,
@@ -230,6 +231,7 @@ impl SplatOps for Fusion<MainBackendBase> {
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
         render_mode: SplatRenderMode,
+        raster_mode: RasterizationMode,
         background: Vec3,
         pass: crate::gaussian_splats::RasterPass,
     ) -> RenderOutput<Self> {
@@ -240,6 +242,7 @@ impl SplatOps for Fusion<MainBackendBase> {
             sh_coeffs,
             raw_opacities,
             render_mode,
+            raster_mode,
             background,
             pass,
             Rasterizer::Legacy,
@@ -256,6 +259,7 @@ impl SplatRasterizerOps for Fusion<MainBackendBase> {
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
         render_mode: SplatRenderMode,
+        raster_mode: RasterizationMode,
         background: Vec3,
         pass: crate::gaussian_splats::RasterPass,
         rasterizer: Rasterizer,
@@ -282,6 +286,7 @@ impl SplatRasterizerOps for Fusion<MainBackendBase> {
             base_sh_coeffs,
             base_raw_opac,
             render_mode,
+            raster_mode,
             background,
             pass,
             rasterizer,

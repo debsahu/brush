@@ -11,7 +11,7 @@
 //! away from f16 quantization limits) so central differences are
 //! second-order accurate.
 
-use brush_render::gaussian_splats::{RasterPass, Rasterizer};
+use brush_render::gaussian_splats::{RasterPass, RasterizationMode, Rasterizer};
 use brush_render::{
     camera::Camera,
     gaussian_splats::{SplatRenderMode, Splats},
@@ -110,7 +110,17 @@ async fn render_value(
         let splats = splats;
         let cam: &Camera = cam;
         let background = Vec3::ZERO;
-        async move { render_splats_with_pass(splats, cam, img_size, background, PASS).await }
+        async move {
+            render_splats_with_pass(
+                splats,
+                cam,
+                img_size,
+                background,
+                PASS,
+                RasterizationMode::Rgba,
+            )
+            .await
+        }
     }
     .await;
     diff.img
@@ -131,7 +141,17 @@ async fn analytical_grads(
         let splats = splats.clone();
         let cam: &Camera = cam;
         let background = Vec3::ZERO;
-        async move { render_splats_with_pass(splats, cam, img_size, background, PASS).await }
+        async move {
+            render_splats_with_pass(
+                splats,
+                cam,
+                img_size,
+                background,
+                PASS,
+                RasterizationMode::Rgba,
+            )
+            .await
+        }
     }
     .await;
     let grads = diff.img.mean().backward();
@@ -256,6 +276,7 @@ async fn candidate_selector_preserves_forward_backward_and_aux() {
             background,
             pass,
             Rasterizer::Legacy,
+            RasterizationMode::Rgba,
         )
         .await;
         let legacy_image = read_vec(legacy.img.clone()).await;
@@ -276,6 +297,7 @@ async fn candidate_selector_preserves_forward_backward_and_aux() {
             background,
             pass,
             Rasterizer::Candidate,
+            RasterizationMode::Rgba,
         )
         .await;
         let candidate_image = read_vec(candidate.img.clone()).await;
@@ -366,6 +388,7 @@ async fn deferred_sh_bridge_preserves_other_gradients_and_aux() {
             img_size,
             Vec3::ZERO,
             compute_refine_weight,
+            RasterizationMode::Rgba,
             true,
         )
         .await;
@@ -439,6 +462,7 @@ async fn deferred_sh_request_falls_back_to_dense_off_native_msl() {
         glam::uvec2(32, 32),
         Vec3::ZERO,
         false,
+        RasterizationMode::Rgba,
         true,
     )
     .await;
@@ -656,7 +680,15 @@ async fn finite_diff_broad_mip_mode() {
             SplatRenderMode::Mip,
             device,
         );
-        let diff = render_splats_with_pass(splats, cam, img_size, Vec3::ZERO, PASS).await;
+        let diff = render_splats_with_pass(
+            splats,
+            cam,
+            img_size,
+            Vec3::ZERO,
+            PASS,
+            RasterizationMode::Rgba,
+        )
+        .await;
         diff.img
             .mean()
             .into_scalar_async::<f32>()
@@ -679,7 +711,15 @@ async fn finite_diff_broad_mip_mode() {
             SplatRenderMode::Mip,
             device,
         );
-        let diff = render_splats_with_pass(splats.clone(), cam, img_size, Vec3::ZERO, PASS).await;
+        let diff = render_splats_with_pass(
+            splats.clone(),
+            cam,
+            img_size,
+            Vec3::ZERO,
+            PASS,
+            RasterizationMode::Rgba,
+        )
+        .await;
         let g = diff.img.mean().backward();
         (splats, g)
     }
@@ -761,7 +801,15 @@ async fn finite_diff_weighted_loss() {
         device: &burn::tensor::Device,
     ) -> f32 {
         let splats = build_splats(scene, device);
-        let diff = render_splats_with_pass(splats, cam, img_size, Vec3::ZERO, PASS).await;
+        let diff = render_splats_with_pass(
+            splats,
+            cam,
+            img_size,
+            Vec3::ZERO,
+            PASS,
+            RasterizationMode::Rgba,
+        )
+        .await;
         (diff.img * weights)
             .sum()
             .into_scalar_async::<f32>()
@@ -777,7 +825,15 @@ async fn finite_diff_weighted_loss() {
         device: &burn::tensor::Device,
     ) -> (Splats, Gradients) {
         let splats = build_splats(scene, device);
-        let diff = render_splats_with_pass(splats.clone(), cam, img_size, Vec3::ZERO, PASS).await;
+        let diff = render_splats_with_pass(
+            splats.clone(),
+            cam,
+            img_size,
+            Vec3::ZERO,
+            PASS,
+            RasterizationMode::Rgba,
+        )
+        .await;
         let loss = (diff.img * weights).sum();
         (splats, loss.backward())
     }

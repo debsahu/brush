@@ -13,8 +13,8 @@ use crate::{
 };
 use brush_appearance::{AppearanceConfig, AppearanceTrainState};
 use brush_dataset::scene::SceneBatch;
-use brush_loss::{ImageLossConfig, image_loss};
-use brush_render::gaussian_splats::{Splats, fold_min_scale};
+use brush_loss::{ImageLossConfig, depth_loss, image_loss};
+use brush_render::gaussian_splats::{RasterizationMode, Splats, fold_min_scale};
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 use brush_render_bwd::{DeferredShGrad, render_splat_features, render_splats_for_training};
 use burn::{
@@ -466,12 +466,19 @@ impl SplatTrainer {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
             let render_input = splats.clone();
+            let use_depth = batch.depth.is_some() && self.config.depth_loss_weight > 0.0;
+            let raster_mode = if use_depth {
+                RasterizationMode::RgbaAndDepth
+            } else {
+                RasterizationMode::Rgba
+            };
             let diff_out = render_splats_for_training(
                 render_input,
                 &camera,
                 img_size,
                 background,
                 compute_refine_weight,
+                raster_mode,
                 defer_sh_grad,
             )
             .instrument(trace_span!("Forward"))
@@ -516,7 +523,7 @@ impl SplatTrainer {
                 mask: masked_alpha,
             };
             let pred_for_loss = if do_alpha_match {
-                pred_image.clone()
+                pred_image.clone().slice(s![.., .., 0..4])
             } else {
                 pred_image.clone().slice(s![.., .., 0..3])
             };
@@ -634,6 +641,16 @@ impl SplatTrainer {
                         .reshape([n as i32, dig::NN_K as i32, feature_dim as i32]);
                     loss = loss + nn_feats.var(1).sum() * self.config.dino_nn_reg_weight;
                 }
+            }
+
+            // Depth Disparity L1 loss on rendered expected depth
+            if use_depth && let Some(depth_data) = &batch.depth {
+                let gt_depth: Tensor<2> = Tensor::from_data(depth_data.clone(), &device);
+                let accumulated_depth = pred_image.clone().slice(s![.., .., 4..5]);
+                let alpha = pred_image.clone().slice(s![.., .., 3..4]);
+                let expected_depth =
+                    (accumulated_depth / alpha.clamp_min(1e-10)).reshape([img_h, img_w]);
+                loss = loss + depth_loss(expected_depth, gt_depth) * self.config.depth_loss_weight;
             }
 
             // Strip the autodiff graph off the loss so consumers can read the

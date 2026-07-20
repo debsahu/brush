@@ -169,11 +169,24 @@ async fn run_loader(
                     None
                 };
 
+                let depth = if let Some(load_depth) = &view.depth {
+                    let [h, w] = [img_packed.shape[0], img_packed.shape[1]];
+                    Some(
+                        load_depth
+                            .load(h, w)
+                            .await
+                            .expect("Scene loader failed to load a depth map"),
+                    )
+                } else {
+                    None
+                };
+
                 let batch = Arc::new(SceneBatch {
                     img_packed,
                     has_alpha,
                     alpha_mode: view.image.alpha_mode(),
                     features,
+                    depth,
                     camera: view.camera,
                     view_index: index,
                 });

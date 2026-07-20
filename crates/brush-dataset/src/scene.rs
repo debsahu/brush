@@ -4,6 +4,7 @@ use glam::{Affine3A, Vec3, vec3};
 use image::DynamicImage;
 use std::sync::Arc;
 
+pub use crate::load_depth::LoadDepth;
 pub use crate::load_features::LoadFeatures;
 pub use crate::load_image::LoadImage;
 
@@ -19,6 +20,7 @@ pub struct SceneView {
     pub image: LoadImage,
     pub camera: Camera,
     pub features: Option<LoadFeatures>,
+    pub depth: Option<LoadDepth>,
 }
 
 // Encapsulates a multi-view scene including cameras and the splats.
@@ -67,6 +69,7 @@ impl Scene {
                 image: v.image.with_scale(scale),
                 camera: v.camera,
                 features: v.features,
+                depth: v.depth,
             })
             .collect();
         Self::new(views)
@@ -141,6 +144,8 @@ pub struct SceneBatch {
     pub alpha_mode: AlphaMode,
     /// Optional `[H, W, C]` f32 feature map plus its channel count `C`.
     pub features: Option<(TensorData, usize)>,
+    /// Optional `[H, W]` f32 metric depth map, `0` marking invalid depth.
+    pub depth: Option<TensorData>,
     pub camera: Camera,
     /// Index of this view in the training scene's view list. Used by
     /// per-view appearance models (bilateral grid / PPISP).

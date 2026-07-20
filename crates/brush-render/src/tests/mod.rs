@@ -659,6 +659,7 @@ async fn render_empty_primitives(
         sh_coeffs,
         raw_opacities,
         SplatRenderMode::Default,
+        crate::gaussian_splats::RasterizationMode::Rgba,
         background,
         pass,
         Rasterizer::Legacy,

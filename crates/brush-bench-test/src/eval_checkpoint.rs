@@ -172,9 +172,11 @@ mod native {
             subsample_points: None,
             alpha_mode: Some(args.alpha_mode),
             train_on_eval: false,
+            estimate_metric_scale: false,
             // Evaluation loads each held-out view exactly once; retain the
             // conventional native budget for loader/config parity.
             max_scene_batch_cache_size: 6 * 1024 * 1024 * 1024,
+            features_dir_name: "dino_features".to_owned(),
         };
         let loaded = load_dataset(dataset_vfs, &load_config)
             .await

@@ -120,9 +120,11 @@ mod native {
             subsample_points: None,
             alpha_mode: args.alpha_mode,
             train_on_eval: false,
+            estimate_metric_scale: false,
             // The replay owns its few decoded views directly, so the scene-loader
             // cache is unused. Keep the conventional value for config parity.
             max_scene_batch_cache_size: 6 * 1024 * 1024 * 1024,
+            features_dir_name: "dino_features".to_owned(),
         };
         let loaded = load_dataset(vfs, &load_config)
             .await
@@ -147,6 +149,8 @@ mod native {
                 img_packed,
                 has_alpha,
                 alpha_mode: view.image.alpha_mode(),
+                features: None,
+                depth: None,
                 camera: view.camera,
                 view_index: index,
             };

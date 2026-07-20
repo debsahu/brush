@@ -55,6 +55,7 @@ impl SplatOps for MainBackendBase {
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
         render_mode: SplatRenderMode,
+        raster_mode: crate::gaussian_splats::RasterizationMode,
         background: Vec3,
         pass: RasterPass,
     ) -> RenderOutput<Self> {
@@ -65,6 +66,7 @@ impl SplatOps for MainBackendBase {
             sh_coeffs,
             raw_opacities,
             render_mode,
+            raster_mode,
             background,
             pass,
             Rasterizer::Legacy,
@@ -82,6 +84,7 @@ impl SplatRasterizerOps for MainBackendBase {
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
         render_mode: SplatRenderMode,
+        raster_mode: crate::gaussian_splats::RasterizationMode,
         background: Vec3,
         pass: RasterPass,
         rasterizer: Rasterizer,
@@ -95,6 +98,7 @@ impl SplatRasterizerOps for MainBackendBase {
         let tile_width = rasterizer.tile_width();
         let tile_height = rasterizer.tile_height();
         let tile_size = rasterizer.tile_size();
+        let render_depth = raster_mode.render_depth() && bwd_info;
 
         let transforms = into_contiguous(transforms);
         let sh_coeffs = into_contiguous(sh_coeffs);
@@ -164,7 +168,11 @@ impl SplatRasterizerOps for MainBackendBase {
                 Self::float_zeros([1].into(), &device, FloatDType::F32)
             };
 
-            let out_dim = if bwd_info { 4 } else { 1 };
+            let out_dim = if bwd_info {
+                if render_depth { 5 } else { 4 }
+            } else {
+                1
+            };
             let out_img = create_tensor(
                 [img_size.y as usize, img_size.x as usize, out_dim],
                 &device,
@@ -201,6 +209,7 @@ impl SplatRasterizerOps for MainBackendBase {
                     smooth_cutoff,
                     tile_width,
                     tile_height,
+                    render_depth,
                 );
             });
 
@@ -423,7 +432,11 @@ impl SplatRasterizerOps for MainBackendBase {
         } else {
             None
         };
-        let out_dim = if bwd_info { 4 } else { 1 };
+        let out_dim = if bwd_info {
+            if render_depth { 5 } else { 4 }
+        } else {
+            1
+        };
         let out_img = create_tensor(
             [img_size.y as usize, img_size.x as usize, out_dim],
             &device,
@@ -468,6 +481,7 @@ impl SplatRasterizerOps for MainBackendBase {
                 smooth_cutoff,
                 tile_width,
                 tile_height,
+                render_depth,
             );
         });
         #[cfg(feature = "raster-census")]

@@ -99,6 +99,7 @@ fn rasterize_bwd_impl(
     rasterizer: Rasterizer,
     smooth_cutoff: bool,
     compute_refine_weight: bool,
+    render_depth: bool,
     trusted_forward: bool,
 ) -> RasterizeGrads<MainBackendBase> {
     let _span = tracing::trace_span!("rasterize_bwd").entered();
@@ -108,9 +109,10 @@ fn rasterize_bwd_impl(
     let num_visible = projected_splats.shape()[0].max(1);
     let client = projected_splats.client.clone();
 
-    // Sparse [num_visible, 10] indexed by compact_gid.
+    // Sparse [num_visible, 11] indexed by compact_gid. Lane 10 is the
+    // expected-depth gradient (zero/unused when render_depth is false).
     let v_combined =
-        MainBackendBase::float_zeros([num_visible, 10].into(), &device, FloatDType::F32);
+        MainBackendBase::float_zeros([num_visible, 11].into(), &device, FloatDType::F32);
 
     let tile_width = rasterizer.tile_width();
     let tile_height = rasterizer.tile_height();
@@ -177,6 +179,7 @@ fn rasterize_bwd_impl(
                     compute_refine_weight,
                     tile_width,
                     tile_height,
+                    render_depth,
                 );
             }
         } else if hard_floats {
@@ -195,6 +198,7 @@ fn rasterize_bwd_impl(
                 compute_refine_weight,
                 tile_width,
                 tile_height,
+                render_depth,
             );
         } else {
             // Keep bounds checks for the CAS fallback: its weak-CAS retry loop does not meet
@@ -214,6 +218,7 @@ fn rasterize_bwd_impl(
                 compute_refine_weight,
                 tile_width,
                 tile_height,
+                render_depth,
             );
         }
     });
@@ -232,6 +237,7 @@ impl SplatBwdOps for MainBackendBase {
         img_size: glam::UVec2,
         v_output: FloatTensor<Self>,
         smooth_cutoff: bool,
+        render_depth: bool,
     ) -> RasterizeGrads<Self> {
         rasterize_bwd_impl(
             out_img,
@@ -244,6 +250,7 @@ impl SplatBwdOps for MainBackendBase {
             Rasterizer::Legacy,
             smooth_cutoff,
             true,
+            render_depth,
             false,
         )
     }
@@ -259,6 +266,7 @@ impl SplatBwdOps for MainBackendBase {
         v_output: FloatTensor<Self>,
         smooth_cutoff: bool,
         compute_refine_weight: bool,
+        render_depth: bool,
     ) -> RasterizeGrads<Self> {
         rasterize_bwd_impl(
             out_img,
@@ -271,6 +279,7 @@ impl SplatBwdOps for MainBackendBase {
             Rasterizer::Legacy,
             smooth_cutoff,
             compute_refine_weight,
+            render_depth,
             false,
         )
     }
@@ -496,6 +505,7 @@ impl InternalSplatBwdOps for MainBackendBase {
             rasterizer,
             smooth_cutoff,
             compute_refine_weight,
+            render_depth,
         ) = input.into_parts();
         rasterize_bwd_impl(
             out_img,
@@ -508,6 +518,7 @@ impl InternalSplatBwdOps for MainBackendBase {
             rasterizer,
             smooth_cutoff,
             compute_refine_weight,
+            render_depth,
             true,
         )
     }

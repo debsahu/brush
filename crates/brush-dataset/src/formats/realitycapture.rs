@@ -155,6 +155,7 @@ async fn read_dataset_inner(
             camera,
             image,
             features: None,
+            depth: None,
         });
     }
 

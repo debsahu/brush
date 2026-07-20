@@ -21,6 +21,24 @@ pub enum SplatRenderMode {
     Mip,
 }
 
+/// Output channels the rasterizer produces.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum RasterizationMode {
+    #[default]
+    Rgba,
+    RgbaAndDepth,
+}
+
+impl RasterizationMode {
+    pub const fn render_depth(self) -> bool {
+        matches!(self, Self::RgbaAndDepth)
+    }
+
+    pub const fn bwd_out_channels(self) -> usize {
+        if self.render_depth() { 5 } else { 4 }
+    }
+}
+
 /// Forward/backward rasterizer mode. Replaces the old `bwd_info: bool` so the
 /// test-only smooth-cutoff variant rides along on the same enum that already
 /// switches in/out the backward bookkeeping.
@@ -413,6 +431,30 @@ pub async fn render_splats(
         splat_scale,
         texture_mode,
         Rasterizer::Legacy,
+        RasterizationMode::Rgba,
+    )
+    .await
+}
+
+/// Non-differentiable depth render entry point for the delivery viewer's
+/// depth-map preview. Always uses the proven legacy rasterizer; only the
+/// output-channel selection differs from [`render_splats`].
+pub async fn render_splats_depth(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    splat_scale: Option<f32>,
+) -> (Tensor<3>, RenderAux) {
+    render_splats_with_rasterizer(
+        splats,
+        camera,
+        img_size,
+        background,
+        splat_scale,
+        TextureMode::Float,
+        Rasterizer::Legacy,
+        RasterizationMode::RgbaAndDepth,
     )
     .await
 }
@@ -431,6 +473,7 @@ pub async fn render_splats_with_rasterizer(
     splat_scale: Option<f32>,
     texture_mode: TextureMode,
     rasterizer: Rasterizer,
+    raster_mode: RasterizationMode,
 ) -> (Tensor<3>, RenderAux) {
     splats.clone().validate_values().await;
 
@@ -480,6 +523,7 @@ pub async fn render_splats_with_rasterizer(
         sh_coeffs.into_dispatch(),
         raw_opacities.into_dispatch(),
         render_mode,
+        raster_mode,
         background,
         pass,
         rasterizer,

@@ -214,6 +214,7 @@ async fn render_test_scene(
         cube_tensor(&device, [means.len(), 1, 3], &sh),
         cube_tensor(&device, [means.len()], &raw_opacity),
         SplatRenderMode::Default,
+        crate::gaussian_splats::RasterizationMode::Rgba,
         Vec3::new(0.13, 0.07, 0.19),
         pass,
         rasterizer,

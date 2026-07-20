@@ -257,6 +257,17 @@ fn split_eval_every(
     })
 }
 
+/// Resolve a bare image name (as stored by colmap / `RealityCapture`, which only
+/// record a filename) to a path in the VFS by brute-force suffix search. Masks
+/// are skipped so an image never resolves to its own mask. Used by
+/// `estimate_metric_scale`, which runs before the per-image `DatasetFileIndex`
+/// is built and is opt-in/rare enough that the linear scan is fine.
+pub(crate) fn find_image_by_name<'a>(vfs: &'a BrushVfs, name: &str) -> Option<&'a Path> {
+    vfs.files_ending_in(name)
+        .filter(|p| !p.iter().any(|f| f == "masks"))
+        .min()
+}
+
 /// Locate a per-image feature map (`<features_dir_name>/<image_stem>.npy`).
 pub(crate) fn find_features_path<'a>(
     vfs: &'a BrushVfs,
@@ -286,6 +297,40 @@ pub(crate) fn find_features_path<'a>(
             let features_dir_subpath =
                 &candidate_components[idx + 1..candidate_components.len() - 1];
             path_dir_components.ends_with(features_dir_subpath)
+        })
+    })
+}
+
+/// Locate the `points3d.{txt,bin}` belonging to the chosen reconstruction.
+fn find_points3d_path<'a>(vfs: &'a BrushVfs, points_dir: &'a Path) -> Option<(&'a Path, bool)> {
+    let path = vfs
+        .files_ending_in("points3d.txt")
+        .chain(vfs.files_ending_in("points3d.bin"))
+        .find(|p| p.parent() == Some(points_dir))?;
+    let is_binary = matches!(path.extension().and_then(|e| e.to_str()), Some("bin"));
+    Some((path, is_binary))
+}
+
+/// Locate a per-image depth map.
+fn find_depth_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Option<&'a Path> {
+    let search_name = path.file_name().expect("File must have a name");
+    let search_stem = path.file_stem().expect("File must have a name");
+
+    vfs.iter_files().find(|candidate| {
+        let Some(stem) = candidate.file_stem() else {
+            return false;
+        };
+        if !(stem.eq_ignore_ascii_case(search_name) || stem.eq_ignore_ascii_case(search_stem)) {
+            return false;
+        }
+        let depth_idx = candidate
+            .components()
+            .position(|c| c.as_os_str().eq_ignore_ascii_case("depth"));
+        depth_idx.is_some_and(|idx| {
+            let candidate_components: Vec<_> = candidate.components().collect();
+            let path_dir_components: Vec<_> = path.parent().unwrap().components().collect();
+            let depth_dir_subpath = &candidate_components[idx + 1..candidate_components.len() - 1];
+            path_dir_components.ends_with(depth_dir_subpath)
         })
     })
 }

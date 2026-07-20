@@ -721,7 +721,7 @@ mod tests {
             glam::Vec2::splat(0.5),
             CameraModel::Pinhole,
         );
-        let scene = Scene::new(vec![SceneView { image, camera }]);
+        let scene = Scene::new(vec![SceneView { image, camera, features: None, depth: None }]);
         let cameras = mip_view_cameras(&scene).await;
         assert_eq!(cameras.len(), 1);
         assert_eq!(cameras[0].0, camera.position);

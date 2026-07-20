@@ -238,7 +238,9 @@ async fn training_with_features_and_refine() {
         has_alpha: false,
         alpha_mode: AlphaMode::Transparent,
         features: Some((TensorData::new(gt, [gh, gw, c]), c)),
+        depth: None,
         camera: test_camera(),
+        view_index: 0,
     };
 
     for _ in 0..3 {

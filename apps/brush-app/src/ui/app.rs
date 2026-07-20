@@ -151,6 +151,7 @@ pub struct CameraSettings {
     pub grid_enabled: Option<bool>,
     /// Render the `DiG` feature-view splats (slot index 1) instead of RGB.
     pub dino_view: bool,
+    pub depth_view: bool,
     pub clamping: CameraClamping,
 }
 

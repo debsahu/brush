@@ -61,6 +61,7 @@ impl CameraSettings {
             background: background.map(|v| v.to_glam()),
             grid_enabled,
             dino_view: false,
+            depth_view: false,
         })
     }
 }
