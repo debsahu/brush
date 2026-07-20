@@ -9,7 +9,10 @@ use brush_process::create_process;
 use brush_process::message::ProcessMessage;
 use brush_process::message::TrainMessage;
 
-use clap::{Error, Parser, builder::ArgPredicate, error::ErrorKind};
+use clap::{
+    CommandFactory, Error, FromArgMatches, Parser, builder::ArgPredicate, error::ErrorKind,
+    parser::ValueSource,
+};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
 use std::time::Duration;
@@ -37,12 +40,82 @@ pub struct Cli {
     )]
     pub with_viewer: bool,
 
+    /// Start the viewer in the DINO feature view (requires --dino training).
+    #[arg(long, default_value = "false")]
+    pub dino_view: bool,
+
     #[clap(flatten)]
     pub train_stream: TrainStreamConfig,
 }
 
+/// Parsed CLI plus the training fields explicitly supplied by the user. This
+/// keeps occurrence metadata without changing the public shape of [`Cli`].
+pub struct ParsedCli {
+    cli: Cli,
+    explicit_train_fields: Vec<String>,
+}
+
+impl std::ops::Deref for ParsedCli {
+    type Target = Cli;
+
+    fn deref(&self) -> &Self::Target {
+        &self.cli
+    }
+}
+
 impl Cli {
+    pub fn parse_with_explicit_fields() -> ParsedCli {
+        Self::try_parse_from_with_explicit_fields(std::env::args_os())
+            .unwrap_or_else(|error| error.exit())
+    }
+
+    pub fn try_parse_from_with_explicit_fields<I, T>(args: I) -> Result<ParsedCli, Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let command = Self::command();
+        let train_fields: Vec<(String, String)> = command
+            .get_arguments()
+            .filter_map(|arg| {
+                let id = arg.get_id().as_str();
+                if matches!(id, "source" | "with_viewer") {
+                    return None;
+                }
+                arg.get_long().map(|long| (id.to_owned(), long.to_owned()))
+            })
+            .collect();
+        let mut matches = command.try_get_matches_from(args)?;
+        let explicit_train_fields = train_fields
+            .into_iter()
+            .filter_map(|(id, long)| {
+                (matches.value_source(&id) == Some(ValueSource::CommandLine)).then_some(long)
+            })
+            .collect();
+        let cli = Self::from_arg_matches_mut(&mut matches)?;
+        Ok(ParsedCli {
+            cli,
+            explicit_train_fields,
+        })
+    }
+
     pub fn validate(self) -> Result<Self, Error> {
+        if !self.with_viewer && self.source.is_none() {
+            return Err(Error::raw(
+                ErrorKind::MissingRequiredArgument,
+                "When --with-viewer is false, --source must be provided",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+impl ParsedCli {
+    pub fn validate(mut self) -> Result<Self, Error> {
+        // The DINO feature view only exists in the viewer.
+        if self.cli.dino_view {
+            self.cli.with_viewer = true;
+        }
         if !self.with_viewer && self.source.is_none() {
             return Err(Error::raw(
                 ErrorKind::MissingRequiredArgument,
@@ -56,10 +129,31 @@ impl Cli {
 /// Build the training process described by `args`, or `None` if no source was
 /// given. Shared by the standalone CLI binary and brush-app's headless path.
 pub fn build_process(args: &Cli) -> Option<RunningProcess> {
+    build_process_with_fields(args, &[])
+}
+
+/// Build a process from occurrence-aware parsed arguments.
+pub fn build_parsed_process(args: &ParsedCli) -> Option<RunningProcess> {
+    build_process_with_fields(&args.cli, &args.explicit_train_fields)
+}
+
+fn build_process_with_fields(
+    args: &Cli,
+    explicit_train_fields: &[String],
+) -> Option<RunningProcess> {
     let source = args.source.clone()?;
     let cli_config = args.train_stream.clone();
+    let explicit_train_fields = explicit_train_fields.to_vec();
     Some(create_process(source, async move |init| {
-        Some(brush_process::args_file::merge_configs(&init, &cli_config))
+        Some(if explicit_train_fields.is_empty() {
+            brush_process::args_file::merge_configs(&init, &cli_config)
+        } else {
+            brush_process::args_file::merge_explicit_cli_fields(
+                &init,
+                &cli_config,
+                &explicit_train_fields,
+            )
+        })
     }))
 }
 
@@ -76,7 +170,7 @@ pub async fn run_headless(
 /// drive the indicatif UI on the main task.
 pub async fn run_cli_ui(
     mut process: RunningProcess,
-    #[allow(unused)] train_stream_config: TrainStreamConfig,
+    mut train_stream_config: TrainStreamConfig,
 ) -> Result<(), anyhow::Error> {
     // Pump the trainer stream from a dedicated Actor thread; the
     // indicatif UI loop below consumes its output on the main task.
@@ -211,7 +305,10 @@ pub async fn run_cli_ui(
             }
             ProcessMessage::SplatsUpdated { .. } => {}
             ProcessMessage::TrainMessage(train) => match train {
-                TrainMessage::TrainConfig { .. } => {}
+                TrainMessage::TrainConfig { config } => {
+                    train_progress.set_length(config.train_config.total_iters() as u64);
+                    train_stream_config = *config;
+                }
                 TrainMessage::Dataset { dataset } => {
                     let train_views = dataset.train.views.len();
                     let eval_views = dataset.eval.as_ref().map_or(0, |v| v.views.len());
@@ -291,4 +388,94 @@ pub async fn run_cli_ui(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracks_explicit_default_valued_training_option() {
+        let cli = Cli::try_parse_from_with_explicit_fields([
+            "brush",
+            "dataset",
+            "--total-train-iters",
+            "30000",
+        ])
+        .expect("CLI should parse");
+
+        assert_eq!(
+            cli.explicit_train_fields,
+            vec!["total-train-iters".to_owned()]
+        );
+    }
+
+    #[test]
+    fn does_not_treat_top_level_options_as_training_overrides() {
+        let cli = Cli::try_parse_from_with_explicit_fields(["brush", "dataset", "--with-viewer"])
+            .expect("CLI should parse");
+
+        assert!(cli.explicit_train_fields.is_empty());
+    }
+
+    #[test]
+    fn parsed_explicit_default_overrides_saved_value_end_to_end() {
+        let parsed = Cli::try_parse_from_with_explicit_fields([
+            "brush",
+            "dataset",
+            "--total-train-iters",
+            "30000",
+        ])
+        .expect("CLI should parse");
+        let mut initial = TrainStreamConfig::default();
+        initial.train_config.total_train_iters = 5000;
+
+        let merged = brush_process::args_file::merge_explicit_cli_fields(
+            &initial,
+            &parsed.train_stream,
+            &parsed.explicit_train_fields,
+        );
+
+        assert_eq!(merged.train_config.total_train_iters, 30_000);
+    }
+
+    #[test]
+    fn parsed_explicit_false_disables_saved_boolean() {
+        let parsed =
+            Cli::try_parse_from_with_explicit_fields(["brush", "dataset", "--train-on-eval=false"])
+                .expect("CLI should parse");
+        let mut initial = TrainStreamConfig::default();
+        initial.load_config.train_on_eval = true;
+
+        let merged = brush_process::args_file::merge_explicit_cli_fields(
+            &initial,
+            &parsed.train_stream,
+            &parsed.explicit_train_fields,
+        );
+
+        assert!(!merged.load_config.train_on_eval);
+    }
+
+    #[test]
+    fn optional_boolean_does_not_consume_following_source() {
+        let bare = Cli::try_parse_from_with_explicit_fields([
+            "brush",
+            "--train-on-eval",
+            "dataset",
+            "--with-viewer",
+        ])
+        .expect("bare boolean must leave the positional source untouched");
+        assert!(bare.train_stream.load_config.train_on_eval);
+        assert!(bare.source.is_some());
+
+        let explicit_false = Cli::try_parse_from_with_explicit_fields([
+            "brush",
+            "--train-on-eval=false",
+            "dataset",
+            "--with-viewer",
+        ])
+        .expect("equals-form boolean must leave the positional source untouched");
+        assert!(!explicit_false.train_stream.load_config.train_on_eval);
+        assert!(explicit_false.source.is_some());
+    }
 }

@@ -11,3 +11,5 @@
 
 pub mod project_backwards;
 pub mod rasterize_backwards;
+pub mod rasterize_features_backwards;
+pub mod sh_grad_materialize;

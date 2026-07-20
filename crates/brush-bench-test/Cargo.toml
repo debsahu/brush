@@ -5,18 +5,32 @@ version.workspace = true
 readme.workspace = true
 license.workspace = true
 
+[features]
+native-msl = [
+    "brush-process/native-msl",
+    "brush-render/native-msl",
+    "brush-render-bwd/native-msl",
+    "brush-train/native-msl",
+]
+raster-census = ["brush-render/raster-census"]
+
 [dependencies]
-brush-render = { path = "../brush-render", features = ["debug-validation"] }
+brush-render.path = "../brush-render"
 brush-render-bwd.path = "../brush-render-bwd"
 brush-train.path = "../brush-train"
 brush-dataset.path = "../brush-dataset"
+brush-process.path = "../brush-process"
+brush-serde.path = "../brush-serde"
+brush-vfs.path = "../brush-vfs"
 
 anyhow.workspace = true
+clap.workspace = true
 glam.workspace = true
 log.workspace = true
 burn = { workspace = true, features = ["autodiff"] }
 burn-cubecl.workspace = true
 rand.workspace = true
+serde_json.workspace = true
 
 divan = "0.1.17"
 safetensors.workspace = true
@@ -29,17 +43,25 @@ rerun = { workspace = true }
 [dev-dependencies]
 brush-async = { path = "../brush-async" }
 brush-cube = { path = "../brush-cube" }
+# Keep full tensor/gradient validation in tests and Divan benches. The
+# standalone checkpoint replay is a normal release binary and must not pay
+# for synchronous debug readbacks on every training step.
+brush-render = { path = "../brush-render", features = ["debug-validation"] }
 
 burn-wgpu.workspace = true
 bytemuck.workspace = true
 
 wasm-bindgen-test = "0.3"
 
-[target.'cfg(target_family = "wasm")'.dev-dependencies]
+[target.'cfg(target_family = "wasm")'.dependencies]
+# The standalone replay has a wasm stub, but Cargo still resolves the package's
+# normal dependency graph for that binary target. Enable JS entropy there too.
 getrandom = { version = "0.4", features = ["wasm_js"] }
 # ahash (pulled in via burn-core) uses getrandom 0.3; enable its wasm_js feature
 # so the wasm_js cfg backend can compile.
 getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
 wasm-logger = "0.2"
 console_error_panic_hook = "0.1"
 
@@ -50,6 +72,14 @@ env_logger = "0.11"
 name = "training_bench"
 harness = false
 path = "src/training_bench.rs"
+
+[[bin]]
+name = "brush-checkpoint-replay"
+path = "src/checkpoint_replay.rs"
+
+[[bin]]
+name = "brush-eval-checkpoint"
+path = "src/eval_checkpoint.rs"
 
 [lints]
 workspace = true

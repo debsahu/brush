@@ -112,6 +112,7 @@ pub fn project_backwards_kernel(
     #[comptime] mip_splatting: bool,
     #[comptime] sh_degree: u32,
     #[comptime] camera_model: CameraModel,
+    #[comptime] materialize_sh_grad: bool,
 ) {
     let compact_gid = ABSOLUTE_POS as u32;
     if compact_gid >= u.num_visible {
@@ -124,7 +125,7 @@ pub fn project_backwards_kernel(
     // splats that contributed to a pixel; non-contributing splats leave
     // v_rasterize_grads at zero and (since the dense outputs are zero-
     // init) we can return without writing anything at all.
-    let rg_base = (compact_gid * 10u32) as usize;
+    let rg_base = (compact_gid * 11u32) as usize;
     let v_mean2d_x = v_rasterize_grads[rg_base];
     let v_mean2d_y = v_rasterize_grads[rg_base + 1];
     let v_conics_x = v_rasterize_grads[rg_base + 2];
@@ -135,6 +136,7 @@ pub fn project_backwards_kernel(
     let v_color_b = v_rasterize_grads[rg_base + 7];
     let v_alpha_in = v_rasterize_grads[rg_base + 8];
     let v_refine_in = v_rasterize_grads[rg_base + 9];
+    let v_depth_in = v_rasterize_grads[rg_base + 10];
 
     let any_grad = v_mean2d_x != 0.0f32
         || v_mean2d_y != 0.0f32
@@ -145,7 +147,8 @@ pub fn project_backwards_kernel(
         || v_color_g != 0.0f32
         || v_color_b != 0.0f32
         || v_alpha_in != 0.0f32
-        || v_refine_in != 0.0f32;
+        || v_refine_in != 0.0f32
+        || v_depth_in != 0.0f32;
     if !any_grad {
         terminate!();
     }
@@ -167,7 +170,9 @@ pub fn project_backwards_kernel(
     let v = u_world.scale(1.0f32 / u_len);
     let coeff_base = global_gid * comptime![num_sh_coeffs(sh_degree) * 3u32];
     let v_color = Vec3A::new(v_color_r, v_color_g, v_color_b);
-    sh_coeffs_to_color_vjp(v_coeffs, coeff_base, sh_degree, v, v_color);
+    if comptime![!materialize_sh_grad] {
+        sh_coeffs_to_color_vjp(v_coeffs, coeff_base, sh_degree, v, v_color);
+    }
     let v_v_sh = sh_color_viewdir_vjp(sh_coeffs, coeff_base, sh_degree, v, v_color);
     let v_dot_vv = v.dot(v_v_sh);
     let v_mean_from_sh = v_v_sh.sub(v.scale(v_dot_vv)).scale(1.0f32 / u_len);
@@ -217,6 +222,8 @@ pub fn project_backwards_kernel(
         Vec2::new(v_mean2d_x, v_mean2d_y),
         camera_model,
     );
+
+    let v_mean_c = Vec3A::new(v_mean_c.x(), v_mean_c.y(), v_mean_c.z() + v_depth_in);
 
     // v_covar_c = J^T * v_cov2d * J (2x2 sym → 3x3 sym).
     let vcc = cam_jac.transpose_congruence_sym2(v_cov2d);

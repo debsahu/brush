@@ -10,6 +10,9 @@ license.workspace = true
 name = "brush-cli"
 path = "src/main.rs"
 
+[features]
+native-msl = ["brush-process/native-msl"]
+
 [dependencies]
 brush-async.path = "../../crates/brush-async"
 brush-process.path = "../../crates/brush-process"

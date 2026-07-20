@@ -8,6 +8,7 @@ use crate::{
 use anyhow::Context;
 use brush_dataset::{load_dataset, scene::Scene, scene_loader::SceneLoader};
 use brush_render::gaussian_splats::{SplatRenderMode, Splats};
+use brush_render::kernels::camera_model::CameraModel;
 use brush_rerun::visualize_tools::VisualizeTools;
 use brush_train::{
     RandomSplatsConfig, create_random_splats,
@@ -22,7 +23,7 @@ use burn::module::AutodiffModule;
 use burn_cubecl::cubecl::Runtime;
 use burn_wgpu::{AutoCompiler, WgpuRuntime};
 use rand::SeedableRng;
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 #[allow(unused)]
 use std::path::Path;
@@ -38,6 +39,8 @@ pub(crate) async fn train_stream(
     slot: SlotSender<Splats>,
 ) -> anyhow::Result<()> {
     log::info!("Start of training stream");
+
+    train_stream_config.validate().map_err(anyhow::Error::msg)?;
 
     let visualize = VisualizeTools::new(train_stream_config.rerun_config.rerun_enabled).await;
 
@@ -57,7 +60,7 @@ pub(crate) async fn train_stream(
     // burn-dispatch's `from_inner` checkpointing bug.
     let device: burn::tensor::Device = wgpu_device.clone().into();
     device.seed(process_config.seed);
-    let mut rng = rand::rngs::StdRng::from_seed([process_config.seed as u8; 32]);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(process_config.seed);
 
     log::info!("Loading dataset");
     let load_result = load_dataset(vfs.clone(), &train_stream_config.load_config)
@@ -73,7 +76,51 @@ pub(crate) async fn train_stream(
             .await;
     }
 
-    let dataset = load_result.dataset;
+    let mut dataset = load_result.dataset;
+
+    // DiG feature training is explicit opt-in (--dino). Warn when the flag
+    // and the data disagree, and drop unused feature handles so batches
+    // don't pay the .npy loads for nothing.
+    let has_features = dataset.train.views.iter().any(|v| v.features.is_some());
+    if train_stream_config.train_config.dino && !has_features {
+        emitter
+            .emit(ProcessMessage::Warning {
+                error: anyhow::anyhow!(
+                    "--dino was set but no per-view feature maps were found (expected \
+                     `<features-dir-name>/<image_stem>.npy` next to the images). Run \
+                     scripts/extract_dino_features.py first; training continues RGB-only."
+                ),
+            })
+            .await;
+    }
+    if train_stream_config.train_config.dino
+        && has_features
+        && train_stream_config.train_config.lod_levels > 0
+    {
+        // LOD decimation changes the splat count outside the trainer's
+        // prune/split bookkeeping and then rebuilds the trainer, which
+        // would silently discard the DiG feature table + decoder.
+        anyhow::bail!(
+            "--dino is not supported together with --lod-levels: LOD decimation resets the \
+             trainer and would discard the trained DiG features. Set --lod-levels 0."
+        );
+    }
+    if !train_stream_config.train_config.dino {
+        if has_features {
+            log::info!("Feature maps found but --dino not set; skipping DiG feature training.");
+        }
+        let stripped: Vec<_> = dataset
+            .train
+            .views
+            .iter()
+            .cloned()
+            .map(|mut v| {
+                v.features = None;
+                v
+            })
+            .collect();
+        dataset.train.views = std::sync::Arc::new(stripped);
+    }
 
     log::info!("Log scene to rerun");
     if let Err(error) = visualize.log_scene(
@@ -147,10 +194,26 @@ pub(crate) async fn train_stream(
     // If the metadata has an up axis prefer that, otherwise estimate the up direction.
     let up_axis = up_axis.or(Some(estimated_up));
 
+    let bounds = get_splat_bounds(init_splats.clone(), BOUND_PERCENTILE).await;
+    // Use the exact capped/scaled image dimensions consumed by the loader.
+    let view_cams = mip_view_cameras(&dataset.train).await;
+    let mut trainer = SplatTrainer::new_seeded(
+        &train_stream_config.train_config,
+        &device,
+        bounds,
+        process_config.seed,
+    );
+    trainer.set_view_cams(view_cams.clone());
+
     // The trainer owns its working `splats` locally and publishes a
     // clone to the `Slot` after every modification (train
     // step, refine, LOD decimation).
-    let mut splats: Splats = init_splats.clone();
+    let mut splats = trainer.apply_min_scale_floor(init_splats.clone());
+    debug_assert_eq!(
+        splats.min_scale.as_ref().map(|floor| floor.dims()[0]),
+        Some(splats.num_splats() as usize),
+        "initial Mip-Splatting floor must be attached before publication"
+    );
     slot.set(0, splats.clone());
     emitter
         .emit(ProcessMessage::SplatsUpdated {
@@ -165,26 +228,83 @@ pub(crate) async fn train_stream(
     emitter.emit(ProcessMessage::DoneLoading).await;
 
     // Start with memory cleared out.
-    let client = WgpuRuntime::<AutoCompiler>::client(wgpu_device);
+    let client = WgpuRuntime::<AutoCompiler>::client(&wgpu_device);
     client.memory_cleanup();
 
     let mut eval_scene = dataset.eval;
 
-    let mut train_duration = Duration::from_secs(0);
-    let mut dataloader = SceneLoader::new(&dataset.train, 42, &train_stream_config.load_config);
-    let bounds = get_splat_bounds(init_splats.clone(), BOUND_PERCENTILE).await;
+    // With `--train-on-eval`, eval views are also training views and carry
+    // learned per-view appearance corrections — map each eval view to its
+    // train index (by image path) so eval can apply them.
+    let train_indices: HashMap<_, _> = dataset
+        .train
+        .views
+        .iter()
+        .enumerate()
+        .map(|(index, view)| (view.image.path().to_path_buf(), index))
+        .collect();
+    let eval_train_indices: Vec<Option<usize>> = eval_scene
+        .as_ref()
+        .map(|eval| {
+            eval.views
+                .iter()
+                .map(|view| train_indices.get(view.image.path()).copied())
+                .collect()
+        })
+        .unwrap_or_default();
 
-    // Per-train-view (world center, focal-px at native res) for the
-    // Mip-Splatting 3D filter (always on).
-    let mut view_cams: Vec<(glam::Vec3, f32)> = Vec::with_capacity(dataset.train.views.len());
-    for view in dataset.train.views.iter() {
-        let (w, h) = view.image.dimensions().await.unwrap_or((1, 1));
-        let focal = view.camera.focal(glam::uvec2(w, h)).x;
-        view_cams.push((view.camera.position, focal));
+    let mut train_duration = Duration::from_secs(0);
+    let mut dataloader = SceneLoader::new(
+        &dataset.train,
+        process_config.seed,
+        &train_stream_config.load_config,
+    );
+
+    // Per-view appearance compensation (bilateral grid / PPISP). PPISP's
+    // per-camera params (vignetting, tone curve) are shared across views
+    // taken by the same physical camera, so group views by intrinsics.
+    let camera_indices = if train_stream_config.train_config.appearance_enabled() {
+        camera_groups(&dataset.train)
+    } else {
+        Vec::new()
+    };
+    trainer.init_appearance(camera_indices.clone(), process_config.start_iter, &device)?;
+    if trainer.has_appearance() {
+        let num_cams = camera_indices.iter().copied().max().unwrap_or(0) + 1;
+        log::info!(
+            "Appearance compensation enabled ({} views, {num_cams} camera group(s))",
+            camera_indices.len()
+        );
     }
 
-    let mut trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
-    trainer.set_view_cams(view_cams.clone());
+    // The DiG export embeds the feature-extraction metadata (model, patch
+    // size, PCA dim) so the artifact is self-describing.
+    #[cfg(not(target_family = "wasm"))]
+    let dig_extraction_meta: Option<serde_json::Value> = {
+        let features_dir = &train_stream_config.load_config.features_dir_name;
+        let meta_path = vfs
+            .files_ending_in("meta.json")
+            .find(|p| {
+                p.parent()
+                    .and_then(|d| d.file_name())
+                    .is_some_and(|d| d.eq_ignore_ascii_case(features_dir))
+            })
+            .map(Path::to_path_buf);
+        match meta_path {
+            Some(path) => {
+                let mut bytes = vec![];
+                use tokio::io::AsyncReadExt as _;
+                if let Ok(mut reader) = vfs.reader_at_path(&path).await
+                    && reader.read_to_end(&mut bytes).await.is_ok()
+                {
+                    serde_json::from_slice(&bytes).ok()
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    };
 
     // Get the dataset name from the base path (if available) for interpolation.
     let dataset_name = vfs
@@ -260,28 +380,50 @@ pub(crate) async fn train_stream(
             let before = splats.num_splats();
             let target_count = (before as f32 * lod_keep_pct as f32 / 100.0).max(1.0) as u32;
 
+            let cumulative_scale = (lod_img_pct as f32 / 100.0).powi(current_lod as i32);
+            let lod_scene = if lod_img_pct < 100 {
+                Some(dataset.train.clone().with_image_scale(cumulative_scale))
+            } else {
+                None
+            };
+            let lod_view_cams = if let Some(scene) = &lod_scene {
+                mip_view_cameras(scene).await
+            } else {
+                view_cams.clone()
+            };
+
             log::info!("LOD {current_lod}/{lod_levels}: Computing sensitivity scores...");
             let scores = compute_pup_scores(splats.clone(), &dataset.train, &device).await;
             splats = decimate_to_count(splats, &scores, target_count).await;
+            // Decimation drops the old-N floor. Attach the target
+            // LOD floor before publishing the splats or running the first
+            // lower-resolution training step.
+            trainer.set_view_cams(lod_view_cams.clone());
+            splats = trainer.apply_min_scale_floor(splats);
             slot.set(0, splats.clone());
 
             let after = splats.num_splats();
             log::info!("LOD {current_lod}/{lod_levels}: {before} -> {after} splats");
 
-            let client = WgpuRuntime::<AutoCompiler>::client(wgpu_device);
+            let client = WgpuRuntime::<AutoCompiler>::client(&wgpu_device);
             client.memory_cleanup();
 
-            let cumulative_scale = (lod_img_pct as f32 / 100.0).powi(current_lod as i32);
-            dataloader = if lod_img_pct < 100 {
-                let lod_scene = dataset.train.clone().with_image_scale(cumulative_scale);
-                SceneLoader::new(&lod_scene, 42, &train_stream_config.load_config)
-            } else {
-                SceneLoader::new(&dataset.train, 42, &train_stream_config.load_config)
-            };
+            dataloader = SceneLoader::new(
+                lod_scene.as_ref().unwrap_or(&dataset.train),
+                process_config.seed,
+                &train_stream_config.load_config,
+            );
 
+            let appearance = trainer.take_appearance();
             let bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
-            trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
-            trainer.set_view_cams(view_cams.clone());
+            trainer = SplatTrainer::new_seeded(
+                &train_stream_config.train_config,
+                &device,
+                bounds,
+                process_config.seed,
+            );
+            trainer.set_view_cams(lod_view_cams);
+            trainer.set_appearance(appearance);
 
             log::info!(
                 "LOD {current_lod}/{lod_levels}: Training for {lod_refine_steps} steps (image scale {:.0}%)",
@@ -301,7 +443,10 @@ pub(crate) async fn train_stream(
         // `step` immediately replaces `splats` with the returned value, so we
         // can move it here instead of cloning every iteration.
         let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(splats);
-        let (new_diff_splats, stats) = trainer.step(batch, diff_splats).await;
+        let compute_refine_weight = trainer.refinement_weight_needed(iter);
+        let (new_diff_splats, stats) = trainer
+            .step_with_refine_weight(batch, diff_splats, compute_refine_weight)
+            .await;
         splats = new_diff_splats.valid();
 
         // Phase-local iteration for refine gating
@@ -322,8 +467,14 @@ pub(crate) async fn train_stream(
             && phase_iter.is_multiple_of(train_stream_config.train_config.refine_every)
             && phase_progress <= 0.95
         {
-            let (new_splats, refine_stats) = trainer.refine(iter, splats).await;
+            let (new_splats, refine_stats) = trainer
+                .refine_for_phase(iter, phase_iter, phase_total, splats)
+                .await;
             splats = new_splats;
+            // Trainer only sees the type-erased tensor device. Cleanup must
+            // use the concrete device registered by the host (including
+            // `Existing(n)` integrations), which remains available here.
+            client.memory_cleanup();
             refine_stats
         } else {
             RefineStats {
@@ -336,6 +487,14 @@ pub(crate) async fn train_stream(
             }
         };
         slot.set(0, splats.clone());
+        // Publish a DiG feature-view recoloring alongside the RGB splats
+        // (slot index 1); the viewer's "DINO feature view" toggle renders
+        // it. Cheap (one MLP decode), refreshed on a small cadence.
+        if iter % 50 == 0
+            && let Some(feature_view) = trainer.dig_view_splats(&splats)
+        {
+            slot.set(1, feature_view);
+        }
         let refine_dur = refine_start.elapsed();
 
         // We just finished iter 'iter', now starting iter + 1.
@@ -360,6 +519,8 @@ pub(crate) async fn train_stream(
                 &device,
                 emitter,
                 &visualize,
+                &trainer,
+                &eval_train_indices,
                 splats.clone(),
                 iter,
                 eval_scene,
@@ -371,6 +532,10 @@ pub(crate) async fn train_stream(
 
             if let Err(error) = eval {
                 emitter.emit(ProcessMessage::Warning { error }).await;
+            }
+
+            if let Some(stats) = trainer.appearance_stats().await {
+                log::info!("Appearance at iter {iter}: {stats}");
             }
         }
 
@@ -405,6 +570,17 @@ pub(crate) async fn train_stream(
                 if let Err(error) = res {
                     emitter.emit(ProcessMessage::Warning { error }).await;
                 }
+
+                // Alongside the PLY, export the DiG feature table + decoder
+                // when feature training is active. Rows match the PLY order.
+                if let Some(dig) = trainer.dig_export().await {
+                    let res = export_dig(&dig, dig_extraction_meta.as_ref(), &export_path, &name)
+                        .await
+                        .with_context(|| format!("DiG export at iteration {iter} failed"));
+                    if let Err(error) = res {
+                        emitter.emit(ProcessMessage::Warning { error }).await;
+                    }
+                }
             }
         }
 
@@ -436,7 +612,7 @@ pub(crate) async fn train_stream(
             {
                 visualize.log_memory(
                     iter,
-                    &WgpuRuntime::<AutoCompiler>::client(wgpu_device).memory_usage()?,
+                    &WgpuRuntime::<AutoCompiler>::client(&wgpu_device).memory_usage()?,
                 )?;
             }
 
@@ -502,10 +678,130 @@ pub(crate) async fn train_stream(
     Ok(())
 }
 
+/// Camera centres and focal lengths in the exact pixel scale consumed by a
+/// scene loader. LOD scenes wrap their images with scaled dimensions, so
+/// recomputing here keeps the Mip-Splatting floor consistent with each phase.
+async fn mip_view_cameras(scene: &Scene) -> Vec<(glam::Vec3, f32)> {
+    let mut cameras = Vec::with_capacity(scene.views.len());
+    for view in scene.views.iter() {
+        let (width, height) = view.image.output_dimensions().await.unwrap_or((1, 1));
+        let focal = view.camera.focal(glam::uvec2(width, height)).x;
+        cameras.push((view.camera.position, focal));
+    }
+    cameras
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use super::*;
+    use brush_dataset::{load_image::LoadImage, scene::SceneView};
+    use brush_render::camera::Camera;
+    use std::{path::Path, sync::Arc};
+
+    #[tokio::test]
+    async fn mip_cameras_use_capped_and_scaled_output_dimensions() {
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lpips");
+        let vfs = Arc::new(
+            BrushVfs::from_path(&fixture_dir)
+                .await
+                .expect("fixture VFS"),
+        );
+        // apple.png is 64x54. A 32px cap followed by 0.5 LOD scale yields
+        // the exact 16x13 dimensions consumed by `LoadImage::load`.
+        let image = LoadImage::new(vfs, "apple.png".into(), None, 32, None).with_scale(0.5);
+        assert_eq!(image.output_dimensions().await.unwrap(), (16, 13));
+        let loaded = image.load().await.expect("fixture decode");
+        assert_eq!((loaded.width(), loaded.height()), (16, 13));
+
+        let camera = Camera::new(
+            glam::Vec3::new(1.0, 2.0, 3.0),
+            glam::Quat::IDENTITY,
+            std::f64::consts::FRAC_PI_2,
+            std::f64::consts::FRAC_PI_2,
+            glam::Vec2::splat(0.5),
+            CameraModel::Pinhole,
+        );
+        let scene = Scene::new(vec![SceneView { image, camera, features: None, depth: None }]);
+        let cameras = mip_view_cameras(&scene).await;
+        assert_eq!(cameras.len(), 1);
+        assert_eq!(cameras[0].0, camera.position);
+        assert!((cameras[0].1 - camera.focal(glam::uvec2(16, 13)).x).abs() < 1e-6);
+    }
+}
+
+/// Group training views by camera intrinsics (fov + principal point +
+/// camera model). Views shot by the same physical camera share PPISP's
+/// per-camera vignetting and tone-curve parameters.
+fn camera_groups(scene: &Scene) -> Vec<u32> {
+    let mut groups = HashMap::new();
+    scene
+        .views
+        .iter()
+        .map(|view| {
+            let cam = &view.camera;
+            let key = (
+                cam.fov_x.to_bits(),
+                cam.fov_y.to_bits(),
+                cam.center_uv.x.to_bits(),
+                cam.center_uv.y.to_bits(),
+                camera_model_key(cam.camera_model),
+            );
+            let next = groups.len() as u32;
+            *groups.entry(key).or_insert(next)
+        })
+        .collect()
+}
+
+fn camera_model_key(model: CameraModel) -> [u32; 9] {
+    let mut key = [0; 9];
+    match model {
+        CameraModel::Pinhole => {}
+        CameraModel::KannalaBrandt4(params) => {
+            key[0] = 1;
+            key[1..5].copy_from_slice(&[
+                params.k1.to_bits(),
+                params.k2.to_bits(),
+                params.k3.to_bits(),
+                params.k4.to_bits(),
+            ]);
+        }
+        CameraModel::RadialTangential8(params) => {
+            key[0] = 2;
+            key[1..9].copy_from_slice(&[
+                params.k1.to_bits(),
+                params.k2.to_bits(),
+                params.k3.to_bits(),
+                params.k4.to_bits(),
+                params.k5.to_bits(),
+                params.k6.to_bits(),
+                params.p1.to_bits(),
+                params.p2.to_bits(),
+            ]);
+        }
+        CameraModel::ThinPrismFisheye(params) => {
+            key[0] = 3;
+            key[1..9].copy_from_slice(&[
+                params.kb4.k1.to_bits(),
+                params.kb4.k2.to_bits(),
+                params.kb4.k3.to_bits(),
+                params.kb4.k4.to_bits(),
+                params.p1.to_bits(),
+                params.p2.to_bits(),
+                params.sx1.to_bits(),
+                params.sy1.to_bits(),
+            ]);
+        }
+    }
+    key
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_eval(
     device: &burn::tensor::Device,
     emitter: &Emitter,
     visualize: &VisualizeTools,
+    trainer: &SplatTrainer,
+    eval_train_indices: &[Option<usize>],
     splats: Splats,
     iter: u32,
     eval_scene: &Scene,
@@ -525,12 +821,21 @@ async fn run_eval(
         brush_async::yield_now().await;
 
         let eval_img = view.image.load().await?;
+        // Only views that exist in the training set have learned per-view
+        // corrections to apply.
+        let train_idx = eval_train_indices.get(i).copied().flatten();
+        let correction = train_idx.filter(|_| trainer.has_appearance()).map(|idx| {
+            move |img: burn::tensor::Tensor<3>| trainer.appearance_eval_correction(img, idx)
+        });
         let sample = eval_stats(
             splats.clone(),
             &view.camera,
             eval_img,
             view.image.alpha_mode(),
             device,
+            correction
+                .as_ref()
+                .map(|f| f as &(dyn Fn(burn::tensor::Tensor<3>) -> burn::tensor::Tensor<3> + Sync)),
         )
         .await
         .context("Failed to run eval for sample.")?;
@@ -591,5 +896,75 @@ async fn export_checkpoint(
     tokio::fs::write(export_path.join(&export_name), splat_data)
         .await
         .context(format!("Failed to export ply {export_path:?}"))?;
+    Ok(())
+}
+
+/// Minimal `NumPy` `.npy` (v1.0, `<f4`, C-order) serializer for the `DiG`
+/// feature export.
+#[cfg(not(target_family = "wasm"))]
+fn npy_bytes_f32(shape: [usize; 2], data: &[f32]) -> Vec<u8> {
+    let dict = format!(
+        "{{'descr': '<f4', 'fortran_order': False, 'shape': ({}, {}), }}",
+        shape[0], shape[1]
+    );
+    // Magic (6) + version (2) + header-len field (2) + header, padded with
+    // spaces to a multiple of 64, terminated by '\n'.
+    let header_len = (10 + dict.len() + 1).div_ceil(64) * 64 - 10;
+    let mut header = dict.into_bytes();
+    header.resize(header_len - 1, b' ');
+    header.push(b'\n');
+
+    let mut out = Vec::with_capacity(10 + header.len() + data.len() * 4);
+    out.extend_from_slice(b"\x93NUMPY\x01\x00");
+    out.extend_from_slice(
+        &u16::try_from(header.len())
+            .expect("npy header too large")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(&header);
+    for v in data {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+/// Write `<name>_dig_features.npy` and `<name>_dig_mlp.json` next to the
+/// exported PLY.
+#[cfg(not(target_family = "wasm"))]
+async fn export_dig(
+    dig: &brush_train::dig::DigExport,
+    extraction_meta: Option<&serde_json::Value>,
+    export_path: &Path,
+    export_name: &str,
+) -> Result<(), anyhow::Error> {
+    let stem = export_name.trim_end_matches(".ply");
+    let feat_bytes = npy_bytes_f32([dig.num_splats, dig.feat_dim], &dig.features);
+    tokio::fs::write(
+        export_path.join(format!("{stem}_dig_features.npy")),
+        feat_bytes,
+    )
+    .await
+    .context("Failed to write DiG features")?;
+
+    let out_dim = dig.mlp.last().map_or(0, |(_, dims, _)| dims[1]);
+    let mlp = serde_json::json!({
+        "layers": dig.mlp.iter().map(|(name, dims, data)| {
+            serde_json::json!({ "name": name, "shape": dims, "weight": data })
+        }).collect::<Vec<_>>(),
+        "activation": "relu",
+        "bias": false,
+        // Self-describing: the decoder maps [feature_dim] stored features
+        // into the extraction's PCA space ([out_dim]); `extraction_meta`
+        // is the dino_features/meta.json this run trained against.
+        "feature_dim": dig.feat_dim,
+        "out_dim": out_dim,
+        "extraction_meta": extraction_meta,
+    });
+    tokio::fs::write(
+        export_path.join(format!("{stem}_dig_mlp.json")),
+        serde_json::to_vec(&mlp).context("Failed to serialize DiG MLP")?,
+    )
+    .await
+    .context("Failed to write DiG MLP")?;
     Ok(())
 }

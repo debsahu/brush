@@ -13,6 +13,8 @@ pub mod helpers {
 
     pub const TILE_WIDTH: u32 = 16;
     pub const TILE_SIZE: u32 = TILE_WIDTH * TILE_WIDTH;
+    pub const FINE_TILE_WIDTH: u32 = 16;
+    pub const FINE_TILE_HEIGHT: u32 = 8;
 
     #[derive(Debug, Clone, Copy)]
     pub struct ProjectUniforms {

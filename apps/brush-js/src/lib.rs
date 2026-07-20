@@ -8,7 +8,7 @@ use brush_process::{DataSource, ProcessStream, burn_init_device, burn_init_setup
 use brush_render::gaussian_splats::Splats;
 use serde::Serialize;
 use std::pin::Pin;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio_stream::StreamExt;
 use wasm_bindgen::prelude::*;
 use web_sys::js_sys;
@@ -280,9 +280,10 @@ impl BrushApp {
     /// resolving to the final config (or `null` to abort).
     ///
     /// The returned [`Training`] owns the underlying message stream. Drive it
-    /// with `await training.trainSteps(N)`. To cancel, just drop it
-    /// (`training.free()` synchronously, or let GC do it eventually) — Rust's
-    /// normal future cancellation tears down any pending Burn work.
+    /// with `await training.trainSteps(N)`. To cancel, call
+    /// `training.cancel()`, wait for any pending `trainSteps` promise to
+    /// settle, then free it. Dropping an idle [`Training`] also tears down its
+    /// pending Burn work.
     ///
     /// To pause, just stop pumping; the training loop back-pressures
     /// because nothing is consuming messages.
@@ -300,9 +301,11 @@ impl BrushApp {
             bridge_config_callback(config_fn, init).await
         });
 
+        let (cancel, _cancelled) = watch::channel(false);
         Training {
-            stream: Mutex::new(process.stream),
+            stream: Mutex::new(Some(process.stream)),
             splat_view: process.splat_view,
+            cancel,
         }
     }
 }
@@ -311,12 +314,29 @@ impl BrushApp {
 /// view; dropping it cancels the run.
 #[wasm_bindgen]
 pub struct Training {
-    stream: Mutex<Pin<Box<dyn ProcessStream>>>,
+    stream: Mutex<Option<Pin<Box<dyn ProcessStream>>>>,
     splat_view: Slot<Splats>,
+    cancel: watch::Sender<bool>,
 }
 
 #[wasm_bindgen]
 impl Training {
+    /// Cancel this training run.
+    ///
+    /// Any pending [`Self::train_steps`] call resolves with an empty message
+    /// list after dropping the process stream. The JS wrapper must wait for
+    /// that promise to settle before calling its generated `free()` method.
+    pub fn cancel(&self) {
+        self.cancel.send_replace(true);
+
+        // If no `train_steps` call currently owns the stream, release it
+        // immediately. Otherwise the watch notification wakes that call and
+        // it performs the same `take()` before returning.
+        if let Ok(mut stream) = self.stream.try_lock() {
+            stream.take();
+        }
+    }
+
     /// Drive the training stream until `steps` `TrainStep` events have been
     /// emitted (or the stream ends), and return every message produced along
     /// the way.
@@ -333,11 +353,37 @@ impl Training {
     /// [`Training`] if recovery is needed.
     #[wasm_bindgen(js_name = trainSteps)]
     pub async fn train_steps(&self, steps: u32) -> Result<Vec<BrushMessage>, JsValue> {
-        let mut stream = self.stream.lock().await;
+        if steps == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut cancelled = self.cancel.subscribe();
+        let mut stream_slot = self.stream.lock().await;
+        if *cancelled.borrow() {
+            stream_slot.take();
+            return Ok(Vec::new());
+        }
+
         let mut out: Vec<BrushMessage> = Vec::new();
         let mut steps_taken: u32 = 0;
         loop {
-            match stream.next().await {
+            let next = {
+                let Some(stream) = stream_slot.as_mut() else {
+                    return Ok(out);
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancelled.changed() => None,
+                    message = stream.next() => Some(message),
+                }
+            };
+
+            let Some(message) = next else {
+                stream_slot.take();
+                return Ok(Vec::new());
+            };
+
+            match message {
                 Some(Ok(ProcessMessage::TrainMessage(TrainMessage::TrainConfig { .. }))) => {}
                 Some(Ok(msg)) => {
                     let is_step = matches!(
@@ -352,8 +398,14 @@ impl Training {
                         }
                     }
                 }
-                Some(Err(e)) => return Err(js_err_str(&format!("{e:#}"))),
-                None => return Ok(out),
+                Some(Err(e)) => {
+                    stream_slot.take();
+                    return Err(js_err_str(&format!("{e:#}")));
+                }
+                None => {
+                    stream_slot.take();
+                    return Ok(out);
+                }
             }
         }
     }

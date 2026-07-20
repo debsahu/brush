@@ -2,8 +2,8 @@
 // measure the sort kernels in isolation, separately from any rendering work.
 //
 // Each bench preallocates the input buffers once outside the timed block and
-// only times the radix_argsort dispatch + a final readback to force the GPU to
-// finish. The buffers are built directly as CubeTensors (DType::U32) instead
+// only times the radix_argsort dispatch plus a device sync. The buffers are
+// built directly as CubeTensors (DType::U32) instead
 // of going through Burn's typed `Tensor::<_, _, Int>::from_ints`, so we can
 // sort the full u32 range — Burn's i32-typed constructor would panic on any
 // value with the high bit set.
@@ -89,32 +89,38 @@ fn upload_u32(device: &WgpuDevice, data: &[u32]) -> CubeTensor<WgpuRuntime> {
     )
 }
 
-fn run_sort(device: &WgpuDevice, inputs: &(Vec<u32>, Vec<u32>), bits: u32) {
-    let keys = upload_u32(device, &inputs.0);
-    let values = upload_u32(device, &inputs.1);
-    let (sorted_keys, sorted_values) = radix_argsort(keys, values, bits);
-    // Force completion: read both buffers back so the GPU finishes before we
-    // return from the bencher closure.
+fn run_sort(
+    device: &WgpuDevice,
+    keys: CubeTensor<WgpuRuntime>,
+    values: CubeTensor<WgpuRuntime>,
+    bits: u32,
+) {
+    let (_sorted_keys, _sorted_values) = radix_argsort(keys, values, bits);
+    // Synchronize without transferring the full result back to the CPU.
     let client = WgpuRuntime::<AutoCompiler>::client(device);
-    let _ = block_on(client.read_async(vec![sorted_keys.handle, sorted_values.handle]));
+    block_on(client.sync()).expect("Failed to sync radix benchmark");
 }
 
 #[cfg(not(target_family = "wasm"))]
 #[divan::bench_group(max_time = 4)]
 mod sort_bench {
-    use crate::{KeyKind, SIZES, device, make_inputs, run_sort};
+    use crate::{KeyKind, SIZES, device, make_inputs, run_sort, upload_u32};
 
     #[divan::bench(args = SIZES)]
     fn radix_argsort_10bit(bencher: divan::Bencher, size: usize) {
         let dev = device();
         let inputs = make_inputs(size, KeyKind::TileIds);
-        bencher.bench_local(move || run_sort(&dev, &inputs, 10));
+        let keys = upload_u32(&dev, &inputs.0);
+        let values = upload_u32(&dev, &inputs.1);
+        bencher.bench_local(move || run_sort(&dev, keys.clone(), values.clone(), 10));
     }
 
     #[divan::bench(args = SIZES)]
     fn radix_argsort_32bit(bencher: divan::Bencher, size: usize) {
         let dev = device();
         let inputs = make_inputs(size, KeyKind::Random32);
-        bencher.bench_local(move || run_sort(&dev, &inputs, 32));
+        let keys = upload_u32(&dev, &inputs.0);
+        let values = upload_u32(&dev, &inputs.1);
+        bencher.bench_local(move || run_sort(&dev, keys.clone(), values.clone(), 32));
     }
 }

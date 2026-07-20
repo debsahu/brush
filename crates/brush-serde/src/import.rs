@@ -146,10 +146,10 @@ fn interleave_coeffs(sh_dc: Vec3, sh_rest: &[f32], result: &mut Vec<f32>) {
 async fn read_chunk<T: AsyncRead + Unpin>(
     mut reader: T,
     buf: &mut Vec<u8>,
-) -> tokio::io::Result<()> {
+) -> tokio::io::Result<usize> {
     buf.reserve(8 * 1024 * 1024);
-    let mut total_read = buf.len();
-    while total_read < buf.capacity() {
+    let mut total_read = 0;
+    while buf.len() < buf.capacity() {
         let bytes_read = reader.read_buf(buf).await?;
         if bytes_read == 0 {
             break;
@@ -157,14 +157,11 @@ async fn read_chunk<T: AsyncRead + Unpin>(
         total_read += bytes_read;
         brush_async::yield_now().await;
     }
-    if total_read == 0 {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "Unexpected EOF",
-        ))
-    } else {
-        Ok(())
-    }
+    Ok(total_read)
+}
+
+fn unexpected_eof() -> DeserializeError {
+    DeserializeError::custom("Unexpected EOF while reading PLY data")
 }
 
 pub async fn load_splat_from_ply<T: AsyncRead + Unpin>(
@@ -172,12 +169,12 @@ pub async fn load_splat_from_ply<T: AsyncRead + Unpin>(
     subsample_points: Option<u32>,
 ) -> Result<SplatMessage, DeserializeError> {
     let stream = stream_splat_from_ply(reader, subsample_points, false);
-    let Some(splat) = pin!(stream).next().await else {
-        return Err(DeserializeError::custom(
-            "Couldn't load single splat from ply",
-        ));
-    };
-    splat
+    let mut stream = pin!(stream);
+    let mut last = None;
+    while let Some(message) = stream.next().await {
+        last = Some(message?);
+    }
+    last.ok_or_else(|| DeserializeError::custom("Couldn't load single splat from ply"))
 }
 
 pub fn stream_splat_from_ply<T: AsyncRead + Unpin>(
@@ -186,8 +183,21 @@ pub fn stream_splat_from_ply<T: AsyncRead + Unpin>(
     streaming: bool,
 ) -> impl Stream<Item = Result<SplatMessage, DeserializeError>> {
     try_fn_stream(|emitter| async move {
+        let subsample = match subsample_points {
+            Some(0) => {
+                return Err(DeserializeError::custom(
+                    "subsample_points must be greater than zero",
+                ));
+            }
+            Some(value) => value as usize,
+            None => 1,
+        };
         let mut file = PlyChunkedReader::new();
-        read_chunk(&mut reader, file.buffer_mut()).await?;
+        let bytes_read = read_chunk(&mut reader, file.buffer_mut()).await?;
+
+        if bytes_read == 0 {
+            return Err(unexpected_eof());
+        }
 
         let header = file
             .header()
@@ -253,7 +263,6 @@ pub fn stream_splat_from_ply<T: AsyncRead + Unpin>(
             return Err(DeserializeError::custom("Unknown format"));
         };
 
-        let subsample = subsample_points.unwrap_or(1) as usize;
         let mut updater = TimedUpdate::new(streaming.then(|| Duration::from_millis(1500)));
 
         match ply_type {
@@ -286,8 +295,41 @@ pub fn stream_splat_from_ply<T: AsyncRead + Unpin>(
     })
 }
 
-fn progress(index: usize, len: usize) -> f32 {
-    ((index + 1) as f32) / len as f32
+fn progress(completed: usize, len: usize) -> f32 {
+    if len == 0 {
+        1.0
+    } else {
+        completed.min(len) as f32 / len as f32
+    }
+}
+
+fn validate_sh_rest_properties<'a>(
+    names: impl Iterator<Item = &'a str>,
+) -> Result<usize, DeserializeError> {
+    let mut indices = names
+        .map(|name| {
+            name.strip_prefix("f_rest_")
+                .and_then(|suffix| suffix.parse::<usize>().ok())
+                .ok_or_else(|| {
+                    DeserializeError::custom(format!("Invalid SH property name: {name}"))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    indices.sort_unstable();
+
+    if indices.iter().copied().ne(0..indices.len()) {
+        return Err(DeserializeError::custom(
+            "SH rest properties must be contiguous from f_rest_0",
+        ));
+    }
+    if !matches!(indices.len(), 0 | 9 | 24 | 45 | 72) {
+        return Err(DeserializeError::custom(format!(
+            "Unsupported SH rest property count: {}",
+            indices.len()
+        )));
+    }
+
+    Ok(indices.len())
 }
 
 fn vec_exact(cap: usize) -> Vec<f32> {
@@ -311,18 +353,55 @@ async fn parse_ply<T: AsyncRead + Unpin>(
     let vertex = header
         .get_element("vertex")
         .ok_or(DeserializeError::custom("Unknown format"))?;
+    let is_ascii = header.format == serde_ply::PlyFormat::Ascii;
     let total_splats = vertex.count;
-    let max_splats = total_splats / subsample;
+    let max_splats = total_splats.div_ceil(subsample);
+    if total_splats == 0 {
+        return Err(DeserializeError::custom("PLY contains no vertices"));
+    }
 
-    let sh_count = vertex
+    let rest_count = validate_sh_rest_properties(
+        vertex
+            .properties
+            .iter()
+            .filter(|property| property.name.starts_with("f_rest_"))
+            .map(|property| property.name.as_str()),
+    )?;
+    let dc_count = vertex
         .properties
         .iter()
-        .filter(|x| {
-            x.name.starts_with("f_rest_")
-                || x.name.starts_with("f_dc_")
-                || matches!(x.name.as_str(), "r" | "g" | "b" | "red" | "green" | "blue")
-        })
+        .filter(|property| matches!(property.name.as_str(), "f_dc_0" | "f_dc_1" | "f_dc_2"))
         .count();
+    let channel_count = |short: &str, long: &str| {
+        vertex
+            .properties
+            .iter()
+            .filter(|property| property.name == short || property.name == long)
+            .count()
+    };
+    let rgb_channels = [
+        channel_count("r", "red"),
+        channel_count("g", "green"),
+        channel_count("b", "blue"),
+    ];
+    let has_rgb = rgb_channels.iter().all(|&count| count == 1);
+    if dc_count != 0 && dc_count != 3 {
+        return Err(DeserializeError::custom(
+            "PLY SH colors require f_dc_0, f_dc_1, and f_dc_2",
+        ));
+    }
+    if rgb_channels.iter().any(|&count| count != 0) && !has_rgb {
+        return Err(DeserializeError::custom(
+            "PLY RGB colors require exactly one red, green, and blue property",
+        ));
+    }
+    let has_color = dc_count == 3 || has_rgb;
+    if rest_count > 0 && !has_color {
+        return Err(DeserializeError::custom(
+            "PLY SH rest properties require a complete DC or RGB color",
+        ));
+    }
+    let sh_count = if has_color { rest_count + 3 } else { 0 };
 
     let mut data = SplatData {
         means: vec_exact(max_splats * 3),
@@ -341,11 +420,24 @@ async fn parse_ply<T: AsyncRead + Unpin>(
     let mut row_index: usize = 0;
 
     loop {
-        read_chunk(&mut reader, file.buffer_mut()).await?;
+        let bytes_read = read_chunk(&mut reader, file.buffer_mut()).await?;
+
+        // ASCII values are delimiter-terminated. At a real EOF, a synthetic
+        // newline lets the parser accept a complete final token while malformed
+        // or incomplete rows still fail deserialization below.
+        if bytes_read == 0 && is_ascii {
+            let buffer = file.buffer_mut();
+            if buffer
+                .last()
+                .is_some_and(|byte| !byte.is_ascii_whitespace())
+            {
+                buffer.push(b'\n');
+            }
+        }
 
         RowVisitor::new(|mut gauss: PlyGaussian| {
             row_index += 1;
-            if !row_index.is_multiple_of(subsample) {
+            if !(row_index - 1).is_multiple_of(subsample) {
                 return;
             }
             data.means.extend([gauss.x, gauss.y, gauss.z]);
@@ -402,6 +494,10 @@ async fn parse_ply<T: AsyncRead + Unpin>(
                     .await;
             }
         }
+
+        if bytes_read == 0 {
+            return Err(unexpected_eof());
+        }
     }
 }
 
@@ -414,6 +510,8 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
     render_mode: Option<SplatRenderMode>,
     mut update: TimedUpdate,
 ) -> Result<(), DeserializeError> {
+    const SPLATS_PER_CHUNK: usize = 256;
+
     #[derive(Default, Deserialize)]
     struct QuantMeta {
         min_x: f32,
@@ -461,11 +559,23 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
     while let Some(element) = file.current_element()
         && element.name == "chunk"
     {
-        read_chunk(&mut reader, file.buffer_mut()).await?;
+        let bytes_read = if element.count == 0 {
+            0
+        } else {
+            read_chunk(&mut reader, file.buffer_mut()).await?
+        };
         RowVisitor::new(|meta: QuantMeta| {
             quant_metas.push(meta);
         })
         .deserialize(&mut file)?;
+
+        if bytes_read == 0
+            && file
+                .current_element()
+                .is_some_and(|element| element.name == "chunk")
+        {
+            return Err(unexpected_eof());
+        }
     }
 
     let vertex = file
@@ -476,7 +586,17 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
         return Err(DeserializeError::custom("Unknown format"));
     }
     let total_splats = vertex.count;
-    let max_splats = total_splats / subsample;
+    let max_splats = total_splats.div_ceil(subsample);
+    if total_splats == 0 {
+        return Err(DeserializeError::custom("PLY contains no vertices"));
+    }
+    let required_chunks = total_splats.div_ceil(SPLATS_PER_CHUNK);
+    if quant_metas.len() < required_chunks {
+        return Err(DeserializeError::custom(format!(
+            "Compressed PLY has {} chunk rows but needs at least {required_chunks} for {total_splats} vertices",
+            quant_metas.len()
+        )));
+    }
 
     let mut means = Vec::with_capacity(max_splats * 3);
     // Atm, unlike normal plys, these values aren't optional.
@@ -493,16 +613,24 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
         .elem_defs
         .get(2)
         .cloned();
+    if let Some(sh) = &sh_vals {
+        if sh.name != "sh" || sh.count != total_splats {
+            return Err(DeserializeError::custom(format!(
+                "Invalid compressed PLY SH element: expected {total_splats} rows"
+            )));
+        }
+        validate_sh_rest_properties(sh.properties.iter().map(|property| property.name.as_str()))?;
+    }
 
     while let Some(element) = file.current_element()
         && element.name == "vertex"
     {
-        read_chunk(&mut reader, file.buffer_mut()).await?;
+        let bytes_read = read_chunk(&mut reader, file.buffer_mut()).await?;
 
         RowVisitor::new(|splat: QuantSplat| {
-            let quant_data = &quant_metas[row_count / 256];
+            let quant_data = &quant_metas[row_count / SPLATS_PER_CHUNK];
             row_count += 1;
-            if row_count % subsample != 0 {
+            if !(row_count - 1).is_multiple_of(subsample) {
                 return;
             }
             means.extend(quant_data.mean(splat.mean).to_array());
@@ -544,6 +672,14 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
             };
             emitter.emit(SplatMessage { meta, data }).await;
         }
+
+        if bytes_read == 0
+            && file
+                .current_element()
+                .is_some_and(|element| element.name == "vertex")
+        {
+            return Err(unexpected_eof());
+        }
     }
 
     if let Some(sh_vals) = sh_vals {
@@ -551,16 +687,20 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
         let mut total_coeffs = Vec::with_capacity(sh_vals.count * (3 + sh_count));
         let mut splat_index = 0;
 
-        let mut row_count = 0;
+        let mut row_count: usize = 0;
 
         while let Some(element) = file.current_element()
             && element.name == "sh"
         {
-            read_chunk(&mut reader, file.buffer_mut()).await?;
+            let bytes_read = if element.count == 0 {
+                0
+            } else {
+                read_chunk(&mut reader, file.buffer_mut()).await?
+            };
 
             RowVisitor::new(|quant_sh: QuantSh| {
                 row_count += 1;
-                if row_count % subsample != 0 {
+                if !(row_count - 1).is_multiple_of(subsample) {
                     return;
                 }
                 let dc = glam::vec3(
@@ -576,6 +716,14 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
                 splat_index += 1;
             })
             .deserialize(&mut file)?;
+
+            if bytes_read == 0
+                && file
+                    .current_element()
+                    .is_some_and(|element| element.name == "sh")
+            {
+                return Err(unexpected_eof());
+            }
         }
 
         let meta = ParseMetadata {
@@ -608,6 +756,328 @@ mod tests {
 
     #[cfg(target_family = "wasm")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    fn truncated_binary_ply() -> Vec<u8> {
+        let mut data = b"ply\n\
+format binary_little_endian 1.0\n\
+element vertex 2\n\
+property float x\n\
+property float y\n\
+property float z\n\
+end_header\n"
+            .to_vec();
+
+        for value in [1.0_f32, 2.0, 3.0] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        // Only the first property of the second vertex is present.
+        data.extend_from_slice(&4.0_f32.to_le_bytes());
+        data
+    }
+
+    fn ascii_ply(vertex_count: usize, rows: &str) -> Vec<u8> {
+        format!(
+            "ply\n\
+             format ascii 1.0\n\
+             element vertex {vertex_count}\n\
+             property float x\n\
+             property float y\n\
+             property float z\n\
+             end_header\n\
+             {rows}"
+        )
+        .into_bytes()
+    }
+
+    fn ascii_ply_with_properties(properties: &[String]) -> Vec<u8> {
+        let mut data = b"ply\n\
+format ascii 1.0\n\
+element vertex 1\n\
+property float x\n\
+property float y\n\
+property float z\n"
+            .to_vec();
+        for property in properties {
+            data.extend_from_slice(format!("property float {property}\n").as_bytes());
+        }
+        data.extend_from_slice(b"end_header\n");
+        data
+    }
+
+    fn compressed_ply_header(
+        chunk_count: usize,
+        vertex_count: usize,
+        sh: Option<(usize, usize)>,
+    ) -> Vec<u8> {
+        let mut header = format!(
+            "ply\n\
+             format binary_little_endian 1.0\n\
+             element chunk {chunk_count}\n\
+             property float min_x\n\
+             property float max_x\n\
+             property float min_y\n\
+             property float max_y\n\
+             property float min_z\n\
+             property float max_z\n\
+             property float min_scale_x\n\
+             property float max_scale_x\n\
+             property float min_scale_y\n\
+             property float max_scale_y\n\
+             property float min_scale_z\n\
+             property float max_scale_z\n\
+             property float min_r\n\
+             property float max_r\n\
+             property float min_g\n\
+             property float max_g\n\
+             property float min_b\n\
+             property float max_b\n\
+             element vertex {vertex_count}\n\
+             property uint packed_position\n\
+             property uint packed_scale\n\
+             property uint packed_rotation\n\
+             property uint packed_color\n"
+        )
+        .into_bytes();
+        if let Some((sh_count, property_count)) = sh {
+            header.extend_from_slice(format!("element sh {sh_count}\n").as_bytes());
+            for index in 0..property_count {
+                header.extend_from_slice(format!("property uchar f_rest_{index}\n").as_bytes());
+            }
+        }
+        header.extend_from_slice(b"end_header\n");
+        header
+    }
+
+    fn truncated_compressed_chunk_ply() -> Vec<u8> {
+        let mut data = compressed_ply_header(1, 1, None);
+        data.extend_from_slice(&0_f32.to_le_bytes());
+        data
+    }
+
+    fn truncated_compressed_vertex_ply() -> Vec<u8> {
+        let mut data = compressed_ply_header(1, 1, None);
+        data.extend_from_slice(&[0; 18 * std::mem::size_of::<f32>()]);
+        data.extend_from_slice(&0_u32.to_le_bytes());
+        data
+    }
+
+    fn truncated_compressed_sh_ply() -> Vec<u8> {
+        let mut data = compressed_ply_header(1, 1, Some((1, 9)));
+        data.extend_from_slice(&[0; 18 * std::mem::size_of::<f32>()]);
+        data.extend_from_slice(&[0; 4 * std::mem::size_of::<u32>()]);
+        data
+    }
+
+    fn compressed_ply_with_sh() -> Vec<u8> {
+        let mut data = compressed_ply_header(1, 1, Some((1, 9)));
+        data.extend_from_slice(&[0; 18 * std::mem::size_of::<f32>()]);
+        data.extend_from_slice(&[0; 4 * std::mem::size_of::<u32>()]);
+        data.extend_from_slice(&[0, 32, 64, 96, 127, 160, 192, 224, 255]);
+        data
+    }
+
+    fn compressed_ply_one_vertex() -> Vec<u8> {
+        let mut data = compressed_ply_header(1, 1, None);
+        data.extend_from_slice(&[0; 18 * std::mem::size_of::<f32>()]);
+        data.extend_from_slice(&[0; 4 * std::mem::size_of::<u32>()]);
+        data
+    }
+
+    fn compressed_ply_with_oversized_sh_header() -> Vec<u8> {
+        let mut data = compressed_ply_header(1, 1, Some((1, 75)));
+        data.extend_from_slice(&[0; 18 * std::mem::size_of::<f32>()]);
+        data
+    }
+
+    fn compressed_ply_without_chunk_metadata() -> Vec<u8> {
+        let mut data = compressed_ply_header(0, 1, None);
+        data.extend_from_slice(&[0; 4 * std::mem::size_of::<u32>()]);
+        data
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    async fn assert_stream_returns_error(data: Vec<u8>) -> DeserializeError {
+        tokio::time::timeout(Duration::from_secs(1), async move {
+            let stream = stream_splat_from_ply(Cursor::new(data), None, false);
+            let mut stream = std::pin::pin!(stream);
+            while let Some(result) = stream.next().await {
+                if let Err(error) = result {
+                    return error;
+                }
+            }
+            panic!("truncated PLY stream ended without an error");
+        })
+        .await
+        .expect("truncated PLY parser timed out")
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn test_truncated_ply_returns_error() {
+        let error = assert_stream_returns_error(truncated_binary_ply()).await;
+        assert!(error.to_string().contains("Unexpected EOF"));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn test_partial_ascii_token_returns_error() {
+        assert_stream_returns_error(ascii_ply(1, "1.0 2.0 3e")).await;
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn test_truncated_compressed_chunk_returns_error() {
+        let error = assert_stream_returns_error(truncated_compressed_chunk_ply()).await;
+        assert!(error.to_string().contains("Unexpected EOF"));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn test_truncated_compressed_vertex_returns_error() {
+        let error = assert_stream_returns_error(truncated_compressed_vertex_ply()).await;
+        assert!(error.to_string().contains("Unexpected EOF"));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn test_truncated_compressed_sh_returns_error() {
+        let error = assert_stream_returns_error(truncated_compressed_sh_ply()).await;
+        assert!(error.to_string().contains("Unexpected EOF"));
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_one_shot_compressed_import_drains_to_final_message() {
+        let imported = load_splat_from_ply(Cursor::new(compressed_ply_with_sh()), None)
+            .await
+            .expect("complete compressed PLY should load");
+
+        assert_eq!(imported.meta.progress, 1.0);
+        assert_eq!(imported.data.sh_coeffs.expect("SH coefficients").len(), 12);
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_one_shot_compressed_import_reports_truncated_sh() {
+        let error = load_splat_from_ply(Cursor::new(truncated_compressed_sh_ply()), None)
+            .await
+            .err()
+            .expect("truncated SH payload should fail");
+        assert!(error.to_string().contains("Unexpected EOF"));
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_compressed_import_rejects_missing_chunk_metadata() {
+        let error = load_splat_from_ply(Cursor::new(compressed_ply_without_chunk_metadata()), None)
+            .await
+            .err()
+            .expect("missing chunk metadata should fail");
+        assert!(error.to_string().contains("chunk rows"));
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_import_rejects_zero_subsample() {
+        let error = load_splat_from_ply(Cursor::new(ascii_ply(1, "1.0 2.0 3.0")), Some(0))
+            .await
+            .err()
+            .expect("zero subsample should fail");
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_regular_subsample_larger_than_input_keeps_first_row() {
+        let imported = load_splat_from_ply(Cursor::new(ascii_ply(1, "1.0 2.0 3.0")), Some(2))
+            .await
+            .expect("first regular row should survive strided subsampling");
+        assert_eq!(imported.data.means, vec![1.0, 2.0, 3.0]);
+        assert_eq!(imported.meta.total_splats, 1);
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_compressed_subsample_larger_than_input_keeps_first_row() {
+        let imported = load_splat_from_ply(Cursor::new(compressed_ply_one_vertex()), Some(2))
+            .await
+            .expect("first compressed row should survive strided subsampling");
+        assert_eq!(imported.data.num_splats(), 1);
+        assert_eq!(imported.meta.total_splats, 1);
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_regular_import_rejects_partial_rgb() {
+        let error = load_splat_from_ply(
+            Cursor::new(ascii_ply_with_properties(&["red".to_owned()])),
+            None,
+        )
+        .await
+        .err()
+        .expect("partial RGB schema should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("exactly one red, green, and blue")
+        );
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_regular_import_rejects_oversized_sh_schema() {
+        let mut properties = vec![
+            "f_dc_0".to_owned(),
+            "f_dc_1".to_owned(),
+            "f_dc_2".to_owned(),
+        ];
+        properties.extend((0..75).map(|index| format!("f_rest_{index}")));
+        let error = load_splat_from_ply(Cursor::new(ascii_ply_with_properties(&properties)), None)
+            .await
+            .err()
+            .expect("oversized SH schema should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("Unsupported SH rest property count")
+        );
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_compressed_import_rejects_oversized_sh_schema() {
+        let error =
+            load_splat_from_ply(Cursor::new(compressed_ply_with_oversized_sh_header()), None)
+                .await
+                .err()
+                .expect("oversized compressed SH schema should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("Unsupported SH rest property count")
+        );
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_ascii_ply_accepts_final_token_without_newline() {
+        let imported = load_splat_from_ply(Cursor::new(ascii_ply(1, "1.0 2.0 3.0")), None)
+            .await
+            .expect("complete final ASCII token should load");
+
+        assert_eq!(imported.data.means, vec![1.0, 2.0, 3.0]);
+        assert_eq!(imported.meta.progress, 1.0);
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_zero_row_regular_ply_returns_error() {
+        let error = load_splat_from_ply(Cursor::new(ascii_ply(0, "")), None)
+            .await
+            .err()
+            .expect("zero-row PLY should fail");
+
+        assert!(error.to_string().contains("no vertices"));
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_zero_row_compressed_ply_returns_error() {
+        let error = load_splat_from_ply(Cursor::new(compressed_ply_header(0, 0, None)), None)
+            .await
+            .err()
+            .expect("zero-row compressed PLY should fail");
+
+        assert!(error.to_string().contains("no vertices"));
+    }
 
     #[wasm_bindgen_test(unsupported = tokio::test)]
     async fn test_import_basic_functionality() {

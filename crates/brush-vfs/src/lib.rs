@@ -65,8 +65,15 @@ impl PathKey {
 
 async fn read_at_most<R: AsyncRead + Unpin>(reader: &mut R, limit: usize) -> io::Result<Vec<u8>> {
     let mut buffer = vec![0; limit];
-    let bytes_read = reader.read(&mut buffer).await?;
-    buffer.truncate(bytes_read);
+    let mut total_read = 0;
+    while total_read < limit {
+        let bytes_read = reader.read(&mut buffer[total_read..]).await?;
+        if bytes_read == 0 {
+            break;
+        }
+        total_read += bytes_read;
+    }
+    buffer.truncate(total_read);
     Ok(buffer)
 }
 
@@ -129,14 +136,42 @@ pub struct BrushVfs {
     container: VfsContainer,
 }
 
+fn is_lookup_path(path: &Path) -> bool {
+    path.extension().is_some()
+        && !path
+            .components()
+            .any(|component| component.as_os_str() == "__MACOSX")
+}
+
 fn lookup_from_paths(paths: &[PathBuf]) -> HashMap<PathKey, PathBuf> {
     paths
         .iter()
-        .map(|p| p.clean())
         // Skip directories and __MACOSX metadata
-        .filter(|p| p.extension().is_some() && !p.components().any(|c| c.as_os_str() == "__MACOSX"))
-        .map(|p| (PathKey::from_path(&p), p))
+        .filter(|path| is_lookup_path(path))
+        // Normalize only the lookup key. The value must remain the exact path
+        // used by the backing container (notably for ZIP entries such as
+        // `./file.ply`).
+        .map(|p| (PathKey::from_path(p), p.clone()))
         .collect()
+}
+
+fn checked_lookup_from_paths(paths: &[PathBuf]) -> io::Result<HashMap<PathKey, PathBuf>> {
+    let mut lookup: HashMap<PathKey, PathBuf> = HashMap::new();
+    for path in paths.iter().filter(|path| is_lookup_path(path)) {
+        let key = PathKey::from_path(path);
+        if let Some(existing) = lookup.get(&key) {
+            return Err(Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Ambiguous ZIP paths normalize to the same name: {} and {}",
+                    existing.display(),
+                    path.display()
+                ),
+            ));
+        }
+        lookup.insert(key, path.clone());
+    }
+    Ok(lookup)
 }
 
 fn zip_error(e: async_zip::error::ZipError) -> io::Error {
@@ -174,10 +209,21 @@ impl BrushVfs {
 
         if peek.starts_with(b"ply") {
             // For single PLY files, keep the reader for streaming
-            let path = PathBuf::from(name.unwrap_or_else(|| "input.ply".to_owned()));
+            let mut path = PathBuf::from(name.unwrap_or_default());
+            if path.file_name().is_none() {
+                path = PathBuf::from("input.ply");
+            } else if path
+                .extension()
+                .is_none_or(|extension| !extension.eq_ignore_ascii_case("ply"))
+            {
+                path.set_extension("ply");
+            }
 
             Ok(Self {
-                lookup: lookup_from_paths(std::slice::from_ref(&path)),
+                // The bytes already identified this as a PLY. Adding the
+                // missing extension lets downstream format discovery treat an
+                // Android picker name such as `file` as a standalone PLY.
+                lookup: HashMap::from([(PathKey::from_path(&path), path)]),
                 container: VfsContainer::Streaming {
                     reader: Arc::new(Mutex::new(Some(reader))),
                 },
@@ -191,7 +237,14 @@ impl BrushVfs {
                     let mut data = vec![];
                     let mut reader = entry.reader_mut().compat();
                     reader.read_to_end(&mut data).await?;
-                    entries.insert(PathBuf::from(filename), Arc::new(data));
+                    let path = PathBuf::from(filename);
+                    if entries.insert(path.clone(), Arc::new(data)).is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Duplicate ZIP path: {}", path.display()),
+                        )
+                        .into());
+                    }
                     zip_reader = entry.skip().await.map_err(zip_error)?;
                 } else {
                     zip_reader = entry.skip().await.map_err(zip_error)?;
@@ -200,10 +253,12 @@ impl BrushVfs {
                 brush_async::yield_now().await;
             }
 
-            let path_bufs = entries.keys().cloned().collect::<Vec<_>>();
+            let mut path_bufs = entries.keys().cloned().collect::<Vec<_>>();
+            path_bufs.sort();
+            let lookup = checked_lookup_from_paths(&path_bufs)?;
 
             Ok(Self {
-                lookup: lookup_from_paths(&path_bufs),
+                lookup,
                 container: VfsContainer::InMemory { entries },
             })
         } else if peek.starts_with(b"<!DOCTYPE html>") {
@@ -433,35 +488,69 @@ impl BrushVfs {
 mod tests {
     use super::*;
     use std::io::Cursor;
-    use tokio::io::AsyncReadExt;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
     use wasm_bindgen_test::wasm_bindgen_test;
 
     #[cfg(target_family = "wasm")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
-    async fn create_test_zip() -> Vec<u8> {
+    struct OneByteReader {
+        data: Vec<u8>,
+        offset: usize,
+    }
+
+    impl OneByteReader {
+        fn new(data: impl Into<Vec<u8>>) -> Self {
+            Self {
+                data: data.into(),
+                offset: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for OneByteReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.offset < self.data.len() && buf.remaining() > 0 {
+                let byte = self.data[self.offset];
+                self.offset += 1;
+                buf.put_slice(&[byte]);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn fragmented_reader(data: impl Into<Vec<u8>>) -> BufReader<OneByteReader> {
+        BufReader::with_capacity(1, OneByteReader::new(data))
+    }
+
+    async fn create_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         use async_zip::base::write::ZipFileWriter;
         use async_zip::{Compression, ZipEntryBuilder};
 
         let mut buffer = Vec::new();
         let mut writer = ZipFileWriter::new(&mut buffer);
 
-        // Add test.txt
-        let entry = ZipEntryBuilder::new("test.txt".into(), Compression::Stored);
-        writer
-            .write_entry_whole(entry, b"hello world")
-            .await
-            .unwrap();
-
-        // Add data.json
-        let entry = ZipEntryBuilder::new("data.json".into(), Compression::Stored);
-        writer
-            .write_entry_whole(entry, b"{\"key\": \"value\"}")
-            .await
-            .unwrap();
+        for (name, data) in entries {
+            let entry = ZipEntryBuilder::new((*name).into(), Compression::Stored);
+            writer.write_entry_whole(entry, data).await.unwrap();
+        }
 
         writer.close().await.unwrap();
         buffer
+    }
+
+    async fn create_test_zip() -> Vec<u8> {
+        create_zip(&[
+            ("test.txt", b"hello world"),
+            ("data.json", b"{\"key\": \"value\"}"),
+        ])
+        .await
     }
 
     #[wasm_bindgen_test(unsupported = tokio::test)]
@@ -512,6 +601,131 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_normalized_zip_path_reads_original_entry() {
+        let zip_data = create_zip(&[("./models/foo.ply", b"ply data")]).await;
+        let vfs = BrushVfs::from_reader(Cursor::new(zip_data), None)
+            .await
+            .unwrap();
+
+        let mut content = String::new();
+        vfs.reader_at_path(Path::new("models/foo.ply"))
+            .await
+            .unwrap()
+            .read_to_string(&mut content)
+            .await
+            .unwrap();
+        assert_eq!(content, "ply data");
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_ambiguous_normalized_zip_paths_are_rejected() {
+        let zip_data = create_zip(&[("./foo.ply", b"first"), ("foo.ply", b"second")]).await;
+        let result = BrushVfs::from_reader(Cursor::new(zip_data), None).await;
+
+        assert!(matches!(
+            result,
+            Err(VfsConstructError::IoError(error))
+                if error.kind() == io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_duplicate_zip_paths_are_rejected() {
+        let zip_data = create_zip(&[("foo.ply", b"first"), ("foo.ply", b"second")]).await;
+        let result = BrushVfs::from_reader(Cursor::new(zip_data), None).await;
+
+        assert!(matches!(
+            result,
+            Err(VfsConstructError::IoError(error))
+                if error.kind() == io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_extensionless_streaming_ply_is_visible() {
+        let ply = b"ply\nformat ascii 1.0\nend_header\n";
+        let vfs = BrushVfs::from_reader(Cursor::new(ply), Some("file".to_owned()))
+            .await
+            .unwrap();
+
+        assert_eq!(vfs.file_count(), 1);
+        assert_eq!(vfs.iter_files().next(), Some(Path::new("file.ply")));
+        assert_eq!(vfs.files_with_extension("ply").count(), 1);
+
+        let mut content = Vec::new();
+        vfs.reader_at_path(Path::new("file.ply"))
+            .await
+            .unwrap()
+            .read_to_end(&mut content)
+            .await
+            .unwrap();
+        assert_eq!(content, ply);
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_empty_ply_names_get_usable_filenames() {
+        let ply = b"ply\nformat ascii 1.0\nend_header\n";
+
+        for (name, expected) in [("", "input.ply"), ("file.", "file.ply")] {
+            let vfs = BrushVfs::from_reader(Cursor::new(ply), Some(name.to_owned()))
+                .await
+                .unwrap();
+
+            assert_eq!(vfs.iter_files().next(), Some(Path::new(expected)));
+            assert_eq!(vfs.files_with_extension("ply").count(), 1);
+        }
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_content_confirmed_ply_replaces_misleading_extension() {
+        let ply = b"ply\nformat ascii 1.0\nend_header\n";
+
+        for (name, expected) in [("scan.bin", "scan.ply"), ("scan.ply?token", "scan.ply")] {
+            let vfs = BrushVfs::from_reader(Cursor::new(ply), Some(name.to_owned()))
+                .await
+                .unwrap();
+
+            assert_eq!(vfs.iter_files().next(), Some(Path::new(expected)));
+            assert_eq!(vfs.files_with_extension("ply").count(), 1);
+        }
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_fragmented_ply_format_detection() {
+        let ply = b"ply\nformat ascii 1.0\nend_header\nvertex data";
+        let vfs = BrushVfs::from_reader(fragmented_reader(ply), None)
+            .await
+            .unwrap();
+
+        let mut content = Vec::new();
+        vfs.reader_at_path(Path::new("input.ply"))
+            .await
+            .unwrap()
+            .read_to_end(&mut content)
+            .await
+            .unwrap();
+        assert_eq!(content, ply);
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_fragmented_zip_format_detection() {
+        let zip_data = create_test_zip().await;
+        let vfs = BrushVfs::from_reader(fragmented_reader(zip_data), None)
+            .await
+            .unwrap();
+
+        assert_eq!(vfs.file_count(), 2);
+        let mut content = String::new();
+        vfs.reader_at_path(Path::new("test.txt"))
+            .await
+            .unwrap()
+            .read_to_string(&mut content)
+            .await
+            .unwrap();
+        assert_eq!(content, "hello world");
     }
 
     #[cfg(not(target_family = "wasm"))]

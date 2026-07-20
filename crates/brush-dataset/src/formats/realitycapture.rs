@@ -1,6 +1,5 @@
 use super::{
-    DatasetLoadResult, FormatError, find_image_by_name, find_mask_path, opengl_c2w_to_pose,
-    split_eval_every,
+    DatasetFileIndex, DatasetLoadResult, FormatError, opengl_c2w_to_pose, split_eval_every,
 };
 use crate::{
     Dataset,
@@ -99,6 +98,7 @@ async fn read_dataset_inner(
     let mut views = Vec::new();
     let mut warnings = Vec::new();
     let mut warned_brown4 = false;
+    let file_index = DatasetFileIndex::new(&vfs);
 
     for line in lines
         .step_by(load_args.subsample_frames.unwrap_or(1) as usize)
@@ -122,12 +122,14 @@ async fn read_dataset_inner(
             warned_brown4 = true;
         }
 
-        let Some(image_path) = find_image_by_name(&vfs, name).map(Path::to_path_buf) else {
+        let Some(image_path) = file_index.find_image_by_name(name).map(Path::to_path_buf) else {
             warnings.push(format!("Skipped '{name}': image file not found"));
             continue;
         };
 
-        let mask_path = find_mask_path(&vfs, &image_path).map(Path::to_path_buf);
+        let mask_path = file_index
+            .find_mask_path(&image_path)
+            .map(Path::to_path_buf);
         let image = LoadImage::new(
             vfs.clone(),
             image_path,
@@ -149,10 +151,16 @@ async fn read_dataset_inner(
             continue;
         }
 
-        views.push(SceneView { camera, image });
+        views.push(SceneView {
+            camera,
+            image,
+            features: None,
+            depth: None,
+        });
     }
 
-    let (train_views, eval_views) = split_eval_every(views, load_args.eval_split_every);
+    let (train_views, eval_views) =
+        split_eval_every(views, load_args.eval_split_every, load_args.train_on_eval);
 
     Ok(DatasetLoadResult {
         init_splat: None,

@@ -190,6 +190,14 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
             false,
             enabled,
         );
+        slider(
+            ui,
+            &mut tc.depth_loss_weight,
+            0.0..=1.0,
+            "Depth loss weight (0 disables)",
+            false,
+            enabled,
+        );
     });
 
     ui.collapsing("Background", |ui| {
@@ -219,6 +227,64 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
             false,
             enabled,
         );
+    });
+
+    ui.collapsing("Appearance compensation", |ui| {
+        let tc = &mut args.train_config;
+        let mut appearance_mode = match (tc.bilateral_grid, tc.ppisp) {
+            (true, false) => 1,
+            (false, true) => 2,
+            _ => 0,
+        };
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.radio_value(&mut appearance_mode, 0, "None");
+            ui.radio_value(&mut appearance_mode, 1, "Per-view affine bilateral grid");
+            ui.radio_value(
+                &mut appearance_mode,
+                2,
+                "PPISP (exposure / color / vignetting / tone curve)",
+            );
+        });
+        if enabled {
+            tc.bilateral_grid = appearance_mode == 1;
+            tc.ppisp = appearance_mode == 2;
+        }
+        if tc.bilateral_grid {
+            slider(
+                ui,
+                &mut tc.bilagrid_tv_weight,
+                0.0..=50.0,
+                "TV regularizer weight",
+                false,
+                enabled,
+            );
+            slider(
+                ui,
+                &mut tc.bilagrid_lr,
+                1e-4..=1e-2,
+                "Grid learning rate",
+                true,
+                enabled,
+            );
+        }
+        if tc.ppisp {
+            slider(
+                ui,
+                &mut tc.ppisp_lr,
+                1e-4..=1e-2,
+                "PPISP learning rate",
+                true,
+                enabled,
+            );
+            slider(
+                ui,
+                &mut tc.ppisp_reg_scale,
+                0.0..=5.0,
+                "Regularization scale",
+                false,
+                enabled,
+            );
+        }
     });
 
     {
@@ -324,6 +390,13 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
                 .prefix("1 out of ")
                 .suffix(" frames"),
         );
+        ui.add_enabled(
+            enabled,
+            egui::Checkbox::new(
+                &mut args.load_config.train_on_eval,
+                "Keep eval views in training (apply learned appearance at eval)",
+            ),
+        );
     }
 
     let mut subsample_frames = args.load_config.subsample_frames.is_some();
@@ -387,6 +460,14 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
             args.load_config.alpha_mode = Some(alpha_mode);
         }
     }
+
+    ui.add_enabled(
+        enabled,
+        egui::Checkbox::new(
+            &mut args.load_config.estimate_metric_scale,
+            "Estimate metric scale",
+        ),
+    );
 
     ui.add_space(16.0);
 
@@ -561,9 +642,12 @@ impl SettingsPopup {
                             {
                                 let args_path = save_dir.join("args.txt");
                                 let config: &TrainStreamConfig = &self.args;
-                                let args = brush_process::args_file::config_to_args(config);
+                                let result = std::fs::write(
+                                    &args_path,
+                                    brush_process::args_file::config_to_string(config),
+                                );
 
-                                match std::fs::write(&args_path, args.join(" ")) {
+                                match result {
                                     Ok(()) => {
                                         self.save_status = Some((
                                             format!("Saved to {}", args_path.display()),

@@ -1,4 +1,4 @@
-use super::{DatasetLoadResult, FormatError, find_mask_path, opengl_c2w_to_pose};
+use super::{DatasetFileIndex, DatasetLoadResult, FormatError, opengl_c2w_to_pose};
 use crate::{
     Dataset,
     config::LoadDatasetConfig,
@@ -14,6 +14,7 @@ use brush_render::kernels::camera_model::kannala_brandt_4::KannalaBrandt4Params;
 use brush_render::kernels::camera_model::radial_tangential_8::RadialTangential8Params;
 use brush_serde::load_splat_from_ply;
 use brush_vfs::BrushVfs;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
@@ -141,6 +142,7 @@ async fn read_transforms_file(
     scene: JsonScene,
     transforms_path: &Path,
     vfs: Arc<BrushVfs>,
+    file_index: &DatasetFileIndex,
     load_args: &LoadDatasetConfig,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<SceneView>, FormatError> {
@@ -165,25 +167,16 @@ async fn read_transforms_file(
         let transform = glam::Mat4::from_cols_slice(&transform_matrix).transpose();
         let (translation, rotation) = opengl_c2w_to_pose(transform);
 
-        let mut path = transforms_path
-            .parent()
-            .expect("Transforms path must be a filename")
-            .join(&frame.file_path);
-
-        // Check if path exists.
-        if vfs.reader_at_path(&path).await.is_err() {
+        let Some(path) = resolve_frame_image_path(&vfs, transforms_path, &frame.file_path).await
+        else {
             warnings.push(format!(
                 "Skipped '{}': image file not found",
                 frame.file_path
             ));
             continue;
-        }
+        };
 
-        // Assume png's by default if no extension is specified.
-        if path.extension().is_none() {
-            path = path.with_extension("png");
-        }
-        let mask_path = find_mask_path(&vfs, &path).map(|p| p.to_path_buf());
+        let mask_path = file_index.find_mask_path(&path).map(Path::to_path_buf);
         let image = LoadImage::new(
             vfs.clone(),
             path,
@@ -260,10 +253,34 @@ async fn read_transforms_file(
             continue;
         }
 
-        let view = SceneView { image, camera };
+        let view = SceneView {
+            image,
+            camera,
+            features: None,
+            depth: None,
+        };
         results.push(view);
     }
     Ok(results)
+}
+
+async fn resolve_frame_image_path(
+    vfs: &BrushVfs,
+    transforms_path: &Path,
+    frame_path: &str,
+) -> Option<std::path::PathBuf> {
+    let mut path = transforms_path
+        .parent()
+        .expect("Transforms path must be a filename")
+        .join(frame_path);
+
+    // Nerfstudio commonly omits the extension and stores a PNG on disk.
+    // Resolve that convention before checking whether the image exists.
+    if path.extension().is_none() {
+        path.set_extension("png");
+    }
+
+    vfs.reader_at_path(&path).await.ok().map(|_| path)
 }
 
 pub async fn read_dataset(
@@ -301,10 +318,12 @@ async fn read_dataset_inner(
         .read_to_string(&mut buf)
         .await?;
     let train_scene: JsonScene = serde_json::from_str(&buf)?;
+    let file_index = DatasetFileIndex::new(&vfs);
     let train_handles = read_transforms_file(
         train_scene.clone(),
         &transforms_path,
         vfs.clone(),
+        &file_index,
         load_args,
         &mut warnings,
     )
@@ -332,6 +351,7 @@ async fn read_dataset_inner(
                 val_scene,
                 eval_trans_path,
                 vfs.clone(),
+                &file_index,
                 load_args,
                 &mut warnings,
             )
@@ -347,6 +367,9 @@ async fn read_dataset_inner(
         if let Some(eval_period) = load_args.eval_split_every {
             // Include extra eval images only when the dataset doesn't have them.
             if i % eval_period == 0 && val_views.is_none() {
+                if load_args.train_on_eval {
+                    train_views.push(view.clone());
+                }
                 eval_views.push(view);
             } else {
                 train_views.push(view);
@@ -357,6 +380,18 @@ async fn read_dataset_inner(
     }
 
     if let Some(val_views) = val_views {
+        if load_args.train_on_eval {
+            let mut train_paths: HashSet<_> = train_views
+                .iter()
+                .map(|view| view.image.path().to_path_buf())
+                .collect();
+            train_views.extend(
+                val_views
+                    .iter()
+                    .filter(|view| train_paths.insert(view.image.path().to_path_buf()))
+                    .cloned(),
+            );
+        }
         eval_views.extend(val_views);
     }
 
@@ -384,4 +419,21 @@ async fn read_dataset_inner(
         dataset,
         warnings,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn resolves_extensionless_frame_to_png_before_lookup() {
+        let vfs = BrushVfs::create_test_vfs(vec![PathBuf::from("images/frame_001.png")]);
+
+        assert_eq!(
+            resolve_frame_image_path(&vfs, Path::new("transforms.json"), "images/frame_001").await,
+            Some(PathBuf::from("images/frame_001.png"))
+        );
+    }
 }

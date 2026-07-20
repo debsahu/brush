@@ -142,20 +142,18 @@ pub fn bounds_from_pos(percentile: f32, means: &[f32]) -> BoundingBox {
         return BoundingBox::from_min_max(Vec3::splat(-1.0), Vec3::splat(1.0));
     }
 
-    x_vals.sort_by(|a, b| a.total_cmp(b));
-    y_vals.sort_by(|a, b| a.total_cmp(b));
-    z_vals.sort_by(|a, b| a.total_cmp(b));
-
-    let pick = |vals: &[f32]| -> (f32, f32) {
+    let pick = |vals: &mut [f32]| -> (f32, f32) {
         let n = vals.len();
         let lo = ((1.0 - percentile) / 2.0 * n as f32) as usize;
         let hi = (n - 1).min(((1.0 + percentile) / 2.0 * n as f32) as usize);
-        (vals[lo], vals[hi])
+        let lo_value = *vals.select_nth_unstable_by(lo, |a, b| a.total_cmp(b)).1;
+        let hi_value = *vals.select_nth_unstable_by(hi, |a, b| a.total_cmp(b)).1;
+        (lo_value, hi_value)
     };
 
-    let (xmin, xmax) = pick(&x_vals);
-    let (ymin, ymax) = pick(&y_vals);
-    let (zmin, zmax) = pick(&z_vals);
+    let (xmin, xmax) = pick(&mut x_vals);
+    let (ymin, ymax) = pick(&mut y_vals);
+    let (zmin, zmax) = pick(&mut z_vals);
     BoundingBox::from_min_max(Vec3::new(xmin, ymin, zmin), Vec3::new(xmax, ymax, zmax))
 }
 
@@ -244,6 +242,34 @@ pub fn to_init_splats(data: SplatData, mode: SplatRenderMode, device: &Device) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{SeedableRng, rngs::StdRng};
+
+    fn bounds_from_pos_sorted_reference(percentile: f32, means: &[f32]) -> BoundingBox {
+        let (mut x_vals, mut y_vals, mut z_vals): (Vec<f32>, Vec<f32>, Vec<f32>) = means
+            .chunks_exact(3)
+            .map(|chunk| (chunk[0], chunk[1], chunk[2]))
+            .collect();
+        x_vals.retain(|x| x.is_finite());
+        y_vals.retain(|y| y.is_finite());
+        z_vals.retain(|z| z.is_finite());
+        if x_vals.is_empty() || y_vals.is_empty() || z_vals.is_empty() {
+            return BoundingBox::from_min_max(Vec3::splat(-1.0), Vec3::splat(1.0));
+        }
+        x_vals.sort_by(f32::total_cmp);
+        y_vals.sort_by(f32::total_cmp);
+        z_vals.sort_by(f32::total_cmp);
+
+        let pick = |vals: &[f32]| {
+            let n = vals.len();
+            let lo = ((1.0 - percentile) / 2.0 * n as f32) as usize;
+            let hi = (n - 1).min(((1.0 + percentile) / 2.0 * n as f32) as usize);
+            (vals[lo], vals[hi])
+        };
+        let (xmin, xmax) = pick(&x_vals);
+        let (ymin, ymax) = pick(&y_vals);
+        let (zmin, zmax) = pick(&z_vals);
+        BoundingBox::from_min_max(Vec3::new(xmin, ymin, zmin), Vec3::new(xmax, ymax, zmax))
+    }
 
     #[test]
     fn bounds_from_pos_all_nan_does_not_panic() {
@@ -291,5 +317,32 @@ mod tests {
         // reasonable.
         assert!(bb.center.is_finite());
         assert!(bb.extent.is_finite());
+    }
+
+    #[test]
+    fn bounds_nth_selection_matches_full_sort() {
+        let mut rng = StdRng::seed_from_u64(0xB0_0D_5E_1E_C7);
+
+        for len in 1..128 {
+            for percentile in [0.0, 0.1, 0.5, 0.8, 0.99, 1.0] {
+                let mut means = Vec::with_capacity(len * 3);
+                for i in 0..len {
+                    let mut point = [
+                        rng.random_range(-100.0..100.0),
+                        rng.random_range(-100.0..100.0),
+                        rng.random_range(-100.0..100.0),
+                    ];
+                    if i % 17 == 0 {
+                        point[i % 3] = f32::NAN;
+                    }
+                    means.extend_from_slice(&point);
+                }
+
+                let actual = bounds_from_pos(percentile, &means);
+                let expected = bounds_from_pos_sorted_reference(percentile, &means);
+                assert_eq!(actual.center, expected.center, "len={len}, p={percentile}");
+                assert_eq!(actual.extent, expected.extent, "len={len}, p={percentile}");
+            }
+        }
     }
 }

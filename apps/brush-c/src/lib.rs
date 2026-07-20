@@ -87,7 +87,7 @@ static SETUP: OnceCell<()> = OnceCell::const_new();
 ///
 /// * `dataset_path` - A pointer to a null-terminated C string representing the path to the dataset.
 /// * `options` - A pointer to a `TrainOptions` struct.
-/// * `progress_callback` - A callback function that will be invoked with progress updates.
+/// * `progress_callback` - An optional callback invoked with progress updates.
 /// * `user_data` - An opaque pointer passed to the `progress_callback`.
 ///
 /// # Safety
@@ -102,14 +102,15 @@ static SETUP: OnceCell<()> = OnceCell::const_new();
 ///   points to must be valid for reading for the duration of this call. It's `output_path` must
 ///   be a valid, null-terminated C string if not null.
 ///
-/// - The `user_data` pointer is passed to `progress_callback` but is not dereferenced by this
-///   function. If it is not null, the caller must ensure it points to memory that remains
-///   valid for the entire duration of this function call, as the callback may dereference it.
+/// - When `progress_callback` is present, the `user_data` pointer is passed to it but is not
+///   dereferenced by this function. If it is not null, the caller must ensure it points to memory
+///   that remains valid for the entire duration of this function call, as the callback may
+///   dereference it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn train_and_save(
     dataset_path: *const c_char,
     options: *const TrainOptions,
-    progress_callback: ProgressCallback,
+    progress_callback: Option<ProgressCallback>,
     user_data: *mut c_void,
 ) -> TrainExitCode {
     if dataset_path.is_null() || options.is_null() {
@@ -145,7 +146,9 @@ pub unsafe extern "C" fn train_and_save(
                 while let Some(message_result) = process.stream.next().await {
                     match message_result {
                         Ok(message) => {
-                            if let Ok(progress_message) = message.try_into() {
+                            if let (Some(progress_callback), Ok(progress_message)) =
+                                (progress_callback, message.try_into())
+                            {
                                 progress_callback(progress_message, user_data);
                             }
                         }

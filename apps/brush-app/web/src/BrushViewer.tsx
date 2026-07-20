@@ -54,10 +54,10 @@ export default function BrushViewer(props: BrushViewerProps) {
   }, [app, props.url]);
 
   useEffect(() => {
-    if (app && props.fullsplat) {
+    if (app) {
       app.set_ui_mode(props.fullsplat ? UiMode.FullScreenSplat : UiMode.Default);
     }
-  }, [app, props.url, props.fullsplat]);
+  }, [app, props.fullsplat]);
 
   useEffect(() => {
     if (app) {

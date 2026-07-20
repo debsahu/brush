@@ -235,8 +235,17 @@ pub async fn pick_file() -> Result<crate::PickedFile<impl AsyncRead + Unpin>, Pi
             }
         }) as Box<dyn FnMut(_)>)
     };
+    let oncancel = {
+        let sender = sender.clone();
+        Closure::wrap(Box::new(move |_: Event| {
+            if let Some(sender) = sender.borrow_mut().take() {
+                let _ = sender.send(None);
+            }
+        }) as Box<dyn FnMut(_)>)
+    };
 
     input.set_onchange(Some(onchange.as_ref().unchecked_ref()));
+    input.set_oncancel(Some(oncancel.as_ref().unchecked_ref()));
     input.click();
 
     let files = receiver

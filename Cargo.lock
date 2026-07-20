@@ -887,6 +887,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "brush-appearance"
+version = "0.3.0"
+dependencies = [
+ "brush-cube",
+ "brush-render",
+ "burn",
+ "burn-cubecl",
+ "burn-fusion",
+ "burn-ir",
+ "getrandom 0.4.2",
+ "tokio",
+ "wasm-bindgen-test",
+]
+
+[[package]]
 name = "brush-async"
 version = "0.3.0"
 dependencies = [
@@ -905,14 +920,18 @@ dependencies = [
  "brush-async",
  "brush-cube",
  "brush-dataset",
+ "brush-process",
  "brush-render",
  "brush-render-bwd",
  "brush-rerun",
+ "brush-serde",
  "brush-train",
+ "brush-vfs",
  "burn",
  "burn-cubecl",
  "burn-wgpu",
  "bytemuck",
+ "clap",
  "console_error_panic_hook",
  "divan",
  "env_logger",
@@ -923,6 +942,7 @@ dependencies = [
  "rand 0.10.1",
  "rerun",
  "safetensors 0.7.0",
+ "serde_json",
  "tokio",
  "wasm-bindgen-test",
  "wasm-logger",
@@ -993,6 +1013,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tiff",
  "tokio",
  "tracing",
  "wasm-bindgen-test",
@@ -1034,6 +1055,7 @@ dependencies = [
  "getrandom 0.4.2",
  "glam",
  "tokio",
+ "tracing",
  "wasm-bindgen-test",
 ]
 
@@ -1103,6 +1125,7 @@ dependencies = [
  "glam",
  "log",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "wasm-bindgen-test",
@@ -1195,6 +1218,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "ball-tree",
+ "brush-appearance",
  "brush-cube",
  "brush-dataset",
  "brush-loss",
@@ -1203,6 +1227,9 @@ dependencies = [
  "brush-serde",
  "burn",
  "burn-cubecl",
+ "burn-fusion",
+ "burn-ir",
+ "burn-wgpu",
  "clap",
  "getrandom 0.4.2",
  "glam",
@@ -2381,9 +2408,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2760,6 +2787,7 @@ dependencies = [
  "cfg_aliases",
  "cubecl-common",
  "cubecl-core",
+ "cubecl-cpp",
  "cubecl-ir",
  "cubecl-runtime",
  "derive-new",

@@ -31,6 +31,8 @@ pub fn project_forward_kernel(
     u: ProjectUniforms,
     #[comptime] mip_splatting: bool,
     #[comptime] camera_model: CameraModel,
+    #[comptime] tile_width: u32,
+    #[comptime] tile_height: u32,
 ) {
     let global_gid = ABSOLUTE_POS as u32;
     if global_gid >= u.total_splats {
@@ -110,8 +112,25 @@ pub fn project_forward_kernel(
         terminate!();
     }
 
-    let bb = get_tile_bbox(mean2d_x, mean2d_y, ex, ey, u.tile_bw, u.tile_bh);
-    let num_tiles_hit = count_contributing_tiles(bb, mean2d_x, mean2d_y, conic, power_threshold);
+    let bb = get_tile_bbox(
+        mean2d_x,
+        mean2d_y,
+        ex,
+        ey,
+        u.tile_bw,
+        u.tile_bh,
+        tile_width,
+        tile_height,
+    );
+    let num_tiles_hit = count_contributing_tiles(
+        bb,
+        mean2d_x,
+        mean2d_y,
+        conic,
+        power_threshold,
+        tile_width,
+        tile_height,
+    );
 
     intersect_counts[global_gid as usize] = num_tiles_hit;
     Atomic::fetch_add(&num_intersections[0], num_tiles_hit);

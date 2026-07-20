@@ -8,6 +8,11 @@ license.workspace = true
 
 [features]
 debug-validation = ["brush-train/debug-validation"]
+native-msl = [
+    "brush-render/native-msl",
+    "brush-render-bwd/native-msl",
+    "brush-train/native-msl",
+]
 
 [dependencies]
 brush-render.path = "../brush-render"
@@ -35,7 +40,7 @@ serde_json.workspace = true
 
 wgpu.workspace = true
 
-tokio = { workspace = true, features = ["io-util", "rt"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync"] }
 tokio-stream.workspace = true
 brush-async.path = "../brush-async"
 

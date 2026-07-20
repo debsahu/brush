@@ -8,8 +8,11 @@ use super::{DatasetLoadResult, FormatError};
 use crate::{
     Dataset,
     config::LoadDatasetConfig,
-    formats::{find_image_by_name, find_mask_path, split_eval_every},
-    scene::{LoadImage, SceneView},
+    formats::{
+        DatasetFileIndex, find_depth_path, find_features_path, find_image_by_name,
+        find_points3d_path, split_eval_every,
+    },
+    scene::{LoadDepth, LoadFeatures, LoadImage, SceneView},
 };
 use brush_render::kernels::camera_model::CameraModel;
 use brush_render::kernels::camera_model::CameraModel::{
@@ -140,11 +143,13 @@ async fn load_dataset_inner(
         .parent()
         .expect("colmap cameras file must have a parent")
         .to_path_buf();
+    let points_dir_ = points_dir.clone();
 
     // One actor for both halves of the colmap load — the camera/image
     // parse and the points3d parse run concurrently on the same thread
     // (no cross-stream GPU concerns; this is pure CPU/I/O).
     let actor = brush_async::Actor::new("colmap-loader");
+    let features_dir_name = load_args.features_dir_name.clone();
     let dataset = actor.run(move || async move {
         let mut cam_file = vfs.reader_at_path(&cam_path).await?;
         let cam_model_data = colmap_reader::read_cameras(&mut cam_file, is_binary).await?;
@@ -153,14 +158,30 @@ async fn load_dataset_inner(
             .map(|cam| (cam.id, cam))
             .collect::<HashMap<_, _>>();
         let mut img_file = vfs.reader_at_path(&img_path).await?;
-        let img_infos = colmap_reader::read_images(&mut img_file, is_binary, false).await?;
+        let img_infos =
+            colmap_reader::read_images(&mut img_file, is_binary, load_args.estimate_metric_scale)
+                .await?;
         let mut img_info_list = img_infos.into_iter().collect::<Vec<_>>();
         img_info_list.sort_by(|img_a, img_b| img_a.name.cmp(&img_b.name));
 
         log::info!("Loading {} images for colmap dataset", img_info_list.len());
 
+        // COLMAP is reconstructed up to an unknown global scale.
+        // If metric depth maps are present, recover that scale so poses + points line
+        // up with the depth.
+        let metric_scale = if load_args.estimate_metric_scale {
+            let scale = estimate_metric_scale(&vfs, &img_info_list, &cam_model_data, &points_dir_)
+                .await
+                .expect("estimate metric scale failed");
+            log::info!("Rescaling colmap reconstruction to metric depth (scale = {scale})");
+            Some(scale)
+        } else {
+            None
+        };
+
         let mut views = Vec::new();
         let mut warnings = Vec::new();
+        let file_index = DatasetFileIndex::new(&vfs);
 
         for img_info in img_info_list
             .iter()
@@ -186,16 +207,23 @@ async fn load_dataset_inner(
             let center_uv =
                 center / glam::vec2(colmap_camera.width as f32, colmap_camera.height as f32);
 
-            let Some(path) = find_image_by_name(&vfs, &img_info.name) else {
+            let Some(path) = file_index.find_image_by_name(&img_info.name) else {
                 warnings.push(format!("Skipped '{}': image file not found", img_info.name));
                 continue;
             };
 
-            let mask_path = find_mask_path(&vfs, path);
+            let mask_path = file_index.find_mask_path(path);
+
+            let features = find_features_path(&vfs, path, &features_dir_name)
+                .map(|p| LoadFeatures::new(vfs.clone(), p.to_path_buf()));
+            let depth =
+                find_depth_path(&vfs, path).map(|p| LoadDepth::new(vfs.clone(), p.to_path_buf()));
 
             // Convert w2c to c2w.
-            let world_to_cam =
-                glam::Affine3A::from_rotation_translation(img_info.quat, img_info.tvec);
+            let world_to_cam = glam::Affine3A::from_rotation_translation(
+                img_info.quat,
+                img_info.tvec * metric_scale.unwrap_or(1.0),
+            );
             let cam_to_world = world_to_cam.inverse();
             let (_, quat, translation) = cam_to_world.to_scale_rotation_translation();
 
@@ -217,25 +245,28 @@ async fn load_dataset_inner(
                 load_args.alpha_mode,
             );
 
-            views.push(SceneView { camera, image });
+            views.push(SceneView {
+                camera,
+                image,
+                features,
+                depth,
+            });
         }
 
-        let (train_views, eval_views) = split_eval_every(views, load_args.eval_split_every);
+        let (train_views, eval_views) =
+            split_eval_every(views, load_args.eval_split_every, load_args.train_on_eval);
 
-        Result::<_, FormatError>::Ok((Dataset::from_views(train_views, eval_views), warnings))
+        Result::<_, FormatError>::Ok((
+            Dataset::from_views(train_views, eval_views),
+            warnings,
+            metric_scale,
+        ))
     });
 
     let load_args = load_args.clone();
 
     let init = actor.run(move || async move {
-        let points_path = vfs_init
-            .files_ending_in("points3d.txt")
-            .chain(vfs_init.files_ending_in("points3d.bin"))
-            .find(|p| p.parent() == Some(points_dir.as_path()))?;
-        let is_binary = matches!(
-            points_path.extension().and_then(|p| p.to_str()),
-            Some("bin")
-        );
+        let (points_path, is_binary) = find_points3d_path(&vfs_init, &points_dir)?;
         // At this point the VFS has said this file exists so just unwrap.
         let mut points_file = vfs_init
             .reader_at_path(points_path)
@@ -292,7 +323,13 @@ async fn load_dataset_inner(
 
     // Wait for both halves.
     let (dataset, init) = tokio::join!(dataset, init);
-    let ((dataset, warnings), init_splat) = (dataset?, init);
+    let ((dataset, warnings, metric_scale), mut init_splat) = (dataset?, init);
+
+    if let (Some(scale), Some(splat)) = (metric_scale, init_splat.as_mut()) {
+        for m in &mut splat.data.means {
+            *m *= scale;
+        }
+    }
 
     Ok(DatasetLoadResult {
         init_splat,
@@ -380,4 +417,84 @@ fn build_camera_model(colmap_camera: &ColmapCamera) -> CameraModel {
             Pinhole
         }
     }
+}
+
+/// Estimate the global scale that maps the COLMAP reconstruction into
+/// the metric frame of the depth maps.
+async fn estimate_metric_scale(
+    vfs: &Arc<BrushVfs>,
+    images: &[colmap_reader::Image],
+    cameras: &HashMap<i32, ColmapCamera>,
+    points_dir: &Path,
+) -> Option<f32> {
+    let any_depth = images.iter().any(|img| {
+        find_image_by_name(vfs, &img.name)
+            .and_then(|p| super::find_depth_path(vfs, p))
+            .is_some()
+    });
+    if !any_depth {
+        return None;
+    }
+
+    let (points_path, is_binary) = find_points3d_path(vfs, points_dir)?;
+    let mut points_file = vfs.reader_at_path(points_path).await.ok()?;
+    let points = colmap_reader::read_points3d(&mut points_file, is_binary, false)
+        .await
+        .ok()?;
+    let point_map: HashMap<i64, glam::Vec3> = points.iter().map(|p| (p.id, p.xyz)).collect();
+
+    let mut accumulated_colmap_depth = 0.0;
+    let mut accumulated_dataset_depth = 0.0;
+
+    for img in images {
+        let Some(point_data) = &img.points else {
+            continue;
+        };
+        let Some(image_path) = find_image_by_name(vfs, &img.name) else {
+            continue;
+        };
+        let Some(depth_path) = find_depth_path(vfs, image_path) else {
+            continue;
+        };
+        let Some(cam) = cameras.get(&img.camera_id) else {
+            continue;
+        };
+
+        let height = cam.height as usize;
+        let width = cam.width as usize;
+
+        let depth_loader = LoadDepth::new(vfs.clone(), depth_path.to_path_buf());
+        let Ok(depth) = depth_loader.load_vec(height, width).await else {
+            continue;
+        };
+
+        for (xy, &pid) in point_data.xys.iter().zip(point_data.point3d_ids.iter()) {
+            if pid < 0 {
+                continue;
+            }
+            let Some(&xyz) = point_map.get(&pid) else {
+                continue;
+            };
+            let colmap_depth = (img.quat * xyz + img.tvec).z;
+
+            let u = xy.x as i32;
+            let v = xy.y as i32;
+
+            if u < 0 || v < 0 || u as usize >= width || v as usize >= height {
+                continue;
+            }
+
+            let expected_depth = depth[v as usize * width + u as usize];
+            if expected_depth <= 0.0 || colmap_depth <= 0.0 {
+                continue;
+            }
+            accumulated_colmap_depth += colmap_depth;
+            accumulated_dataset_depth += expected_depth;
+        }
+    }
+
+    let scale = accumulated_dataset_depth / accumulated_colmap_depth;
+
+    log::info!("Estimated metric scale {scale}");
+    Some(scale)
 }

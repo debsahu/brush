@@ -126,7 +126,10 @@ fn generate_test_batch(resolution: (u32, u32)) -> SceneBatch {
         img_packed,
         has_alpha: false,
         alpha_mode: AlphaMode::Transparent,
+        features: None,
+        depth: None,
         camera,
+        view_index: 0,
     }
 }
 
@@ -252,7 +255,10 @@ async fn train_with_zero_visible_does_not_crash() {
         img_packed: TensorData::new(vec![pixel; 64 * 64], [64usize, 64]),
         has_alpha: false,
         alpha_mode: AlphaMode::Transparent,
+        features: None,
+        depth: None,
         camera,
+        view_index: 0,
     };
 
     let config = TrainConfig::default();
@@ -261,9 +267,46 @@ async fn train_with_zero_visible_does_not_crash() {
         &device,
         BoundingBox::from_min_max(Vec3::splat(-2.0), Vec3::splat(2.0)),
     );
-    let (new_splats, _stats) = trainer.step(batch, splats).await;
+    let (new_splats, _stats) = trainer.step_with_refine_weight(batch, splats, false).await;
     // Should succeed; nothing visible means num_visible ≈ 0.
     assert!(new_splats.num_splats() > 0);
+}
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn refinement_weight_stops_at_growth_boundary() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let config = TrainConfig {
+        total_train_iters: 100,
+        growth_stop_iter: 40,
+        ..TrainConfig::default()
+    };
+    let trainer = SplatTrainer::new(
+        &config,
+        &device,
+        BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
+    );
+
+    assert!(trainer.refinement_weight_needed(39));
+    assert!(!trainer.refinement_weight_needed(40));
+    assert!(!trainer.refinement_weight_needed(100));
+
+    // Growth is clamped to base-training length. A fresh LOD or resumed
+    // trainer therefore stays on the aux-only path even though its local
+    // step counter starts from zero.
+    let lod_config = TrainConfig {
+        total_train_iters: 100,
+        growth_stop_iter: 200,
+        ..TrainConfig::default()
+    };
+    let lod_trainer = SplatTrainer::new(
+        &lod_config,
+        &device,
+        BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
+    );
+    assert!(lod_trainer.refinement_weight_needed(99));
+    assert!(!lod_trainer.refinement_weight_needed(100));
+    assert!(!lod_trainer.refinement_weight_needed(150));
 }
 
 // Training with a deliberately degenerate bounding box (NaN center) used to

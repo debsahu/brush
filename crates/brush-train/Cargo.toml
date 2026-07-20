@@ -7,9 +7,17 @@ license.workspace = true
 
 [features]
 debug-validation = ["brush-render-bwd/debug-validation"]
+native-msl = [
+    "brush-loss/native-msl",
+    "brush-render/native-msl",
+    "brush-render-bwd/native-msl",
+    "burn-wgpu/metal",
+]
 
 [dependencies]
 brush-render.path = "../brush-render"
+brush-appearance.path = "../brush-appearance"
+brush-cube.path = "../brush-cube"
 brush-dataset.path = "../brush-dataset"
 brush-render-bwd.path = "../brush-render-bwd"
 brush-loss.path = "../brush-loss"
@@ -31,6 +39,9 @@ rayon.workspace = true
 tokio = { workspace = true, features = ["io-util", "rt"] }
 burn = { workspace = true, features = ["autodiff"] }
 burn-cubecl.workspace = true
+burn-fusion.workspace = true
+burn-ir.workspace = true
+burn-wgpu.workspace = true
 
 [dev-dependencies]
 brush-cube = { path = "../brush-cube" }

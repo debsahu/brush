@@ -7,8 +7,8 @@ use camera::Camera;
 use clap::ValueEnum;
 use glam::Vec3;
 
-use crate::gaussian_splats::SplatRenderMode;
-pub use crate::gaussian_splats::{Splats, TextureMode, render_splats};
+use crate::gaussian_splats::{RasterPass, RasterizationMode, Rasterizer, SplatRenderMode};
+pub use crate::gaussian_splats::{Splats, TextureMode, render_splats, render_splats_depth};
 pub use crate::render_aux::{RenderAux, RenderAuxInner, RenderOutput};
 
 pub mod burn_glue;
@@ -18,6 +18,13 @@ pub mod dim_check;
 pub mod kernels;
 pub mod render_aux;
 pub mod shaders;
+
+#[doc(hidden)]
+pub mod native_msl;
+
+#[cfg(feature = "raster-census")]
+#[doc(hidden)]
+pub mod raster_census;
 
 pub mod sh;
 
@@ -30,6 +37,7 @@ pub mod gaussian_splats;
 #[doc(hidden)]
 pub mod get_tile_offset;
 pub mod render;
+pub mod render_features;
 pub mod validation;
 
 /// `DispatchTensorKind` variant for the active wgpu backend. burn-dispatch
@@ -73,8 +81,29 @@ pub trait SplatOps: Backend {
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
         render_mode: SplatRenderMode,
+        rasterization_mode: RasterizationMode,
+        background: Vec3,
+        pass: RasterPass,
+    ) -> impl Future<Output = RenderOutput<Self>>;
+}
+
+/// Internal extension used to exercise alternate rasterizer layouts without
+/// changing the stable [`SplatOps`] API.
+#[doc(hidden)]
+#[burn::backend::backend_extension(Wgpu)]
+pub trait SplatRasterizerOps: SplatOps {
+    #[allow(clippy::too_many_arguments)]
+    fn render_with_rasterizer(
+        camera: &Camera,
+        img_size: glam::UVec2,
+        transforms: FloatTensor<Self>,
+        sh_coeffs: FloatTensor<Self>,
+        raw_opacities: FloatTensor<Self>,
+        render_mode: SplatRenderMode,
+        rasterization_mode: RasterizationMode,
         background: Vec3,
         pass: gaussian_splats::RasterPass,
+        rasterizer: Rasterizer,
     ) -> impl Future<Output = RenderOutput<Self>>;
 }
 

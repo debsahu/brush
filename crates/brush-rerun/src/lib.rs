@@ -11,7 +11,15 @@ pub mod visualize_tools;
 #[serde(rename_all = "kebab-case")]
 pub struct RerunConfig {
     /// Whether to enable rerun.io logging for this run.
-    #[arg(long, help_heading = "Rerun options", default_value = "false")]
+    #[arg(
+        long,
+        help_heading = "Rerun options",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = false
+    )]
     pub rerun_enabled: bool,
     /// How often to log basic training statistics.
     #[arg(

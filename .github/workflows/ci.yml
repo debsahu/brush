@@ -84,6 +84,9 @@ jobs:
       - name: check wasm32 (browser crates)
         run: cargo check --locked -p brush-app -p brush-js --lib --target wasm32-unknown-unknown
 
+      - name: check wasm32 (native MSL feature falls back to WGSL)
+        run: cargo check --locked -p brush-app --lib --target wasm32-unknown-unknown --features native-msl
+
   # ---------------------------------------------------------------------------
 
   cargo-deny:
@@ -112,7 +115,7 @@ jobs:
 
   tests:
     name: Run tests
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
@@ -130,8 +133,40 @@ jobs:
           cache-workspace-crates: true
           cache-on-failure: true
 
-      - name: Run tests
+      - name: Run tests (default WGSL codegen)
+        run: cargo test --all
+
+      - name: Run tests (all features, native MSL optimization preset)
+        env:
+          BRUSH_NATIVE_MSL_PRESET: "1"
         run: cargo test --all --all-features
+
+      # This separate package build intentionally omits `--all-features`:
+      # debug-validation keeps sparse SH gradients on the dense fallback.
+      - name: Run native MSL production preset smoke
+        env:
+          BRUSH_NATIVE_MSL_PRESET: "1"
+          CUBECL_DEBUG_OPTION: profile-medium
+          CUBECL_DEBUG_LOG: ${{ runner.temp }}/native-msl-profile.log
+        run: |
+          test "$(uname -m)" = arm64
+          cargo test --locked -p brush-c --features native-msl \
+            test_train_and_save_ffi_short -- --nocapture
+          grep -q 'saved_partials: Some(' "$CUBECL_DEBUG_LOG"
+          grep -q 'SparseShAdamKernel' "$CUBECL_DEBUG_LOG"
+          awk '
+            /\[START_KERNEL_COMPILATION\]/ {
+              block = 1; raster = 0; unchecked = 0; fine_tiles = 0
+            }
+            block && /RasterizeBackwardsKernel/ { raster = 1 }
+            block && /mode: Unchecked/ { unchecked = 1 }
+            block && /tile_height: 8,/ { fine_tiles = 1 }
+            /\[END_KERNEL_COMPILATION\]/ {
+              if (raster && unchecked && fine_tiles) found = 1
+              block = 0
+            }
+            END { exit found ? 0 : 1 }
+          ' "$CUBECL_DEBUG_LOG"
 
       - name: Run doc-tests
         run: cargo test --all --all-features --doc

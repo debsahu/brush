@@ -16,6 +16,11 @@ pub async fn decimate_to_count(mut splats: Splats, scores: &[f32], target_count:
         return splats;
     }
 
+    // The floor is camera-derived auxiliary state. Drop it without rewriting
+    // the canonical scale/opacity parameters; the caller attaches a freshly
+    // computed floor for the target LOD camera scale after selecting rows.
+    splats.min_scale = None;
+
     let mut indexed: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -140,4 +145,50 @@ pub async fn compute_pup_scores(
         .iter()
         .map(log_det_6x6)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brush_render::gaussian_splats::SplatRenderMode;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn decimation_clears_old_floor_without_accumulating_it() {
+        let device: Device = brush_cube::test_helpers::test_device().await.into();
+        let splats = Splats::from_raw(
+            vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            vec![0.0; 9],
+            vec![0.0; 9],
+            vec![0.0; 3],
+            SplatRenderMode::Mip,
+            &device,
+        )
+        .with_min_scale(Tensor::<1>::from_floats([0.1, 0.2, 0.3], &device));
+
+        let decimated = decimate_to_count(splats, &[0.1, 0.9, 0.8], 2).await;
+        assert_eq!(decimated.num_splats(), 2);
+        assert!(
+            decimated.min_scale.is_none(),
+            "decimation must not retain the old-N floor"
+        );
+
+        let refreshed = decimated.with_min_scale(Tensor::<1>::from_floats([0.4, 0.5], &device));
+        let scales: Vec<f32> = refreshed
+            .scales()
+            .into_data_async()
+            .await
+            .expect("scale readback")
+            .to_vec()
+            .expect("f32 scales");
+        // The selected raw scales are still exactly 1.0. Only the new floor is
+        // applied; the old 0.2/0.3 values must not be baked underneath it.
+        let expected = [(1.0 + 0.4f32.powi(2)).sqrt(), (1.0 + 0.5f32.powi(2)).sqrt()];
+        for (row, expected) in scales.chunks_exact(3).zip(expected) {
+            for actual in row {
+                assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+            }
+        }
+    }
 }

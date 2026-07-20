@@ -4,17 +4,39 @@ use crate::kernels::camera_model::kannala_brandt_4::KannalaBrandt4Params;
 use crate::kernels::camera_model::radial_tangential_8::RadialTangential8Params;
 use crate::kernels::camera_model::thin_prism_fisheye::ThinPrismFisheyeParams;
 use crate::{
-    TextureMode,
+    RenderOutput, SplatRasterizerOps, TextureMode,
     camera::Camera,
-    gaussian_splats::{SplatRenderMode, Splats, render_splats},
+    gaussian_splats::{RasterPass, Rasterizer, SplatRenderMode, Splats, render_splats},
 };
 use assert_approx_eq::assert_approx_eq;
+use brush_cube::{MainBackendBase, create_tensor_from_slice};
+use burn::backend::{TensorMetadata, ops::FloatTensorOps};
+use burn::tensor::{DType, Shape};
 use burn::tensor::{Distribution, Tensor};
 use glam::Vec3;
 use wasm_bindgen_test::wasm_bindgen_test;
 
+mod raster_oracle;
+
 #[cfg(target_family = "wasm")]
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn shader_compiler_matches_native_msl_feature() {
+    use burn_cubecl::cubecl::Runtime;
+    use burn_wgpu::{AutoCompiler, WgpuRuntime};
+
+    let device = brush_cube::test_helpers::test_device().await;
+    let client = WgpuRuntime::<AutoCompiler>::client(&device);
+    let expected = if cfg!(feature = "native-msl") {
+        "wgpu<msl>"
+    } else {
+        "wgpu<wgsl>"
+    };
+
+    assert_eq!(WgpuRuntime::<AutoCompiler>::name(&client), expected);
+}
 
 #[wasm_bindgen_test(unsupported = tokio::test)]
 async fn renders_at_all() {
@@ -618,11 +640,37 @@ async fn render_panics_loudly_on_nan_positions() {
     let _ = render_splats(splats, &cam, img_size, Vec3::ZERO, None, TextureMode::Float).await;
 }
 
-// Zero-splat Splats must not crash and must render every pixel as the
-// background color. Reading pixels back forces fusion to flush, which is
-// what catches bugs in the empty-tensor code paths.
+async fn render_empty_primitives(
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    pass: RasterPass,
+) -> RenderOutput<MainBackendBase> {
+    let device = brush_cube::test_helpers::test_device().await;
+    let empty = || create_tensor_from_slice::<f32>(&[], &device, DType::F32);
+    let transforms = MainBackendBase::float_reshape(empty(), Shape::new([0, 10]));
+    let sh_coeffs = MainBackendBase::float_reshape(empty(), Shape::new([0, 1, 3]));
+    let raw_opacities = MainBackendBase::float_reshape(empty(), Shape::new([0]));
+
+    <MainBackendBase as SplatRasterizerOps>::render_with_rasterizer(
+        camera,
+        img_size,
+        transforms,
+        sh_coeffs,
+        raw_opacities,
+        SplatRenderMode::Default,
+        crate::gaussian_splats::RasterizationMode::Rgba,
+        background,
+        pass,
+        Rasterizer::Legacy,
+    )
+    .await
+}
+
+// Zero-splat inputs must not crash and must render every pixel as the
+// background color. The primitive entry point avoids Burn's unrelated empty
+// `Tensor::cat` limitation and exercises the renderer's exact GPU contract.
 #[wasm_bindgen_test(unsupported = tokio::test)]
-#[ignore = "Needs CubeCL patch for 0 sized dispatch."]
 async fn zero_splats_renders_background() {
     let cam = Camera::new(
         glam::vec3(0.0, 0.0, -3.0),
@@ -633,22 +681,18 @@ async fn zero_splats_renders_background() {
         CameraModel::Pinhole,
     );
     let img_size = glam::uvec2(32, 32);
-    let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
-
-    let splats = Splats::from_tensor_data(
-        Tensor::<2>::zeros([0, 3], &device),
-        Tensor::<2>::zeros([0, 4], &device),
-        Tensor::<2>::zeros([0, 3], &device),
-        Tensor::<3>::zeros([0, 1, 3], &device),
-        Tensor::<1>::zeros([0], &device),
-        SplatRenderMode::Default,
-    );
-    assert_eq!(splats.num_splats(), 0);
-
     let bg = glam::vec3(0.7, 0.3, 0.1);
-    let (output, _aux) = render_splats(splats, &cam, img_size, bg, None, TextureMode::Float).await;
-    let pixels = output
-        .to_data_async()
+    let output = render_empty_primitives(&cam, img_size, bg, RasterPass::Backward).await;
+    assert_eq!(
+        output.out_img.shape().dims::<3>(),
+        [img_size.y as usize, img_size.x as usize, 4]
+    );
+    assert_eq!(output.aux.num_visible, 0);
+    assert_eq!(output.aux.num_intersections, 0);
+    assert_eq!(output.aux.visible.shape().dims::<1>(), [0]);
+    assert_eq!(output.aux.max_radius.shape().dims::<1>(), [0]);
+    assert_eq!(output.aux.tile_offsets.shape().dims::<3>(), [2, 2, 2]);
+    let pixels = MainBackendBase::float_into_data(output.out_img)
         .await
         .expect("readback")
         .to_vec::<f32>()
@@ -668,6 +712,47 @@ async fn zero_splats_renders_background() {
             bg.z,
         );
     }
+}
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn zero_splats_renders_packed_background() {
+    let cam = Camera::new(
+        glam::vec3(0.0, 0.0, -3.0),
+        glam::Quat::IDENTITY,
+        0.5,
+        0.5,
+        glam::vec2(0.5, 0.5),
+        CameraModel::Pinhole,
+    );
+    let img_size = glam::uvec2(32, 32);
+    let bg = glam::vec3(0.7, 0.3, 0.1);
+
+    let output = render_empty_primitives(&cam, img_size, bg, RasterPass::Forward).await;
+
+    assert_eq!(
+        output.out_img.shape().dims::<3>(),
+        [img_size.y as usize, img_size.x as usize, 1]
+    );
+    assert_eq!(output.aux.num_visible, 0);
+    assert_eq!(output.aux.num_intersections, 0);
+    // Packed mode retains the established one-element dummy visible buffer.
+    assert_eq!(output.aux.visible.shape().dims::<1>(), [1]);
+    assert_eq!(output.aux.max_radius.shape().dims::<1>(), [0]);
+    assert_eq!(output.aux.tile_offsets.shape().dims::<3>(), [2, 2, 2]);
+
+    let pixels = MainBackendBase::float_into_data(output.out_img)
+        .await
+        .expect("readback")
+        .to_vec::<f32>()
+        .expect("data vec");
+    let expected = ((bg.x * 255.0).clamp(0.0, 255.0) as u32)
+        | (((bg.y * 255.0).clamp(0.0, 255.0) as u32) << 8)
+        | (((bg.z * 255.0).clamp(0.0, 255.0) as u32) << 16);
+    assert_eq!(pixels.len(), (img_size.x * img_size.y) as usize);
+    assert!(
+        pixels.iter().all(|pixel| pixel.to_bits() == expected),
+        "packed background differs from {expected:#010x}",
+    );
 }
 
 // Zero-length quats must be culled by PF, adding them to a scene must

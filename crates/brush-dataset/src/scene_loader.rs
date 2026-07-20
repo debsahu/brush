@@ -9,6 +9,8 @@ use crate::{
     scene::{Scene, SceneBatch, sample_to_packed_data, view_to_sample_image},
 };
 
+const PREFETCH_BATCHES: usize = 4;
+
 /// Shared cache of GPU-ready scene batches. Each slot holds at most one
 /// batch; once the running total passes `budget_bytes`, new batches bypass
 /// the cache and just get re-decoded + re-packed on every visit.
@@ -63,44 +65,37 @@ pub struct SceneLoader {
 
 impl SceneLoader {
     pub fn new(scene: &Scene, seed: u64, config: &LoadDatasetConfig) -> Self {
-        // Prefetch buffer: at most 4 batches ahead of the trainer.
-        // Two tasks per actor share this buffer so one task's I/O can
-        // overlap with the other's decode + GPU upload.
-        let (tx, rx) = mpsc::channel(4);
+        // Producers reserve a channel slot before decoding, so queued and
+        // in-flight work together stay within this prefetch target.
+        let (tx, rx) = mpsc::channel(PREFETCH_BATCHES);
 
-        // Fan out only as many loaders as we have real parallelism.
-        // Wasm shares one JS event loop, so extra actors just add
-        // contention without overlapping I/O.
-        let n_actors = if cfg!(target_family = "wasm") {
-            1
-        } else {
-            std::thread::available_parallelism().map_or(8, |p| p.get())
-        };
-        const TASKS_PER_ACTOR: usize = 2;
+        // Use up to one actor thread per producer so synchronous image decode
+        // can actually run in parallel. When fewer CPU threads are available,
+        // multiple async producers share each actor and still overlap I/O.
+        let available_parallelism =
+            std::thread::available_parallelism().map_or(1, |parallelism| parallelism.get());
+        let n_actors = loader_actor_count(available_parallelism, cfg!(target_family = "wasm"));
 
         let views = scene.views.clone();
         let cache = Arc::new(Mutex::new(BatchCache::new(
             views.len(),
             config.max_scene_batch_cache_size,
         )));
+        let load_locks = Arc::new((0..views.len()).map(|_| Mutex::new(())).collect::<Vec<_>>());
 
-        let mut task_idx: u64 = 0;
         let actors: Vec<Actor> = (0..n_actors)
-            .map(|i| {
-                let actor = Actor::new(&format!("dataloader-{i}"));
-                for _ in 0..TASKS_PER_ACTOR {
-                    let views = views.clone();
-                    let cache = cache.clone();
-                    let tx = tx.clone();
-                    let task_seed = seed.wrapping_add(task_idx);
-                    task_idx += 1;
-                    actor
-                        .run(move || run_loader(views, cache, tx, task_seed))
-                        .detach();
-                }
-                actor
-            })
+            .map(|i| Actor::new(&format!("dataloader-{i}")))
             .collect();
+        for producer_idx in 0..PREFETCH_BATCHES {
+            let views = views.clone();
+            let cache = cache.clone();
+            let load_locks = load_locks.clone();
+            let tx = tx.clone();
+            let task_seed = seed.wrapping_add(producer_idx as u64);
+            actors[producer_idx % n_actors]
+                .run(move || run_loader(views, cache, load_locks, tx, task_seed))
+                .detach();
+        }
 
         Self {
             rx,
@@ -116,9 +111,18 @@ impl SceneLoader {
     }
 }
 
+fn loader_actor_count(available_parallelism: usize, is_wasm: bool) -> usize {
+    if is_wasm {
+        1
+    } else {
+        available_parallelism.clamp(1, PREFETCH_BATCHES)
+    }
+}
+
 async fn run_loader(
     views: Arc<Vec<crate::scene::SceneView>>,
     cache: Arc<Mutex<BatchCache>>,
+    load_locks: Arc<Vec<Mutex<()>>>,
     tx: mpsc::Sender<SceneBatch>,
     seed: u64,
 ) {
@@ -126,6 +130,10 @@ async fn run_loader(
     let mut shuffled: Vec<usize> = Vec::new();
 
     loop {
+        let Ok(permit) = tx.reserve().await else {
+            break;
+        };
+
         if shuffled.is_empty() {
             shuffled = (0..views.len()).collect();
             shuffled.shuffle(&mut rng);
@@ -136,28 +144,79 @@ async fn run_loader(
         let batch = if let Some(batch) = cache.lock().await.get(index) {
             batch
         } else {
-            let raw = view
-                .image
-                .load()
-                .await
-                .expect("Scene loader failed to load an image");
-            let sample = view_to_sample_image(raw, view.image.alpha_mode());
-            let (img_packed, has_alpha) = sample_to_packed_data(sample);
-            let batch = Arc::new(SceneBatch {
-                img_packed,
-                has_alpha,
-                alpha_mode: view.image.alpha_mode(),
-                camera: view.camera,
-            });
-            cache.lock().await.insert(index, batch.clone());
-            batch
+            // A shuffled producer may pick the same uncached view. Serialize
+            // only that view's miss and recheck the cache after waiting.
+            let _load_guard = load_locks[index].lock().await;
+            if let Some(batch) = cache.lock().await.get(index) {
+                batch
+            } else {
+                let raw = view
+                    .image
+                    .load()
+                    .await
+                    .expect("Scene loader failed to load an image");
+                let sample = view_to_sample_image(raw, view.image.alpha_mode());
+                let (img_packed, has_alpha) = sample_to_packed_data(sample);
+
+                let features = if let Some(load_features) = &view.features {
+                    Some(
+                        load_features
+                            .load()
+                            .await
+                            .expect("Scene loader failed to load a feature map"),
+                    )
+                } else {
+                    None
+                };
+
+                let depth = if let Some(load_depth) = &view.depth {
+                    let [h, w] = [img_packed.shape[0], img_packed.shape[1]];
+                    Some(
+                        load_depth
+                            .load(h, w)
+                            .await
+                            .expect("Scene loader failed to load a depth map"),
+                    )
+                } else {
+                    None
+                };
+
+                let batch = Arc::new(SceneBatch {
+                    img_packed,
+                    has_alpha,
+                    alpha_mode: view.image.alpha_mode(),
+                    features,
+                    depth,
+                    camera: view.camera,
+                    view_index: index,
+                });
+                cache.lock().await.insert(index, batch.clone());
+                batch
+            }
         };
 
         // The channel takes an owned batch; clone the packed buffer out of
         // the shared cache entry.
-        if tx.send(batch.as_ref().clone()).await.is_err() {
-            break;
-        }
+        permit.send(batch.as_ref().clone());
         brush_async::yield_now().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn loader_producers_are_bounded_by_prefetch_capacity() {
+        assert_eq!(loader_actor_count(1, false), 1);
+        assert_eq!(loader_actor_count(2, false), 2);
+        assert_eq!(loader_actor_count(128, false), 4);
+        assert_eq!(loader_actor_count(128, true), 1);
+
+        assert!(
+            loader_actor_count(128, false) <= PREFETCH_BATCHES,
+            "loader actors exceeded prefetch capacity"
+        );
     }
 }

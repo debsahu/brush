@@ -21,6 +21,7 @@ assert_approx_eq.workspace = true
 glam.workspace = true
 clap.workspace = true
 serde.workspace = true
+serde_json = { workspace = true, optional = true }
 tracing.workspace = true
 log.workspace = true
 bytemuck.workspace = true
@@ -29,12 +30,12 @@ tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 
 [features]
 debug-validation = []
+native-msl = ["burn-wgpu/metal"]
+raster-census = ["dep:serde_json"]
 
-# Force the WebGPU backend on every platform. We previously used Vulkan
-# on Linux/Windows and Metal on macOS, but both produced random crashes
-# (see #423 / #395 — buffer-destroyed validation errors, ARM/AMD instability).
-# WebGPU runs through wgpu's WGSL frontend everywhere so we avoid the
-# per-backend cubecl codegen divergence.
+# CubeCL emits WGSL by default on every platform. The native-msl feature opts
+# the macOS Metal backend into CubeCL's MSL compiler; other backends still use
+# WGSL.
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 

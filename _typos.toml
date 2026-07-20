@@ -2,3 +2,5 @@
 lod = "lod"
 Lod = "Lod"
 ba = "ba"
+# Short for "n delta" in the appearance kernels/tests.
+nd = "nd"

@@ -14,6 +14,7 @@ use wgpu::{Adapter, Device, Queue};
 
 use std::future::Future;
 use std::pin::{Pin, pin};
+use std::sync::LazyLock;
 
 use anyhow::Error;
 use async_fn_stream::{TryStreamEmitter, try_fn_stream};
@@ -73,19 +74,62 @@ pub struct RunningProcess {
 /// machine, so this is just the channel for `emit(msg).await`.
 pub(crate) type Emitter = TryStreamEmitter<ProcessMessage, Error>;
 
-use tokio::sync::SetOnce;
+use tokio::sync::watch;
 
-static DEVICE: SetOnce<WgpuDevice> = SetOnce::const_new();
+// Keep the most recently registered device. Hosts can initialize Brush before
+// they own a WebGPU device and then replace that setup with an existing device;
+// future processes must use the replacement rather than the first device seen.
+static DEVICE: LazyLock<watch::Sender<Option<WgpuDevice>>> =
+    LazyLock::new(|| watch::channel(None).0);
 
 pub(crate) fn connect_device(device: WgpuDevice) {
-    // Idempotent: a JS host can call `init()` and `init_existing()`, or a
-    // dev-mode double-mount can re-run setup. Re-registering the same device
-    // is fine; we only care that *some* device wins the race.
-    let _ = DEVICE.set(device);
+    DEVICE.send_replace(Some(device));
 }
 
-pub async fn wait_for_device() -> &'static WgpuDevice {
-    DEVICE.wait().await
+pub async fn wait_for_device() -> WgpuDevice {
+    let mut receiver = DEVICE.subscribe();
+    loop {
+        if let Some(device) = receiver.borrow_and_update().clone() {
+            return device;
+        }
+        receiver
+            .changed()
+            .await
+            .expect("device registry must remain available");
+    }
+}
+
+fn is_training_source(vfs: &brush_vfs::BrushVfs, ply_count: usize) -> bool {
+    if ply_count == 0 {
+        return true;
+    }
+
+    // A PLY-only archive remains a viewer source even when it contains
+    // ancillary files such as a README. Supported training datasets have both
+    // source images and a recognizable camera-metadata file.
+    const IMAGE_EXTENSIONS: &[&str] = &[
+        "avif", "bmp", "exr", "gif", "jpeg", "jpg", "png", "pnm", "qoi", "tga", "tif", "tiff",
+        "webp",
+    ];
+    let has_images = vfs.iter_files().any(|path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                IMAGE_EXTENSIONS
+                    .iter()
+                    .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+            })
+    });
+    let has_metadata = vfs.iter_files().any(|path| {
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        extension.is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("json") || extension.eq_ignore_ascii_case("csv")
+        }) || path.file_name().is_some_and(|name| {
+            name.eq_ignore_ascii_case("cameras.bin") || name.eq_ignore_ascii_case("cameras.txt")
+        })
+    });
+
+    has_images && has_metadata
 }
 
 /// Create a running process from a datasource and args.
@@ -141,7 +185,7 @@ async fn run_process<
         ply_count
     );
 
-    let is_training = vfs_counts != ply_count;
+    let is_training = is_training_source(&vfs, ply_count);
 
     // Emit source info - just the display name
     let paths: Vec<_> = vfs.file_paths().collect();
@@ -178,9 +222,9 @@ async fn run_process<
     if !is_training {
         let wgpu_device = wait_for_device().await;
         let device: burn::tensor::Device = wgpu_device.clone().into();
-        let mut paths: Vec<_> = vfs.file_paths().collect();
+        let mut paths: Vec<_> = vfs.files_with_extension("ply").collect();
         alphanumeric_sort::sort_path_slice(&mut paths);
-        let client = WgpuRuntime::<AutoCompiler>::client(wgpu_device);
+        let client = WgpuRuntime::<AutoCompiler>::client(&wgpu_device);
         let total_frames = paths.len() as u32;
 
         for (frame, path) in paths.iter().enumerate() {
@@ -238,4 +282,33 @@ async fn run_process<
     };
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_training_source;
+    use brush_vfs::BrushVfs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn ancillary_files_do_not_turn_ply_animations_into_datasets() {
+        let vfs = BrushVfs::create_test_vfs(vec![
+            PathBuf::from("000.ply"),
+            PathBuf::from("001.ply"),
+            PathBuf::from("README.txt"),
+        ]);
+        assert!(!is_training_source(&vfs, 2));
+    }
+
+    #[test]
+    fn ply_initialization_with_dataset_metadata_still_trains() {
+        for paths in [
+            vec!["init.ply", "transforms.json", "images/0001.png"],
+            vec!["init.ply", "cameras.bin", "images/0001.jpg"],
+            vec!["init.ply", "cameras.csv", "images/0001.tif"],
+        ] {
+            let vfs = BrushVfs::create_test_vfs(paths.into_iter().map(PathBuf::from).collect());
+            assert!(is_training_source(&vfs, 1));
+        }
+    }
 }

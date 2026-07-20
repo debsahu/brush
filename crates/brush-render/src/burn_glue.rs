@@ -17,9 +17,13 @@ use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorI
 use burn_wgpu::WgpuRuntime;
 use glam::Vec3;
 
+use crate::gaussian_splats::RasterizationMode;
 use crate::{
-    RenderAuxInner, SplatOps, camera::Camera, gaussian_splats::SplatRenderMode,
-    render_aux::RenderOutput, wgpu_kind,
+    RenderAuxInner, SplatOps, SplatRasterizerOps,
+    camera::Camera,
+    gaussian_splats::{Rasterizer, SplatRenderMode},
+    render_aux::RenderOutput,
+    wgpu_kind,
 };
 
 /// Inner Wgpu autodiff backend (same as `Autodiff<burn::backend::Wgpu>`).
@@ -141,6 +145,14 @@ pub fn detach_autodiff<const D: usize>(t: Tensor<D>) -> Tensor<D> {
         DispatchTensorKind::Autodiff(inner) => *inner,
         other => other,
     };
+    // Hand-rolled render/backward bridges store the concrete autodiff tensor
+    // inside the Wgpu backend variant. Strip that layer too; merely removing
+    // Dispatch's outer bridge leaves `BackendTensor::Autodiff` behind and a
+    // subsequent inner custom op panics when it requests a float primitive.
+    let kind = match kind {
+        wgpu_kind!(BackendTensor::Autodiff(t)) => wgpu_kind!(BackendTensor::Float(t.primitive)),
+        other => other,
+    };
     Tensor::from_dispatch(DispatchTensor {
         kind,
         checkpointing: None,
@@ -219,8 +231,38 @@ impl SplatOps for Fusion<MainBackendBase> {
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
         render_mode: SplatRenderMode,
+        raster_mode: RasterizationMode,
         background: Vec3,
         pass: crate::gaussian_splats::RasterPass,
+    ) -> RenderOutput<Self> {
+        <Self as SplatRasterizerOps>::render_with_rasterizer(
+            camera,
+            img_size,
+            transforms,
+            sh_coeffs,
+            raw_opacities,
+            render_mode,
+            raster_mode,
+            background,
+            pass,
+            Rasterizer::Legacy,
+        )
+        .await
+    }
+}
+
+impl SplatRasterizerOps for Fusion<MainBackendBase> {
+    async fn render_with_rasterizer(
+        camera: &Camera,
+        img_size: glam::UVec2,
+        transforms: FloatTensor<Self>,
+        sh_coeffs: FloatTensor<Self>,
+        raw_opacities: FloatTensor<Self>,
+        render_mode: SplatRenderMode,
+        raster_mode: RasterizationMode,
+        background: Vec3,
+        pass: crate::gaussian_splats::RasterPass,
+        rasterizer: Rasterizer,
     ) -> RenderOutput<Self> {
         let client = transforms.client.clone();
 
@@ -237,15 +279,17 @@ impl SplatOps for Fusion<MainBackendBase> {
             .resolve_tensor_float::<MainBackendBase>(raw_opacities);
 
         // Run the full pipeline on MainBackendBase.
-        let out = MainBackendBase::render(
+        let out = <MainBackendBase as SplatRasterizerOps>::render_with_rasterizer(
             camera,
             img_size,
             base_transforms,
             base_sh_coeffs,
             base_raw_opac,
             render_mode,
+            raster_mode,
             background,
             pass,
+            rasterizer,
         )
         .await;
 

@@ -1,9 +1,9 @@
 use crate::camera::calculate_jacobian_clamp_limits;
 use crate::{
-    RenderAuxInner, SplatOps,
+    RenderAuxInner, SplatOps, SplatRasterizerOps,
     camera::Camera,
     dim_check::DimCheck,
-    gaussian_splats::{RasterPass, SplatRenderMode},
+    gaussian_splats::{RasterPass, Rasterizer, SplatRenderMode},
     get_tile_offset::{CHECKS_PER_ITER, get_tile_offsets},
     kernels,
     render_aux::RenderOutput,
@@ -28,9 +28,21 @@ use std::f32::consts::PI;
 
 #[doc(hidden)]
 pub fn calc_tile_bounds(img_size: glam::UVec2) -> glam::UVec2 {
+    calc_tile_bounds_for_dims(
+        img_size,
+        shaders::helpers::TILE_WIDTH,
+        shaders::helpers::TILE_WIDTH,
+    )
+}
+
+fn calc_tile_bounds_for_dims(
+    img_size: glam::UVec2,
+    tile_width: u32,
+    tile_height: u32,
+) -> glam::UVec2 {
     uvec2(
-        img_size.x.div_ceil(shaders::helpers::TILE_WIDTH),
-        img_size.y.div_ceil(shaders::helpers::TILE_WIDTH),
+        img_size.x.div_ceil(tile_width),
+        img_size.y.div_ceil(tile_height),
     )
 }
 
@@ -43,8 +55,39 @@ impl SplatOps for MainBackendBase {
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
         render_mode: SplatRenderMode,
+        raster_mode: crate::gaussian_splats::RasterizationMode,
         background: Vec3,
         pass: RasterPass,
+    ) -> RenderOutput<Self> {
+        <Self as SplatRasterizerOps>::render_with_rasterizer(
+            camera,
+            img_size,
+            transforms,
+            sh_coeffs,
+            raw_opacities,
+            render_mode,
+            raster_mode,
+            background,
+            pass,
+            Rasterizer::Legacy,
+        )
+        .await
+    }
+}
+
+impl SplatRasterizerOps for MainBackendBase {
+    #[allow(clippy::too_many_arguments)]
+    async fn render_with_rasterizer(
+        camera: &Camera,
+        img_size: glam::UVec2,
+        transforms: FloatTensor<Self>,
+        sh_coeffs: FloatTensor<Self>,
+        raw_opacities: FloatTensor<Self>,
+        render_mode: SplatRenderMode,
+        raster_mode: crate::gaussian_splats::RasterizationMode,
+        background: Vec3,
+        pass: RasterPass,
+        rasterizer: Rasterizer,
     ) -> RenderOutput<Self> {
         assert!(
             img_size[0] > 0 && img_size[1] > 0,
@@ -52,6 +95,10 @@ impl SplatOps for MainBackendBase {
         );
         let bwd_info = pass.bwd_info();
         let smooth_cutoff = pass.smooth_cutoff();
+        let tile_width = rasterizer.tile_width();
+        let tile_height = rasterizer.tile_height();
+        let tile_size = rasterizer.tile_size();
+        let render_depth = raster_mode.render_depth() && bwd_info;
 
         let transforms = into_contiguous(transforms);
         let sh_coeffs = into_contiguous(sh_coeffs);
@@ -77,7 +124,7 @@ impl SplatOps for MainBackendBase {
             pinhole_params,
             camera_position: [camera.position.x, camera.position.y, camera.position.z, 0.0],
             img_size: img_size.into(),
-            tile_bounds: calc_tile_bounds(img_size).into(),
+            tile_bounds: calc_tile_bounds_for_dims(img_size, tile_width, tile_height).into(),
             sh_degree,
             total_splats,
             num_visible: 0, // num_visible — not yet known.
@@ -90,6 +137,120 @@ impl SplatOps for MainBackendBase {
 
         let device = transforms.device.clone();
         let client = transforms.client.clone();
+
+        // No projection buffer can be sliced or dispatched for an empty
+        // scene. Rasterizing zero tile ranges still gives both output modes
+        // their normal contracts: RGBA f32 for backward-enabled renders and
+        // packed RGBA8 bits for forward-only renders.
+        if total_splats == 0 {
+            let tile_bounds: glam::UVec2 = project_uniforms.tile_bounds.into();
+            let num_tiles = tile_bounds.x * tile_bounds.y;
+            let tile_offsets = Self::int_zeros(
+                [tile_bounds.y as usize, tile_bounds.x as usize, 2].into(),
+                &device,
+                IntDType::U32,
+            );
+            let projected_splats = Self::float_zeros(
+                [1, kernels::helpers::PROJECTED_LANES_USIZE].into(),
+                &device,
+                FloatDType::F32,
+            );
+            let compact_gid_from_isect = Self::int_zeros([1].into(), &device, IntDType::U32);
+            let global_from_compact_gid = Self::int_zeros([1].into(), &device, IntDType::U32);
+
+            // Reuse the already-resolved empty input allocation for true
+            // zero-length aux tensors. Calling `float_zeros([0])` would itself
+            // attempt a zero-sized fill dispatch on some CubeCL backends.
+            let max_radius = Self::float_reshape(transforms.clone(), [0].into());
+            let visible = if bwd_info {
+                Self::float_reshape(transforms.clone(), [0].into())
+            } else {
+                Self::float_zeros([1].into(), &device, FloatDType::F32)
+            };
+
+            let out_dim = if bwd_info {
+                if render_depth { 5 } else { 4 }
+            } else {
+                1
+            };
+            let out_img = create_tensor(
+                [img_size.y as usize, img_size.x as usize, out_dim],
+                &device,
+                DType::F32,
+            );
+            let (out_packed_arg, out_f32_arg) = if bwd_info {
+                (create_tensor([1], &device, DType::U32), out_img.clone())
+            } else {
+                (out_img.clone(), create_tensor([1], &device, DType::F32))
+            };
+
+            tracing::trace_span!("RasterizeEmpty").in_scope(|| {
+                let uniforms = RasterizeUniformsLaunch::new(
+                    project_uniforms.tile_bounds[0],
+                    project_uniforms.img_size[0],
+                    project_uniforms.img_size[1],
+                    background.x,
+                    background.y,
+                    background.z,
+                );
+                kernels::rasterize::rasterize_kernel::launch::<WgpuRuntime>(
+                    &client,
+                    calc_cube_count_1d(num_tiles * tile_size, tile_size),
+                    CubeDim::new_1d(tile_size),
+                    compact_gid_from_isect.clone().into_tensor_arg(),
+                    tile_offsets.clone().into_tensor_arg(),
+                    projected_splats.clone().into_tensor_arg(),
+                    out_packed_arg.into_tensor_arg(),
+                    out_f32_arg.into_tensor_arg(),
+                    global_from_compact_gid.clone().into_tensor_arg(),
+                    visible.clone().into_tensor_arg(),
+                    uniforms,
+                    bwd_info,
+                    smooth_cutoff,
+                    tile_width,
+                    tile_height,
+                    render_depth,
+                );
+            });
+
+            #[cfg(feature = "raster-census")]
+            if bwd_info && let Some(request) = crate::raster_census::take_request() {
+                let offsets = vec![0; num_tiles as usize * 2];
+                let report =
+                    crate::raster_census::analyze(&crate::raster_census::RasterCensusInput {
+                        request,
+                        img_size,
+                        tile_bounds,
+                        tile_width,
+                        tile_height,
+                        num_visible: 0,
+                        num_intersections: 0,
+                        smooth_cutoff,
+                        pre_offsets: &offsets,
+                        post_offsets: &offsets,
+                        compact_gid_from_isect: &[],
+                        projected_splats: &[],
+                    })
+                    .expect("empty raster census analysis failed");
+                crate::raster_census::emit(&report);
+            }
+
+            return RenderOutput {
+                out_img,
+                aux: RenderAuxInner {
+                    num_visible: 0,
+                    num_intersections: 0,
+                    visible,
+                    max_radius,
+                    tile_offsets,
+                    img_size,
+                },
+                projected_splats,
+                compact_gid_from_isect,
+                project_uniforms,
+                global_from_compact_gid,
+            };
+        }
 
         let (
             global_from_presort_gid,
@@ -131,6 +292,8 @@ impl SplatOps for MainBackendBase {
                 uniforms,
                 mip_splat,
                 camera.camera_model,
+                tile_width,
+                tile_height,
             );
             (
                 global_from_presort_gid,
@@ -222,6 +385,8 @@ impl SplatOps for MainBackendBase {
                 project_uniforms.tile_bounds[0],
                 project_uniforms.tile_bounds[1],
                 num_visible,
+                tile_width,
+                tile_height,
             );
         });
         let bits = u32::BITS - num_tiles.leading_zeros();
@@ -244,7 +409,34 @@ impl SplatOps for MainBackendBase {
                 tile_offsets.clone().into_tensor_arg(),
             );
         });
-        let out_dim = if bwd_info { 4 } else { 1 };
+        #[cfg(feature = "raster-census")]
+        let raster_census_capture = if bwd_info {
+            if let Some(request) = crate::raster_census::take_request() {
+                let tp = TransactionPrimitive::<Self>::new(
+                    vec![],
+                    vec![],
+                    vec![tile_offsets.clone()],
+                    vec![],
+                );
+                let data = <Self as TransactionOps<Self>>::tr_execute(tp)
+                    .await
+                    .expect("failed to read pre-raster tile offsets for raster census");
+                let pre_offsets = data.read_ints[0]
+                    .clone()
+                    .into_vec::<u32>()
+                    .expect("raster census tile offsets must be u32");
+                Some((request, pre_offsets))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let out_dim = if bwd_info {
+            if render_depth { 5 } else { 4 }
+        } else {
+            1
+        };
         let out_img = create_tensor(
             [img_size.y as usize, img_size.x as usize, out_dim],
             &device,
@@ -275,11 +467,8 @@ impl SplatOps for MainBackendBase {
             );
             kernels::rasterize::rasterize_kernel::launch::<WgpuRuntime>(
                 &client,
-                calc_cube_count_1d(
-                    num_tiles * (shaders::helpers::TILE_WIDTH * shaders::helpers::TILE_WIDTH),
-                    shaders::helpers::TILE_WIDTH * shaders::helpers::TILE_WIDTH,
-                ),
-                CubeDim::new_1d(shaders::helpers::TILE_SIZE),
+                calc_cube_count_1d(num_tiles * tile_size, tile_size),
+                CubeDim::new_1d(tile_size),
                 compact_gid_from_isect.clone().into_tensor_arg(),
                 tile_offsets.clone().into_tensor_arg(),
                 projected_splats.clone().into_tensor_arg(),
@@ -290,8 +479,51 @@ impl SplatOps for MainBackendBase {
                 uniforms,
                 bwd_info,
                 smooth_cutoff,
+                tile_width,
+                tile_height,
+                render_depth,
             );
         });
+        #[cfg(feature = "raster-census")]
+        if let Some((request, pre_offsets)) = raster_census_capture {
+            let tp = TransactionPrimitive::<Self>::new(
+                vec![projected_splats.clone()],
+                vec![],
+                vec![compact_gid_from_isect.clone(), tile_offsets.clone()],
+                vec![],
+            );
+            let data = <Self as TransactionOps<Self>>::tr_execute(tp)
+                .await
+                .expect("failed to read raster census inputs");
+            let projected_splats_host = data.read_floats[0]
+                .clone()
+                .into_vec::<f32>()
+                .expect("raster census projected splats must be f32");
+            let compact_gid_from_isect_host = data.read_ints[0]
+                .clone()
+                .into_vec::<u32>()
+                .expect("raster census compact IDs must be u32");
+            let post_offsets = data.read_ints[1]
+                .clone()
+                .into_vec::<u32>()
+                .expect("raster census tile offsets must be u32");
+            let report = crate::raster_census::analyze(&crate::raster_census::RasterCensusInput {
+                request,
+                img_size,
+                tile_bounds,
+                tile_width,
+                tile_height,
+                num_visible,
+                num_intersections,
+                smooth_cutoff,
+                pre_offsets: &pre_offsets,
+                post_offsets: &post_offsets,
+                compact_gid_from_isect: &compact_gid_from_isect_host,
+                projected_splats: &projected_splats_host,
+            })
+            .expect("raster census analysis failed");
+            crate::raster_census::emit(&report);
+        }
         RenderOutput {
             out_img,
             aux: RenderAuxInner {
