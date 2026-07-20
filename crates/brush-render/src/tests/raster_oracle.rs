@@ -9,6 +9,7 @@ use crate::{
     camera::Camera,
     gaussian_splats::{RasterPass, Rasterizer, SplatRenderMode},
     kernels::camera_model::CameraModel,
+    kernels::helpers::PROJECTED_LANES_USIZE as PROJECTED_LANES,
 };
 use brush_cube::{MainBackendBase, Runtime};
 use burn::{
@@ -19,7 +20,13 @@ use burn_wgpu::{CubeTensor, WgpuDevice, WgpuRuntime};
 use glam::{UVec2, Vec3};
 use wasm_bindgen_test::wasm_bindgen_test;
 
-const PROJECTED_LANES: usize = 9;
+// PROJECTED_LANES is imported from kernels::helpers (currently 10: xy_x,
+// xy_y, conic_x, conic_y, conic_z, color_a, color_r, color_g, color_b,
+// depth) rather than redeclared here. A stale local copy of this constant
+// previously desynced from the real per-splat stride, which silently
+// misaligned every splat after the first when `chunks_exact`/`truncate`
+// walked the readback buffer -- producing wildly wrong composited colors
+// that looked like a rendering bug but was purely a test-side bug.
 const ALPHA_CUTOFF_MID: f32 = 1.0 / 255.0;
 const ALPHA_CUTOFF_BAND: f32 = 1.0e-3;
 
@@ -101,7 +108,12 @@ fn assert_close(label: &str, actual: &[f32], expected: &[f32], tolerance: f32) {
 
 #[test]
 fn oracle_composites_one_splat_and_clamps_negative_color() {
-    let projected = [0.5, 0.5, 1.0, 0.0, 1.0, 0.5, 1.0, 0.5, -1.0];
+    // Lanes: xy_x, xy_y, conic_x, conic_y, conic_z, color_a, color_r,
+    // color_g, color_b, depth. `depth` is unused by `rasterize_reference`
+    // (the caller is responsible for supplying pre-sorted splats), but the
+    // slot must still be present so `chunks_exact(PROJECTED_LANES)` lines up
+    // with the real per-splat stride.
+    let projected = [0.5, 0.5, 1.0, 0.0, 1.0, 0.5, 1.0, 0.5, -1.0, 0.0];
     let image = rasterize_reference(&projected, UVec2::ONE, Vec3::new(0.2, 0.4, 0.6), false);
     assert_close("one splat", &image, &[0.6, 0.45, 0.3, 0.5], 1.0e-6);
 }
@@ -109,8 +121,8 @@ fn oracle_composites_one_splat_and_clamps_negative_color() {
 #[test]
 fn oracle_does_not_accumulate_the_early_out_splat() {
     let projected = [
-        0.5, 0.5, 1.0, 0.0, 1.0, 0.999, 1.0, 0.0, 0.0, // red
-        0.5, 0.5, 1.0, 0.0, 1.0, 0.999, 0.0, 1.0, 0.0, // green
+        0.5, 0.5, 1.0, 0.0, 1.0, 0.999, 1.0, 0.0, 0.0, 0.0, // red
+        0.5, 0.5, 1.0, 0.0, 1.0, 0.999, 0.0, 1.0, 0.0, 0.0, // green
     ];
     let image = rasterize_reference(&projected, UVec2::ONE, Vec3::ZERO, false);
     assert_close("early out", &image, &[0.999, 0.0, 0.0, 0.999], 1.0e-6);
@@ -118,7 +130,18 @@ fn oracle_does_not_accumulate_the_early_out_splat() {
 
 #[test]
 fn oracle_matches_hard_and_smooth_cutoff_definitions() {
-    let projected = [0.5, 0.5, 1.0, 0.0, 1.0, ALPHA_CUTOFF_MID, 1.0, 0.0, 0.0];
+    let projected = [
+        0.5,
+        0.5,
+        1.0,
+        0.0,
+        1.0,
+        ALPHA_CUTOFF_MID,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+    ];
     let hard = rasterize_reference(&projected, UVec2::ONE, Vec3::ZERO, false);
     let smooth = rasterize_reference(&projected, UVec2::ONE, Vec3::ZERO, true);
     assert_close(
