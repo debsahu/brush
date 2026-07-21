@@ -337,6 +337,21 @@ pub(crate) async fn train_stream(
     let process_config = &train_stream_config.process_config;
 
     log::info!("Start training loop.");
+
+    // Env-gated JSONL metrics writer. When `BRUSH_METRICS_LOG` points at a
+    // file, append one JSON line every `BRUSH_METRICS_EVERY` iters (default 50),
+    // plus the first and last iter, so a running train is pollable via
+    // `tail -f`. Reading the loss scalar forces a GPU readback, so it only
+    // happens on the iters we actually log. When the env var is unset this is a
+    // single `Option` check per iter, so default behaviour is byte-identical.
+    let metrics_log_path = std::env::var_os("BRUSH_METRICS_LOG").map(PathBuf::from);
+    let metrics_every: u32 = std::env::var("BRUSH_METRICS_EVERY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(50);
+    let metrics_start = Instant::now();
+
     for iter in process_config.start_iter..train_stream_config.train_config.total_iters() {
         let target_lod = if lod_levels == 0 || iter < training_steps {
             0u32
@@ -629,6 +644,37 @@ pub(crate) async fn train_stream(
                     .log_splat_distribution_stats(iter, splats.clone())
                     .await
                     .unwrap();
+            }
+        }
+
+        // --- Env-gated JSONL metrics log ---
+        // `iter` here is the post-increment value that matches the reported
+        // iteration. Only touch the loss tensor (GPU readback) on log iters.
+        if let Some(metrics_path) = &metrics_log_path {
+            let is_first_step = iter == process_config.start_iter + 1;
+            if is_first_step || is_last_step || iter.is_multiple_of(metrics_every) {
+                let loss = stats.loss.clone().into_scalar_async::<f32>().await? as f64;
+                let num_splats = splats.num_splats();
+                let elapsed_s = metrics_start.elapsed().as_secs_f64();
+                let line = format!(
+                    "{{\"iter\":{iter},\"num_splats\":{num_splats},\"loss\":{loss},\"elapsed_s\":{elapsed_s}}}"
+                );
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(metrics_path)
+                {
+                    Ok(mut file) => {
+                        use std::io::Write as _;
+                        if let Err(error) = writeln!(file, "{line}").and_then(|()| file.flush()) {
+                            log::warn!("BRUSH_METRICS_LOG write failed: {error}");
+                        }
+                    }
+                    Err(error) => log::warn!(
+                        "BRUSH_METRICS_LOG open failed ({}): {error}",
+                        metrics_path.display()
+                    ),
+                }
             }
         }
 
