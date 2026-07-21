@@ -488,7 +488,20 @@ impl SplatTrainer {
             // rendered image before any loss term sees it, so the splats
             // themselves learn appearance-free colors. Alpha passes through
             // untouched.
+            //
+            // Appearance correction (PPISP / bilateral grid) models only the
+            // color/alpha response and its ISP kernel asserts a 3- or 4-channel
+            // input. When depth loss is active the render carries an extra
+            // depth channel (index 4) that is geometry, not color: it must
+            // bypass the correction. Split the RGBA channels off, correct
+            // those, then re-attach the untouched depth so `pred_image` keeps
+            // its [H, W, 5] layout for the depth-loss term below.
             let pred_image = match &active_appearance {
+                Some(active) if use_depth => {
+                    let rgba = diff_out.img.clone().slice(s![.., .., 0..4]);
+                    let depth = diff_out.img.slice(s![.., .., 4..5]);
+                    Tensor::cat(vec![active.apply(rgba), depth], 2)
+                }
                 Some(active) => active.apply(diff_out.img),
                 None => diff_out.img,
             };
