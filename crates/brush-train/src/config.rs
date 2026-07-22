@@ -39,14 +39,16 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options", default_value = "50.0")]
     pub mean_noise_weight: f32,
 
-    /// MRNF bounds-scaled noise injection (MRNF port, R2). When set, the
-    /// low-opacity mean-noise perturbation is applied in the densification
-    /// path PRE-refine, gated on VALID robust bounds (LFS `_bounds_valid`,
-    /// mrnf.cpp:618) and on the ACCUMULATED per-refine visibility count
-    /// (`RefineRecord::vis_weight`, LFS `_vis_count`), mirroring LFS
-    /// `MRNF::inject_noise` / `launch_mrnf_noise_injection` (mrnf.cpp:1085,
-    /// `mrnf_kernels.cu:41`). Replaces Brush's generic per-step noise. OFF by
-    /// default.
+    /// MRNF-gated noise injection (MRNF port, R2). Like the generic Brush
+    /// per-step noise, LFS injects mean-noise EVERY training step from
+    /// `post_backward` (mrnf.cpp:617); the difference this flag makes is the
+    /// GATING, not the frequency. When set, the low-opacity mean-noise
+    /// perturbation is gated on VALID robust bounds (LFS `_bounds_valid`) and
+    /// on the ACCUMULATED per-refine-window visibility count
+    /// (`RefineRecord::vis_weight`, LFS `_vis_count > 0`) instead of the
+    /// single-step `visible` mask, mirroring LFS `MRNF::inject_noise` /
+    /// `launch_mrnf_noise_injection` (mrnf.cpp:1085, `mrnf_kernels.cu:41`).
+    /// Replaces Brush's generic per-step noise. OFF by default.
     #[arg(long, help_heading = "Refine options", default_value = "false")]
     #[serde(default)]
     pub mrnf_noise_injection: bool,
@@ -155,11 +157,14 @@ pub struct TrainConfig {
     pub near_zero_rotation_prune: bool,
 
     /// Use an L2 radial distance from the robust scene center for the
-    /// out-of-bounds prune instead of the legacy per-axis (L-inf / Chebyshev)
-    /// test. Matches MRNF's radial `dist_from_center > max_extent*100`
-    /// (mrnf.cpp:664-670). OFF by default: L2 >= L-inf so this prunes a
-    /// superset of the legacy test, changing default behaviour, hence
-    /// flag-gated.
+    /// out-of-bounds prune instead of the per-axis (L-inf / Chebyshev) test.
+    /// NOTE: MRNF is NOT radial — its out-of-bounds cull is L-inf:
+    /// `dist_from_center = (means - center).abs().max(1)` then
+    /// `dist_from_center > max_allowed` (mrnf.cpp:663-669). So Brush's DEFAULT
+    /// per-axis test already matches MRNF; this flag is a STRICTER divergence
+    /// experiment, not MRNF parity. OFF by default: L2 >= L-inf so this prunes
+    /// a superset of the per-axis (MRNF) test, changing default behaviour,
+    /// hence flag-gated.
     #[arg(long, help_heading = "Refine options", default_value = "false")]
     pub radial_bounds_prune: bool,
 

@@ -121,11 +121,6 @@ pub struct SplatTrainer {
     ssim_enabled: bool,
     bounds: BoundingBox,
     step_count: u32,
-    /// Current stepped mean-parameter learning rate (median-size-folded), cached
-    /// from the last `step()` so the MRNF densification-path noise injection
-    /// (`inject_mrnf_noise`) can scale by it without re-stepping the schedule.
-    /// Mirrors LFS reading the optimizer's Means LR in `inject_noise`.
-    last_lr_mean: f64,
     max_sh_degree: u32,
     rng: rand::rngs::StdRng,
     /// Per-train-view (world center, focal in px at native res) for the
@@ -283,7 +278,6 @@ impl SplatTrainer {
             ssim_enabled,
             bounds,
             step_count: 0,
-            last_lr_mean: 0.0,
             max_sh_degree: 0,
             rng: rand::rngs::StdRng::seed_from_u64(seed),
             view_cams: Vec::new(),
@@ -812,8 +806,6 @@ impl SplatTrainer {
             });
 
         let lr_mean = self.sched_mean.step() * median_scale as f64;
-        // Cache for the MRNF densification-path noise injection (R2).
-        self.last_lr_mean = lr_mean;
         // MRNF LR schedule (R1): step the independent scale-LR schedule in
         // lock-step with the mean schedule (LFS mrnf.cpp:1360).
         let lr_scale = self.sched_scale.step();
@@ -901,16 +893,67 @@ impl SplatTrainer {
             });
         }
 
-        // Add random noise. Only do this in the growth phase, otherwise
-        // let the splats settle in without noise, not much point in exploring regions anymore.
-        // The noise gate is non-differentiable bookkeeping. Read opacity from
-        // the valid (inner) splats so the sigmoid never lands on the autodiff
-        // graph, and `visible` is already inner — so nothing here builds a
-        // node that won't get a backward pass.
-        // MRNF port (R2): when `--mrnf-noise-injection` is set the mean-noise
-        // perturbation moves to the densification path (`inject_mrnf_noise`,
-        // PRE-refine, accumulated-vis-gated). Skip the generic per-step block.
-        if !self.config.mrnf_noise_injection {
+        // Add random noise to the means of low-opacity gaussians. Only do this
+        // in the growth phase, otherwise let the splats settle in without
+        // noise — not much point exploring regions anymore. The noise gate is
+        // non-differentiable bookkeeping: read opacity from the valid (inner)
+        // splats so the sigmoid never lands on the autodiff graph, and the
+        // visibility gate is already inner — so nothing here builds a node that
+        // won't get a backward pass.
+        //
+        // MRNF port (R2): LFS injects mean-noise EVERY step from `post_backward`
+        // (mrnf.cpp:617), the same frequency as this generic block. When
+        // `--mrnf-noise-injection` is set we change the GATING (not the location
+        // or frequency): the per-gaussian gate becomes the ACCUMULATED
+        // per-refine-window visibility (`RefineRecord::vis_weight > 0`, LFS
+        // `_vis_count > 0`) instead of the single-step `visible` mask, plus a
+        // bounds-valid gate (LFS `_bounds_valid`) that skips injection until the
+        // robust median extent is finite and positive.
+        if self.config.mrnf_noise_injection {
+            // Bounds-valid gate (LFS `_bounds_valid`): skip entirely until the
+            // robust per-axis bounds have a finite, positive median extent.
+            if median_scale.is_finite() && median_scale > 0.0 {
+                let num_splats = splats.num_splats() as usize;
+                let inv_opac: Tensor<1> = 1.0 - splats.valid().opacities();
+                // Accumulated per-refine-window visibility gate (LFS
+                // `_vis_count > 0`). `RefineRecord::vis_mask()` already lives on
+                // the inner device. Fall back to the single-step `visible`
+                // tensor when the record is missing or its length no longer
+                // matches the current splat count (first steps of a window after
+                // a count change) — the record is recreated post-refine so
+                // mid-window alignment normally holds.
+                let vis_gate = match self.refine_record.as_ref() {
+                    Some(record) if record.vis_weight.dims()[0] == num_splats => {
+                        record.vis_mask().float()
+                    }
+                    _ => visible,
+                };
+                let noise_weight =
+                    (inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * vis_gate).unsqueeze_dim(1);
+                // `samples` is pure data — keep it on the inner device so it can
+                // multiply with the inner `noise_weight` without crossing backends.
+                let samples = Tensor::random(
+                    [num_splats, 3],
+                    Distribution::Normal(0.0, 1.0),
+                    &splats.device().inner(),
+                );
+                // Scale by THIS step's stepped mean LR (already median-size-
+                // folded, as LFS's optimizer Means LR); mean_lr already decays
+                // over time.
+                let noise_weight_means =
+                    noise_weight * (lr_mean as f32 * self.config.mean_noise_weight);
+
+                splats.transforms = splats.transforms.map(|t| {
+                    // Clamp travel to one robust median box (LFS clamps per-dim
+                    // noise to +/- median_size).
+                    let noise_m = (samples * noise_weight_means).clamp(-median_scale, median_scale);
+                    let inner = t.inner();
+                    let noised_means = inner.clone().slice(s![.., 0..3]) + noise_m;
+                    let out = inner.slice_assign(s![.., 0..3], noised_means);
+                    Tensor::from_inner(out).require_grad()
+                });
+            }
+        } else {
             let inv_opac: Tensor<1> = 1.0 - splats.valid().opacities();
             let noise_weight = inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * visible;
             let noise_weight = noise_weight.unsqueeze_dim(1);
@@ -940,7 +983,7 @@ impl SplatTrainer {
                 let out = inner.slice_assign(s![.., 0..3], noised_means);
                 Tensor::from_inner(out).require_grad()
             });
-        } // end generic per-step noise block (skipped when MRNF injection is on)
+        } // end per-step noise block
 
         let stats = TrainStepStats {
             num_visible,
@@ -953,71 +996,6 @@ impl SplatTrainer {
         };
 
         (splats, stats)
-    }
-
-    /// MRNF bounds-scaled noise injection (MRNF port, R2). Perturbs the MEANS
-    /// of low-opacity, visible gaussians by Gaussian noise scaled by
-    /// `lr_mean * mean_noise_weight * (1 - opacity)^150`, clamped to the
-    /// scene's robust median extent so a noised splat travels at most one
-    /// median box. Mirrors LFS `MRNF::inject_noise` / the
-    /// `mrnf_noise_injection_kernel` (mrnf.cpp:1085, `mrnf_kernels.cu:41)`:
-    /// applied in the densification path PRE-refine, only when the robust
-    /// per-refine bounds are VALID (LFS `_bounds_valid`, mrnf.cpp:618), and
-    /// gated on the ACCUMULATED per-refine visibility count
-    /// (`RefineRecord::vis_weight`, LFS `_vis_count`) rather than a single
-    /// view's visibility. Replaces Brush's generic per-step noise when
-    /// `--mrnf-noise-injection` is set.
-    fn inject_mrnf_noise(&self, refiner: &RefineRecord, mut splats: Splats) -> Splats {
-        // NOTE: refine runs on INNER (non-autodiff) splats — `train_stream`
-        // strips autodiff via `.valid()` after each train step and only
-        // re-lifts (`lift_splats_to_autodiff`) before the next one. So unlike
-        // the per-step noise block in `train_step` (autodiff splats: read via
-        // `.valid()`, re-lift via `from_inner().require_grad()`), everything
-        // here must stay on the inner backend. Calling `.valid()` / `.inner()`
-        // on already-inner FLOAT tensors panics in burn-dispatch
-        // ("Requires autodiff tensor", backend.rs:463). `detach_autodiff` is
-        // the checked passthrough for either backend variant.
-        use brush_render::burn_glue::detach_autodiff;
-
-        // Bounds-valid gate: skip until the robust per-axis bounds have a
-        // finite, positive median extent.
-        let median_scale = self.bounds.median_size();
-        if !(median_scale.is_finite() && median_scale > 0.0) {
-            return splats;
-        }
-
-        // inv_opac = 1 - sigmoid(raw_opacity), on the inner backend so the
-        // sigmoid never lands on an autodiff graph.
-        let inv_opac: Tensor<1> = 1.0 - detach_autodiff(splats.opacities());
-        // Low-opacity weight (pow 150, mrnf_kernels.cu:64) gated by the
-        // accumulated per-refine visibility (LFS `vis_count[idx] > 0`).
-        let vis_f = refiner.vis_mask().float();
-        let noise_weight = (inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * vis_f).unsqueeze_dim(1);
-
-        let samples = Tensor::random(
-            [splats.num_splats() as usize, 3],
-            Distribution::Normal(0.0, 1.0),
-            &splats.device(),
-        );
-
-        // weight = lr_mean * mean_noise_weight; `last_lr_mean` is the current
-        // stepped mean LR (already median-size-folded, as LFS's optimizer LR).
-        let noise_weight_means =
-            noise_weight * (self.last_lr_mean as f32 * self.config.mean_noise_weight);
-
-        splats.transforms = splats.transforms.map(|t| {
-            // Clamp travel to one robust median box (LFS clamps per-dim noise
-            // to +/- median_size).
-            let noise_m = (samples * noise_weight_means).clamp(-median_scale, median_scale);
-            // Stay inner: no `require_grad` re-lift here — the whole refine
-            // path returns inner params (see `map_splats_and_opt`) and the
-            // next train step re-lifts all of them.
-            let t = detach_autodiff(t);
-            let noised_means = t.clone().slice(s![.., 0..3]) + noise_m;
-            t.slice_assign(s![.., 0..3], noised_means)
-        });
-
-        splats
     }
 
     pub async fn refine(&mut self, iter: u32, splats: Splats) -> (Splats, RefineStats) {
@@ -1045,15 +1023,6 @@ impl SplatTrainer {
             .refine_record
             .take()
             .expect("Can only refine if refine stats are initialized");
-
-        // MRNF bounds-scaled noise injection (R2), flag-gated, PRE-refine.
-        // Runs on the pre-prune splat set so `refiner.vis_weight` (accumulated
-        // per-refine visibility) stays index-aligned with the means.
-        let splats = if self.config.mrnf_noise_injection {
-            self.inject_mrnf_noise(&refiner, splats)
-        } else {
-            splats
-        };
 
         // Track how many splats are visually large (the "big-low-α" failure
         // mode). `max_screen_size` is the larger 2D ellipse extent as a
@@ -1121,11 +1090,14 @@ impl SplatTrainer {
         let center = self.bounds.center;
         let bound_center =
             Tensor::<1>::from_floats([center.x, center.y, center.z], &device).reshape([1, 3]);
-        // Out-of-bounds prune. Default: legacy per-axis (L-inf / Chebyshev)
-        // test — a splat is culled if ANY axis' |distance from center| exceeds
-        // the bound. With `--radial-bounds-prune`, use the L2 radial distance
-        // instead, matching MRNF's `dist_from_center > max_extent*100`
-        // (mrnf.cpp:664-670).
+        // Out-of-bounds prune. Default: per-axis (L-inf / Chebyshev) test — a
+        // splat is culled if ANY axis' |distance from center| exceeds the
+        // bound. This per-axis default is what MRNF actually does: LFS computes
+        // `dist_from_center = (means - center).abs().max(1)` (L-inf) then culls
+        // `dist_from_center > max_allowed` (mrnf.cpp:663-669) — it is NOT
+        // radial. `--radial-bounds-prune` switches to the L2 radial distance
+        // instead; since L2 >= L-inf it prunes a superset, so it is a STRICTER
+        // divergence experiment, not MRNF parity.
         let bound_mask = if self.config.radial_bounds_prune {
             let diff = splats.means() - bound_center;
             let radial = diff.powi_scalar(2).sum_dim(1).sqrt().squeeze_dim(1);
