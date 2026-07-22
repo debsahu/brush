@@ -1,9 +1,8 @@
-use std::f32::consts::FRAC_1_SQRT_2;
-
 use crate::{
     adam_scaled::{AdamScaled, AdamScaledConfig, AdamState},
     config::TrainConfig,
     dig::{self, DigTrainState},
+    edge,
     min_scale::compute_min_scale,
     msg::{RefineStats, TrainStepStats},
     multinomial::multinomial_sample,
@@ -14,6 +13,7 @@ use crate::{
 use brush_appearance::{AppearanceConfig, AppearanceTrainState};
 use brush_dataset::scene::SceneBatch;
 use brush_loss::{ImageLossConfig, depth_loss, image_loss};
+use brush_render::camera::Camera;
 use brush_render::gaussian_splats::{RasterizationMode, Splats, fold_min_scale};
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 use brush_render_bwd::{DeferredShGrad, render_splat_features, render_splats_for_training};
@@ -34,13 +34,20 @@ use hashbrown::{HashMap, HashSet};
 use rand::SeedableRng;
 use tracing::{Instrument, trace_span};
 
+/// Default robust-AABB percentile, used for the one-time initial/LOD bounds by
+/// external callers. The per-refine bounds recompute inside the trainer uses the
+/// configurable `TrainConfig::bounds_percentile` (default matches this).
 pub const BOUND_PERCENTILE: f32 = 0.8;
-
-const MIN_OPACITY: f32 = 1.0 / 255.0;
 
 /// Mip-Splatting 3D-filter strength. This is intentionally fixed: changing it
 /// alters the learned/exported representation rather than just training speed.
 const MIN_SCALE_FACTOR: f32 = 0.1;
+
+/// Target number of GT views sampled per refine window for edge guidance
+/// (MRNF port, delta #4; LFS `MRNF_EDGE_MIN_VIEW_SAMPLES = 10`, mrnf.cpp:69).
+/// The trainer samples every `refine_every / this` steps so a full window
+/// contributes roughly this many views to the per-gaussian edge accumulator.
+const EDGE_MIN_VIEW_SAMPLES: u32 = 10;
 
 type OptimizerType = OptimizerAdaptor<AdamScaled, Splats>;
 
@@ -105,6 +112,7 @@ fn can_defer_sh_grad(_optimizer: &OptimizerType, _splats: &Splats) -> bool {
 pub struct SplatTrainer {
     config: TrainConfig,
     sched_mean: ExponentialLrScheduler,
+    sched_scale: ExponentialLrScheduler,
     refine_record: Option<RefineRecord>,
     optim: Option<OptimizerType>,
     /// Optional per-view appearance compensation (bilateral grid / PPISP).
@@ -113,6 +121,11 @@ pub struct SplatTrainer {
     ssim_enabled: bool,
     bounds: BoundingBox,
     step_count: u32,
+    /// Current stepped mean-parameter learning rate (median-size-folded), cached
+    /// from the last `step()` so the MRNF densification-path noise injection
+    /// (`inject_mrnf_noise`) can scale by it without re-stepping the schedule.
+    /// Mirrors LFS reading the optimizer's Means LR in `inject_noise`.
+    last_lr_mean: f64,
     max_sh_degree: u32,
     rng: rand::rngs::StdRng,
     /// Per-train-view (world center, focal in px at native res) for the
@@ -236,6 +249,19 @@ impl SplatTrainer {
             (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_train_iters as f64);
         let lr_mean = ExponentialLrSchedulerConfig::new(config.lr_mean, decay);
 
+        // MRNF LR schedule (R1): independent exponential decay for the log-scale
+        // parameters, mirroring LFS `_scale_lr_gamma` (mrnf.cpp:425) and the
+        // per-step `_scale_lr_current *= _scale_lr_gamma` (mrnf.cpp:1360). Guarded
+        // like LFS `compute_decay_gamma` (start/end > 0), so the default
+        // lr_scale_end == lr_scale yields gamma == 1.0 (constant, opt-in).
+        let scale_decay = if config.lr_scale > 0.0 && config.lr_scale_end > 0.0 {
+            (config.lr_scale_end / config.lr_scale)
+                .powf(1.0 / config.total_train_iters.max(1) as f64)
+        } else {
+            1.0
+        };
+        let lr_scale = ExponentialLrSchedulerConfig::new(config.lr_scale, scale_decay);
+
         let ssim_enabled = config.ssim_weight > 0.0;
 
         // Growth is gated on the global iter. LOD phases run past
@@ -250,12 +276,14 @@ impl SplatTrainer {
         Self {
             config,
             sched_mean: lr_mean.init().expect("Mean lr schedule must be valid."),
+            sched_scale: lr_scale.init().expect("Scale lr schedule must be valid."),
             optim: None,
             appearance: None,
             refine_record: None,
             ssim_enabled,
             bounds,
             step_count: 0,
+            last_lr_mean: 0.0,
             max_sh_degree: 0,
             rng: rand::rngs::StdRng::seed_from_u64(seed),
             view_cams: Vec::new(),
@@ -404,6 +432,41 @@ impl SplatTrainer {
     /// high-gradient densification at `global_iter`.
     pub fn refinement_weight_needed(&self, global_iter: u32) -> bool {
         global_iter < self.config.growth_stop_iter
+    }
+
+    /// Steps between edge-guidance samples: `refine_every / EDGE_MIN_VIEW_SAMPLES`
+    /// so a refine window contributes ~`EDGE_MIN_VIEW_SAMPLES` views.
+    fn edge_sample_stride(&self) -> u32 {
+        (self.config.refine_every / EDGE_MIN_VIEW_SAMPLES).max(1)
+    }
+
+    /// Accumulate this step's GT-view edge score into the refine record (MRNF
+    /// port, delta #4). No-op unless `--use-edge-map` is set and this step lands
+    /// on the sampling stride. `splats` are the render-time (pre-optimizer-step)
+    /// splats; `camera`/`gt_packed` are this step's view. Pure non-differentiable
+    /// bookkeeping: reads the inner/detached GT and splats, never the autodiff
+    /// graph. See `crate::edge` for the (pinhole-only, center-sample) fallback
+    /// caveats vs. LFS's alpha-blended edge rasterizer.
+    fn accumulate_edge_sample(
+        &mut self,
+        splats: &Splats,
+        camera: &Camera,
+        gt_packed: &Tensor<2, Int>,
+        composite_bg: Option<glam::Vec3>,
+        img_size: glam::UVec2,
+    ) {
+        if !self.config.use_edge_map || !self.step_count.is_multiple_of(self.edge_sample_stride()) {
+            return;
+        }
+        // GT RGB `[H, W, 3]` on the inner backend (same unpack the LPIPS path uses).
+        let gt_rgb = brush_loss::unpack_gt_rgb(gt_packed.clone(), composite_bg);
+        let edge_map = edge::canny_edge_map(gt_rgb);
+        let valid = splats.valid();
+        let score =
+            edge::project_edge_scores(valid.means(), valid.opacities(), edge_map, camera, img_size);
+        if let Some(record) = self.refine_record.as_mut() {
+            record.gather_edge(score);
+        }
     }
 
     /// Run one training step, optionally omitting the refinement-only raster
@@ -707,6 +770,11 @@ impl SplatTrainer {
                 }
             });
 
+            // Edge-guidance accumulation (MRNF port, delta #4). Uses the
+            // render-time splats + this view's GT and camera; gated on
+            // `--use-edge-map` and the sampling stride inside the method.
+            self.accumulate_edge_sample(&splats, &camera, &gt_packed, composite_bg, img_size);
+
             (
                 grads,
                 visible,
@@ -744,6 +812,11 @@ impl SplatTrainer {
             });
 
         let lr_mean = self.sched_mean.step() * median_scale as f64;
+        // Cache for the MRNF densification-path noise injection (R2).
+        self.last_lr_mean = lr_mean;
+        // MRNF LR schedule (R1): step the independent scale-LR schedule in
+        // lock-step with the mean schedule (LFS mrnf.cpp:1360).
+        let lr_scale = self.sched_scale.step();
 
         // Update per-component LR scaling for the transforms param.
         // transforms layout: means(3) + rotations(4) + log_scales(3)
@@ -759,9 +832,9 @@ impl SplatTrainer {
                 self.config.lr_rotation as f32,
                 self.config.lr_rotation as f32,
                 self.config.lr_rotation as f32,
-                self.config.lr_scale as f32,
-                self.config.lr_scale as f32,
-                self.config.lr_scale as f32,
+                lr_scale as f32,
+                lr_scale as f32,
+                lr_scale as f32,
             ];
             let transform_scaling =
                 Tensor::<1>::from_floats(lr_values.as_slice(), &opt_device).reshape([1, 10]);
@@ -834,34 +907,40 @@ impl SplatTrainer {
         // the valid (inner) splats so the sigmoid never lands on the autodiff
         // graph, and `visible` is already inner — so nothing here builds a
         // node that won't get a backward pass.
-        let inv_opac: Tensor<1> = 1.0 - splats.valid().opacities();
-        let noise_weight = inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * visible;
-        let noise_weight = noise_weight.unsqueeze_dim(1);
-        // `samples` is pure data — keep it on the inner device so it can
-        // multiply with the `.inner()`-stripped `noise_weight` without
-        // crossing backends.
-        let samples = Tensor::random(
-            [splats.num_splats() as usize, 3],
-            Distribution::Normal(0.0, 1.0),
-            &splats.device().inner(),
-        );
+        // MRNF port (R2): when `--mrnf-noise-injection` is set the mean-noise
+        // perturbation moves to the densification path (`inject_mrnf_noise`,
+        // PRE-refine, accumulated-vis-gated). Skip the generic per-step block.
+        if !self.config.mrnf_noise_injection {
+            let inv_opac: Tensor<1> = 1.0 - splats.valid().opacities();
+            let noise_weight = inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * visible;
+            let noise_weight = noise_weight.unsqueeze_dim(1);
+            // `samples` is pure data — keep it on the inner device so it can
+            // multiply with the `.inner()`-stripped `noise_weight` without
+            // crossing backends.
+            let samples = Tensor::random(
+                [splats.num_splats() as usize, 3],
+                Distribution::Normal(0.0, 1.0),
+                &splats.device().inner(),
+            );
 
-        // Could scale by train time, but, the mean_lr already decays over time.
-        let noise_weight_means = noise_weight * (lr_mean as f32 * self.config.mean_noise_weight);
+            // Could scale by train time, but, the mean_lr already decays over time.
+            let noise_weight_means =
+                noise_weight * (lr_mean as f32 * self.config.mean_noise_weight);
 
-        // Add noise to the means portion (cols 0..3), and optionally scales
-        // (cols 7..10) and rotations (cols 3..7).
-        splats.transforms = splats.transforms.map(|t| {
-            // Only allow noised gaussians to travel at most the entire extent of the current bounds.
-            let noise_m = (samples * noise_weight_means).clamp(-median_scale, median_scale);
-            let inner = t.inner();
-            // slice + slice_assign with a clone of inner avoids holding two
-            // refs across slice_assign — `inner` is consumed by slice_assign
-            // and the resulting buffer is the only writer.
-            let noised_means = inner.clone().slice(s![.., 0..3]) + noise_m;
-            let out = inner.slice_assign(s![.., 0..3], noised_means);
-            Tensor::from_inner(out).require_grad()
-        });
+            // Add noise to the means portion (cols 0..3), and optionally scales
+            // (cols 7..10) and rotations (cols 3..7).
+            splats.transforms = splats.transforms.map(|t| {
+                // Only allow noised gaussians to travel at most the entire extent of the current bounds.
+                let noise_m = (samples * noise_weight_means).clamp(-median_scale, median_scale);
+                let inner = t.inner();
+                // slice + slice_assign with a clone of inner avoids holding two
+                // refs across slice_assign — `inner` is consumed by slice_assign
+                // and the resulting buffer is the only writer.
+                let noised_means = inner.clone().slice(s![.., 0..3]) + noise_m;
+                let out = inner.slice_assign(s![.., 0..3], noised_means);
+                Tensor::from_inner(out).require_grad()
+            });
+        } // end generic per-step noise block (skipped when MRNF injection is on)
 
         let stats = TrainStepStats {
             num_visible,
@@ -874,6 +953,71 @@ impl SplatTrainer {
         };
 
         (splats, stats)
+    }
+
+    /// MRNF bounds-scaled noise injection (MRNF port, R2). Perturbs the MEANS
+    /// of low-opacity, visible gaussians by Gaussian noise scaled by
+    /// `lr_mean * mean_noise_weight * (1 - opacity)^150`, clamped to the
+    /// scene's robust median extent so a noised splat travels at most one
+    /// median box. Mirrors LFS `MRNF::inject_noise` / the
+    /// `mrnf_noise_injection_kernel` (mrnf.cpp:1085, `mrnf_kernels.cu:41)`:
+    /// applied in the densification path PRE-refine, only when the robust
+    /// per-refine bounds are VALID (LFS `_bounds_valid`, mrnf.cpp:618), and
+    /// gated on the ACCUMULATED per-refine visibility count
+    /// (`RefineRecord::vis_weight`, LFS `_vis_count`) rather than a single
+    /// view's visibility. Replaces Brush's generic per-step noise when
+    /// `--mrnf-noise-injection` is set.
+    fn inject_mrnf_noise(&self, refiner: &RefineRecord, mut splats: Splats) -> Splats {
+        // NOTE: refine runs on INNER (non-autodiff) splats — `train_stream`
+        // strips autodiff via `.valid()` after each train step and only
+        // re-lifts (`lift_splats_to_autodiff`) before the next one. So unlike
+        // the per-step noise block in `train_step` (autodiff splats: read via
+        // `.valid()`, re-lift via `from_inner().require_grad()`), everything
+        // here must stay on the inner backend. Calling `.valid()` / `.inner()`
+        // on already-inner FLOAT tensors panics in burn-dispatch
+        // ("Requires autodiff tensor", backend.rs:463). `detach_autodiff` is
+        // the checked passthrough for either backend variant.
+        use brush_render::burn_glue::detach_autodiff;
+
+        // Bounds-valid gate: skip until the robust per-axis bounds have a
+        // finite, positive median extent.
+        let median_scale = self.bounds.median_size();
+        if !(median_scale.is_finite() && median_scale > 0.0) {
+            return splats;
+        }
+
+        // inv_opac = 1 - sigmoid(raw_opacity), on the inner backend so the
+        // sigmoid never lands on an autodiff graph.
+        let inv_opac: Tensor<1> = 1.0 - detach_autodiff(splats.opacities());
+        // Low-opacity weight (pow 150, mrnf_kernels.cu:64) gated by the
+        // accumulated per-refine visibility (LFS `vis_count[idx] > 0`).
+        let vis_f = refiner.vis_mask().float();
+        let noise_weight = (inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * vis_f).unsqueeze_dim(1);
+
+        let samples = Tensor::random(
+            [splats.num_splats() as usize, 3],
+            Distribution::Normal(0.0, 1.0),
+            &splats.device(),
+        );
+
+        // weight = lr_mean * mean_noise_weight; `last_lr_mean` is the current
+        // stepped mean LR (already median-size-folded, as LFS's optimizer LR).
+        let noise_weight_means =
+            noise_weight * (self.last_lr_mean as f32 * self.config.mean_noise_weight);
+
+        splats.transforms = splats.transforms.map(|t| {
+            // Clamp travel to one robust median box (LFS clamps per-dim noise
+            // to +/- median_size).
+            let noise_m = (samples * noise_weight_means).clamp(-median_scale, median_scale);
+            // Stay inner: no `require_grad` re-lift here — the whole refine
+            // path returns inner params (see `map_splats_and_opt`) and the
+            // next train step re-lifts all of them.
+            let t = detach_autodiff(t);
+            let noised_means = t.clone().slice(s![.., 0..3]) + noise_m;
+            t.slice_assign(s![.., 0..3], noised_means)
+        });
+
+        splats
     }
 
     pub async fn refine(&mut self, iter: u32, splats: Splats) -> (Splats, RefineStats) {
@@ -901,6 +1045,15 @@ impl SplatTrainer {
             .refine_record
             .take()
             .expect("Can only refine if refine stats are initialized");
+
+        // MRNF bounds-scaled noise injection (R2), flag-gated, PRE-refine.
+        // Runs on the pre-prune splat set so `refiner.vis_weight` (accumulated
+        // per-refine visibility) stays index-aligned with the means.
+        let splats = if self.config.mrnf_noise_injection {
+            self.inject_mrnf_noise(&refiner, splats)
+        } else {
+            splats
+        };
 
         // Track how many splats are visually large (the "big-low-α" failure
         // mode). `max_screen_size` is the larger 2D ellipse extent as a
@@ -942,7 +1095,7 @@ impl SplatTrainer {
             }
         }
 
-        let max_allowed_bounds = self.bounds.extent.max_element() * 100.0;
+        let max_allowed_bounds = self.bounds.extent.max_element() * self.config.prune_extent_factor;
 
         // If not refining, update splat to step with gradients applied.
         // Prune dead splats. This ALWAYS happen even if we're not "refining" anymore.
@@ -951,7 +1104,7 @@ impl SplatTrainer {
             .take()
             .expect("Can only refine after optimizer is initialized")
             .to_record();
-        let alpha_mask = splats.opacities().lower_elem(MIN_OPACITY);
+        let alpha_mask = splats.opacities().lower_elem(self.config.min_opacity);
         let scales = splats.scales();
 
         // Note: we do NOT cull on a minimum scale. A genuinely flat splat
@@ -968,11 +1121,22 @@ impl SplatTrainer {
         let center = self.bounds.center;
         let bound_center =
             Tensor::<1>::from_floats([center.x, center.y, center.z], &device).reshape([1, 3]);
-        let splat_dists = (splats.means() - bound_center).abs();
-        let bound_mask = splat_dists
-            .greater_elem(max_allowed_bounds)
-            .any_dim(1)
-            .squeeze_dim(1);
+        // Out-of-bounds prune. Default: legacy per-axis (L-inf / Chebyshev)
+        // test — a splat is culled if ANY axis' |distance from center| exceeds
+        // the bound. With `--radial-bounds-prune`, use the L2 radial distance
+        // instead, matching MRNF's `dist_from_center > max_extent*100`
+        // (mrnf.cpp:664-670).
+        let bound_mask = if self.config.radial_bounds_prune {
+            let diff = splats.means() - bound_center;
+            let radial = diff.powi_scalar(2).sum_dim(1).sqrt().squeeze_dim(1);
+            radial.greater_elem(max_allowed_bounds)
+        } else {
+            let splat_dists = (splats.means() - bound_center).abs();
+            splat_dists
+                .greater_elem(max_allowed_bounds)
+                .any_dim(1)
+                .squeeze_dim(1)
+        };
 
         // Prune parameter that's NaN.
         fn row_non_finite(t: &Tensor<2>) -> Tensor<1, Bool> {
@@ -995,8 +1159,57 @@ impl SplatTrainer {
             .bool_or(bound_mask)
             .bool_or(non_finite_mask);
 
+        // Optional min-scale degenerate prune (MRNF port, delta #3). MRNF culls
+        // splats whose smallest log-scale axis drops below log(1e-10) (see
+        // mrnf.cpp:668, MRNF_LOG_MIN_SCALE_THRESHOLD). Brush deliberately omits
+        // this to keep thin "pancake" surface splats (see note above), so it is
+        // flag-gated and OFF by default. Tests the RAW log-scales
+        // (`log_scales().exp()`), NOT `scales()` which folds in the
+        // Mip-Splatting min-scale floor; that floor keeps folded scales above
+        // the threshold so the prune would never fire. Testing raw scales
+        // reproduces LFS's raw-scale cull (mrnf.cpp:668).
+        let prune_mask = if self.config.min_scale_prune {
+            let scale_small = splats
+                .log_scales()
+                .exp()
+                .lower_elem(self.config.min_scale_prune_threshold)
+                .any_dim(1)
+                .squeeze_dim(1);
+            prune_mask.bool_or(scale_small)
+        } else {
+            prune_mask
+        };
+
+        // Near-zero-rotation prune (MRNF port). Cull splats whose RAW
+        // quaternion has collapsed toward zero (squared norm < 1e-8), a
+        // degenerate rotation. Mirrors compute_near_zero_rotation_mask
+        // (mrnf.cpp:667; pruning_kernels.cu:64 `mag_sq = q.q < 1e-8`). Uses the
+        // raw quaternion (`splats.rotations()` = transforms[.., 3..7]),
+        // matching LFS's `rotation_raw()`. Flag-gated (OFF by default).
+        let prune_mask = if self.config.near_zero_rotation_prune {
+            let quat_norm_sq = splats.rotations().powi_scalar(2).sum_dim(1).squeeze_dim(1);
+            let near_zero_rot = quat_norm_sq.lower_elem(1e-8f32);
+            prune_mask.bool_or(near_zero_rot)
+        } else {
+            prune_mask
+        };
+
         let (mut splats, refiner, pruned_count) =
             prune_points(splats, &mut record, refiner, prune_mask, self.dig.as_mut()).await;
+
+        // Edge-guidance factor (MRNF port, delta #4), aligned to the post-prune
+        // splat order. Multiplies into both the dead-slot replacement and the
+        // high-gradient growth sampling weights below so densification is biased
+        // toward high-frequency image edges. `None` when edge guidance is off or
+        // no views were sampled this window.
+        let edge_factor = if self.config.use_edge_map {
+            refiner
+                .edge_factor_host(self.config.edge_score_weight)
+                .await
+        } else {
+            None
+        };
+
         let mut split_inds = HashSet::new();
 
         // Always replace dead gaussians, so that the pruned budget is reused.
@@ -1006,12 +1219,18 @@ impl SplatTrainer {
             // weighted distribution (where error actually lives).
             let vis_f = refiner.vis_mask().float();
             let resampled_weights = splats.opacities() * vis_f.clone();
-            let resampled_weights = resampled_weights
+            let mut resampled_weights = resampled_weights
                 .into_data_async()
                 .await
                 .expect("Failed to get weights")
                 .into_vec::<f32>()
                 .expect("Failed to read weights");
+            // Bias replacement toward edge gaussians (MRNF delta #4).
+            if let Some(factor) = &edge_factor {
+                for (w, f) in resampled_weights.iter_mut().zip(factor.iter()) {
+                    *w *= f;
+                }
+            }
             let resampled_inds =
                 multinomial_sample(&mut self.rng, &resampled_weights, pruned_count);
             split_inds.extend(resampled_inds);
@@ -1076,12 +1295,18 @@ impl SplatTrainer {
             // If still growing, sample from indices which are over the threshold.
             if grow_count > 0 {
                 let weights = above_threshold.float() * refiner.refine_weight_norm.clone();
-                let weights = weights
+                let mut weights = weights
                     .into_data_async()
                     .await
                     .expect("Failed to get weights")
                     .into_vec::<f32>()
                     .expect("Failed to read weights");
+                // Bias growth toward edge gaussians (MRNF delta #4).
+                if let Some(factor) = &edge_factor {
+                    for (w, f) in weights.iter_mut().zip(factor.iter()) {
+                        *w *= f;
+                    }
+                }
                 let growth_inds = multinomial_sample(&mut self.rng, &weights, grow_count);
                 split_inds.extend(growth_inds);
             }
@@ -1106,7 +1331,7 @@ impl SplatTrainer {
         }
 
         // Update current bounds based on the splats.
-        self.bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
+        self.bounds = get_splat_bounds(splats.clone(), self.config.bounds_percentile).await;
         // Recompute the per-splat 3D-filter floor against the new positions/
         // count and attach it. Refine must always leave the floor attached:
         // otherwise the late-training and LOD tails can shrink below it.
@@ -1165,44 +1390,77 @@ impl SplatTrainer {
 
             let cur_scales = cur_log_scale.clone().exp();
 
-            let cur_opac = sigmoid(cur_raw_opac.clone());
-            let inv_opac: Tensor<1> = 1.0 - cur_opac;
-            // Post-split child opacity as a power law in transmittance,
-            // p = 0.5 would keep the transmittance for cloning splats but as we offset them
-            // choose a higher p.
-            let new_opac: Tensor<1> = 1.0 - inv_opac.powf_scalar(FRAC_1_SQRT_2);
-            let new_raw_opac = inv_sigmoid(new_opac.clamp(MIN_OPACITY, 1.0 - MIN_OPACITY));
+            // Long-Axis-Split (LAS) child geometry — MRNF port, delta #2.
+            // Mirrors LFS `long_axis_split_gaussians_inplace_kernel`
+            // (densification_kernels.cu:669-771): split the single longest scale
+            // axis, halving it and pushing the two children apart along that axis
+            // by half its world extent (centroid-preserving), shrink the other
+            // two axes to 0.85x, and cut opacity to 0.6x. Replaces Brush's
+            // covariance 1/√2 split. The append + Adam-moment-zeroing +
+            // require_grad re-lift scaffold below is unchanged (see E.1).
 
-            // Smooth covariance-aware split. Per-axis shrink + mass-conserving
-            // deterministic offset (one child at +offset, the other at -offset).
-            // Children inherit the
-            // parent's rotation; the split is the scale shrink + ±offset.
-            let cur_scales_sq = cur_scales.clone().powi_scalar(2);
-            let max_scale_sq = cur_scales_sq.clone().max_dim(1).clamp_min(1e-30);
-            let ratio = cur_scales_sq / max_scale_sq;
-            // Max-axis shrink factor `k` (per splat). The standard split uses
-            // 1/√2 (mass-conserving). When `split_at_screen_size` is set, splats
-            // that are too big on screen shrink harder so their children land at
-            // (at most) the cap: `k = min(1/√2, split_at_screen_size / screen)`.
-            // Splats already within √2× of the cap are unaffected (min → 1/√2).
-            let k_per_axis: Tensor<2> = if self.config.split_at_screen_size > 0.0 {
-                let k_max = screen_sizes
+            // Post-split child (and parent) opacity: sigmoid(raw) * 0.6, back to
+            // logit — LFS `inverse_sigmoid(sigmoid(opacity) * 0.6)`. NOT
+            // mass-conserving like the old 1-inv^(1/√2) rule; intentional per
+            // MRNF (watch for a small brightness step at refines, E.2).
+            let new_opac: Tensor<1> =
+                sigmoid(cur_raw_opac.clone()).mul_scalar(self.config.split_opacity_scale);
+            let new_raw_opac =
+                inv_sigmoid(new_opac.clamp(self.config.min_opacity, 1.0 - self.config.min_opacity));
+
+            // One-hot [refine_count, 3] selecting each splat's longest log-scale
+            // axis. exp is monotone so argmax over log-scale == argmax over scale;
+            // argmax picks a single index, matching LFS `get_max_value_index`
+            // (avoids the double-offset a tie in an `equal` mask could cause).
+            let ls_device = cur_log_scale.device();
+            let longest_idx: Tensor<2, Int> = cur_log_scale.clone().argmax(1);
+            let long_onehot: Tensor<2> = Tensor::zeros([refine_count, 3], &ls_device).scatter(
+                1,
+                longest_idx,
+                Tensor::ones([refine_count, 1], &ls_device),
+                IndexingUpdateOp::Add,
+            );
+
+            // Longest-axis shrink multiplier. LFS uses a fixed 0.5; we keep that
+            // for normally-sized splats but let `split_at_screen_size` shrink the
+            // longest axis harder for oversized ones so their children land at (at
+            // most) the on-screen cap — Brush's oversize benefit, retained per the
+            // design's recommendation for equirect. min(0.5, split_at_screen_size
+            // / screen); reduces to LFS's fixed 0.5 when the cap is not binding or
+            // is disabled (split_at_screen_size <= 0).
+            let m_long: Tensor<2> = if self.config.split_at_screen_size > 0.0 {
+                screen_sizes
                     .select(0, refine_inds.clone())
                     .unsqueeze_dim(1)
                     .clamp_min(1e-6)
                     .recip()
                     .mul_scalar(self.config.split_at_screen_size)
-                    .clamp_max(FRAC_1_SQRT_2);
-                -(ratio * (-k_max + 1.0)) + 1.0
+                    .clamp_max(self.config.split_long_axis_scale)
             } else {
-                -(ratio * (1.0_f32 - FRAC_1_SQRT_2)) + 1.0
+                Tensor::zeros([refine_count, 1], &ls_device)
+                    .add_scalar(self.config.split_long_axis_scale)
             };
-            let offset_factor = (-k_per_axis.clone().powi_scalar(2) + 1.0)
-                .clamp_min(0.0)
-                .sqrt();
-            let offset_local = offset_factor * cur_scales;
+
+            // Offset each child by half the longest axis' world extent, along that
+            // axis in world space: the local vector `e_L * (0.5 * exp(scale[L]))`
+            // (non-zero only on axis L) rotated by the parent quaternion. Matches
+            // LFS `global_offset = R[:,L] * (exp(scale[L]) * 0.5)`. Offset
+            // magnitude stays at LFS's fixed 0.5*extent; only the scale shrink
+            // follows m_long.
+            let offset_local = long_onehot.clone() * cur_scales * self.config.split_long_axis_scale;
             let samples = quaternion_vec_multiply(cur_rots.clone(), offset_local);
-            let new_log_scales = cur_log_scale.clone() + k_per_axis.log();
+
+            // New log-scales: shrink all three axes to 0.85x, then override the
+            // longest axis to `log_scale[L] + ln(m_long)` (== +ln(0.5) in the
+            // default case). LFS: new_scale[L] = scale[L]+ln(0.5),
+            // new_scale[other] = scale[other]+ln(0.85).
+            let base_log_scales = cur_log_scale
+                .clone()
+                .add_scalar(self.config.split_other_axis_scale.ln());
+            let long_log_scales = cur_log_scale.clone() + m_long.log();
+            let new_log_scales =
+                base_log_scales * (-long_onehot.clone() + 1.0) + long_log_scales * long_onehot;
+            // LAS keeps the parent rotation for both children.
             let child_rots = cur_rots;
 
             // Scatter into transforms: build a [refine_count, 10] update tensor
@@ -1293,6 +1551,31 @@ impl SplatTrainer {
             let new_opac = sigmoid(f) - minus_opac;
             inv_sigmoid(new_opac.clamp(1e-12, 1.0 - 1e-12))
         });
+
+        // Shrink scales slowly over time (MRNF port, delta #1). MRNF decays
+        // both opacity and scale every refine; Brush only had the opacity half.
+        // Mirrors `mrnf_decay_kernel` (mrnf_kernels.cu:127-131):
+        //   scale = exp(log_scale) * (1 - scale_decay * t_shrink)
+        //   log_scale = log(max(scale, 1e-12))
+        // Uses the SAME phase-local `t_shrink_strength` as opacity decay (not
+        // MRNF's global iter/iterations) to keep LOD-aware training intact, and
+        // is applied to the SAME rows — all live splats after append — so freshly
+        // split children get exactly one decay. This writes the RAW log-scales
+        // (transforms cols 7..10) BEFORE the caller recomputes the Mip-Splatting
+        // min-scale floor (`apply_min_scale_floor`), so the floor and decay do
+        // not fight. Off (scale_decay == 0) reproduces upstream behaviour.
+        if self.config.scale_decay > 0.0 {
+            let scale_factor = 1.0 - self.config.scale_decay * t_shrink_strength;
+            splats.transforms = splats.transforms.map(|t| {
+                let log_scales = t.clone().slice(s![.., 7..10]);
+                let new_log_scales = log_scales
+                    .exp()
+                    .mul_scalar(scale_factor)
+                    .clamp_min(1e-12)
+                    .log();
+                t.slice_assign(s![.., 7..10], new_log_scales)
+            });
+        }
 
         self.optim = Some(create_optimizer_from_config().load_record(record));
         splats

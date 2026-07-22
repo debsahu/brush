@@ -39,6 +39,18 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options", default_value = "50.0")]
     pub mean_noise_weight: f32,
 
+    /// MRNF bounds-scaled noise injection (MRNF port, R2). When set, the
+    /// low-opacity mean-noise perturbation is applied in the densification
+    /// path PRE-refine, gated on VALID robust bounds (LFS `_bounds_valid`,
+    /// mrnf.cpp:618) and on the ACCUMULATED per-refine visibility count
+    /// (`RefineRecord::vis_weight`, LFS `_vis_count`), mirroring LFS
+    /// `MRNF::inject_noise` / `launch_mrnf_noise_injection` (mrnf.cpp:1085,
+    /// `mrnf_kernels.cu:41`). Replaces Brush's generic per-step noise. OFF by
+    /// default.
+    #[arg(long, help_heading = "Refine options", default_value = "false")]
+    #[serde(default)]
+    pub mrnf_noise_injection: bool,
+
     /// Learning rate for the base SH (RGB) coefficients.
     #[arg(long, help_heading = "Training options", default_value = "2e-3")]
     pub lr_coeffs_dc: f64,
@@ -54,6 +66,16 @@ pub struct TrainConfig {
     /// Learning rate for the scale parameters.
     #[arg(long, help_heading = "Training options", default_value = "5e-3")]
     pub lr_scale: f64,
+
+    /// End learning rate for the scale parameters (MRNF LR schedule, R1).
+    /// Independent exponential decay `lr_scale` -> `lr_scale_end` over
+    /// `total_train_iters`, mirroring LFS `scaling_lr_end` +
+    /// `compute_decay_gamma` (mrnf.cpp:425) and the per-step
+    /// `_scale_lr_current *= _scale_lr_gamma` (mrnf.cpp:1360). Defaults to
+    /// `lr_scale` so the schedule is a no-op (gamma == 1.0) unless the
+    /// operator opts in with a lower end value.
+    #[arg(long, help_heading = "Training options", default_value = "5e-3")]
+    pub lr_scale_end: f64,
 
     /// Learning rate for the rotation parameters.
     #[arg(long, help_heading = "Training options", default_value = "2e-3")]
@@ -99,6 +121,111 @@ pub struct TrainConfig {
     /// Factor of the opacity decay.
     #[arg(long, help_heading = "Training options", default_value = "0.004")]
     pub opac_decay: f32,
+
+    /// Factor of the per-refine scale decay (MRNF port, delta #1). Mirrors
+    /// opacity decay but shrinks the log-scales: `scale *= 1 - scale_decay *
+    /// t_shrink`, strongest early in a phase and fading to zero at its end.
+    /// 0 disables (matching upstream Brush behaviour).
+    #[arg(long, help_heading = "Refine options", default_value = "0.0")]
+    pub scale_decay: f32,
+
+    /// Prune genuinely degenerate splats whose smallest scale axis falls below
+    /// `1e-10` (MRNF delta #3). OFF by default: Brush deliberately keeps thin
+    /// "pancake" surface splats, and the Mip-Splatting min-scale floor already
+    /// keeps rendered scales above this, so this only bites raw-degenerate
+    /// splats. Enable only if an A/B shows it helps without softening surfaces.
+    #[arg(long, help_heading = "Refine options", default_value = "false")]
+    pub min_scale_prune: bool,
+
+    /// Smallest-scale-axis threshold for the optional min-scale degenerate
+    /// prune (only used when `--min-scale-prune` is set). Matches MRNF's
+    /// `MRNF_LOG_MIN_SCALE_THRESHOLD = log(1e-10)` (mrnf.cpp:72), expressed here
+    /// as the linear scale so it compares against the effective (floored)
+    /// scales.
+    #[arg(long, help_heading = "Refine options", default_value = "1e-10")]
+    pub min_scale_prune_threshold: f32,
+
+    /// Prune splats whose raw quaternion has collapsed toward zero (squared
+    /// norm < 1e-8), i.e. a degenerate rotation that renders as garbage.
+    /// Mirrors MRNF's `compute_near_zero_rotation_mask` (mrnf.cpp:667;
+    /// `pruning_kernels.cu:64` `mag_sq = q.q < 1e-8`). OFF by default: a healthy
+    /// quaternion has norm ~1 so this only bites already-collapsed splats, but
+    /// it is flag-gated because it adds a term to the default prune mask.
+    #[arg(long, help_heading = "Refine options", default_value = "false")]
+    pub near_zero_rotation_prune: bool,
+
+    /// Use an L2 radial distance from the robust scene center for the
+    /// out-of-bounds prune instead of the legacy per-axis (L-inf / Chebyshev)
+    /// test. Matches MRNF's radial `dist_from_center > max_extent*100`
+    /// (mrnf.cpp:664-670). OFF by default: L2 >= L-inf so this prunes a
+    /// superset of the legacy test, changing default behaviour, hence
+    /// flag-gated.
+    #[arg(long, help_heading = "Refine options", default_value = "false")]
+    pub radial_bounds_prune: bool,
+
+    /// Opacity below which a splat is pruned, and the clamp applied to split
+    /// children's opacity. Mirrors MRNF's `min_opacity = 1/255`
+    /// (parameters.cpp:249, prune threshold `logit(1/255)` at mrnf.cpp:71).
+    #[arg(long, help_heading = "Refine options", default_value_t = 1.0f32 / 255.0)]
+    pub min_opacity: f32,
+
+    /// World-extent multiplier for the out-of-bounds prune: a splat is culled if
+    /// any scale axis, or its distance from the robust scene center, exceeds this
+    /// factor times the scene's largest robust half-extent. Mirrors MRNF's
+    /// `max_allowed = max_extent * 100` (mrnf.cpp:644). This is the sky-floater
+    /// killer; lower it to cull closer to the scene box.
+    #[arg(long, help_heading = "Refine options", default_value = "100.0")]
+    pub prune_extent_factor: f32,
+
+    /// Percentile for the robust per-axis AABB recomputed each refine (drives the
+    /// out-of-bounds prune). Mirrors MRNF's `bounds_percentile = 0.8`
+    /// (parameters.hpp:182). Note: this governs the per-refine bounds recompute;
+    /// the one-time initial bounds use the module default.
+    #[arg(long, help_heading = "Refine options", default_value = "0.8")]
+    pub bounds_percentile: f32,
+
+    /// Long-Axis-Split (LAS) longest-axis factor (MRNF delta #2): the split
+    /// halves the longest scale axis and offsets the two children apart by this
+    /// fraction of its world extent. Mirrors MRNF's fixed `0.5`
+    /// (densification_kernels.cu:669-771). For oversized splats the effective
+    /// longest-axis shrink is further capped by `--split-at-screen-size`.
+    #[arg(long, help_heading = "Refine options", default_value = "0.5")]
+    pub split_long_axis_scale: f32,
+
+    /// Long-Axis-Split (LAS) shrink applied to the two non-longest scale axes of
+    /// both split children. Mirrors MRNF's fixed `0.85`
+    /// (densification_kernels.cu:669-771).
+    #[arg(long, help_heading = "Refine options", default_value = "0.85")]
+    pub split_other_axis_scale: f32,
+
+    /// Long-Axis-Split (LAS) opacity multiplier applied to both split children:
+    /// `sigmoid(raw) *= split_opacity_scale`. Mirrors MRNF's revised-opacity
+    /// `inverse_sigmoid(sigmoid(opacity) * 0.6)` (`densification_kernels.cu:722`).
+    /// NOT mass-conserving; set to 1.0 for a mass-conserving-ish split A/B.
+    #[arg(long, help_heading = "Refine options", default_value = "0.6")]
+    pub split_opacity_scale: f32,
+
+    /// Edge-guidance densification (MRNF port, delta #4). When set, a Canny edge
+    /// map of each sampled GT view is projected onto the gaussians and the
+    /// accumulated per-gaussian edge score biases growth + dead-slot replacement
+    /// toward high-frequency image edges (LFS `use_edge_map`, `mrnf_defaults`). OFF
+    /// by default; this is the highest-effort MRNF lever, only worth enabling if
+    /// Phases 1-3 leave a floater/detail gap.
+    ///
+    /// NOTE: the current implementation is a burn-op projection fallback
+    /// (pinhole-only, center-sample, opacity-weighted), NOT the full alpha-blended
+    /// edge rasterizer — see `crate::edge`.
+    #[arg(long, help_heading = "Refine options", default_value = "false")]
+    #[serde(default)]
+    pub use_edge_map: bool,
+
+    /// Strength of the edge-guidance factor: the normalized per-gaussian edge
+    /// score is scaled by this before the `+ 1.0` that turns it into a
+    /// multiplicative sampling weight (LFS `MRNF_EDGE_SCORE_WEIGHT = 0.25`,
+    /// mrnf.cpp:68). Only used when `--use-edge-map` is set.
+    #[arg(long, help_heading = "Refine options", default_value = "0.25")]
+    #[serde(default = "default_edge_score_weight")]
+    pub edge_score_weight: f32,
 
     /// Weight of l1 loss on alpha if input view has transparency.
     #[arg(long, help_heading = "Refine options", default_value = "0.1")]
@@ -350,6 +477,10 @@ fn default_ppisp_lr() -> f64 {
 
 fn default_ppisp_reg_scale() -> f32 {
     1.0
+}
+
+fn default_edge_score_weight() -> f32 {
+    0.25
 }
 
 #[cfg(test)]
