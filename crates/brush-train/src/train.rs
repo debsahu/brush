@@ -2,7 +2,7 @@ use crate::{
     adam_scaled::{AdamScaled, AdamScaledConfig, AdamState},
     config::TrainConfig,
     dig::{self, DigTrainState},
-    edge,
+    edge, error_map,
     min_scale::compute_min_scale,
     msg::{RefineStats, TrainStepStats},
     multinomial::multinomial_sample,
@@ -489,6 +489,64 @@ impl SplatTrainer {
         }
     }
 
+    /// Accumulate this step's error-map growth score into the refine record
+    /// (MRNF `use_error_map` port). No-op unless `--error-map-densification` is
+    /// set and this step lands on the sampling stride (shared with edge
+    /// guidance, `EDGE_MIN_VIEW_SAMPLES` views per window). `pred_rgb` is the
+    /// post-appearance predicted RGB `[H, W, 3]` on the inner backend (the same
+    /// image the SSIM loss sees); `gt_packed` is this view's GT.
+    ///
+    /// Reproduces LFS's per-view error signal term-for-term:
+    ///   1. `ê = mean_normalize(max(0, 1 − meanSSIM(pred, gt)))` — a clean,
+    ///      nonnegative, map-mean-normalized D-SSIM error map (`crate::error_map`).
+    ///   2. `s_g = Σ_p T_g(p)·α_g(p)·ê(p)` — the alpha-blended projection, via
+    ///      the same `feat_dim=1` feature backward the edge path uses.
+    ///   3. window-MAX accumulate (`gather_error`), NOT sum/mean.
+    ///
+    /// CRUCIALLY, unlike the edge path, the per-gaussian score is NOT
+    /// positive-median normalized: it must stay on LFS's native scale so
+    /// `error_map_growth_threshold` (`τ_err` = 0.003) transfers verbatim
+    /// (design spec §5). Pure non-differentiable bookkeeping — the score comes
+    /// from an isolated feature forward+backward that never touches the
+    /// photometric graph.
+    async fn accumulate_error_sample(
+        &mut self,
+        splats: &Splats,
+        camera: &Camera,
+        pred_rgb: Tensor<3>,
+        gt_packed: &Tensor<2, Int>,
+        composite_bg: Option<glam::Vec3>,
+        img_size: glam::UVec2,
+    ) {
+        if !self.config.error_map_densification
+            || !self.step_count.is_multiple_of(self.edge_sample_stride())
+        {
+            return;
+        }
+        // GT RGB `[H, W, 3]` on the inner backend (same unpack the loss uses for
+        // its SSIM). `pred_rgb` already arrives detached on the inner backend.
+        let gt_rgb = brush_loss::unpack_gt_rgb(gt_packed.clone(), composite_bg);
+        // Clean D-SSIM error map, then MRNF map-mean normalize to ~1.0 so the
+        // projected score lands on LFS's native scale.
+        let error = error_map::ssim_error_map(pred_rgb, gt_rgb);
+        let error = error_map::mean_normalize(error);
+
+        let valid = splats.valid();
+        let n = valid.num_splats() as usize;
+        if n == 0 {
+            return;
+        }
+        // `Σ_p T·α·ê` per gaussian, via the shared feature backward.
+        let score = edge::project_edge_scores(&valid, error, camera, img_size).await;
+
+        // INVARIANT (same as the edge path): the splat set is constant within a
+        // refine window, and `RefineRecord` is recreated fresh after each prune,
+        // so the window-MAX starts from zero every window (no cross-window leak).
+        if let Some(record) = self.refine_record.as_mut() {
+            record.gather_error(score);
+        }
+    }
+
     /// Run one training step, optionally omitting the refinement-only raster
     /// gradient statistic. Model gradients, visibility, and screen-radius
     /// bookkeeping are always preserved.
@@ -795,6 +853,25 @@ impl SplatTrainer {
             // `--use-edge-map` and the sampling stride inside the method.
             self.accumulate_edge_sample(&splats, &camera, &gt_packed, composite_bg, img_size)
                 .await;
+
+            // Error-map growth accumulation (MRNF `use_error_map` port). Uses
+            // the post-appearance predicted RGB (the same image the SSIM loss
+            // sees) detached onto the inner backend, plus this view's GT; gated
+            // on `--error-map-densification` and the sampling stride inside.
+            let pred_rgb = brush_render::burn_glue::detach_autodiff(pred_image.clone().slice(s![
+                ..,
+                ..,
+                0..3
+            ]));
+            self.accumulate_error_sample(
+                &splats,
+                &camera,
+                pred_rgb,
+                &gt_packed,
+                composite_bg,
+                img_size,
+            )
+            .await;
 
             (
                 grads,
@@ -1269,7 +1346,23 @@ impl SplatTrainer {
 
         let pre_high_grad = split_inds.len();
         if global_iter < self.config.growth_stop_iter {
-            let above_threshold = refiner.above_threshold(self.config.growth_grad_threshold);
+            // Growth signal selection (MRNF `use_error_map` port). When error-map
+            // densification is on, the growth candidate set + sampling weight come
+            // from the window-MAX error score `Σ T·α·ê` thresholded at τ_err
+            // (LFS `refine_candidates = _refine_weight_max > 0.003 && _vis_count>0`,
+            // mrnf.cpp:726) — the error signal REPLACES the gradient as the base
+            // signal. Off, this is exactly upstream's gradient-norm gate.
+            let (above_threshold, growth_base) = if self.config.error_map_densification {
+                (
+                    refiner.error_above_threshold(self.config.error_map_growth_threshold),
+                    refiner.error_score_max_or_zeros(),
+                )
+            } else {
+                (
+                    refiner.above_threshold(self.config.growth_grad_threshold),
+                    refiner.refine_weight_norm.clone(),
+                )
+            };
 
             let threshold_count = above_threshold
                 .clone()
@@ -1293,7 +1386,13 @@ impl SplatTrainer {
 
             // If still growing, sample from indices which are over the threshold.
             if grow_count > 0 {
-                let weights = above_threshold.float() * refiner.refine_weight_norm.clone();
+                // Base sampling weight: gradient-norm, or the error score when
+                // error-map densification is on (both masked to the thresholded
+                // set). Edge guidance, when ALSO on, is a MULTIPLICATIVE bias
+                // layered on top — it only reweights WITHIN the thresholded set,
+                // never adds a gaussian the base signal missed (LFS: error is the
+                // base growth signal, edge is `factor = score·w + 1.0`).
+                let weights = above_threshold.float() * growth_base;
                 let mut weights = weights
                     .into_data_async()
                     .await

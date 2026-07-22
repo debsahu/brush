@@ -9,6 +9,7 @@ pub mod train;
 
 mod adam_scaled;
 mod edge;
+mod error_map;
 mod min_scale;
 mod multinomial;
 mod quat_vec;

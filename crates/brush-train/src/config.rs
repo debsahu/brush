@@ -232,6 +232,35 @@ pub struct TrainConfig {
     #[serde(default = "default_edge_score_weight")]
     pub edge_score_weight: f32,
 
+    /// Error-map densification (MRNF `use_error_map` port). When set, the growth
+    /// signal switches from the screen-space position-gradient norm to LFS's
+    /// error-weighted signal: a mean-normalized D-SSIM error map of each sampled
+    /// view is projected onto the gaussians as `Σ_p T·α·ê(p)`, window-MAX
+    /// accumulated, and thresholded directly (LFS `use_error_map`,
+    /// mrnf.cpp:726). OFF by default; when off the trajectory is bit-identical
+    /// to upstream (gradient-driven) growth. When BOTH this and `--use-edge-map`
+    /// are set, error is the base growth signal and edge is a multiplicative
+    /// bias within the error-thresholded set (LFS semantics).
+    ///
+    /// The per-gaussian score reuses the same `feat_dim=1` feature backward as
+    /// edge guidance (see `crate::error_map`), so it works for every camera
+    /// model the renderer supports.
+    #[arg(long, help_heading = "Refine options", default_value = "false")]
+    #[serde(default)]
+    pub error_map_densification: bool,
+
+    /// Growth threshold for the error-map signal (LFS `τ_err`, mrnf.cpp:726).
+    /// Governs ONLY the `--error-map-densification` path; the gradient path uses
+    /// `--growth-grad-threshold` (a different scale, do not conflate). Because
+    /// the error map is mean-normalized to 1.0, the per-gaussian score lands on
+    /// LFS's native scale (`Σ T·α · O(1)`), so this LFS default transfers
+    /// verbatim: it is a LOW floor admitting any gaussian with nonzero
+    /// visible-and-erroneous contribution; `--growth-select-fraction` does the
+    /// real selection pressure.
+    #[arg(long, help_heading = "Refine options", default_value = "0.003")]
+    #[serde(default = "default_error_map_growth_threshold")]
+    pub error_map_growth_threshold: f32,
+
     /// Weight of l1 loss on alpha if input view has transparency.
     #[arg(long, help_heading = "Refine options", default_value = "0.1")]
     pub match_alpha_weight: f32,
@@ -488,6 +517,10 @@ fn default_edge_score_weight() -> f32 {
     0.25
 }
 
+fn default_error_map_growth_threshold() -> f32 {
+    0.003
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +531,26 @@ mod tests {
             .err()
             .expect("stacked appearance flags must conflict");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn error_map_flags_default_off_and_parse() {
+        // Default: error-map densification OFF, LFS τ_err floor.
+        let def = TrainConfig::default();
+        assert!(!def.error_map_densification);
+        assert!((def.error_map_growth_threshold - 0.003).abs() < 1e-9);
+        // The gradient threshold is a SEPARATE knob (different scale), untouched.
+        assert!((def.growth_grad_threshold - 0.0025).abs() < 1e-9);
+
+        let on = TrainConfig::try_parse_from([
+            "brush",
+            "--error-map-densification",
+            "--error-map-growth-threshold",
+            "0.01",
+        ])
+        .expect("error-map flags must parse");
+        assert!(on.error_map_densification);
+        assert!((on.error_map_growth_threshold - 0.01).abs() < 1e-9);
     }
 
     #[test]
