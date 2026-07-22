@@ -39,6 +39,18 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options", default_value = "50.0")]
     pub mean_noise_weight: f32,
 
+    /// MRNF bounds-scaled noise injection (MRNF port, R2). When set, the
+    /// low-opacity mean-noise perturbation is applied in the densification
+    /// path PRE-refine, gated on VALID robust bounds (LFS `_bounds_valid`,
+    /// mrnf.cpp:618) and on the ACCUMULATED per-refine visibility count
+    /// (`RefineRecord::vis_weight`, LFS `_vis_count`), mirroring LFS
+    /// `MRNF::inject_noise` / `launch_mrnf_noise_injection` (mrnf.cpp:1085,
+    /// mrnf_kernels.cu:41). Replaces Brush's generic per-step noise. OFF by
+    /// default.
+    #[arg(long, help_heading = "Refine options", default_value = "false")]
+    #[serde(default)]
+    pub mrnf_noise_injection: bool,
+
     /// Learning rate for the base SH (RGB) coefficients.
     #[arg(long, help_heading = "Training options", default_value = "2e-3")]
     pub lr_coeffs_dc: f64,
