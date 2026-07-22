@@ -1046,12 +1046,15 @@ impl SplatTrainer {
         // splats whose smallest log-scale axis drops below log(1e-10) (see
         // mrnf.cpp:668, MRNF_LOG_MIN_SCALE_THRESHOLD). Brush deliberately omits
         // this to keep thin "pancake" surface splats (see note above), so it is
-        // flag-gated and OFF by default. `scales` is the effective (floored)
-        // scale, so this is near-inert on floored splats and only bites raw
-        // degenerate geometry.
+        // flag-gated and OFF by default. Tests the RAW log-scales
+        // (`log_scales().exp()`), NOT `scales()` which folds in the
+        // Mip-Splatting min-scale floor; that floor keeps folded scales above
+        // the threshold so the prune would never fire. Testing raw scales
+        // reproduces LFS's raw-scale cull (mrnf.cpp:668).
         let prune_mask = if self.config.min_scale_prune {
-            let scale_small = scales
-                .clone()
+            let scale_small = splats
+                .log_scales()
+                .exp()
                 .lower_elem(self.config.min_scale_prune_threshold)
                 .any_dim(1)
                 .squeeze_dim(1);

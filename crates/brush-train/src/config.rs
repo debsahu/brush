@@ -104,7 +104,7 @@ pub struct TrainConfig {
     /// opacity decay but shrinks the log-scales: `scale *= 1 - scale_decay *
     /// t_shrink`, strongest early in a phase and fading to zero at its end.
     /// 0 disables (matching upstream Brush behaviour).
-    #[arg(long, help_heading = "Refine options", default_value = "0.002")]
+    #[arg(long, help_heading = "Refine options", default_value = "0.0")]
     pub scale_decay: f32,
 
     /// Prune genuinely degenerate splats whose smallest scale axis falls below
