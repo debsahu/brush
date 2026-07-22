@@ -111,6 +111,7 @@ impl RefineRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::tensor::TensorData;
 
     async fn values(tensor: Tensor<1>) -> Vec<f32> {
         tensor
@@ -138,5 +139,48 @@ mod tests {
         assert_eq!(values(record.refine_weight_norm).await, [1.0, 2.0, 3.0]);
         assert_eq!(values(record.vis_weight).await, [1.5, 1.0, 2.0]);
         assert_eq!(values(record.max_screen_size).await, [0.2, 0.2, 0.4]);
+    }
+
+    /// Edge accumulation across a splat-count change: `gather_edge` sums two
+    /// views elementwise (constant-N invariant), `keep` reindexes the
+    /// accumulator through a prune, and `edge_factor_host` averages by the
+    /// sample count and normalizes — the factors must track exactly the kept
+    /// gaussians in their post-prune order.
+    #[tokio::test]
+    async fn edge_accumulation_survives_prune_and_averages_by_sample_count() {
+        let device: Device = brush_cube::test_helpers::test_device().await.into();
+        let mut record = RefineRecord::new(4, &device);
+
+        // Two sampled views; elementwise `sum + score` requires N == 4 both times.
+        record.gather_edge(Tensor::from_floats([1.0, 2.0, 3.0, 4.0], &device));
+        record.gather_edge(Tensor::from_floats([3.0, 4.0, 5.0, 6.0], &device));
+        // sum = [4, 6, 8, 10]; edge_sample_count = 2.
+
+        // Prune gaussian 1: keep indices [0, 2, 3].
+        let keep_idx: Tensor<1, Int> =
+            Tensor::<1, Int>::from_data(TensorData::new(vec![0i32, 2, 3], [3]), &device);
+        let record = record.keep(keep_idx);
+
+        // kept sum = [4, 8, 10]; mean = sum/2 = [2, 4, 5];
+        // positive-median = 4 (upper median of {2,4,5});
+        // normalized = [0.5, 1.0, 1.25]; *0.25 + 1 = [1.125, 1.25, 1.3125].
+        let factors = record
+            .edge_factor_host(0.25)
+            .await
+            .expect("edge factors present after 2 samples");
+        assert_eq!(factors.len(), 3, "factors track the 3 kept gaussians");
+        let expected = [1.125f32, 1.25, 1.3125];
+        for (got, want) in factors.iter().zip(&expected) {
+            assert!((got - want).abs() < 1e-6, "factor {got} vs {want}");
+        }
+    }
+
+    /// No edge samples gathered -> `edge_factor_host` yields `None` (guidance
+    /// is a no-op, weights untouched).
+    #[tokio::test]
+    async fn edge_factor_host_none_without_samples() {
+        let device: Device = brush_cube::test_helpers::test_device().await.into();
+        let record = RefineRecord::new(3, &device);
+        assert!(record.edge_factor_host(0.25).await.is_none());
     }
 }

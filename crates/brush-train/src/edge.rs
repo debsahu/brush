@@ -458,6 +458,39 @@ mod tests {
         Tensor::<1>::from_data(TensorData::new(iota, [h * w]), device).reshape([h as i32, w as i32])
     }
 
+    /// Edge map that is 1.0 in a centered `k×k` window, 0 elsewhere.
+    fn central_window_edge_map(
+        h: usize,
+        w: usize,
+        k: usize,
+        device: &burn::tensor::Device,
+    ) -> Tensor<2> {
+        let mut data = vec![0.0f32; h * w];
+        let r0 = (h - k) / 2;
+        let c0 = (w - k) / 2;
+        for r in r0..r0 + k {
+            for c in c0..c0 + k {
+                data[r * w + c] = 1.0;
+            }
+        }
+        Tensor::<1>::from_data(TensorData::new(data, [h * w]), device).reshape([h as i32, w as i32])
+    }
+
+    /// A very narrow-FOV pinhole (fov ≈ 2.9°) at the origin looking down +Z.
+    /// The tight FOV keeps the affine EWA projection accurate and lets a
+    /// moderately-scaled on-axis gaussian cover the frame with near-uniform
+    /// alpha.
+    fn narrow_pinhole() -> Camera {
+        Camera::new(
+            glam::Vec3::ZERO,
+            glam::Quat::IDENTITY,
+            0.05,
+            0.05,
+            glam::vec2(0.5, 0.5),
+            CameraModel::Pinhole,
+        )
+    }
+
     async fn read1(t: Tensor<1>) -> Vec<f32> {
         t.into_data_async()
             .await
@@ -698,5 +731,149 @@ mod tests {
                 "scale-equivariance broken: {a} vs {b}"
             );
         }
+    }
+
+    /// Genuinely independent correctness gate on the score's ABSOLUTE
+    /// magnitude, hand-derived from first principles rather than from another
+    /// call into `render_splat_features` (which would only re-confirm autodiff
+    /// linearity). A single on-axis isotropic gaussian with `raw_opacity = 0`
+    /// has peak alpha `sigmoid(0) * filter_comp = 0.5` (filter_comp == 1.0 in
+    /// Default / non-mip mode; verified in `project_forward.rs`). It is the
+    /// only gaussian, so `T == 1` in front of it, and its wide projected
+    /// footprint (≈130 px 2D std) makes alpha ≈ 0.5 across the tiny central
+    /// `k×k` edge window (falloff over ±4 px is < 0.1 %). Hence
+    /// `score = Σ_window T·α·edge = 0.5 · k²`, a literal number no kernel bug
+    /// (wrong opacity activation, dropped transmittance base case, mis-scaled
+    /// Σ T·α) can satisfy silently. Loose tol absorbs sub-pixel centering and
+    /// the residual window falloff.
+    #[tokio::test]
+    async fn edge_score_absolute_value_from_first_principles() {
+        let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
+        let (w, h) = (32usize, 32usize);
+        let img_size = glam::uvec2(w as u32, h as u32);
+        let camera = narrow_pinhole();
+
+        // On-axis; 3σ (= 3·0.8 = 2.4) < depth (4) so it stays in front of the
+        // near plane, yet the narrow FOV projects it to a footprint far wider
+        // than the 8×8 window.
+        let means = [[0.0f32, 0.0, 4.0]];
+        let log_scales = [[-0.223_143_5f32, -0.223_143_5, -0.223_143_5]]; // ln(0.8)
+        let raw_opac = [0.0f32]; // sigmoid(0) = 0.5
+        let splats = make_splats(&means, &log_scales, &raw_opac, &device);
+
+        let k = 8usize;
+        let edge = central_window_edge_map(h, w, k, &device);
+        let expected = 0.5 * (k * k) as f32; // 0.5 per window pixel, T == 1
+
+        let score = read1(project_edge_scores(&splats, edge, &camera, img_size).await).await;
+        assert_eq!(score.len(), 1);
+        assert!(score[0].is_finite(), "score must be finite: {}", score[0]);
+        assert!(
+            (score[0] - expected).abs() <= 0.08 * expected,
+            "score {} deviates from first-principles reference {expected}",
+            score[0]
+        );
+    }
+
+    /// Coverage regression (behind-camera + off-frustum culling). A gaussian
+    /// behind the near plane and one laterally outside the frustum are both
+    /// terminated in projection, so each must yield a FINITE score of exactly
+    /// 0.0 — never a projection-singularity NaN (which `normalize_by_positive_
+    /// median` would silently mask) and never a spurious nonzero (which would
+    /// bias densification undetected). A third in-frame gaussian confirms the
+    /// zeros are real culling, not a global render failure.
+    #[tokio::test]
+    async fn edge_score_zero_for_behind_and_offscreen() {
+        let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
+        let (w, h) = (64usize, 64usize);
+        let img_size = glam::uvec2(w as u32, h as u32);
+        let camera = origin_pinhole(); // at origin looking +Z
+
+        // g0 behind the camera (z < 0); g1 far to the side (projects off-frame);
+        // g2 in front, on-axis (visible control).
+        let means = [[0.0f32, 0.0, -5.0], [100.0, 0.0, 5.0], [0.0, 0.0, 5.0]];
+        let log_scales = [
+            [-1.8f32, -1.8, -1.8],
+            [-1.8, -1.8, -1.8],
+            [-1.8, -1.8, -1.8],
+        ];
+        let splats = make_splats(&means, &log_scales, &[2.5, 2.5, 2.5], &device);
+        let edge = iota_edge_map(h, w, &device);
+
+        let score = read1(project_edge_scores(&splats, edge, &camera, img_size).await).await;
+        assert_eq!(score.len(), 3);
+        assert!(
+            score.iter().all(|s| s.is_finite()),
+            "scores must be finite: {score:?}"
+        );
+        assert_eq!(
+            score[0], 0.0,
+            "behind-camera gaussian must score exactly 0: {}",
+            score[0]
+        );
+        assert_eq!(
+            score[1], 0.0,
+            "off-frustum gaussian must score exactly 0: {}",
+            score[1]
+        );
+        assert!(
+            score[2] > 0.0,
+            "in-frame control must score > 0: {}",
+            score[2]
+        );
+    }
+
+    #[test]
+    fn normalize_by_positive_median_zeros_all_nonpositive() {
+        // All-zero input: no positives -> zeroed.
+        let mut z = vec![0.0f32, 0.0, 0.0];
+        normalize_by_positive_median(&mut z);
+        assert_eq!(z, [0.0, 0.0, 0.0]);
+        // All-negative input: no positives -> zeroed (not scaled).
+        let mut n = vec![-1.0f32, -2.0, -3.0];
+        normalize_by_positive_median(&mut n);
+        assert_eq!(n, [0.0, 0.0, 0.0]);
+        // edge_guidance_factor on all-zero scores is the neutral 1.0 everywhere.
+        let f = edge_guidance_factor(vec![0.0, 0.0, 0.0], 0.25);
+        assert_eq!(f, [1.0, 1.0, 1.0]);
+    }
+
+    /// Blank-view path (e.g. a sky-only frame with an all-zero edge map):
+    /// every per-gaussian score is exactly 0.0 and finite, exercising
+    /// `normalize_by_positive_median`'s empty-positive zeroing branch and
+    /// `edge_guidance_factor`'s neutral 1.0 output — the factor must never go
+    /// inf/NaN and poison densify for the window.
+    #[tokio::test]
+    async fn edge_score_zero_edge_map_is_neutral() {
+        let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
+        let (w, h) = (48usize, 48usize);
+        let img_size = glam::uvec2(w as u32, h as u32);
+        let camera = origin_pinhole();
+
+        let means = [[-1.5f32, 0.5, 5.0], [1.5, -0.5, 5.0], [0.0, 0.0, 4.0]];
+        let log_scales = [
+            [-1.6f32, -1.6, -1.6],
+            [-1.6, -1.6, -1.6],
+            [-1.6, -1.6, -1.6],
+        ];
+        let splats = make_splats(&means, &log_scales, &[2.5, 2.5, 2.5], &device);
+        let zero_edge = Tensor::<2>::zeros([h, w], &device);
+
+        let score = read1(project_edge_scores(&splats, zero_edge, &camera, img_size).await).await;
+        assert_eq!(score.len(), 3);
+        assert!(
+            score.iter().all(|s| s.is_finite()),
+            "scores must be finite: {score:?}"
+        );
+        assert!(
+            score.iter().all(|s| *s == 0.0),
+            "zero edge map must give all-zero scores: {score:?}"
+        );
+
+        let factor = edge_guidance_factor(score, 0.25);
+        assert!(
+            factor.iter().all(|f| (f - 1.0).abs() < 1e-6),
+            "neutral factor expected for a blank view: {factor:?}"
+        );
     }
 }
