@@ -112,6 +112,7 @@ fn can_defer_sh_grad(_optimizer: &OptimizerType, _splats: &Splats) -> bool {
 pub struct SplatTrainer {
     config: TrainConfig,
     sched_mean: ExponentialLrScheduler,
+    sched_scale: ExponentialLrScheduler,
     refine_record: Option<RefineRecord>,
     optim: Option<OptimizerType>,
     /// Optional per-view appearance compensation (bilateral grid / PPISP).
@@ -243,6 +244,19 @@ impl SplatTrainer {
             (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_train_iters as f64);
         let lr_mean = ExponentialLrSchedulerConfig::new(config.lr_mean, decay);
 
+        // MRNF LR schedule (R1): independent exponential decay for the log-scale
+        // parameters, mirroring LFS `_scale_lr_gamma` (mrnf.cpp:425) and the
+        // per-step `_scale_lr_current *= _scale_lr_gamma` (mrnf.cpp:1360). Guarded
+        // like LFS `compute_decay_gamma` (start/end > 0), so the default
+        // lr_scale_end == lr_scale yields gamma == 1.0 (constant, opt-in).
+        let scale_decay = if config.lr_scale > 0.0 && config.lr_scale_end > 0.0 {
+            (config.lr_scale_end / config.lr_scale)
+                .powf(1.0 / config.total_train_iters.max(1) as f64)
+        } else {
+            1.0
+        };
+        let lr_scale = ExponentialLrSchedulerConfig::new(config.lr_scale, scale_decay);
+
         let ssim_enabled = config.ssim_weight > 0.0;
 
         // Growth is gated on the global iter. LOD phases run past
@@ -257,6 +271,7 @@ impl SplatTrainer {
         Self {
             config,
             sched_mean: lr_mean.init().expect("Mean lr schedule must be valid."),
+            sched_scale: lr_scale.init().expect("Scale lr schedule must be valid."),
             optim: None,
             appearance: None,
             refine_record: None,
@@ -791,6 +806,9 @@ impl SplatTrainer {
             });
 
         let lr_mean = self.sched_mean.step() * median_scale as f64;
+        // MRNF LR schedule (R1): step the independent scale-LR schedule in
+        // lock-step with the mean schedule (LFS mrnf.cpp:1360).
+        let lr_scale = self.sched_scale.step();
 
         // Update per-component LR scaling for the transforms param.
         // transforms layout: means(3) + rotations(4) + log_scales(3)
@@ -806,9 +824,9 @@ impl SplatTrainer {
                 self.config.lr_rotation as f32,
                 self.config.lr_rotation as f32,
                 self.config.lr_rotation as f32,
-                self.config.lr_scale as f32,
-                self.config.lr_scale as f32,
-                self.config.lr_scale as f32,
+                lr_scale as f32,
+                lr_scale as f32,
+                lr_scale as f32,
             ];
             let transform_scaling =
                 Tensor::<1>::from_floats(lr_values.as_slice(), &opt_device).reshape([1, 10]);

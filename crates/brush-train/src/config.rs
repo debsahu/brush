@@ -55,6 +55,16 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options", default_value = "5e-3")]
     pub lr_scale: f64,
 
+    /// End learning rate for the scale parameters (MRNF LR schedule, R1).
+    /// Independent exponential decay `lr_scale` -> `lr_scale_end` over
+    /// `total_train_iters`, mirroring LFS `scaling_lr_end` +
+    /// `compute_decay_gamma` (mrnf.cpp:425) and the per-step
+    /// `_scale_lr_current *= _scale_lr_gamma` (mrnf.cpp:1360). Defaults to
+    /// `lr_scale` so the schedule is a no-op (gamma == 1.0) unless the
+    /// operator opts in with a lower end value.
+    #[arg(long, help_heading = "Training options", default_value = "5e-3")]
+    pub lr_scale_end: f64,
+
     /// Learning rate for the rotation parameters.
     #[arg(long, help_heading = "Training options", default_value = "2e-3")]
     pub lr_rotation: f64,
