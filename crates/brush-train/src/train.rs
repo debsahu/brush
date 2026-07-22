@@ -1,5 +1,3 @@
-use std::f32::consts::FRAC_1_SQRT_2;
-
 use crate::{
     adam_scaled::{AdamScaled, AdamScaledConfig, AdamState},
     config::TrainConfig,
@@ -1183,44 +1181,73 @@ impl SplatTrainer {
 
             let cur_scales = cur_log_scale.clone().exp();
 
-            let cur_opac = sigmoid(cur_raw_opac.clone());
-            let inv_opac: Tensor<1> = 1.0 - cur_opac;
-            // Post-split child opacity as a power law in transmittance,
-            // p = 0.5 would keep the transmittance for cloning splats but as we offset them
-            // choose a higher p.
-            let new_opac: Tensor<1> = 1.0 - inv_opac.powf_scalar(FRAC_1_SQRT_2);
+            // Long-Axis-Split (LAS) child geometry — MRNF port, delta #2.
+            // Mirrors LFS `long_axis_split_gaussians_inplace_kernel`
+            // (densification_kernels.cu:669-771): split the single longest scale
+            // axis, halving it and pushing the two children apart along that axis
+            // by half its world extent (centroid-preserving), shrink the other
+            // two axes to 0.85x, and cut opacity to 0.6x. Replaces Brush's
+            // covariance 1/√2 split. The append + Adam-moment-zeroing +
+            // require_grad re-lift scaffold below is unchanged (see E.1).
+
+            // Post-split child (and parent) opacity: sigmoid(raw) * 0.6, back to
+            // logit — LFS `inverse_sigmoid(sigmoid(opacity) * 0.6)`. NOT
+            // mass-conserving like the old 1-inv^(1/√2) rule; intentional per
+            // MRNF (watch for a small brightness step at refines, E.2).
+            let new_opac: Tensor<1> = sigmoid(cur_raw_opac.clone()).mul_scalar(0.6);
             let new_raw_opac = inv_sigmoid(new_opac.clamp(MIN_OPACITY, 1.0 - MIN_OPACITY));
 
-            // Smooth covariance-aware split. Per-axis shrink + mass-conserving
-            // deterministic offset (one child at +offset, the other at -offset).
-            // Children inherit the
-            // parent's rotation; the split is the scale shrink + ±offset.
-            let cur_scales_sq = cur_scales.clone().powi_scalar(2);
-            let max_scale_sq = cur_scales_sq.clone().max_dim(1).clamp_min(1e-30);
-            let ratio = cur_scales_sq / max_scale_sq;
-            // Max-axis shrink factor `k` (per splat). The standard split uses
-            // 1/√2 (mass-conserving). When `split_at_screen_size` is set, splats
-            // that are too big on screen shrink harder so their children land at
-            // (at most) the cap: `k = min(1/√2, split_at_screen_size / screen)`.
-            // Splats already within √2× of the cap are unaffected (min → 1/√2).
-            let k_per_axis: Tensor<2> = if self.config.split_at_screen_size > 0.0 {
-                let k_max = screen_sizes
+            // One-hot [refine_count, 3] selecting each splat's longest log-scale
+            // axis. exp is monotone so argmax over log-scale == argmax over scale;
+            // argmax picks a single index, matching LFS `get_max_value_index`
+            // (avoids the double-offset a tie in an `equal` mask could cause).
+            let ls_device = cur_log_scale.device();
+            let longest_idx: Tensor<2, Int> = cur_log_scale.clone().argmax(1);
+            let long_onehot: Tensor<2> = Tensor::zeros([refine_count, 3], &ls_device).scatter(
+                1,
+                longest_idx,
+                Tensor::ones([refine_count, 1], &ls_device),
+                IndexingUpdateOp::Add,
+            );
+
+            // Longest-axis shrink multiplier. LFS uses a fixed 0.5; we keep that
+            // for normally-sized splats but let `split_at_screen_size` shrink the
+            // longest axis harder for oversized ones so their children land at (at
+            // most) the on-screen cap — Brush's oversize benefit, retained per the
+            // design's recommendation for equirect. min(0.5, split_at_screen_size
+            // / screen); reduces to LFS's fixed 0.5 when the cap is not binding or
+            // is disabled (split_at_screen_size <= 0).
+            let m_long: Tensor<2> = if self.config.split_at_screen_size > 0.0 {
+                screen_sizes
                     .select(0, refine_inds.clone())
                     .unsqueeze_dim(1)
                     .clamp_min(1e-6)
                     .recip()
                     .mul_scalar(self.config.split_at_screen_size)
-                    .clamp_max(FRAC_1_SQRT_2);
-                -(ratio * (-k_max + 1.0)) + 1.0
+                    .clamp_max(0.5)
             } else {
-                -(ratio * (1.0_f32 - FRAC_1_SQRT_2)) + 1.0
+                Tensor::zeros([refine_count, 1], &ls_device).add_scalar(0.5)
             };
-            let offset_factor = (-k_per_axis.clone().powi_scalar(2) + 1.0)
-                .clamp_min(0.0)
-                .sqrt();
-            let offset_local = offset_factor * cur_scales;
+
+            // Offset each child by half the longest axis' world extent, along that
+            // axis in world space: the local vector `e_L * (0.5 * exp(scale[L]))`
+            // (non-zero only on axis L) rotated by the parent quaternion. Matches
+            // LFS `global_offset = R[:,L] * (exp(scale[L]) * 0.5)`. Offset
+            // magnitude stays at LFS's fixed 0.5*extent; only the scale shrink
+            // follows m_long.
+            let offset_local = long_onehot.clone() * cur_scales * 0.5;
             let samples = quaternion_vec_multiply(cur_rots.clone(), offset_local);
-            let new_log_scales = cur_log_scale.clone() + k_per_axis.log();
+
+            // New log-scales: shrink all three axes to 0.85x, then override the
+            // longest axis to `log_scale[L] + ln(m_long)` (== +ln(0.5) in the
+            // default case). LFS: new_scale[L] = scale[L]+ln(0.5),
+            // new_scale[other] = scale[other]+ln(0.85).
+            const LN_0_85: f32 = -0.162_518_93; // ln(0.85)
+            let base_log_scales = cur_log_scale.clone().add_scalar(LN_0_85);
+            let long_log_scales = cur_log_scale.clone() + m_long.log();
+            let new_log_scales =
+                base_log_scales * (-long_onehot.clone() + 1.0) + long_log_scales * long_onehot;
+            // LAS keeps the parent rotation for both children.
             let child_rots = cur_rots;
 
             // Scatter into transforms: build a [refine_count, 10] update tensor
