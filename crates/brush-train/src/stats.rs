@@ -10,6 +10,12 @@ pub(crate) struct RefineRecord {
     pub refine_weight_norm: Tensor<1>,
     pub vis_weight: Tensor<1>,
     pub max_screen_size: Tensor<1>,
+    // Edge-guidance accumulator (MRNF port, delta #4): sum over the refine
+    // window's sampled views of the per-gaussian projected edge score, plus the
+    // sample count. `None`/0 until the first sample; only populated when
+    // `--use-edge-map` is set. Lives on the inner device like the others.
+    edge_score_sum: Option<Tensor<1>>,
+    edge_sample_count: u32,
 }
 
 impl RefineRecord {
@@ -18,6 +24,8 @@ impl RefineRecord {
             refine_weight_norm: Tensor::<1>::zeros([num_points as usize], device),
             vis_weight: Tensor::<1>::zeros([num_points as usize], device),
             max_screen_size: Tensor::<1>::zeros([num_points as usize], device),
+            edge_score_sum: None,
+            edge_sample_count: 0,
         }
     }
 
@@ -59,10 +67,44 @@ impl RefineRecord {
         self.vis_weight.clone().greater_elem(0.0)
     }
 
+    /// Accumulate one sampled view's per-gaussian edge score. `score` is `[N]`,
+    /// aligned to the current (constant within a refine window) splat count.
+    pub(crate) fn gather_edge(&mut self, score: Tensor<1>) {
+        let _span = trace_span!("Gather edge").entered();
+        self.edge_score_sum = Some(match self.edge_score_sum.take() {
+            Some(sum) => sum + score,
+            None => score,
+        });
+        self.edge_sample_count += 1;
+    }
+
+    /// Per-gaussian edge-guidance factor as a host vector, aligned to the current
+    /// splat order (call AFTER `keep`/prune so it matches the post-prune weights).
+    /// `None` when no edge samples were gathered. Reads back once per refine — the
+    /// weights it multiplies into are already host vectors, so no extra roundtrip.
+    pub(crate) async fn edge_factor_host(&self, weight: f32) -> Option<Vec<f32>> {
+        if self.edge_sample_count == 0 {
+            return None;
+        }
+        let sum = self.edge_score_sum.clone()?;
+        let mean = sum
+            .mul_scalar(1.0 / self.edge_sample_count as f32)
+            .into_data_async()
+            .await
+            .ok()?
+            .into_vec::<f32>()
+            .ok()?;
+        Some(crate::edge::edge_guidance_factor(mean, weight))
+    }
+
     pub(crate) fn keep(self, indices: Tensor<1, Int>) -> Self {
         Self {
             refine_weight_norm: self.refine_weight_norm.select(0, indices.clone()),
             vis_weight: self.vis_weight.clone().select(0, indices.clone()),
+            edge_score_sum: self
+                .edge_score_sum
+                .map(|s| s.select(0, indices.clone())),
+            edge_sample_count: self.edge_sample_count,
             max_screen_size: self.max_screen_size.select(0, indices),
         }
     }

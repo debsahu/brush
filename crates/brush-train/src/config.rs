@@ -165,6 +165,28 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Refine options", default_value = "0.6")]
     pub split_opacity_scale: f32,
 
+    /// Edge-guidance densification (MRNF port, delta #4). When set, a Canny edge
+    /// map of each sampled GT view is projected onto the gaussians and the
+    /// accumulated per-gaussian edge score biases growth + dead-slot replacement
+    /// toward high-frequency image edges (LFS `use_edge_map`, mrnf_defaults). OFF
+    /// by default; this is the highest-effort MRNF lever, only worth enabling if
+    /// Phases 1-3 leave a floater/detail gap.
+    ///
+    /// NOTE: the current implementation is a burn-op projection fallback
+    /// (pinhole-only, center-sample, opacity-weighted), NOT the full alpha-blended
+    /// edge rasterizer — see `crate::edge`.
+    #[arg(long, help_heading = "Refine options", default_value = "false")]
+    #[serde(default)]
+    pub use_edge_map: bool,
+
+    /// Strength of the edge-guidance factor: the normalized per-gaussian edge
+    /// score is scaled by this before the `+ 1.0` that turns it into a
+    /// multiplicative sampling weight (LFS `MRNF_EDGE_SCORE_WEIGHT = 0.25`,
+    /// mrnf.cpp:68). Only used when `--use-edge-map` is set.
+    #[arg(long, help_heading = "Refine options", default_value = "0.25")]
+    #[serde(default = "default_edge_score_weight")]
+    pub edge_score_weight: f32,
+
     /// Weight of l1 loss on alpha if input view has transparency.
     #[arg(long, help_heading = "Refine options", default_value = "0.1")]
     pub match_alpha_weight: f32,
@@ -415,6 +437,10 @@ fn default_ppisp_lr() -> f64 {
 
 fn default_ppisp_reg_scale() -> f32 {
     1.0
+}
+
+fn default_edge_score_weight() -> f32 {
+    0.25
 }
 
 #[cfg(test)]

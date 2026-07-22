@@ -2,6 +2,7 @@ use crate::{
     adam_scaled::{AdamScaled, AdamScaledConfig, AdamState},
     config::TrainConfig,
     dig::{self, DigTrainState},
+    edge,
     min_scale::compute_min_scale,
     msg::{RefineStats, TrainStepStats},
     multinomial::multinomial_sample,
@@ -12,6 +13,7 @@ use crate::{
 use brush_appearance::{AppearanceConfig, AppearanceTrainState};
 use brush_dataset::scene::SceneBatch;
 use brush_loss::{ImageLossConfig, depth_loss, image_loss};
+use brush_render::camera::Camera;
 use brush_render::gaussian_splats::{RasterizationMode, Splats, fold_min_scale};
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 use brush_render_bwd::{DeferredShGrad, render_splat_features, render_splats_for_training};
@@ -40,6 +42,12 @@ pub const BOUND_PERCENTILE: f32 = 0.8;
 /// Mip-Splatting 3D-filter strength. This is intentionally fixed: changing it
 /// alters the learned/exported representation rather than just training speed.
 const MIN_SCALE_FACTOR: f32 = 0.1;
+
+/// Target number of GT views sampled per refine window for edge guidance
+/// (MRNF port, delta #4; LFS `MRNF_EDGE_MIN_VIEW_SAMPLES = 10`, mrnf.cpp:69).
+/// The trainer samples every `refine_every / this` steps so a full window
+/// contributes roughly this many views to the per-gaussian edge accumulator.
+const EDGE_MIN_VIEW_SAMPLES: u32 = 10;
 
 type OptimizerType = OptimizerAdaptor<AdamScaled, Splats>;
 
@@ -405,6 +413,41 @@ impl SplatTrainer {
         global_iter < self.config.growth_stop_iter
     }
 
+    /// Steps between edge-guidance samples: `refine_every / EDGE_MIN_VIEW_SAMPLES`
+    /// so a refine window contributes ~`EDGE_MIN_VIEW_SAMPLES` views.
+    fn edge_sample_stride(&self) -> u32 {
+        (self.config.refine_every / EDGE_MIN_VIEW_SAMPLES).max(1)
+    }
+
+    /// Accumulate this step's GT-view edge score into the refine record (MRNF
+    /// port, delta #4). No-op unless `--use-edge-map` is set and this step lands
+    /// on the sampling stride. `splats` are the render-time (pre-optimizer-step)
+    /// splats; `camera`/`gt_packed` are this step's view. Pure non-differentiable
+    /// bookkeeping: reads the inner/detached GT and splats, never the autodiff
+    /// graph. See `crate::edge` for the (pinhole-only, center-sample) fallback
+    /// caveats vs. LFS's alpha-blended edge rasterizer.
+    fn accumulate_edge_sample(
+        &mut self,
+        splats: &Splats,
+        camera: &Camera,
+        gt_packed: &Tensor<2, Int>,
+        composite_bg: Option<glam::Vec3>,
+        img_size: glam::UVec2,
+    ) {
+        if !self.config.use_edge_map || self.step_count % self.edge_sample_stride() != 0 {
+            return;
+        }
+        // GT RGB `[H, W, 3]` on the inner backend (same unpack the LPIPS path uses).
+        let gt_rgb = brush_loss::unpack_gt_rgb(gt_packed.clone(), composite_bg);
+        let edge_map = edge::canny_edge_map(gt_rgb);
+        let valid = splats.valid();
+        let score =
+            edge::project_edge_scores(valid.means(), valid.opacities(), edge_map, camera, img_size);
+        if let Some(record) = self.refine_record.as_mut() {
+            record.gather_edge(score);
+        }
+    }
+
     /// Run one training step, optionally omitting the refinement-only raster
     /// gradient statistic. Model gradients, visibility, and screen-radius
     /// bookkeeping are always preserved.
@@ -705,6 +748,11 @@ impl SplatTrainer {
                     record.gather_aux_stats(visible.clone(), max_radius);
                 }
             });
+
+            // Edge-guidance accumulation (MRNF port, delta #4). Uses the
+            // render-time splats + this view's GT and camera; gated on
+            // `--use-edge-map` and the sampling stride inside the method.
+            self.accumulate_edge_sample(&splats, &camera, &gt_packed, composite_bg, img_size);
 
             (
                 grads,
@@ -1014,6 +1062,18 @@ impl SplatTrainer {
 
         let (mut splats, refiner, pruned_count) =
             prune_points(splats, &mut record, refiner, prune_mask, self.dig.as_mut()).await;
+
+        // Edge-guidance factor (MRNF port, delta #4), aligned to the post-prune
+        // splat order. Multiplies into both the dead-slot replacement and the
+        // high-gradient growth sampling weights below so densification is biased
+        // toward high-frequency image edges. `None` when edge guidance is off or
+        // no views were sampled this window.
+        let edge_factor = if self.config.use_edge_map {
+            refiner.edge_factor_host(self.config.edge_score_weight).await
+        } else {
+            None
+        };
+
         let mut split_inds = HashSet::new();
 
         // Always replace dead gaussians, so that the pruned budget is reused.
@@ -1023,12 +1083,18 @@ impl SplatTrainer {
             // weighted distribution (where error actually lives).
             let vis_f = refiner.vis_mask().float();
             let resampled_weights = splats.opacities() * vis_f.clone();
-            let resampled_weights = resampled_weights
+            let mut resampled_weights = resampled_weights
                 .into_data_async()
                 .await
                 .expect("Failed to get weights")
                 .into_vec::<f32>()
                 .expect("Failed to read weights");
+            // Bias replacement toward edge gaussians (MRNF delta #4).
+            if let Some(factor) = &edge_factor {
+                for (w, f) in resampled_weights.iter_mut().zip(factor.iter()) {
+                    *w *= f;
+                }
+            }
             let resampled_inds =
                 multinomial_sample(&mut self.rng, &resampled_weights, pruned_count);
             split_inds.extend(resampled_inds);
@@ -1093,12 +1159,18 @@ impl SplatTrainer {
             // If still growing, sample from indices which are over the threshold.
             if grow_count > 0 {
                 let weights = above_threshold.float() * refiner.refine_weight_norm.clone();
-                let weights = weights
+                let mut weights = weights
                     .into_data_async()
                     .await
                     .expect("Failed to get weights")
                     .into_vec::<f32>()
                     .expect("Failed to read weights");
+                // Bias growth toward edge gaussians (MRNF delta #4).
+                if let Some(factor) = &edge_factor {
+                    for (w, f) in weights.iter_mut().zip(factor.iter()) {
+                        *w *= f;
+                    }
+                }
                 let growth_inds = multinomial_sample(&mut self.rng, &weights, grow_count);
                 split_inds.extend(growth_inds);
             }
