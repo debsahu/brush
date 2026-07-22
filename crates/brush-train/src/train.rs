@@ -995,6 +995,24 @@ impl SplatTrainer {
             .bool_or(bound_mask)
             .bool_or(non_finite_mask);
 
+        // Optional min-scale degenerate prune (MRNF port, delta #3). MRNF culls
+        // splats whose smallest log-scale axis drops below log(1e-10) (see
+        // mrnf.cpp:668, MRNF_LOG_MIN_SCALE_THRESHOLD). Brush deliberately omits
+        // this to keep thin "pancake" surface splats (see note above), so it is
+        // flag-gated and OFF by default. `scales` is the effective (floored)
+        // scale, so this is near-inert on floored splats and only bites raw
+        // degenerate geometry.
+        let prune_mask = if self.config.min_scale_prune {
+            let scale_small = scales
+                .clone()
+                .lower_elem(1e-10)
+                .any_dim(1)
+                .squeeze_dim(1);
+            prune_mask.bool_or(scale_small)
+        } else {
+            prune_mask
+        };
+
         let (mut splats, refiner, pruned_count) =
             prune_points(splats, &mut record, refiner, prune_mask, self.dig.as_mut()).await;
         let mut split_inds = HashSet::new();
@@ -1293,6 +1311,31 @@ impl SplatTrainer {
             let new_opac = sigmoid(f) - minus_opac;
             inv_sigmoid(new_opac.clamp(1e-12, 1.0 - 1e-12))
         });
+
+        // Shrink scales slowly over time (MRNF port, delta #1). MRNF decays
+        // both opacity and scale every refine; Brush only had the opacity half.
+        // Mirrors `mrnf_decay_kernel` (mrnf_kernels.cu:127-131):
+        //   scale = exp(log_scale) * (1 - scale_decay * t_shrink)
+        //   log_scale = log(max(scale, 1e-12))
+        // Uses the SAME phase-local `t_shrink_strength` as opacity decay (not
+        // MRNF's global iter/iterations) to keep LOD-aware training intact, and
+        // is applied to the SAME rows — all live splats after append — so freshly
+        // split children get exactly one decay. This writes the RAW log-scales
+        // (transforms cols 7..10) BEFORE the caller recomputes the Mip-Splatting
+        // min-scale floor (`apply_min_scale_floor`), so the floor and decay do
+        // not fight. Off (scale_decay == 0) reproduces upstream behaviour.
+        if self.config.scale_decay > 0.0 {
+            let scale_factor = 1.0 - self.config.scale_decay * t_shrink_strength;
+            splats.transforms = splats.transforms.map(|t| {
+                let log_scales = t.clone().slice(s![.., 7..10]);
+                let new_log_scales = log_scales
+                    .exp()
+                    .mul_scalar(scale_factor)
+                    .clamp_min(1e-12)
+                    .log();
+                t.slice_assign(s![.., 7..10], new_log_scales)
+            });
+        }
 
         self.optim = Some(create_optimizer_from_config().load_record(record));
         splats

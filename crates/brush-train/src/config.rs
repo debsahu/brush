@@ -100,6 +100,21 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options", default_value = "0.004")]
     pub opac_decay: f32,
 
+    /// Factor of the per-refine scale decay (MRNF port, delta #1). Mirrors
+    /// opacity decay but shrinks the log-scales: `scale *= 1 - scale_decay *
+    /// t_shrink`, strongest early in a phase and fading to zero at its end.
+    /// 0 disables (matching upstream Brush behaviour).
+    #[arg(long, help_heading = "Refine options", default_value = "0.002")]
+    pub scale_decay: f32,
+
+    /// Prune genuinely degenerate splats whose smallest scale axis falls below
+    /// `1e-10` (MRNF delta #3). OFF by default: Brush deliberately keeps thin
+    /// "pancake" surface splats, and the Mip-Splatting min-scale floor already
+    /// keeps rendered scales above this, so this only bites raw-degenerate
+    /// splats. Enable only if an A/B shows it helps without softening surfaces.
+    #[arg(long, help_heading = "Refine options", default_value = "false")]
+    pub min_scale_prune: bool,
+
     /// Weight of l1 loss on alpha if input view has transparency.
     #[arg(long, help_heading = "Refine options", default_value = "0.1")]
     pub match_alpha_weight: f32,
