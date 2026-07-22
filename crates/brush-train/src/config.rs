@@ -217,9 +217,9 @@ pub struct TrainConfig {
     /// by default; this is the highest-effort MRNF lever, only worth enabling if
     /// Phases 1-3 leave a floater/detail gap.
     ///
-    /// NOTE: the current implementation is a burn-op projection fallback
-    /// (pinhole-only, center-sample, opacity-weighted), NOT the full alpha-blended
-    /// edge rasterizer — see `crate::edge`.
+    /// The per-gaussian score is the alpha-blended `Σ_p T·α·edge` (LFS parity),
+    /// computed by the `feat_dim=1` feature backward — see `crate::edge`. Works for
+    /// every camera model the renderer supports (pinhole + distortion models).
     #[arg(long, help_heading = "Refine options", default_value = "false")]
     #[serde(default)]
     pub use_edge_map: bool,

@@ -438,10 +438,11 @@ impl SplatTrainer {
     /// port, delta #4). No-op unless `--use-edge-map` is set and this step lands
     /// on the sampling stride. `splats` are the render-time (pre-optimizer-step)
     /// splats; `camera`/`gt_packed` are this step's view. Pure non-differentiable
-    /// bookkeeping: reads the inner/detached GT and splats, never the autodiff
-    /// graph. See `crate::edge` for the (pinhole-only, center-sample) fallback
-    /// caveats vs. LFS's alpha-blended edge rasterizer.
-    fn accumulate_edge_sample(
+    /// bookkeeping: the alpha-blended score comes from an isolated feature
+    /// forward+backward rooted at a throwaway unit-feature leaf, dropped after the
+    /// gradient read — it never entangles the training photometric graph. See
+    /// `crate::edge::project_edge_scores` for the T·α·edge parity.
+    async fn accumulate_edge_sample(
         &mut self,
         splats: &Splats,
         camera: &Camera,
@@ -454,10 +455,35 @@ impl SplatTrainer {
         }
         // GT RGB `[H, W, 3]` on the inner backend (same unpack the LPIPS path uses).
         let gt_rgb = brush_loss::unpack_gt_rgb(gt_packed.clone(), composite_bg);
+        // Canny + directional NMS. Intentionally NOT median-normalized here: LFS
+        // step (a) (per-view edge-MAP normalize) is a provable no-op given the
+        // per-gaussian score normalize (step (b)) below is always applied —
+        // `normalize_by_positive_median` is scale-equivariant, so an edge-map
+        // scale cancels in the quotient. Do not restore it.
         let edge_map = edge::canny_edge_map(gt_rgb);
         let valid = splats.valid();
-        let score =
-            edge::project_edge_scores(valid.means(), valid.opacities(), edge_map, camera, img_size);
+        let n = valid.num_splats() as usize;
+        let device = splats.device().inner();
+        let score = edge::project_edge_scores(&valid, edge_map, camera, img_size).await;
+
+        // LFS step (b): positive-median normalize this view's per-gaussian score
+        // before accumulation, so a high-contrast view can't dominate the window.
+        let mut score_host: Vec<f32> = score
+            .into_data_async()
+            .await
+            .expect("edge score readback")
+            .into_vec()
+            .expect("f32 edge score");
+        edge::normalize_by_positive_median(&mut score_host);
+        let score = Tensor::<1>::from_data(TensorData::new(score_host, [n]), &device);
+
+        // INVARIANT: the splat set is constant within a refine window — this runs
+        // on the render-time splats, `gather_edge` only sums, and `RefineRecord`
+        // is recreated fresh right after each prune. So there is no mid-window
+        // splat creation/freeze, which is why LFS's `zero_frozen_scores`
+        // (mrnf.cpp:566) has no analogue here (its frozen set is empty in Brush's
+        // model). If mid-window splat birth/freezing is ever introduced, restore
+        // that guard so newborn splats can't self-reinforce their own scores.
         if let Some(record) = self.refine_record.as_mut() {
             record.gather_edge(score);
         }
@@ -767,7 +793,8 @@ impl SplatTrainer {
             // Edge-guidance accumulation (MRNF port, delta #4). Uses the
             // render-time splats + this view's GT and camera; gated on
             // `--use-edge-map` and the sampling stride inside the method.
-            self.accumulate_edge_sample(&splats, &camera, &gt_packed, composite_bg, img_size);
+            self.accumulate_edge_sample(&splats, &camera, &gt_packed, composite_bg, img_size)
+                .await;
 
             (
                 grads,
