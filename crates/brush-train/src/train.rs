@@ -968,6 +968,17 @@ impl SplatTrainer {
     /// view's visibility. Replaces Brush's generic per-step noise when
     /// `--mrnf-noise-injection` is set.
     fn inject_mrnf_noise(&self, refiner: &RefineRecord, mut splats: Splats) -> Splats {
+        // NOTE: refine runs on INNER (non-autodiff) splats — `train_stream`
+        // strips autodiff via `.valid()` after each train step and only
+        // re-lifts (`lift_splats_to_autodiff`) before the next one. So unlike
+        // the per-step noise block in `train_step` (autodiff splats: read via
+        // `.valid()`, re-lift via `from_inner().require_grad()`), everything
+        // here must stay on the inner backend. Calling `.valid()` / `.inner()`
+        // on already-inner FLOAT tensors panics in burn-dispatch
+        // ("Requires autodiff tensor", backend.rs:463). `detach_autodiff` is
+        // the checked passthrough for either backend variant.
+        use brush_render::burn_glue::detach_autodiff;
+
         // Bounds-valid gate: skip until the robust per-axis bounds have a
         // finite, positive median extent.
         let median_scale = self.bounds.median_size();
@@ -975,9 +986,9 @@ impl SplatTrainer {
             return splats;
         }
 
-        // inv_opac = 1 - sigmoid(raw_opacity), read from the valid (inner)
-        // splats so the sigmoid stays off the autodiff graph.
-        let inv_opac: Tensor<1> = 1.0 - splats.valid().opacities();
+        // inv_opac = 1 - sigmoid(raw_opacity), on the inner backend so the
+        // sigmoid never lands on an autodiff graph.
+        let inv_opac: Tensor<1> = 1.0 - detach_autodiff(splats.opacities());
         // Low-opacity weight (pow 150, mrnf_kernels.cu:64) gated by the
         // accumulated per-refine visibility (LFS `vis_count[idx] > 0`).
         let vis_f = refiner.vis_mask().float();
@@ -986,7 +997,7 @@ impl SplatTrainer {
         let samples = Tensor::random(
             [splats.num_splats() as usize, 3],
             Distribution::Normal(0.0, 1.0),
-            &splats.device().inner(),
+            &splats.device(),
         );
 
         // weight = lr_mean * mean_noise_weight; `last_lr_mean` is the current
@@ -998,10 +1009,12 @@ impl SplatTrainer {
             // Clamp travel to one robust median box (LFS clamps per-dim noise
             // to +/- median_size).
             let noise_m = (samples * noise_weight_means).clamp(-median_scale, median_scale);
-            let inner = t.inner();
-            let noised_means = inner.clone().slice(s![.., 0..3]) + noise_m;
-            let out = inner.slice_assign(s![.., 0..3], noised_means);
-            Tensor::from_inner(out).require_grad()
+            // Stay inner: no `require_grad` re-lift here — the whole refine
+            // path returns inner params (see `map_splats_and_opt`) and the
+            // next train step re-lifts all of them.
+            let t = detach_autodiff(t);
+            let noised_means = t.clone().slice(s![.., 0..3]) + noise_m;
+            t.slice_assign(s![.., 0..3], noised_means)
         });
 
         splats
