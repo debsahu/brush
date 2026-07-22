@@ -324,8 +324,9 @@ mod tests {
         );
     }
 
-    /// T7 (threshold gate): the candidate set is exactly `median_normalized_score
-    /// > τ AND vis_count > 0`. Positive-median normalization sends the (upper)
+    /// T7 (threshold gate): the candidate set is exactly
+    /// `median_normalized_score > τ AND vis_count > 0`. Positive-median
+    /// normalization sends the (upper)
     /// median to 1.0, so at `τ = 1.0` only strictly-above-median gaussians are
     /// candidates — AND only if visible. Scores [1,2,3,4,5] → upper median 3 →
     /// normalized [⅓,⅔,1,4⁄3,5⁄3]; g3,g4 exceed 1.0, but g3 is invisible, so only
@@ -350,7 +351,7 @@ mod tests {
 
     /// T8 (replace-vs-bias): the growth SAMPLING weight is `above_threshold ·
     /// median_normalized_score`, and a subsequent edge-factor multiply is a bias
-    /// WITHIN the thresholded set — a gaussian below τ_err (mask 0) stays weight 0
+    /// WITHIN the thresholded set — a gaussian below `τ_err` (mask 0) stays weight 0
     /// no matter how large its edge factor, so edge can never GROW a gaussian the
     /// error signal did not admit (req 7). Mirrors the train.rs growth path
     /// (`above_threshold.float() * growth_base`, then `*= edge_factor`).

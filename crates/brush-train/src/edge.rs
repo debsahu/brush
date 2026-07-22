@@ -525,7 +525,7 @@ mod tests {
     // --- GPU parity helpers -------------------------------------------------
 
     /// A pinhole looking down +Z from the origin: focal = dim/2, principal point
-    /// at the image center (fov 90 deg, center_uv 0.5).
+    /// at the image center (fov 90 deg, `center_uv` 0.5).
     fn origin_pinhole() -> Camera {
         Camera::new(
             glam::Vec3::ZERO,
@@ -647,7 +647,7 @@ mod tests {
         (a - b).abs() <= rel * b.abs().max(1.0) + abs
     }
 
-    /// Primary correctness gate: the feat_dim=1 backward score matches, per
+    /// Primary correctness gate: the `feat_dim=1` backward score matches, per
     /// gaussian, the independent forward-kernel `Σ_p T·α·edge` reference. Two
     /// spatially disjoint gaussians (so each has `T=1` over its own footprint),
     /// each compared against its single-gaussian forward render. Also pins the
@@ -771,7 +771,7 @@ mod tests {
         );
     }
 
-    /// Camera coverage: a non-pinhole (KannalaBrandt4 fisheye) camera yields
+    /// Camera coverage: a non-pinhole (`KannalaBrandt4` fisheye) camera yields
     /// finite, nonzero scores — the old pinhole-only restriction is gone.
     #[tokio::test]
     async fn edge_score_nonzero_for_fisheye() {
@@ -829,8 +829,8 @@ mod tests {
             read1(project_edge_scores(&splats, edge.mul_scalar(0.37), &camera, img_size).await)
                 .await;
 
-        let mut n1 = s1.clone();
-        let mut n2 = s2.clone();
+        let mut n1 = s1;
+        let mut n2 = s2;
         normalize_by_positive_median(&mut n1);
         normalize_by_positive_median(&mut n2);
         for (a, b) in n1.iter().zip(&n2) {
@@ -845,7 +845,7 @@ mod tests {
     /// magnitude, hand-derived from first principles rather than from another
     /// call into `render_splat_features` (which would only re-confirm autodiff
     /// linearity). A single on-axis isotropic gaussian with `raw_opacity = 0`
-    /// has peak alpha `sigmoid(0) * filter_comp = 0.5` (filter_comp == 1.0 in
+    /// has peak alpha `sigmoid(0) * filter_comp = 0.5` (`filter_comp` == 1.0 in
     /// Default / non-mip mode; verified in `project_forward.rs`). It is the
     /// only gaussian, so `T == 1` in front of it, and its wide projected
     /// footprint (≈130 px 2D std) makes alpha ≈ 0.5 across the tiny central

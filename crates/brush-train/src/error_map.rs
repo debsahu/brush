@@ -236,7 +236,7 @@ mod tests {
             .reshape([h as i32, w as i32, 3]);
         let e = read2(ssim_error_map(pred, gt)).await;
         assert!(
-            e.iter().cloned().fold(0.0f32, f32::max) > 0.05,
+            e.iter().copied().fold(0.0f32, f32::max) > 0.05,
             "mismatch must produce positive error"
         );
     }
@@ -275,7 +275,8 @@ mod tests {
     #[tokio::test]
     async fn mean_normalize_sets_mean_to_one() {
         let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
-        let (h, w) = (8usize, 8usize);
+        let h = 8usize;
+        let w = 8usize;
         // Base map with mean 2.0.
         let base = Tensor::<2>::ones([h, w], &device).mul_scalar(2.0);
         let n1 = read2(mean_normalize(base.clone())).await;
