@@ -394,7 +394,7 @@ pub(crate) async fn project_coverage_weighted_mean(
     // `clamp_grad`, but this isolated backward does not. Sanitize NaN→0 and tame
     // ±inf BEFORE any reduction: a single NaN in the scene-mean sum below would
     // otherwise poison EVERY gaussian's score (observed: iter 400 → all-NaN,
-    // thr_count 0, growth stalled). A sanitized-to-0 gaussian falls below τ and
+    // threshold count 0, growth stalled). A sanitized-to-0 gaussian falls below τ and
     // is simply not selected — the correct outcome for a degenerate splat.
     let sanitize = |t: Tensor<1>| t.clone().mask_fill(t.is_nan(), 0.0).clamp(-1e12, 1e12);
     let row1 = sanitize(rows.clone().slice(s![.., 0..1]).reshape([n as i32]));
@@ -851,7 +851,7 @@ mod tests {
     /// footprint (≈130 px 2D std) makes alpha ≈ 0.5 across the tiny central
     /// `k×k` edge window (falloff over ±4 px is < 0.1 %). Hence
     /// `score = Σ_window T·α·edge = 0.5 · k²`, a literal number no kernel bug
-    /// (wrong opacity activation, dropped transmittance base case, mis-scaled
+    /// (wrong opacity activation, dropped transmittance base case, wrongly scaled
     /// Σ T·α) can satisfy silently. Loose tol absorbs sub-pixel centering and
     /// the residual window falloff.
     #[tokio::test]
