@@ -1,6 +1,7 @@
+use brush_render::burn_glue::detach_autodiff;
 use burn::{
     prelude::Int,
-    tensor::{Bool, Device, Tensor},
+    tensor::{Bool, Device, Tensor, TensorData},
 };
 use tracing::trace_span;
 
@@ -17,8 +18,10 @@ pub(crate) struct RefineRecord {
     edge_score_sum: Option<Tensor<1>>,
     edge_sample_count: u32,
     // Error-map growth accumulator (MRNF `use_error_map` port): the window-MAX
-    // over sampled views of the per-gaussian `Σ_p T·α·ê(p)` score (LFS
-    // `_refine_weight_max`, mrnf.cpp:602-605). Distinct from `edge_score_sum`
+    // over sampled views of the per-gaussian coverage-weighted MEAN error
+    // `(Σ_p T·α·ê)/(Σ_p T·α)`, per-view positive-median normalized (LFS
+    // `_refine_weight_max`, mrnf.cpp:602-605, but coverage-normalized — see
+    // `train::accumulate_error_sample` defect-2 note). Distinct from `edge_score_sum`
     // (SUM/mean, a bias factor): this is MAX-accumulated and REPLACES the
     // gradient as the growth signal when `--error-map-densification` is set.
     // `None` until the first sample; reset every window because the whole
@@ -46,31 +49,50 @@ impl RefineRecord {
             .bool_and(self.vis_mask())
     }
 
-    /// Error-map growth gate (MRNF `use_error_map`): `error_score_max > threshold
-    /// AND vis_count > 0` (LFS `refine_candidates`, mrnf.cpp:726-727). Returns an
-    /// all-false mask if no error views were sampled this window (safe: grows
-    /// nothing from the error signal rather than falling back to the gradient).
-    pub(crate) fn error_above_threshold(&self, threshold: f32) -> Tensor<1, Bool> {
-        match &self.error_score_max {
-            Some(score) => score
-                .clone()
-                .greater_elem(threshold)
-                .bool_and(self.vis_mask()),
-            // No error views sampled: an all-false mask of the right shape/device
-            // (visibility counts are ≥ 0, so `< 0` is false everywhere).
-            None => self.vis_weight.clone().lower_elem(0.0),
-        }
-    }
-
-    /// The window-MAX error score as a dense `[N]` tensor (zeros if no error
-    /// views were sampled), for use as a growth SAMPLING weight. Deliberately
-    /// NOT positive-median normalized — the score must stay on LFS's native
-    /// scale so `τ_err` transfers (design spec §5).
+    /// The raw window-MAX error score as a dense `[N]` tensor (zeros if no error
+    /// views were sampled): the per-gaussian coverage-weighted MEAN error,
+    /// window-MAX'd over the refine window. NOT yet normalized — feed through
+    /// [`Self::error_scores_median_normalized`] for the thresholded/sampling
+    /// signal.
     pub(crate) fn error_score_max_or_zeros(&self) -> Tensor<1> {
         match &self.error_score_max {
             Some(score) => score.clone(),
             None => Tensor::<1>::zeros(self.refine_weight_norm.dims(), &self.device()),
         }
+    }
+
+    /// The growth SAMPLING/threshold signal: the window-MAX coverage-weighted
+    /// mean error (`error_score_max_or_zeros`) POSITIVE-MEDIAN normalized so its
+    /// median is 1.0 (defect-2 fix). Normalization is applied ONCE here, over the
+    /// final MAX distribution — a per-view normalize is defeated by the window-MAX
+    /// (see `train::accumulate_error_sample`). On this scale `τ_err = 1.0` selects
+    /// the worse-than-median half. Reads back once per refine (host median), like
+    /// the edge path; also zeroes any NaN.
+    pub(crate) async fn error_scores_median_normalized(&self) -> Tensor<1> {
+        let raw = self.error_score_max_or_zeros();
+        let n = raw.dims()[0];
+        let device = raw.device();
+        let mut host: Vec<f32> = raw
+            .into_data_async()
+            .await
+            .expect("error score readback")
+            .into_vec()
+            .expect("f32 error score");
+        crate::edge::normalize_by_positive_median(&mut host);
+        Tensor::<1>::from_data(TensorData::new(host, [n]), &device)
+    }
+
+    /// Error-map growth gate (MRNF `use_error_map`): `normalized_score > threshold
+    /// AND vis_count > 0` (LFS `refine_candidates`, mrnf.cpp:726-727), where the
+    /// score is median-normalized ([`Self::error_scores_median_normalized`]). An
+    /// all-zero (no-error-views) window normalizes to zeros, so nothing is
+    /// admitted — safe (grows nothing from the error signal, no gradient
+    /// fallback).
+    pub(crate) async fn error_above_threshold(&self, threshold: f32) -> Tensor<1, Bool> {
+        self.error_scores_median_normalized()
+            .await
+            .greater_elem(threshold)
+            .bool_and(self.vis_mask())
     }
 
     fn device(&self) -> Device {
@@ -127,6 +149,20 @@ impl RefineRecord {
     /// mirroring LFS's `_refine_weight_max`.
     pub(crate) fn gather_error(&mut self, score: Tensor<1>) {
         let _span = trace_span!("Gather error").entered();
+        // DEFECT-1 FIX: the score is produced by `project_coverage_weighted_mean`,
+        // which roots an ISOLATED autodiff feature-backward graph, so its
+        // `feats.grad(..)` result comes back autodiff-KIND (a `BackendTensor::
+        // Autodiff` bridge tensor). The rest of `RefineRecord` (`vis_weight`,
+        // `refine_weight_norm`) lives on the INNER Wgpu backend, and the growth
+        // path multiplies this against inner tensors (`above_threshold.float() *
+        // growth_base`, train.rs). Storing the autodiff tensor unmodified crossed
+        // backends and panicked at first refine ("tensors are not on the same
+        // backend"). Detach to inner at the STORE — mirroring the
+        // `detach_autodiff(refine_weight)` that keeps `refine_weight_norm` inner.
+        // `detach_autodiff` (not `.inner()`) is the checked passthrough: it
+        // unwraps the autodiff bridge AND is a no-op on an already-inner tensor,
+        // whereas `.inner()` panics on the latter.
+        let score = detach_autodiff(score);
         self.error_score_max = Some(match self.error_score_max.take() {
             Some(prev) => score.max_pair(prev),
             None => score,
@@ -283,60 +319,61 @@ mod tests {
             [0.0, 0.0, 0.0]
         );
         assert_eq!(
-            bools(record.error_above_threshold(0.003)).await,
+            bools(record.error_above_threshold(1.0).await).await,
             [false, false, false]
         );
     }
 
-    /// T7 (threshold gate): the candidate set is exactly `error_score_max >
-    /// 0.003 AND vis_count > 0`. A gaussian above the threshold but never
-    /// visible is excluded; a visible gaussian below the threshold is excluded.
+    /// T7 (threshold gate): the candidate set is exactly `median_normalized_score
+    /// > τ AND vis_count > 0`. Positive-median normalization sends the (upper)
+    /// median to 1.0, so at `τ = 1.0` only strictly-above-median gaussians are
+    /// candidates — AND only if visible. Scores [1,2,3,4,5] → upper median 3 →
+    /// normalized [⅓,⅔,1,4⁄3,5⁄3]; g3,g4 exceed 1.0, but g3 is invisible, so only
+    /// g4 is admitted (below-median g0,g1 and at-median g2 excluded).
     #[tokio::test]
     async fn error_above_threshold_is_score_and_visibility() {
         let device: Device = brush_cube::test_helpers::test_device().await.into();
-        let mut record = RefineRecord::new(4, &device);
-        // Visibility: g0,g1,g2 visible; g3 never visible.
+        let mut record = RefineRecord::new(5, &device);
+        // Visibility: all but g3 visible.
         record.gather_aux_stats(
-            Tensor::from_floats([1.0, 1.0, 1.0, 0.0], &device),
-            Tensor::from_floats([0.0, 0.0, 0.0, 0.0], &device),
+            Tensor::from_floats([1.0, 1.0, 1.0, 0.0, 1.0], &device),
+            Tensor::from_floats([0.0, 0.0, 0.0, 0.0, 0.0], &device),
         );
-        // Scores straddling 0.003: g0 below, g1 above, g2 above, g3 above.
-        record.gather_error(Tensor::from_floats([0.001, 0.01, 0.5, 0.9], &device));
+        record.gather_error(Tensor::from_floats([1.0, 2.0, 3.0, 4.0, 5.0], &device));
         assert_eq!(
-            bools(record.error_above_threshold(0.003)).await,
-            [false, true, true, false], // g0 below thresh, g3 invisible
+            bools(record.error_above_threshold(1.0).await).await,
+            // g0,g1 below median; g2 at median (=1.0, not >); g3 above but
+            // invisible; g4 above and visible.
+            [false, false, false, false, true],
         );
     }
 
     /// T8 (replace-vs-bias): the growth SAMPLING weight is `above_threshold ·
-    /// error_score_max`, and a subsequent edge-factor multiply is a bias WITHIN
-    /// the thresholded set — a gaussian below τ_err (mask 0) stays weight 0 no
-    /// matter how large its edge factor, so edge can never GROW a gaussian the
+    /// median_normalized_score`, and a subsequent edge-factor multiply is a bias
+    /// WITHIN the thresholded set — a gaussian below τ_err (mask 0) stays weight 0
+    /// no matter how large its edge factor, so edge can never GROW a gaussian the
     /// error signal did not admit (req 7). Mirrors the train.rs growth path
     /// (`above_threshold.float() * growth_base`, then `*= edge_factor`).
     #[tokio::test]
     async fn edge_factor_never_grows_subthreshold_error_gaussian() {
         let device: Device = brush_cube::test_helpers::test_device().await.into();
-        let mut record = RefineRecord::new(3, &device);
+        let mut record = RefineRecord::new(4, &device);
         record.gather_aux_stats(
-            Tensor::from_floats([1.0, 1.0, 1.0], &device),
-            Tensor::from_floats([0.0, 0.0, 0.0], &device),
+            Tensor::from_floats([1.0, 1.0, 1.0, 1.0], &device),
+            Tensor::from_floats([0.0, 0.0, 0.0, 0.0], &device),
         );
-        // g0 below τ_err, g1 & g2 above.
-        record.gather_error(Tensor::from_floats([0.001, 0.02, 0.5], &device));
-        let above = record.error_above_threshold(0.003);
-        let base = above.float() * record.error_score_max_or_zeros();
+        // [1,2,3,9] → upper median 3 → normalized [⅓,⅔,1,3]; only g3 clears τ=1.0.
+        record.gather_error(Tensor::from_floats([1.0, 2.0, 3.0, 9.0], &device));
+        let above = record.error_above_threshold(1.0).await;
+        let base = above.float() * record.error_scores_median_normalized().await;
         // A huge edge factor on the sub-threshold g0 must not resurrect it.
-        let edge_factor = [100.0f32, 1.0, 1.0];
+        let edge_factor = [100.0f32, 1.0, 1.0, 1.0];
         let mut weights = values(base).await;
         for (w, f) in weights.iter_mut().zip(&edge_factor) {
             *w *= f;
         }
         assert_eq!(weights[0], 0.0, "sub-threshold gaussian must stay weight 0");
-        assert!(
-            weights[1] > 0.0 && weights[2] > 0.0,
-            "admitted set keeps weight"
-        );
+        assert!(weights[3] > 0.0, "admitted gaussian keeps weight");
     }
 
     /// T-prune (desync guard): `keep` reindexes `error_score_max` through a

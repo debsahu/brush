@@ -305,6 +305,114 @@ pub(crate) async fn project_edge_scores(
         .reshape([n as i32])
 }
 
+/// Per-gaussian coverage-weighted MEAN of `map` over each gaussian's footprint:
+///
+/// ```text
+/// score_g = (Σ_p T_g(p)·α_g(p)·map(p)) / (Σ_p T_g(p)·α_g(p))
+/// ```
+///
+/// i.e. LFS's error-weighted row (numerator, `Σ T·α·map`, fastgs
+/// `kernels_backward.cuh:564`) DIVIDED by LFS's coverage/weight row (denominator,
+/// `Σ T·α`, the `densification_weight` at `kernels_backward.cuh:563` /
+/// gsplat `RasterizeToPixelsFromWorld3DGSBwd.cu:352`). LFS accumulates BOTH rows
+/// but thresholds only the raw numerator (`mrnf.cpp:601-605,726`); see
+/// [`crate::error_map`] for WHY the port divides where LFS does not (the raw sum
+/// scales with footprint pixel-count and does not transfer LFS's `τ` across the
+/// port's 8K-derived render resolution — the ratio is footprint- and
+/// resolution-invariant, on the `map` scale).
+///
+/// BOTH rows come from a SINGLE `feat_dim=2` feature backward: channel 0 is
+/// weighted by `map`, channel 1 by the constant `1.0`, so one forward+backward
+/// yields `[Σ T·α·map, Σ T·α]` per gaussian. Returns the per-gaussian ratio
+/// `[N]` on the inner backend (`0` where a gaussian has ~no coverage; `N == 0`
+/// → `[0]`), finite and nonnegative. The caller applies the per-view
+/// positive-median re-anchor that puts the threshold on a stable scale.
+pub(crate) async fn project_coverage_weighted_mean(
+    splats: &Splats,
+    map: Tensor<2>,
+    camera: &Camera,
+    img_size: glam::UVec2,
+) -> Tensor<1> {
+    let n = splats.num_splats() as usize;
+    let device = splats.transforms.val().device();
+    if n == 0 {
+        return Tensor::zeros([0], &device);
+    }
+
+    // Same Mip-Splatting 3D-filter floor fold + render mode as the RGB / DiG
+    // paths and `project_edge_scores`.
+    let (transforms, raw_opac) = match &splats.min_scale {
+        Some(f) => fold_min_scale(
+            splats.transforms.val(),
+            splats.raw_opacities.val(),
+            f.clone(),
+        ),
+        None => (splats.transforms.val(), splats.raw_opacities.val()),
+    };
+    let render_mode = if splats.render_mip {
+        SplatRenderMode::Mip
+    } else {
+        SplatRenderMode::Default
+    };
+
+    // feat_dim = 2 unit features: channel 0 collects `Σ T·α·map`, channel 1
+    // collects `Σ T·α`. `render_splat_features` supports arbitrary feat_dim (the
+    // DiG DINO path renders dozens of channels), so both rows fall out of one
+    // forward + one backward — half the render cost of two `feat_dim=1` passes.
+    let ones = detach_autodiff(Tensor::<2>::ones([n, 2], &device));
+    let feats = lift_to_autodiff(ones).require_grad();
+
+    let feat_img = render_splat_features(
+        transforms,
+        raw_opac,
+        feats.clone(),
+        camera,
+        img_size,
+        render_mode,
+    )
+    .await;
+
+    let [h, w, _] = feat_img.dims();
+    let feat0 = feat_img
+        .clone()
+        .slice(s![.., .., 0..1])
+        .reshape([h as i32, w as i32]);
+    let feat1 = feat_img
+        .slice(s![.., .., 1..2])
+        .reshape([h as i32, w as i32]);
+
+    let map_ad = lift_to_autodiff(map);
+    // loss = Σ_p map(p)·feat0(p) + Σ_p 1·feat1(p); ∂/∂feat[g][0] = Σ_p map·T_g·α_g
+    // (row 1), ∂/∂feat[g][1] = Σ_p T_g·α_g (row 0).
+    let loss = (feat0 * map_ad).sum() + feat1.sum();
+    let grads = loss.backward();
+    let rows = feats
+        .grad(&grads)
+        .expect("feature leaf must receive a gradient"); // [N, 2]
+    // A handful of degenerate/newborn gaussians (right after a split) can yield a
+    // non-finite feature gradient — the RGB path tolerates this via fastgs
+    // `clamp_grad`, but this isolated backward does not. Sanitize NaN→0 and tame
+    // ±inf BEFORE any reduction: a single NaN in the scene-mean sum below would
+    // otherwise poison EVERY gaussian's score (observed: iter 400 → all-NaN,
+    // thr_count 0, growth stalled). A sanitized-to-0 gaussian falls below τ and
+    // is simply not selected — the correct outcome for a degenerate splat.
+    let sanitize = |t: Tensor<1>| t.clone().mask_fill(t.is_nan(), 0.0).clamp(-1e12, 1e12);
+    let row1 = sanitize(rows.clone().slice(s![.., 0..1]).reshape([n as i32]));
+    let row0 = sanitize(rows.slice(s![.., 1..2]).reshape([n as i32]));
+
+    // Per-gaussian coverage-weighted mean error; guard the near-zero-coverage
+    // denominator. A gaussian with ~no visible contribution has row0 ≈ row1 ≈ 0,
+    // so the ratio is ~0 and the `vis_count > 0` gate excludes it regardless.
+    // Final NaN→0 + bound so nothing non-finite can reach the caller (the
+    // per-view positive-median re-anchor and the window-MAX accumulator both
+    // assume finite input). The caller ([`crate::train::accumulate_error_sample`])
+    // positive-median normalizes this per view — anchoring the threshold — since
+    // the raw coverage-weighted mean of a mean-normalized `ê` is not O(1) under
+    // the map's heavy right-skew + masking (see that fn's defect-2 note).
+    let per_g = row1 / row0.clamp_min(1e-8);
+    per_g.clone().mask_fill(per_g.is_nan(), 0.0).clamp(0.0, 1e6)
+}
+
 /// Divide every entry by the median of the strictly-positive entries (clamped to
 /// `>= 1e-9`), after zeroing NaNs. Mirrors LFS
 /// `normalize_by_positive_median_inplace` (mrnf.cpp:345); uses the upper median
@@ -875,5 +983,81 @@ mod tests {
             factor.iter().all(|f| (f - 1.0).abs() < 1e-6),
             "neutral factor expected for a blank view: {factor:?}"
         );
+    }
+
+    /// DEFECT-1 regression: a projected per-gaussian score is rooted in an
+    /// ISOLATED autodiff feature-backward graph, so it comes back autodiff-KIND.
+    /// `gather_error` must DETACH it to the inner backend at the store; otherwise
+    /// `error_score_max_or_zeros()` returns an autodiff tensor and multiplying it
+    /// against a genuinely-inner tensor (as the growth path does,
+    /// `above_threshold.float() * growth_base`) crosses backends and panics
+    /// ("tensors are not on the same backend"). This test stores a real projected
+    /// score and multiplies the RAW stored value against an inner tensor — the
+    /// exact leak. Pre-fix (no detach in `gather_error`) it panics; post-fix it
+    /// yields finite output.
+    #[tokio::test]
+    async fn projected_score_survives_gather_error_and_inner_multiply() {
+        let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
+        let (w, h) = (64usize, 64usize);
+        let img_size = glam::uvec2(w as u32, h as u32);
+        let camera = origin_pinhole();
+
+        // A centered gaussian that covers the frame, so it has real error mass.
+        let means = [[0.0f32, 0.0, 5.0]];
+        let log_scales = [[-0.5f32, -0.5, -0.5]];
+        let splats = make_splats(&means, &log_scales, &[3.0], &device);
+        let n = splats.num_splats() as usize;
+        // A nonuniform error map so the score is nonzero and view-dependent.
+        let map = central_window_edge_map(h, w, 24, &device);
+
+        // The score comes back autodiff-KIND (feature-backward bridge).
+        let score = project_coverage_weighted_mean(&splats, map, &camera, img_size).await;
+
+        // Store it, then pull the RAW stored score back out (NOT through the
+        // median-normalize path, which would launder the backend via a host
+        // rebuild) and multiply against a genuinely-inner tensor.
+        let mut record = crate::stats::RefineRecord::new(n as u32, &device);
+        record.gather_error(score);
+        let stored = record.error_score_max_or_zeros();
+        let inner_ones = Tensor::<1>::ones([n], &device);
+        let weights = read1((stored * inner_ones).reshape([n as i32])).await;
+        assert!(
+            weights.iter().all(|v| v.is_finite()),
+            "growth weights must be finite (no backend leak): {weights:?}"
+        );
+    }
+
+    /// DEFECT-2 semantics: `project_coverage_weighted_mean` returns the
+    /// coverage-weighted MEAN of the map over each gaussian's footprint, so a
+    /// CONSTANT map of value `k` yields `k` for EVERY gaussian regardless of its
+    /// footprint size (`(Σ T·α·k)/(Σ T·α) = k`) — the footprint- and
+    /// resolution-invariance the raw pixel-SUM lacked (the sum would give a big
+    /// gaussian a far larger score than a small one). Two disjoint gaussians of
+    /// very different scale must both land on `k`.
+    #[tokio::test]
+    async fn coverage_weighted_mean_is_footprint_invariant() {
+        let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
+        let (w, h) = (64usize, 64usize);
+        let img_size = glam::uvec2(w as u32, h as u32);
+        let camera = origin_pinhole();
+
+        // Disjoint on screen (u≈16, u≈48); very different scales/footprints.
+        let means = [[-2.5f32, 0.0, 5.0], [2.5, 0.0, 5.0]];
+        let log_scales = [[-0.6f32, -0.6, -0.6], [-2.0, -2.0, -2.0]];
+        let splats = make_splats(&means, &log_scales, &[3.0, 3.0], &device);
+
+        // Constant map k = 2.0 everywhere.
+        let k = 2.0f32;
+        let map = Tensor::<2>::ones([h, w], &device).mul_scalar(k);
+
+        let score =
+            read1(project_coverage_weighted_mean(&splats, map, &camera, img_size).await).await;
+        assert_eq!(score.len(), 2);
+        for (g, s) in score.iter().enumerate() {
+            assert!(
+                (s - k).abs() < 5e-3,
+                "g{g}: coverage-weighted mean of constant {k} must be {k}, got {s}"
+            );
+        }
     }
 }

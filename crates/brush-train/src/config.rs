@@ -235,29 +235,35 @@ pub struct TrainConfig {
     /// Error-map densification (MRNF `use_error_map` port). When set, the growth
     /// signal switches from the screen-space position-gradient norm to LFS's
     /// error-weighted signal: a mean-normalized D-SSIM error map of each sampled
-    /// view is projected onto the gaussians as `Σ_p T·α·ê(p)`, window-MAX
-    /// accumulated, and thresholded directly (LFS `use_error_map`,
-    /// mrnf.cpp:726). OFF by default; when off the trajectory is bit-identical
-    /// to upstream (gradient-driven) growth. When BOTH this and `--use-edge-map`
-    /// are set, error is the base growth signal and edge is a multiplicative
-    /// bias within the error-thresholded set (LFS semantics).
+    /// view is projected onto the gaussians as the coverage-weighted mean error
+    /// `(Σ_p T·α·ê)/(Σ_p T·α)`, window-MAX accumulated, and thresholded (LFS
+    /// `use_error_map`, mrnf.cpp:726, coverage-normalized — see the defect-2 note
+    /// on `error_map_growth_threshold`). OFF by default; when off the trajectory
+    /// is bit-identical to upstream (gradient-driven) growth. When BOTH this and
+    /// `--use-edge-map` are set, error is the base growth signal and edge is a
+    /// multiplicative bias within the error-thresholded set (LFS semantics).
     ///
-    /// The per-gaussian score reuses the same `feat_dim=1` feature backward as
-    /// edge guidance (see `crate::error_map`), so it works for every camera
+    /// The per-gaussian score comes from a `feat_dim=2` feature backward (error
+    /// and coverage rows in one pass), then per-view positive-median normalized
+    /// (see `crate::edge` / `crate::error_map`), so it works for every camera
     /// model the renderer supports.
     #[arg(long, help_heading = "Refine options", default_value = "false")]
     #[serde(default)]
     pub error_map_densification: bool,
 
-    /// Growth threshold for the error-map signal (LFS `τ_err`, mrnf.cpp:726).
-    /// Governs ONLY the `--error-map-densification` path; the gradient path uses
-    /// `--growth-grad-threshold` (a different scale, do not conflate). Because
-    /// the error map is mean-normalized to 1.0, the per-gaussian score lands on
-    /// LFS's native scale (`Σ T·α · O(1)`), so this LFS default transfers
-    /// verbatim: it is a LOW floor admitting any gaussian with nonzero
-    /// visible-and-erroneous contribution; `--growth-select-fraction` does the
-    /// real selection pressure.
-    #[arg(long, help_heading = "Refine options", default_value = "0.003")]
+    /// Growth threshold for the error-map signal (`τ_err`). Governs ONLY the
+    /// `--error-map-densification` path; the gradient path uses
+    /// `--growth-grad-threshold` (a different scale, do not conflate). The
+    /// per-gaussian score is the coverage-weighted MEAN error over a gaussian's
+    /// footprint, `(Σ T·α·ê)/(Σ T·α)`, then per-view POSITIVE-MEDIAN normalized
+    /// (median → 1.0, like the edge path) so it lands on a stable scale
+    /// (defect-2 fix, 2026-07-22). So the default 1.0 admits gaussians
+    /// reconstructing WORSE than the per-view median. NOTE this is NOT LFS's raw-sum `τ_err = 0.003`
+    /// (mrnf.cpp:726) — that 0.003 is the gradient-mode scalar scale and on the
+    /// pixel-summed error degenerates to a no-op floor at the port's render
+    /// resolution; see `train::accumulate_error_sample` for the full derivation.
+    /// `--growth-select-fraction` still layers on selection pressure.
+    #[arg(long, help_heading = "Refine options", default_value = "1.0")]
     #[serde(default = "default_error_map_growth_threshold")]
     pub error_map_growth_threshold: f32,
 
@@ -518,7 +524,10 @@ fn default_edge_score_weight() -> f32 {
 }
 
 fn default_error_map_growth_threshold() -> f32 {
-    0.003
+    // Scene-average anchor on the coverage-weighted mean-error scale (mean-
+    // normalized ê has scene mean 1.0); selects gaussians reconstructing worse
+    // than average. See `TrainConfig::error_map_growth_threshold` (defect-2 fix).
+    1.0
 }
 
 #[cfg(test)]
@@ -535,10 +544,11 @@ mod tests {
 
     #[test]
     fn error_map_flags_default_off_and_parse() {
-        // Default: error-map densification OFF, LFS τ_err floor.
+        // Default: error-map densification OFF; τ_err = 1.0 scene-average anchor
+        // on the coverage-weighted mean-error scale (defect-2 fix).
         let def = TrainConfig::default();
         assert!(!def.error_map_densification);
-        assert!((def.error_map_growth_threshold - 0.003).abs() < 1e-9);
+        assert!((def.error_map_growth_threshold - 1.0).abs() < 1e-9);
         // The gradient threshold is a SEPARATE knob (different scale), untouched.
         assert!((def.growth_grad_threshold - 0.0025).abs() < 1e-9);
 

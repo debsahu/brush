@@ -12,9 +12,32 @@
 //!
 //! and the window signal is `S_g = max_v s_g^v` (window-MAX). Growth admits
 //! `S_g > τ_err (=0.003) AND vis_count_g > 0`. See LFS
-//! `trainer.cpp:3480-3567` (error map), `ssim.cu:2319-2336`
+//! `trainer.cpp:3480-3567` (error map, incl. `tile_error_map.div_(map_mean)` at
+//! 3563-3566 — LFS DOES mean-normalize `ê`, verified), `ssim.cu:2319-2336`
 //! (`ssim_to_error_map`), `kernels_backward.cuh:559-565` (per-pixel
-//! `Σ T·α·error`), `mrnf.cpp:600-616,726-736` (window-MAX + threshold).
+//! `Σ T·α·error` into row 1, `Σ T·α` into row 0 at 563), `mrnf.cpp:600-616,726-736`
+//! (window-MAX of row 1 + threshold; row 0 used only for the `vis>0` gate).
+//!
+//! # Defect-2 fix (2026-07-22): coverage normalization, `τ_err = 1.0`
+//!
+//! LFS thresholds the RAW pixel-sum `s_g = Σ_p T·α·ê` at `τ_err = 0.003`. But
+//! 0.003 is the scale of the GRADIENT-mode row 1 — a per-gaussian per-view
+//! SCALAR, the mean2d gradient norm (`kernels_backward.cuh:335`) — not the
+//! pixel-SUMMED error (`:564`). On a pixel-sum, `s_g` scales with the gaussian's
+//! footprint pixel-count; at the port's 8K-derived cube render size a background
+//! gaussian's footprint is 10^5–10^6 px, so `s_g` reached ~1.16e6 and 0.003
+//! admitted 99.99% of gaussians (a no-op floor — in LFS the real pressure there
+//! is the weighted sample at `mrnf.cpp:790`, not the threshold). To make the
+//! THRESHOLD select (the port's design goal), the port divides `s_g` by the
+//! coverage sum `Σ_p T·α` — LFS's own row 0, `densification_weight`
+//! (`kernels_backward.cuh:563` / gsplat `RasterizeToPixelsFromWorld3DGSBwd.cu:352`)
+//! — yielding the coverage-weighted MEAN error per gaussian, footprint- and
+//! resolution-INVARIANT (in [`crate::edge::project_coverage_weighted_mean`],
+//! both rows from one `feat_dim=2` backward). That mean is then per-view
+//! POSITIVE-MEDIAN normalized in [`crate::train`] (median → 1.0, mirroring the
+//! edge path) so the natural anchor is `τ_err = 1.0` — worse than the per-view
+//! median. (A scene-mean anchor was tried and rejected: it explodes on a
+//! near-converged view and poisons the window-MAX.)
 //!
 //! # Implementation path (Design 1, fallback path A) — and why
 //!

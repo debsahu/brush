@@ -500,8 +500,9 @@ impl SplatTrainer {
     ///      clean, nonnegative, map-mean-normalized D-SSIM error map
     ///      (`crate::error_map`), with the SAME `· gt.a` masking the photometric
     ///      loss applies in `AlphaMode::Masked` (brush-loss `mask` multiply).
-    ///   2. `s_g = Σ_p T_g(p)·α_g(p)·ê(p)` — the alpha-blended projection, via
-    ///      the same `feat_dim=1` feature backward the edge path uses.
+    ///   2. `s_g = (Σ_p T_g·α_g·ê) / (Σ_p T_g·α_g)` — the coverage-weighted MEAN
+    ///      of `ê` over the gaussian's footprint, via a `feat_dim=2` feature
+    ///      backward (`crate::edge::project_coverage_weighted_mean`).
     ///   3. window-MAX accumulate (`gather_error`), NOT sum/mean.
     ///
     /// UNLIKE the edge path, this runs on EVERY step, not on the edge sampling
@@ -516,12 +517,30 @@ impl SplatTrainer {
     /// intrinsic to the path-A fallback (LFS gets row1 for free inside its RGB
     /// backward, which Brush's autodiff cannot piggyback — see `error_map` doc).
     ///
-    /// CRUCIALLY, unlike the edge path, the per-gaussian score is NOT
-    /// positive-median normalized: it must stay on LFS's native scale so
-    /// `error_map_growth_threshold` (`τ_err` = 0.003) transfers verbatim
-    /// (design spec §5). Pure non-differentiable bookkeeping — the score comes
-    /// from an isolated feature forward+backward that never touches the
-    /// photometric graph.
+    /// SCALE (defect-2 fix, 2026-07-22). LFS thresholds the RAW pixel-sum
+    /// `Σ_p T·α·ê` at `τ_err = 0.003` (`mrnf.cpp:601-605,726`), but that 0.003 is
+    /// the scale of the gradient-mode row 1 — a per-gaussian per-view SCALAR
+    /// (the mean2d gradient norm, `kernels_backward.cuh:335`) — NOT the
+    /// pixel-SUMMED error (`kernels_backward.cuh:564`). On a pixel-sum, `Σ T·α`
+    /// scales with the gaussian's footprint (10^5–10^6 px at the port's
+    /// 8K-derived render size), so the raw score reached ~1.16e6 and 0.003
+    /// admitted 99.99% of gaussians — a no-op floor (in LFS-land the real
+    /// pressure there is the weighted sample, `mrnf.cpp:790`, not the threshold).
+    /// To make the THRESHOLD itself select — the port's stated design goal — the
+    /// per-gaussian score divides the error sum by the coverage sum (LFS's own
+    /// row 0, `densification_weight`, `kernels_backward.cuh:563`), recovering the
+    /// coverage-weighted MEAN error per gaussian, footprint- and
+    /// resolution-INVARIANT. That mean is still not O(1) (the mean-normalized `ê`
+    /// is heavily right-skewed and, in masked mode, masked-out zeros deflate the
+    /// covered-region mean, so ~all unmasked gaussians exceed the map's spatial
+    /// mean 1.0). So — exactly as the edge path does — each view's per-gaussian
+    /// scores are then POSITIVE-MEDIAN normalized (median → 1.0), which is robust
+    /// to that skew and to low-error views (a scene-mean anchor instead explodes
+    /// on a near-converged view and poisons the window-MAX). On that scale the
+    /// natural anchor is `τ_err = 1.0` — a gaussian reconstructing worse than the
+    /// per-view median — not 0.003. Pure non-differentiable bookkeeping: the
+    /// score comes from an isolated feature forward+backward that never touches
+    /// the photometric graph.
     async fn accumulate_error_sample(
         &mut self,
         splats: &Splats,
@@ -569,12 +588,25 @@ impl SplatTrainer {
         if n == 0 {
             return;
         }
-        // `Σ_p T·α·ê` per gaussian, via the shared feature backward.
-        let score = edge::project_edge_scores(&valid, error, camera, img_size).await;
+        // Coverage-weighted MEAN error per gaussian: `(Σ_p T·α·ê)/(Σ_p T·α)`,
+        // via a single feat_dim=2 feature backward (numerator = LFS row 1,
+        // denominator = LFS row 0 / `densification_weight`). The division makes
+        // the score footprint- and resolution-invariant, on the `ê` scale — see
+        // `accumulate_error_sample` doc and `crate::error_map` for why the port
+        // divides where LFS sums.
+        let score = edge::project_coverage_weighted_mean(&valid, error, camera, img_size).await;
 
         // INVARIANT (same as the edge path): the splat set is constant within a
         // refine window, and `RefineRecord` is recreated fresh after each prune,
         // so the window-MAX starts from zero every window (no cross-window leak).
+        // The raw coverage-weighted mean is accumulated by window-MAX here;
+        // positive-median normalization is applied ONCE at refine over the final
+        // window-MAX (`RefineRecord::error_scores_median_normalized`), NOT
+        // per-view — a per-view median normalize is defeated by the window-MAX
+        // (the max over ~`refine_every` views of a median-1.0 quantity lands well
+        // above 1.0 for ~every gaussian; smoke: still 99.6%). Normalizing the
+        // final MAX distribution anchors its median at 1.0 so `τ_err = 1.0`
+        // selects the worse-than-median half.
         if let Some(record) = self.refine_record.as_mut() {
             record.gather_error(score);
         }
@@ -1390,8 +1422,10 @@ impl SplatTrainer {
             // signal. Off, this is exactly upstream's gradient-norm gate.
             let (above_threshold, growth_base) = if self.config.error_map_densification {
                 (
-                    refiner.error_above_threshold(self.config.error_map_growth_threshold),
-                    refiner.error_score_max_or_zeros(),
+                    refiner
+                        .error_above_threshold(self.config.error_map_growth_threshold)
+                        .await,
+                    refiner.error_scores_median_normalized().await,
                 )
             } else {
                 (
