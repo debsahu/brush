@@ -247,8 +247,9 @@ impl SplatTrainer {
         // MRNF LR schedule (R1): independent exponential decay for the log-scale
         // parameters, mirroring LFS `_scale_lr_gamma` (mrnf.cpp:425) and the
         // per-step `_scale_lr_current *= _scale_lr_gamma` (mrnf.cpp:1360). Guarded
-        // like LFS `compute_decay_gamma` (start/end > 0), so the default
-        // lr_scale_end == lr_scale yields gamma == 1.0 (constant, opt-in).
+        // like LFS `compute_decay_gamma` (start/end > 0). ON by default now
+        // (LFS `mrnf_defaults` parity): lr_scale 7e-3 -> lr_scale_end 5e-3 gives
+        // gamma < 1.0. Set `--lr-scale-end` == `--lr-scale` to make gamma == 1.0.
         let scale_decay = if config.lr_scale > 0.0 && config.lr_scale_end > 0.0 {
             (config.lr_scale_end / config.lr_scale)
                 .powf(1.0 / config.total_train_iters.max(1) as f64)
@@ -1305,9 +1306,9 @@ impl SplatTrainer {
 
         // Optional min-scale degenerate prune (MRNF port, delta #3). MRNF culls
         // splats whose smallest log-scale axis drops below log(1e-10) (see
-        // mrnf.cpp:668, MRNF_LOG_MIN_SCALE_THRESHOLD). Brush deliberately omits
-        // this to keep thin "pancake" surface splats (see note above), so it is
-        // flag-gated and OFF by default. Tests the RAW log-scales
+        // mrnf.cpp:668, MRNF_LOG_MIN_SCALE_THRESHOLD). ON by default (LFS
+        // `mrnf_defaults` parity); disable with `--min-scale-prune=false` to
+        // keep thin "pancake" surface splats (see note above). Tests the RAW log-scales
         // (`log_scales().exp()`), NOT `scales()` which folds in the
         // Mip-Splatting min-scale floor; that floor keeps folded scales above
         // the threshold so the prune would never fire. Testing raw scales
@@ -1329,7 +1330,8 @@ impl SplatTrainer {
         // degenerate rotation. Mirrors compute_near_zero_rotation_mask
         // (mrnf.cpp:667; pruning_kernels.cu:64 `mag_sq = q.q < 1e-8`). Uses the
         // raw quaternion (`splats.rotations()` = transforms[.., 3..7]),
-        // matching LFS's `rotation_raw()`. Flag-gated (OFF by default).
+        // matching LFS's `rotation_raw()`. ON by default (LFS `mrnf_defaults`
+        // parity); disable with `--near-zero-rotation-prune=false`.
         let prune_mask = if self.config.near_zero_rotation_prune {
             let quat_norm_sq = splats.rotations().powi_scalar(2).sum_dim(1).squeeze_dim(1);
             let near_zero_rot = quat_norm_sq.lower_elem(1e-8f32);
