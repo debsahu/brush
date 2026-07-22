@@ -115,6 +115,56 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Refine options", default_value = "false")]
     pub min_scale_prune: bool,
 
+    /// Smallest-scale-axis threshold for the optional min-scale degenerate
+    /// prune (only used when `--min-scale-prune` is set). Matches MRNF's
+    /// `MRNF_LOG_MIN_SCALE_THRESHOLD = log(1e-10)` (mrnf.cpp:72), expressed here
+    /// as the linear scale so it compares against the effective (floored)
+    /// scales.
+    #[arg(long, help_heading = "Refine options", default_value = "1e-10")]
+    pub min_scale_prune_threshold: f32,
+
+    /// Opacity below which a splat is pruned, and the clamp applied to split
+    /// children's opacity. Mirrors MRNF's `min_opacity = 1/255`
+    /// (parameters.cpp:249, prune threshold `logit(1/255)` at mrnf.cpp:71).
+    #[arg(long, help_heading = "Refine options", default_value_t = 1.0f32 / 255.0)]
+    pub min_opacity: f32,
+
+    /// World-extent multiplier for the out-of-bounds prune: a splat is culled if
+    /// any scale axis, or its distance from the robust scene center, exceeds this
+    /// factor times the scene's largest robust half-extent. Mirrors MRNF's
+    /// `max_allowed = max_extent * 100` (mrnf.cpp:644). This is the sky-floater
+    /// killer; lower it to cull closer to the scene box.
+    #[arg(long, help_heading = "Refine options", default_value = "100.0")]
+    pub prune_extent_factor: f32,
+
+    /// Percentile for the robust per-axis AABB recomputed each refine (drives the
+    /// out-of-bounds prune). Mirrors MRNF's `bounds_percentile = 0.8`
+    /// (parameters.hpp:182). Note: this governs the per-refine bounds recompute;
+    /// the one-time initial bounds use the module default.
+    #[arg(long, help_heading = "Refine options", default_value = "0.8")]
+    pub bounds_percentile: f32,
+
+    /// Long-Axis-Split (LAS) longest-axis factor (MRNF delta #2): the split
+    /// halves the longest scale axis and offsets the two children apart by this
+    /// fraction of its world extent. Mirrors MRNF's fixed `0.5`
+    /// (densification_kernels.cu:669-771). For oversized splats the effective
+    /// longest-axis shrink is further capped by `--split-at-screen-size`.
+    #[arg(long, help_heading = "Refine options", default_value = "0.5")]
+    pub split_long_axis_scale: f32,
+
+    /// Long-Axis-Split (LAS) shrink applied to the two non-longest scale axes of
+    /// both split children. Mirrors MRNF's fixed `0.85`
+    /// (densification_kernels.cu:669-771).
+    #[arg(long, help_heading = "Refine options", default_value = "0.85")]
+    pub split_other_axis_scale: f32,
+
+    /// Long-Axis-Split (LAS) opacity multiplier applied to both split children:
+    /// `sigmoid(raw) *= split_opacity_scale`. Mirrors MRNF's revised-opacity
+    /// `inverse_sigmoid(sigmoid(opacity) * 0.6)` (densification_kernels.cu:722).
+    /// NOT mass-conserving; set to 1.0 for a mass-conserving-ish split A/B.
+    #[arg(long, help_heading = "Refine options", default_value = "0.6")]
+    pub split_opacity_scale: f32,
+
     /// Weight of l1 loss on alpha if input view has transparency.
     #[arg(long, help_heading = "Refine options", default_value = "0.1")]
     pub match_alpha_weight: f32,

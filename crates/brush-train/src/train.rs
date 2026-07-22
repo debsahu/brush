@@ -32,9 +32,10 @@ use hashbrown::{HashMap, HashSet};
 use rand::SeedableRng;
 use tracing::{Instrument, trace_span};
 
+/// Default robust-AABB percentile, used for the one-time initial/LOD bounds by
+/// external callers. The per-refine bounds recompute inside the trainer uses the
+/// configurable `TrainConfig::bounds_percentile` (default matches this).
 pub const BOUND_PERCENTILE: f32 = 0.8;
-
-const MIN_OPACITY: f32 = 1.0 / 255.0;
 
 /// Mip-Splatting 3D-filter strength. This is intentionally fixed: changing it
 /// alters the learned/exported representation rather than just training speed.
@@ -940,7 +941,7 @@ impl SplatTrainer {
             }
         }
 
-        let max_allowed_bounds = self.bounds.extent.max_element() * 100.0;
+        let max_allowed_bounds = self.bounds.extent.max_element() * self.config.prune_extent_factor;
 
         // If not refining, update splat to step with gradients applied.
         // Prune dead splats. This ALWAYS happen even if we're not "refining" anymore.
@@ -949,7 +950,7 @@ impl SplatTrainer {
             .take()
             .expect("Can only refine after optimizer is initialized")
             .to_record();
-        let alpha_mask = splats.opacities().lower_elem(MIN_OPACITY);
+        let alpha_mask = splats.opacities().lower_elem(self.config.min_opacity);
         let scales = splats.scales();
 
         // Note: we do NOT cull on a minimum scale. A genuinely flat splat
@@ -1003,7 +1004,7 @@ impl SplatTrainer {
         let prune_mask = if self.config.min_scale_prune {
             let scale_small = scales
                 .clone()
-                .lower_elem(1e-10)
+                .lower_elem(self.config.min_scale_prune_threshold)
                 .any_dim(1)
                 .squeeze_dim(1);
             prune_mask.bool_or(scale_small)
@@ -1122,7 +1123,7 @@ impl SplatTrainer {
         }
 
         // Update current bounds based on the splats.
-        self.bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
+        self.bounds = get_splat_bounds(splats.clone(), self.config.bounds_percentile).await;
         // Recompute the per-splat 3D-filter floor against the new positions/
         // count and attach it. Refine must always leave the floor attached:
         // otherwise the late-training and LOD tails can shrink below it.
@@ -1194,8 +1195,11 @@ impl SplatTrainer {
             // logit — LFS `inverse_sigmoid(sigmoid(opacity) * 0.6)`. NOT
             // mass-conserving like the old 1-inv^(1/√2) rule; intentional per
             // MRNF (watch for a small brightness step at refines, E.2).
-            let new_opac: Tensor<1> = sigmoid(cur_raw_opac.clone()).mul_scalar(0.6);
-            let new_raw_opac = inv_sigmoid(new_opac.clamp(MIN_OPACITY, 1.0 - MIN_OPACITY));
+            let new_opac: Tensor<1> =
+                sigmoid(cur_raw_opac.clone()).mul_scalar(self.config.split_opacity_scale);
+            let new_raw_opac = inv_sigmoid(
+                new_opac.clamp(self.config.min_opacity, 1.0 - self.config.min_opacity),
+            );
 
             // One-hot [refine_count, 3] selecting each splat's longest log-scale
             // axis. exp is monotone so argmax over log-scale == argmax over scale;
@@ -1224,9 +1228,10 @@ impl SplatTrainer {
                     .clamp_min(1e-6)
                     .recip()
                     .mul_scalar(self.config.split_at_screen_size)
-                    .clamp_max(0.5)
+                    .clamp_max(self.config.split_long_axis_scale)
             } else {
-                Tensor::zeros([refine_count, 1], &ls_device).add_scalar(0.5)
+                Tensor::zeros([refine_count, 1], &ls_device)
+                    .add_scalar(self.config.split_long_axis_scale)
             };
 
             // Offset each child by half the longest axis' world extent, along that
@@ -1235,15 +1240,16 @@ impl SplatTrainer {
             // LFS `global_offset = R[:,L] * (exp(scale[L]) * 0.5)`. Offset
             // magnitude stays at LFS's fixed 0.5*extent; only the scale shrink
             // follows m_long.
-            let offset_local = long_onehot.clone() * cur_scales * 0.5;
+            let offset_local = long_onehot.clone() * cur_scales * self.config.split_long_axis_scale;
             let samples = quaternion_vec_multiply(cur_rots.clone(), offset_local);
 
             // New log-scales: shrink all three axes to 0.85x, then override the
             // longest axis to `log_scale[L] + ln(m_long)` (== +ln(0.5) in the
             // default case). LFS: new_scale[L] = scale[L]+ln(0.5),
             // new_scale[other] = scale[other]+ln(0.85).
-            const LN_0_85: f32 = -0.162_518_93; // ln(0.85)
-            let base_log_scales = cur_log_scale.clone().add_scalar(LN_0_85);
+            let base_log_scales = cur_log_scale
+                .clone()
+                .add_scalar(self.config.split_other_axis_scale.ln());
             let long_log_scales = cur_log_scale.clone() + m_long.log();
             let new_log_scales =
                 base_log_scales * (-long_onehot.clone() + 1.0) + long_log_scales * long_onehot;
