@@ -87,6 +87,11 @@ fn should_launch_unchecked(
     hard_floats && unchecked_requested && trusted_forward
 }
 
+// Multiple independent compile/runtime render-mode flags for a GPU kernel
+// dispatch function (smooth_cutoff, compute_refine_weight, render_depth,
+// trusted_forward, ...) -- these are orthogonal switches, not related state
+// that would be clearer as an enum, so we allow this alongside the existing
+// too-many-arguments allow rather than force an artificial options struct.
 #[allow(clippy::fn_params_excessive_bools)]
 #[allow(clippy::too_many_arguments)]
 fn rasterize_bwd_impl(
@@ -404,7 +409,7 @@ impl SplatBwdOps for MainBackendBase {
                 // SAFETY: the gate above proves total_splats == num_points,
                 // degree <= 4, and a fixed 32-lane plane. Every active plane
                 // therefore owns one in-bounds global row; compact+1 is either
-                // the zero sentinel or indexes the compact [num_visible, 10]
+                // the zero sentinel or indexes the compact [num_visible, 11]
                 // gradient, and the three lane stores cover the entire SH row.
                 unsafe {
                     kernels::sh_grad_materialize::materialize_sh_grad_kernel::launch_unchecked::<

@@ -409,9 +409,12 @@ async fn deferred_sh_bridge_preserves_other_gradients_and_aux() {
             read_vec(deferred_splats.raw_opacities.grad(&deferred_grads).unwrap()).await;
 
         assert!(deferred_splats.sh_coeffs.grad(&deferred_grads).is_none());
+        // v_combined is the sparse rasterize-backward buffer: 11 lanes per
+        // compact splat (5 geom + 3 rgb + alpha + refine + depth). The depth
+        // lane was appended by the DiG/depth merge.
         assert_eq!(
             sparse.compact_grads.dims(),
-            [num_visible.max(1) as usize, 10]
+            [num_visible.max(1) as usize, 11]
         );
         assert_eq!(sparse.render_transforms.dims(), [scene.raw_opac.len(), 10]);
         assert!(sparse.global_from_compact_gid.dims()[0] >= num_visible.max(1) as usize);

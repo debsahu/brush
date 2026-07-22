@@ -476,8 +476,12 @@ mod tests {
 
     const LOW_ALPHA: f32 = 1.0e-4;
 
-    fn splat(alpha: f32) -> [f32; 9] {
-        [0.5, 0.5, 1.0, 0.0, 1.0, alpha, 1.0, 1.0, 1.0]
+    // A projected splat is PROJECTED_LANES (=10) wide: xy(2) + conic(3) +
+    // alpha(1) + rgb(3) + depth(1). The trailing depth lane was appended by
+    // the DiG/depth merge; the census replay only reads lanes 0..5, so the
+    // value is inert here but the stride must match PROJECTED_LANES.
+    fn splat(alpha: f32) -> [f32; 10] {
+        [0.5, 0.5, 1.0, 0.0, 1.0, alpha, 1.0, 1.0, 1.0, 1.0]
     }
 
     #[test]
@@ -578,7 +582,8 @@ mod tests {
 
     #[test]
     fn sampled_replay_uses_rectangular_tile_height() {
-        let projected = [[0.5, 12.5, 1.0, 0.0, 1.0, 0.5, 1.0, 1.0, 1.0]].concat();
+        // 10-lane projected splat (trailing depth lane); census reads lanes 0..5.
+        let projected = [[0.5, 12.5, 1.0, 0.0, 1.0, 0.5, 1.0, 1.0, 1.0, 1.0]].concat();
         let compact = [0];
         let offsets = [0, 0, 0, 1];
         let report = analyze(&RasterCensusInput {
