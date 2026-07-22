@@ -491,17 +491,30 @@ impl SplatTrainer {
 
     /// Accumulate this step's error-map growth score into the refine record
     /// (MRNF `use_error_map` port). No-op unless `--error-map-densification` is
-    /// set and this step lands on the sampling stride (shared with edge
-    /// guidance, `EDGE_MIN_VIEW_SAMPLES` views per window). `pred_rgb` is the
-    /// post-appearance predicted RGB `[H, W, 3]` on the inner backend (the same
-    /// image the SSIM loss sees); `gt_packed` is this view's GT.
+    /// set. `pred_rgb` is the post-appearance predicted RGB `[H, W, 3]` on the
+    /// inner backend (the same image the SSIM loss sees); `gt_packed` is this
+    /// view's GT; `masked` is true in `AlphaMode::Masked` (mask densification).
     ///
     /// Reproduces LFS's per-view error signal term-for-term:
-    ///   1. `ê = mean_normalize(max(0, 1 − meanSSIM(pred, gt)))` — a clean,
-    ///      nonnegative, map-mean-normalized D-SSIM error map (`crate::error_map`).
+    ///   1. `ê = mean_normalize(max(0, 1 − meanSSIM(pred, gt)) · mask(p))` — a
+    ///      clean, nonnegative, map-mean-normalized D-SSIM error map
+    ///      (`crate::error_map`), with the SAME `· gt.a` masking the photometric
+    ///      loss applies in `AlphaMode::Masked` (brush-loss `mask` multiply).
     ///   2. `s_g = Σ_p T_g(p)·α_g(p)·ê(p)` — the alpha-blended projection, via
     ///      the same `feat_dim=1` feature backward the edge path uses.
     ///   3. window-MAX accumulate (`gather_error`), NOT sum/mean.
+    ///
+    /// UNLIKE the edge path, this runs on EVERY step, not on the edge sampling
+    /// stride: LFS folds row1 (the error map) into `_refine_weight_max` on every
+    /// training view (`kernels_backward.cuh` + mrnf.cpp:602-605), whereas the edge
+    /// guidance is deliberately sub-sampled (`MRNF_EDGE_MIN_VIEW_SAMPLES = 10`).
+    /// Sharing the edge stride would score the error map on only ~10 of the
+    /// ~`refine_every` views/window, so any gaussian whose reconstruction error
+    /// peaks in an unsampled view would be under-scored (or, if never sampled,
+    /// scored 0 and silently excluded from error-driven growth). The cost is one
+    /// extra feature render+backward per step while the flag is on; this is
+    /// intrinsic to the path-A fallback (LFS gets row1 for free inside its RGB
+    /// backward, which Brush's autodiff cannot piggyback — see `error_map` doc).
     ///
     /// CRUCIALLY, unlike the edge path, the per-gaussian score is NOT
     /// positive-median normalized: it must stay on LFS's native scale so
@@ -516,19 +529,39 @@ impl SplatTrainer {
         pred_rgb: Tensor<3>,
         gt_packed: &Tensor<2, Int>,
         composite_bg: Option<glam::Vec3>,
+        masked: bool,
         img_size: glam::UVec2,
     ) {
-        if !self.config.error_map_densification
-            || !self.step_count.is_multiple_of(self.edge_sample_stride())
-        {
+        if !self.config.error_map_densification {
             return;
         }
         // GT RGB `[H, W, 3]` on the inner backend (same unpack the loss uses for
         // its SSIM). `pred_rgb` already arrives detached on the inner backend.
         let gt_rgb = brush_loss::unpack_gt_rgb(gt_packed.clone(), composite_bg);
-        // Clean D-SSIM error map, then MRNF map-mean normalize to ~1.0 so the
-        // projected score lands on LFS's native scale.
+        // Clean D-SSIM error map.
         let error = error_map::ssim_error_map(pred_rgb, gt_rgb);
+        // Masked-mode parity: the photometric loss multiplies its loss-map by
+        // `gt.a` in `AlphaMode::Masked` (brush-loss kernel `mask` multiply), so
+        // masked-out pixels contribute ZERO loss. Mirror it here BEFORE the
+        // map-mean normalize — otherwise a masked region (e.g. sky, `gt.a = 0`)
+        // with a bright raw GT vs a near-black pred yields a HIGH D-SSIM error
+        // and the growth signal would densify gaussians INTO the masked region,
+        // inverting the very mask that exists to suppress it. `gt.a` is bits
+        // 24..31 of the packed `[r8 g8 b8 a8]` u32; `>> 24 & 0xff` recovers the
+        // byte regardless of the i32 arithmetic-shift sign extension.
+        let error = if masked {
+            let alpha = gt_packed
+                .clone()
+                .bitwise_right_shift_scalar(24)
+                .bitwise_and_scalar(0xff)
+                .float()
+                .div_scalar(255.0);
+            error * alpha
+        } else {
+            error
+        };
+        // MRNF map-mean normalize to ~1.0 so the projected score lands on LFS's
+        // native scale.
         let error = error_map::mean_normalize(error);
 
         let valid = splats.valid();
@@ -857,7 +890,9 @@ impl SplatTrainer {
             // Error-map growth accumulation (MRNF `use_error_map` port). Uses
             // the post-appearance predicted RGB (the same image the SSIM loss
             // sees) detached onto the inner backend, plus this view's GT; gated
-            // on `--error-map-densification` and the sampling stride inside.
+            // on `--error-map-densification` inside. Runs every step (LFS folds
+            // the error map into `_refine_weight_max` on every view). `masked_alpha`
+            // applies the same `gt.a` mask the photometric loss uses.
             let pred_rgb = brush_render::burn_glue::detach_autodiff(pred_image.clone().slice(s![
                 ..,
                 ..,
@@ -869,6 +904,7 @@ impl SplatTrainer {
                 pred_rgb,
                 &gt_packed,
                 composite_bg,
+                masked_alpha,
                 img_size,
             )
             .await;

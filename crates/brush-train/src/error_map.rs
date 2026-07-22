@@ -218,6 +218,34 @@ mod tests {
         );
     }
 
+    /// T-numeric (definitional parity): for uniform pred = a, gt = b the D-SSIM
+    /// error collapses to the closed form `(a − b)^2 / (a^2 + b^2 + C1)` at any
+    /// interior pixel. Both variances and the covariance vanish on a constant
+    /// image, so the contrast/structure ratio `d_top / b` is `C2 / C2 = 1` and
+    /// `SSIM = (2ab + C1) / (a^2 + b^2 + C1)`, hence `1 − SSIM` as above. This
+    /// pins the C1 placement and the luminance/contrast/structure grouping
+    /// against a first-principles value — the property tests (identical ⇒ 0,
+    /// mismatch > 0, normalize ⇒ mean 1) all still pass under a swapped
+    /// C1<->C2 or a regrouped term, so only a numeric anchor catches those.
+    #[tokio::test]
+    async fn ssim_error_matches_closed_form_uniform() {
+        let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
+        let (h, w) = (32usize, 32usize);
+        for &(a, b) in &[(0.2f32, 0.9f32), (0.1f32, 0.7f32), (0.5f32, 0.5f32)] {
+            let pred = const_img(h, w, a, &device);
+            let gt = const_img(h, w, b, &device);
+            let e = read2(ssim_error_map(pred, gt)).await;
+            // Central pixel is >= HALO (5) from every border on a 32x32 image,
+            // so the 11-tap Gaussian sees full support (mu = a exactly).
+            let center = e[(h / 2) * w + w / 2];
+            let expected = (a - b).powi(2) / (a * a + b * b + C1);
+            assert!(
+                (center - expected).abs() < 1e-3,
+                "closed-form mismatch for a={a}, b={b}: got {center}, want {expected}"
+            );
+        }
+    }
+
     /// T3 (normalization): map-mean normalize sends the mean to ~1.0 and scales
     /// linearly (a 2× input map still normalizes to mean 1.0), so a downstream
     /// `Σ T·α·ê` lands on the same scale regardless of the raw map magnitude.
