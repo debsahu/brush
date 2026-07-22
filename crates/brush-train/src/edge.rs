@@ -18,7 +18,7 @@
 //!
 //! Stage 2 in LFS is a full tiled, front-to-back, alpha-compositing forward
 //! rasterizer that writes a per-gaussian scalar. Porting that as a first-class
-//! CubeCL kernel is the "genuinely new render-like subsystem" the design flags as
+//! `CubeCL` kernel is the "genuinely new render-like subsystem" the design flags as
 //! the only large piece of the MRNF port. This module instead lands a **burn-op
 //! projection fallback**: it projects each gaussian's *center* to a pixel and
 //! samples the edge map there, weighting by the gaussian's opacity as a proxy for
@@ -32,11 +32,11 @@
 //!
 //! The public surface (config flags, `RefineRecord` accumulator, growth/
 //! replacement wiring) is the real scaffold; swapping `project_edge_scores` for a
-//! CubeCL alpha-blended edge rasterizer is the remaining work to reach parity.
+//! `CubeCL` alpha-blended edge rasterizer is the remaining work to reach parity.
 
-use burn::tensor::{Tensor, module::conv2d, ops::ConvOptions, s};
 use brush_render::camera::Camera;
 use brush_render::kernels::camera_model::CameraModel;
+use burn::tensor::{Tensor, module::conv2d, ops::ConvOptions, s};
 
 // spirulae-splat 5x5 Gaussian blur (matches LFS `SPIRULAE_BLUR_5x5`,
 // image_kernels.cu:21).
@@ -86,12 +86,27 @@ pub(crate) fn canny_edge_map(rgb: Tensor<3>) -> Tensor<2> {
     let gray = gray.reshape([1, 1, h as i32, w as i32]);
 
     let blur_w = Tensor::<1>::from_floats(SPIRULAE_BLUR_5X5, &device).reshape([1, 1, 5, 5]);
-    let blurred = conv2d(gray, blur_w, None, ConvOptions::new([1, 1], [2, 2], [1, 1], 1));
+    let blurred = conv2d(
+        gray,
+        blur_w,
+        None,
+        ConvOptions::new([1, 1], [2, 2], [1, 1], 1),
+    );
 
     let sx = Tensor::<1>::from_floats(SOBEL_X, &device).reshape([1, 1, 3, 3]);
     let sy = Tensor::<1>::from_floats(SOBEL_Y, &device).reshape([1, 1, 3, 3]);
-    let gx = conv2d(blurred.clone(), sx, None, ConvOptions::new([1, 1], [1, 1], [1, 1], 1));
-    let gy = conv2d(blurred, sy, None, ConvOptions::new([1, 1], [1, 1], [1, 1], 1));
+    let gx = conv2d(
+        blurred.clone(),
+        sx,
+        None,
+        ConvOptions::new([1, 1], [1, 1], [1, 1], 1),
+    );
+    let gy = conv2d(
+        blurred,
+        sy,
+        None,
+        ConvOptions::new([1, 1], [1, 1], [1, 1], 1),
+    );
 
     let mag = (gx.clone() * gx + gy.clone() * gy).sqrt();
     mag.reshape([h as i32, w as i32])
@@ -124,9 +139,12 @@ pub(crate) fn project_edge_scores(
     let wl = camera.world_to_local();
     let m = wl.matrix3;
     let t = wl.translation;
-    let r0 = Tensor::<1>::from_floats([m.x_axis.x, m.y_axis.x, m.z_axis.x], &device).reshape([1, 3]);
-    let r1 = Tensor::<1>::from_floats([m.x_axis.y, m.y_axis.y, m.z_axis.y], &device).reshape([1, 3]);
-    let r2 = Tensor::<1>::from_floats([m.x_axis.z, m.y_axis.z, m.z_axis.z], &device).reshape([1, 3]);
+    let r0 =
+        Tensor::<1>::from_floats([m.x_axis.x, m.y_axis.x, m.z_axis.x], &device).reshape([1, 3]);
+    let r1 =
+        Tensor::<1>::from_floats([m.x_axis.y, m.y_axis.y, m.z_axis.y], &device).reshape([1, 3]);
+    let r2 =
+        Tensor::<1>::from_floats([m.x_axis.z, m.y_axis.z, m.z_axis.z], &device).reshape([1, 3]);
 
     let px = (means.clone() * r0).sum_dim(1).add_scalar(t.x); // [N, 1]
     let py = (means.clone() * r1).sum_dim(1).add_scalar(t.y);
@@ -198,7 +216,7 @@ pub(crate) fn normalize_by_positive_median(values: &mut [f32]) {
 /// stay at 1.0, so the factor only ever *biases* sampling, never zeros it.
 pub(crate) fn edge_guidance_factor(mut mean_scores: Vec<f32>, weight: f32) -> Vec<f32> {
     normalize_by_positive_median(&mut mean_scores);
-    for v in mean_scores.iter_mut() {
+    for v in &mut mean_scores {
         *v = *v * weight + 1.0;
     }
     mean_scores
@@ -257,17 +275,15 @@ mod tests {
         // A: (0,0,5)   -> u=50,  v=50  -> pixel (50,50) flat 5050
         // B: (1,0,5)   -> u=60,  v=50  -> pixel (60,50) flat 5060
         // C: (0,0,-5)  -> behind camera -> score 0
-        let means = Tensor::<1>::from_floats(
-            [0.0, 0.0, 5.0, 1.0, 0.0, 5.0, 0.0, 0.0, -5.0],
-            &device,
-        )
-        .reshape([3, 3]);
+        let means =
+            Tensor::<1>::from_floats([0.0, 0.0, 5.0, 1.0, 0.0, 5.0, 0.0, 0.0, -5.0], &device)
+                .reshape([3, 3]);
         let opac = Tensor::<1>::from_floats([0.5, 0.5, 0.5], &device);
 
         // edge_map[r][c] = flat index (r*w + c).
         let iota: Vec<f32> = (0..(h * w)).map(|i| i as f32).collect();
-        let edge_map =
-            Tensor::<1>::from_data(TensorData::new(iota, [h * w]), &device).reshape([h as i32, w as i32]);
+        let edge_map = Tensor::<1>::from_data(TensorData::new(iota, [h * w]), &device)
+            .reshape([h as i32, w as i32]);
 
         let score = project_edge_scores(means, opac, edge_map, &camera, img_size);
         let score: Vec<f32> = score

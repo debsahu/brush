@@ -45,7 +45,7 @@ pub struct TrainConfig {
     /// mrnf.cpp:618) and on the ACCUMULATED per-refine visibility count
     /// (`RefineRecord::vis_weight`, LFS `_vis_count`), mirroring LFS
     /// `MRNF::inject_noise` / `launch_mrnf_noise_injection` (mrnf.cpp:1085,
-    /// mrnf_kernels.cu:41). Replaces Brush's generic per-step noise. OFF by
+    /// `mrnf_kernels.cu:41`). Replaces Brush's generic per-step noise. OFF by
     /// default.
     #[arg(long, help_heading = "Refine options", default_value = "false")]
     #[serde(default)]
@@ -148,7 +148,7 @@ pub struct TrainConfig {
     /// Prune splats whose raw quaternion has collapsed toward zero (squared
     /// norm < 1e-8), i.e. a degenerate rotation that renders as garbage.
     /// Mirrors MRNF's `compute_near_zero_rotation_mask` (mrnf.cpp:667;
-    /// pruning_kernels.cu:64 `mag_sq = q.q < 1e-8`). OFF by default: a healthy
+    /// `pruning_kernels.cu:64` `mag_sq = q.q < 1e-8`). OFF by default: a healthy
     /// quaternion has norm ~1 so this only bites already-collapsed splats, but
     /// it is flag-gated because it adds a term to the default prune mask.
     #[arg(long, help_heading = "Refine options", default_value = "false")]
@@ -200,7 +200,7 @@ pub struct TrainConfig {
 
     /// Long-Axis-Split (LAS) opacity multiplier applied to both split children:
     /// `sigmoid(raw) *= split_opacity_scale`. Mirrors MRNF's revised-opacity
-    /// `inverse_sigmoid(sigmoid(opacity) * 0.6)` (densification_kernels.cu:722).
+    /// `inverse_sigmoid(sigmoid(opacity) * 0.6)` (`densification_kernels.cu:722`).
     /// NOT mass-conserving; set to 1.0 for a mass-conserving-ish split A/B.
     #[arg(long, help_heading = "Refine options", default_value = "0.6")]
     pub split_opacity_scale: f32,
@@ -208,7 +208,7 @@ pub struct TrainConfig {
     /// Edge-guidance densification (MRNF port, delta #4). When set, a Canny edge
     /// map of each sampled GT view is projected onto the gaussians and the
     /// accumulated per-gaussian edge score biases growth + dead-slot replacement
-    /// toward high-frequency image edges (LFS `use_edge_map`, mrnf_defaults). OFF
+    /// toward high-frequency image edges (LFS `use_edge_map`, `mrnf_defaults`). OFF
     /// by default; this is the highest-effort MRNF lever, only worth enabling if
     /// Phases 1-3 leave a floater/detail gap.
     ///

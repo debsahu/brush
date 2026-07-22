@@ -734,6 +734,7 @@ async fn render_splats_with_pass_and_refine_weight(
     }
 }
 
+#[allow(clippy::fn_params_excessive_bools)]
 #[allow(clippy::too_many_arguments)]
 fn rasterize_bwd_fusion(
     out_img: FloatTensor<Fusion<MainBackendBase>>,
@@ -912,7 +913,8 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]    fn project_bwd(
+    #[allow(clippy::too_many_arguments)]
+    fn project_bwd(
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opac: FloatTensor<Self>,

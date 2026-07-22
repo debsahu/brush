@@ -255,6 +255,7 @@ fn load_splat_for_batch(
     (compact_gid, splat, splat_active)
 }
 
+#[allow(clippy::fn_params_excessive_bools)]
 #[allow(clippy::too_many_arguments)]
 #[cube]
 fn accumulate_grads_for_batch(

@@ -87,6 +87,7 @@ fn should_launch_unchecked(
     hard_floats && unchecked_requested && trusted_forward
 }
 
+#[allow(clippy::fn_params_excessive_bools)]
 #[allow(clippy::too_many_arguments)]
 fn rasterize_bwd_impl(
     out_img: FloatTensor<MainBackendBase>,

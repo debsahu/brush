@@ -455,7 +455,7 @@ impl SplatTrainer {
         composite_bg: Option<glam::Vec3>,
         img_size: glam::UVec2,
     ) {
-        if !self.config.use_edge_map || self.step_count % self.edge_sample_stride() != 0 {
+        if !self.config.use_edge_map || !self.step_count.is_multiple_of(self.edge_sample_stride()) {
             return;
         }
         // GT RGB `[H, W, 3]` on the inner backend (same unpack the LPIPS path uses).
@@ -911,34 +911,35 @@ impl SplatTrainer {
         // perturbation moves to the densification path (`inject_mrnf_noise`,
         // PRE-refine, accumulated-vis-gated). Skip the generic per-step block.
         if !self.config.mrnf_noise_injection {
-        let inv_opac: Tensor<1> = 1.0 - splats.valid().opacities();
-        let noise_weight = inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * visible;
-        let noise_weight = noise_weight.unsqueeze_dim(1);
-        // `samples` is pure data — keep it on the inner device so it can
-        // multiply with the `.inner()`-stripped `noise_weight` without
-        // crossing backends.
-        let samples = Tensor::random(
-            [splats.num_splats() as usize, 3],
-            Distribution::Normal(0.0, 1.0),
-            &splats.device().inner(),
-        );
+            let inv_opac: Tensor<1> = 1.0 - splats.valid().opacities();
+            let noise_weight = inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * visible;
+            let noise_weight = noise_weight.unsqueeze_dim(1);
+            // `samples` is pure data — keep it on the inner device so it can
+            // multiply with the `.inner()`-stripped `noise_weight` without
+            // crossing backends.
+            let samples = Tensor::random(
+                [splats.num_splats() as usize, 3],
+                Distribution::Normal(0.0, 1.0),
+                &splats.device().inner(),
+            );
 
-        // Could scale by train time, but, the mean_lr already decays over time.
-        let noise_weight_means = noise_weight * (lr_mean as f32 * self.config.mean_noise_weight);
+            // Could scale by train time, but, the mean_lr already decays over time.
+            let noise_weight_means =
+                noise_weight * (lr_mean as f32 * self.config.mean_noise_weight);
 
-        // Add noise to the means portion (cols 0..3), and optionally scales
-        // (cols 7..10) and rotations (cols 3..7).
-        splats.transforms = splats.transforms.map(|t| {
-            // Only allow noised gaussians to travel at most the entire extent of the current bounds.
-            let noise_m = (samples * noise_weight_means).clamp(-median_scale, median_scale);
-            let inner = t.inner();
-            // slice + slice_assign with a clone of inner avoids holding two
-            // refs across slice_assign — `inner` is consumed by slice_assign
-            // and the resulting buffer is the only writer.
-            let noised_means = inner.clone().slice(s![.., 0..3]) + noise_m;
-            let out = inner.slice_assign(s![.., 0..3], noised_means);
-            Tensor::from_inner(out).require_grad()
-        });
+            // Add noise to the means portion (cols 0..3), and optionally scales
+            // (cols 7..10) and rotations (cols 3..7).
+            splats.transforms = splats.transforms.map(|t| {
+                // Only allow noised gaussians to travel at most the entire extent of the current bounds.
+                let noise_m = (samples * noise_weight_means).clamp(-median_scale, median_scale);
+                let inner = t.inner();
+                // slice + slice_assign with a clone of inner avoids holding two
+                // refs across slice_assign — `inner` is consumed by slice_assign
+                // and the resulting buffer is the only writer.
+                let noised_means = inner.clone().slice(s![.., 0..3]) + noise_m;
+                let out = inner.slice_assign(s![.., 0..3], noised_means);
+                Tensor::from_inner(out).require_grad()
+            });
         } // end generic per-step noise block (skipped when MRNF injection is on)
 
         let stats = TrainStepStats {
@@ -959,7 +960,7 @@ impl SplatTrainer {
     /// `lr_mean * mean_noise_weight * (1 - opacity)^150`, clamped to the
     /// scene's robust median extent so a noised splat travels at most one
     /// median box. Mirrors LFS `MRNF::inject_noise` / the
-    /// `mrnf_noise_injection_kernel` (mrnf.cpp:1085, mrnf_kernels.cu:41):
+    /// `mrnf_noise_injection_kernel` (mrnf.cpp:1085, `mrnf_kernels.cu:41)`:
     /// applied in the densification path PRE-refine, only when the robust
     /// per-refine bounds are VALID (LFS `_bounds_valid`, mrnf.cpp:618), and
     /// gated on the ACCUMULATED per-refine visibility count
@@ -980,8 +981,7 @@ impl SplatTrainer {
         // Low-opacity weight (pow 150, mrnf_kernels.cu:64) gated by the
         // accumulated per-refine visibility (LFS `vis_count[idx] > 0`).
         let vis_f = refiner.vis_mask().float();
-        let noise_weight =
-            (inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * vis_f).unsqueeze_dim(1);
+        let noise_weight = (inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * vis_f).unsqueeze_dim(1);
 
         let samples = Tensor::random(
             [splats.num_splats() as usize, 3],
@@ -1190,7 +1190,9 @@ impl SplatTrainer {
         // toward high-frequency image edges. `None` when edge guidance is off or
         // no views were sampled this window.
         let edge_factor = if self.config.use_edge_map {
-            refiner.edge_factor_host(self.config.edge_score_weight).await
+            refiner
+                .edge_factor_host(self.config.edge_score_weight)
+                .await
         } else {
             None
         };
@@ -1390,9 +1392,8 @@ impl SplatTrainer {
             // MRNF (watch for a small brightness step at refines, E.2).
             let new_opac: Tensor<1> =
                 sigmoid(cur_raw_opac.clone()).mul_scalar(self.config.split_opacity_scale);
-            let new_raw_opac = inv_sigmoid(
-                new_opac.clamp(self.config.min_opacity, 1.0 - self.config.min_opacity),
-            );
+            let new_raw_opac =
+                inv_sigmoid(new_opac.clamp(self.config.min_opacity, 1.0 - self.config.min_opacity));
 
             // One-hot [refine_count, 3] selecting each splat's longest log-scale
             // axis. exp is monotone so argmax over log-scale == argmax over scale;

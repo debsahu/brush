@@ -101,9 +101,7 @@ impl RefineRecord {
         Self {
             refine_weight_norm: self.refine_weight_norm.select(0, indices.clone()),
             vis_weight: self.vis_weight.clone().select(0, indices.clone()),
-            edge_score_sum: self
-                .edge_score_sum
-                .map(|s| s.select(0, indices.clone())),
+            edge_score_sum: self.edge_score_sum.map(|s| s.select(0, indices.clone())),
             edge_sample_count: self.edge_sample_count,
             max_screen_size: self.max_screen_size.select(0, indices),
         }
