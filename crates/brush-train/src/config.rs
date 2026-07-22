@@ -145,6 +145,24 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Refine options", default_value = "1e-10")]
     pub min_scale_prune_threshold: f32,
 
+    /// Prune splats whose raw quaternion has collapsed toward zero (squared
+    /// norm < 1e-8), i.e. a degenerate rotation that renders as garbage.
+    /// Mirrors MRNF's `compute_near_zero_rotation_mask` (mrnf.cpp:667;
+    /// pruning_kernels.cu:64 `mag_sq = q.q < 1e-8`). OFF by default: a healthy
+    /// quaternion has norm ~1 so this only bites already-collapsed splats, but
+    /// it is flag-gated because it adds a term to the default prune mask.
+    #[arg(long, help_heading = "Refine options", default_value = "false")]
+    pub near_zero_rotation_prune: bool,
+
+    /// Use an L2 radial distance from the robust scene center for the
+    /// out-of-bounds prune instead of the legacy per-axis (L-inf / Chebyshev)
+    /// test. Matches MRNF's radial `dist_from_center > max_extent*100`
+    /// (mrnf.cpp:664-670). OFF by default: L2 >= L-inf so this prunes a
+    /// superset of the legacy test, changing default behaviour, hence
+    /// flag-gated.
+    #[arg(long, help_heading = "Refine options", default_value = "false")]
+    pub radial_bounds_prune: bool,
+
     /// Opacity below which a splat is pruned, and the clamp applied to split
     /// children's opacity. Mirrors MRNF's `min_opacity = 1/255`
     /// (parameters.cpp:249, prune threshold `logit(1/255)` at mrnf.cpp:71).

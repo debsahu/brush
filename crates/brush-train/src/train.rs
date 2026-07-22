@@ -1108,11 +1108,22 @@ impl SplatTrainer {
         let center = self.bounds.center;
         let bound_center =
             Tensor::<1>::from_floats([center.x, center.y, center.z], &device).reshape([1, 3]);
-        let splat_dists = (splats.means() - bound_center).abs();
-        let bound_mask = splat_dists
-            .greater_elem(max_allowed_bounds)
-            .any_dim(1)
-            .squeeze_dim(1);
+        // Out-of-bounds prune. Default: legacy per-axis (L-inf / Chebyshev)
+        // test — a splat is culled if ANY axis' |distance from center| exceeds
+        // the bound. With `--radial-bounds-prune`, use the L2 radial distance
+        // instead, matching MRNF's `dist_from_center > max_extent*100`
+        // (mrnf.cpp:664-670).
+        let bound_mask = if self.config.radial_bounds_prune {
+            let diff = splats.means() - bound_center;
+            let radial = diff.powi_scalar(2).sum_dim(1).sqrt().squeeze_dim(1);
+            radial.greater_elem(max_allowed_bounds)
+        } else {
+            let splat_dists = (splats.means() - bound_center).abs();
+            splat_dists
+                .greater_elem(max_allowed_bounds)
+                .any_dim(1)
+                .squeeze_dim(1)
+        };
 
         // Prune parameter that's NaN.
         fn row_non_finite(t: &Tensor<2>) -> Tensor<1, Bool> {
@@ -1152,6 +1163,20 @@ impl SplatTrainer {
                 .any_dim(1)
                 .squeeze_dim(1);
             prune_mask.bool_or(scale_small)
+        } else {
+            prune_mask
+        };
+
+        // Near-zero-rotation prune (MRNF port). Cull splats whose RAW
+        // quaternion has collapsed toward zero (squared norm < 1e-8), a
+        // degenerate rotation. Mirrors compute_near_zero_rotation_mask
+        // (mrnf.cpp:667; pruning_kernels.cu:64 `mag_sq = q.q < 1e-8`). Uses the
+        // raw quaternion (`splats.rotations()` = transforms[.., 3..7]),
+        // matching LFS's `rotation_raw()`. Flag-gated (OFF by default).
+        let prune_mask = if self.config.near_zero_rotation_prune {
+            let quat_norm_sq = splats.rotations().powi_scalar(2).sum_dim(1).squeeze_dim(1);
+            let near_zero_rot = quat_norm_sq.lower_elem(1e-8f32);
+            prune_mask.bool_or(near_zero_rot)
         } else {
             prune_mask
         };
