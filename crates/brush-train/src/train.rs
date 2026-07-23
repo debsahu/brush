@@ -2,7 +2,7 @@ use crate::{
     adam_scaled::{AdamScaled, AdamScaledConfig, AdamState},
     config::TrainConfig,
     dig::{self, DigTrainState},
-    edge,
+    edge, error_map,
     min_scale::compute_min_scale,
     msg::{RefineStats, TrainStepStats},
     multinomial::multinomial_sample,
@@ -121,11 +121,6 @@ pub struct SplatTrainer {
     ssim_enabled: bool,
     bounds: BoundingBox,
     step_count: u32,
-    /// Current stepped mean-parameter learning rate (median-size-folded), cached
-    /// from the last `step()` so the MRNF densification-path noise injection
-    /// (`inject_mrnf_noise`) can scale by it without re-stepping the schedule.
-    /// Mirrors LFS reading the optimizer's Means LR in `inject_noise`.
-    last_lr_mean: f64,
     max_sh_degree: u32,
     rng: rand::rngs::StdRng,
     /// Per-train-view (world center, focal in px at native res) for the
@@ -252,8 +247,9 @@ impl SplatTrainer {
         // MRNF LR schedule (R1): independent exponential decay for the log-scale
         // parameters, mirroring LFS `_scale_lr_gamma` (mrnf.cpp:425) and the
         // per-step `_scale_lr_current *= _scale_lr_gamma` (mrnf.cpp:1360). Guarded
-        // like LFS `compute_decay_gamma` (start/end > 0), so the default
-        // lr_scale_end == lr_scale yields gamma == 1.0 (constant, opt-in).
+        // like LFS `compute_decay_gamma` (start/end > 0). ON by default now
+        // (LFS `mrnf_defaults` parity): lr_scale 7e-3 -> lr_scale_end 5e-3 gives
+        // gamma < 1.0. Set `--lr-scale-end` == `--lr-scale` to make gamma == 1.0.
         let scale_decay = if config.lr_scale > 0.0 && config.lr_scale_end > 0.0 {
             (config.lr_scale_end / config.lr_scale)
                 .powf(1.0 / config.total_train_iters.max(1) as f64)
@@ -283,7 +279,6 @@ impl SplatTrainer {
             ssim_enabled,
             bounds,
             step_count: 0,
-            last_lr_mean: 0.0,
             max_sh_degree: 0,
             rng: rand::rngs::StdRng::seed_from_u64(seed),
             view_cams: Vec::new(),
@@ -444,10 +439,11 @@ impl SplatTrainer {
     /// port, delta #4). No-op unless `--use-edge-map` is set and this step lands
     /// on the sampling stride. `splats` are the render-time (pre-optimizer-step)
     /// splats; `camera`/`gt_packed` are this step's view. Pure non-differentiable
-    /// bookkeeping: reads the inner/detached GT and splats, never the autodiff
-    /// graph. See `crate::edge` for the (pinhole-only, center-sample) fallback
-    /// caveats vs. LFS's alpha-blended edge rasterizer.
-    fn accumulate_edge_sample(
+    /// bookkeeping: the alpha-blended score comes from an isolated feature
+    /// forward+backward rooted at a throwaway unit-feature leaf, dropped after the
+    /// gradient read — it never entangles the training photometric graph. See
+    /// `crate::edge::project_edge_scores` for the T·α·edge parity.
+    async fn accumulate_edge_sample(
         &mut self,
         splats: &Splats,
         camera: &Camera,
@@ -460,12 +456,160 @@ impl SplatTrainer {
         }
         // GT RGB `[H, W, 3]` on the inner backend (same unpack the LPIPS path uses).
         let gt_rgb = brush_loss::unpack_gt_rgb(gt_packed.clone(), composite_bg);
+        // Canny + directional NMS. Intentionally NOT median-normalized here: LFS
+        // step (a) (per-view edge-MAP normalize) is a provable no-op given the
+        // per-gaussian score normalize (step (b)) below is always applied —
+        // `normalize_by_positive_median` is scale-equivariant, so an edge-map
+        // scale cancels in the quotient. Do not restore it.
         let edge_map = edge::canny_edge_map(gt_rgb);
         let valid = splats.valid();
-        let score =
-            edge::project_edge_scores(valid.means(), valid.opacities(), edge_map, camera, img_size);
+        let n = valid.num_splats() as usize;
+        let device = splats.device().inner();
+        let score = edge::project_edge_scores(&valid, edge_map, camera, img_size).await;
+
+        // LFS step (b): positive-median normalize this view's per-gaussian score
+        // before accumulation, so a high-contrast view can't dominate the window.
+        let mut score_host: Vec<f32> = score
+            .into_data_async()
+            .await
+            .expect("edge score readback")
+            .into_vec()
+            .expect("f32 edge score");
+        edge::normalize_by_positive_median(&mut score_host);
+        let score = Tensor::<1>::from_data(TensorData::new(score_host, [n]), &device);
+
+        // INVARIANT: the splat set is constant within a refine window — this runs
+        // on the render-time splats, `gather_edge` only sums, and `RefineRecord`
+        // is recreated fresh right after each prune. So there is no mid-window
+        // splat creation/freeze, which is why LFS's `zero_frozen_scores`
+        // (mrnf.cpp:566) has no analogue here (its frozen set is empty in Brush's
+        // model). If mid-window splat birth/freezing is ever introduced, restore
+        // that guard so newborn splats can't self-reinforce their own scores.
         if let Some(record) = self.refine_record.as_mut() {
             record.gather_edge(score);
+        }
+    }
+
+    /// Accumulate this step's error-map growth score into the refine record
+    /// (MRNF `use_error_map` port). No-op unless `--error-map-densification` is
+    /// set. `pred_rgb` is the post-appearance predicted RGB `[H, W, 3]` on the
+    /// inner backend (the same image the SSIM loss sees); `gt_packed` is this
+    /// view's GT; `masked` is true in `AlphaMode::Masked` (mask densification).
+    ///
+    /// Reproduces LFS's per-view error signal term-for-term:
+    ///   1. `ê = mean_normalize(max(0, 1 − meanSSIM(pred, gt)) · mask(p))` — a
+    ///      clean, nonnegative, map-mean-normalized D-SSIM error map
+    ///      (`crate::error_map`), with the SAME `· gt.a` masking the photometric
+    ///      loss applies in `AlphaMode::Masked` (brush-loss `mask` multiply).
+    ///   2. `s_g = (Σ_p T_g·α_g·ê) / (Σ_p T_g·α_g)` — the coverage-weighted MEAN
+    ///      of `ê` over the gaussian's footprint, via a `feat_dim=2` feature
+    ///      backward (`crate::edge::project_coverage_weighted_mean`).
+    ///   3. window-MAX accumulate (`gather_error`), NOT sum/mean.
+    ///
+    /// UNLIKE the edge path, this runs on EVERY step, not on the edge sampling
+    /// stride: LFS folds row1 (the error map) into `_refine_weight_max` on every
+    /// training view (`kernels_backward.cuh` + mrnf.cpp:602-605), whereas the edge
+    /// guidance is deliberately sub-sampled (`MRNF_EDGE_MIN_VIEW_SAMPLES = 10`).
+    /// Sharing the edge stride would score the error map on only ~10 of the
+    /// ~`refine_every` views/window, so any gaussian whose reconstruction error
+    /// peaks in an unsampled view would be under-scored (or, if never sampled,
+    /// scored 0 and silently excluded from error-driven growth). The cost is one
+    /// extra feature render+backward per step while the flag is on; this is
+    /// intrinsic to the path-A fallback (LFS gets row1 for free inside its RGB
+    /// backward, which Brush's autodiff cannot piggyback — see `error_map` doc).
+    ///
+    /// SCALE (defect-2 fix, 2026-07-22). LFS thresholds the RAW pixel-sum
+    /// `Σ_p T·α·ê` at `τ_err = 0.003` (`mrnf.cpp:601-605,726`), but that 0.003 is
+    /// the scale of the gradient-mode row 1 — a per-gaussian per-view SCALAR
+    /// (the mean2d gradient norm, `kernels_backward.cuh:335`) — NOT the
+    /// pixel-SUMMED error (`kernels_backward.cuh:564`). On a pixel-sum, `Σ T·α`
+    /// scales with the gaussian's footprint (10^5–10^6 px at the port's
+    /// 8K-derived render size), so the raw score reached ~1.16e6 and 0.003
+    /// admitted 99.99% of gaussians — a no-op floor (in LFS-land the real
+    /// pressure there is the weighted sample, `mrnf.cpp:790`, not the threshold).
+    /// To make the THRESHOLD itself select — the port's stated design goal — the
+    /// per-gaussian score divides the error sum by the coverage sum (LFS's own
+    /// row 0, `densification_weight`, `kernels_backward.cuh:563`), recovering the
+    /// coverage-weighted MEAN error per gaussian, footprint- and
+    /// resolution-INVARIANT. That mean is still not O(1) (the mean-normalized `ê`
+    /// is heavily right-skewed and, in masked mode, masked-out zeros deflate the
+    /// covered-region mean, so ~all unmasked gaussians exceed the map's spatial
+    /// mean 1.0). So — exactly as the edge path does — each view's per-gaussian
+    /// scores are then POSITIVE-MEDIAN normalized (median → 1.0), which is robust
+    /// to that skew and to low-error views (a scene-mean anchor instead explodes
+    /// on a near-converged view and poisons the window-MAX). On that scale the
+    /// natural anchor is `τ_err = 1.0` — a gaussian reconstructing worse than the
+    /// per-view median — not 0.003. Pure non-differentiable bookkeeping: the
+    /// score comes from an isolated feature forward+backward that never touches
+    /// the photometric graph.
+    async fn accumulate_error_sample(
+        &mut self,
+        splats: &Splats,
+        camera: &Camera,
+        pred_rgb: Tensor<3>,
+        gt_packed: &Tensor<2, Int>,
+        composite_bg: Option<glam::Vec3>,
+        masked: bool,
+        img_size: glam::UVec2,
+    ) {
+        if !self.config.error_map_densification {
+            return;
+        }
+        // GT RGB `[H, W, 3]` on the inner backend (same unpack the loss uses for
+        // its SSIM). `pred_rgb` already arrives detached on the inner backend.
+        let gt_rgb = brush_loss::unpack_gt_rgb(gt_packed.clone(), composite_bg);
+        // Clean D-SSIM error map.
+        let error = error_map::ssim_error_map(pred_rgb, gt_rgb);
+        // Masked-mode parity: the photometric loss multiplies its loss-map by
+        // `gt.a` in `AlphaMode::Masked` (brush-loss kernel `mask` multiply), so
+        // masked-out pixels contribute ZERO loss. Mirror it here BEFORE the
+        // map-mean normalize — otherwise a masked region (e.g. sky, `gt.a = 0`)
+        // with a bright raw GT vs a near-black pred yields a HIGH D-SSIM error
+        // and the growth signal would densify gaussians INTO the masked region,
+        // inverting the very mask that exists to suppress it. `gt.a` is bits
+        // 24..31 of the packed `[r8 g8 b8 a8]` u32; `>> 24 & 0xff` recovers the
+        // byte regardless of the i32 arithmetic-shift sign extension.
+        let error = if masked {
+            let alpha = gt_packed
+                .clone()
+                .bitwise_right_shift_scalar(24)
+                .bitwise_and_scalar(0xff)
+                .float()
+                .div_scalar(255.0);
+            error * alpha
+        } else {
+            error
+        };
+        // MRNF map-mean normalize to ~1.0 so the projected score lands on LFS's
+        // native scale.
+        let error = error_map::mean_normalize(error);
+
+        let valid = splats.valid();
+        let n = valid.num_splats() as usize;
+        if n == 0 {
+            return;
+        }
+        // Coverage-weighted MEAN error per gaussian: `(Σ_p T·α·ê)/(Σ_p T·α)`,
+        // via a single feat_dim=2 feature backward (numerator = LFS row 1,
+        // denominator = LFS row 0 / `densification_weight`). The division makes
+        // the score footprint- and resolution-invariant, on the `ê` scale — see
+        // `accumulate_error_sample` doc and `crate::error_map` for why the port
+        // divides where LFS sums.
+        let score = edge::project_coverage_weighted_mean(&valid, error, camera, img_size).await;
+
+        // INVARIANT (same as the edge path): the splat set is constant within a
+        // refine window, and `RefineRecord` is recreated fresh after each prune,
+        // so the window-MAX starts from zero every window (no cross-window leak).
+        // The raw coverage-weighted mean is accumulated by window-MAX here;
+        // positive-median normalization is applied ONCE at refine over the final
+        // window-MAX (`RefineRecord::error_scores_median_normalized`), NOT
+        // per-view — a per-view median normalize is defeated by the window-MAX
+        // (the max over ~`refine_every` views of a median-1.0 quantity lands well
+        // above 1.0 for ~every gaussian; smoke: still 99.6%). Normalizing the
+        // final MAX distribution anchors its median at 1.0 so `τ_err = 1.0`
+        // selects the worse-than-median half.
+        if let Some(record) = self.refine_record.as_mut() {
+            record.gather_error(score);
         }
     }
 
@@ -773,7 +917,30 @@ impl SplatTrainer {
             // Edge-guidance accumulation (MRNF port, delta #4). Uses the
             // render-time splats + this view's GT and camera; gated on
             // `--use-edge-map` and the sampling stride inside the method.
-            self.accumulate_edge_sample(&splats, &camera, &gt_packed, composite_bg, img_size);
+            self.accumulate_edge_sample(&splats, &camera, &gt_packed, composite_bg, img_size)
+                .await;
+
+            // Error-map growth accumulation (MRNF `use_error_map` port). Uses
+            // the post-appearance predicted RGB (the same image the SSIM loss
+            // sees) detached onto the inner backend, plus this view's GT; gated
+            // on `--error-map-densification` inside. Runs every step (LFS folds
+            // the error map into `_refine_weight_max` on every view). `masked_alpha`
+            // applies the same `gt.a` mask the photometric loss uses.
+            let pred_rgb = brush_render::burn_glue::detach_autodiff(pred_image.clone().slice(s![
+                ..,
+                ..,
+                0..3
+            ]));
+            self.accumulate_error_sample(
+                &splats,
+                &camera,
+                pred_rgb,
+                &gt_packed,
+                composite_bg,
+                masked_alpha,
+                img_size,
+            )
+            .await;
 
             (
                 grads,
@@ -812,8 +979,6 @@ impl SplatTrainer {
             });
 
         let lr_mean = self.sched_mean.step() * median_scale as f64;
-        // Cache for the MRNF densification-path noise injection (R2).
-        self.last_lr_mean = lr_mean;
         // MRNF LR schedule (R1): step the independent scale-LR schedule in
         // lock-step with the mean schedule (LFS mrnf.cpp:1360).
         let lr_scale = self.sched_scale.step();
@@ -901,16 +1066,67 @@ impl SplatTrainer {
             });
         }
 
-        // Add random noise. Only do this in the growth phase, otherwise
-        // let the splats settle in without noise, not much point in exploring regions anymore.
-        // The noise gate is non-differentiable bookkeeping. Read opacity from
-        // the valid (inner) splats so the sigmoid never lands on the autodiff
-        // graph, and `visible` is already inner — so nothing here builds a
-        // node that won't get a backward pass.
-        // MRNF port (R2): when `--mrnf-noise-injection` is set the mean-noise
-        // perturbation moves to the densification path (`inject_mrnf_noise`,
-        // PRE-refine, accumulated-vis-gated). Skip the generic per-step block.
-        if !self.config.mrnf_noise_injection {
+        // Add random noise to the means of low-opacity gaussians. Only do this
+        // in the growth phase, otherwise let the splats settle in without
+        // noise — not much point exploring regions anymore. The noise gate is
+        // non-differentiable bookkeeping: read opacity from the valid (inner)
+        // splats so the sigmoid never lands on the autodiff graph, and the
+        // visibility gate is already inner — so nothing here builds a node that
+        // won't get a backward pass.
+        //
+        // MRNF port (R2): LFS injects mean-noise EVERY step from `post_backward`
+        // (mrnf.cpp:617), the same frequency as this generic block. When
+        // `--mrnf-noise-injection` is set we change the GATING (not the location
+        // or frequency): the per-gaussian gate becomes the ACCUMULATED
+        // per-refine-window visibility (`RefineRecord::vis_weight > 0`, LFS
+        // `_vis_count > 0`) instead of the single-step `visible` mask, plus a
+        // bounds-valid gate (LFS `_bounds_valid`) that skips injection until the
+        // robust median extent is finite and positive.
+        if self.config.mrnf_noise_injection {
+            // Bounds-valid gate (LFS `_bounds_valid`): skip entirely until the
+            // robust per-axis bounds have a finite, positive median extent.
+            if median_scale.is_finite() && median_scale > 0.0 {
+                let num_splats = splats.num_splats() as usize;
+                let inv_opac: Tensor<1> = 1.0 - splats.valid().opacities();
+                // Accumulated per-refine-window visibility gate (LFS
+                // `_vis_count > 0`). `RefineRecord::vis_mask()` already lives on
+                // the inner device. Fall back to the single-step `visible`
+                // tensor when the record is missing or its length no longer
+                // matches the current splat count (first steps of a window after
+                // a count change) — the record is recreated post-refine so
+                // mid-window alignment normally holds.
+                let vis_gate = match self.refine_record.as_ref() {
+                    Some(record) if record.vis_weight.dims()[0] == num_splats => {
+                        record.vis_mask().float()
+                    }
+                    _ => visible,
+                };
+                let noise_weight =
+                    (inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * vis_gate).unsqueeze_dim(1);
+                // `samples` is pure data — keep it on the inner device so it can
+                // multiply with the inner `noise_weight` without crossing backends.
+                let samples = Tensor::random(
+                    [num_splats, 3],
+                    Distribution::Normal(0.0, 1.0),
+                    &splats.device().inner(),
+                );
+                // Scale by THIS step's stepped mean LR (already median-size-
+                // folded, as LFS's optimizer Means LR); mean_lr already decays
+                // over time.
+                let noise_weight_means =
+                    noise_weight * (lr_mean as f32 * self.config.mean_noise_weight);
+
+                splats.transforms = splats.transforms.map(|t| {
+                    // Clamp travel to one robust median box (LFS clamps per-dim
+                    // noise to +/- median_size).
+                    let noise_m = (samples * noise_weight_means).clamp(-median_scale, median_scale);
+                    let inner = t.inner();
+                    let noised_means = inner.clone().slice(s![.., 0..3]) + noise_m;
+                    let out = inner.slice_assign(s![.., 0..3], noised_means);
+                    Tensor::from_inner(out).require_grad()
+                });
+            }
+        } else {
             let inv_opac: Tensor<1> = 1.0 - splats.valid().opacities();
             let noise_weight = inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * visible;
             let noise_weight = noise_weight.unsqueeze_dim(1);
@@ -940,7 +1156,7 @@ impl SplatTrainer {
                 let out = inner.slice_assign(s![.., 0..3], noised_means);
                 Tensor::from_inner(out).require_grad()
             });
-        } // end generic per-step noise block (skipped when MRNF injection is on)
+        } // end per-step noise block
 
         let stats = TrainStepStats {
             num_visible,
@@ -953,71 +1169,6 @@ impl SplatTrainer {
         };
 
         (splats, stats)
-    }
-
-    /// MRNF bounds-scaled noise injection (MRNF port, R2). Perturbs the MEANS
-    /// of low-opacity, visible gaussians by Gaussian noise scaled by
-    /// `lr_mean * mean_noise_weight * (1 - opacity)^150`, clamped to the
-    /// scene's robust median extent so a noised splat travels at most one
-    /// median box. Mirrors LFS `MRNF::inject_noise` / the
-    /// `mrnf_noise_injection_kernel` (mrnf.cpp:1085, `mrnf_kernels.cu:41)`:
-    /// applied in the densification path PRE-refine, only when the robust
-    /// per-refine bounds are VALID (LFS `_bounds_valid`, mrnf.cpp:618), and
-    /// gated on the ACCUMULATED per-refine visibility count
-    /// (`RefineRecord::vis_weight`, LFS `_vis_count`) rather than a single
-    /// view's visibility. Replaces Brush's generic per-step noise when
-    /// `--mrnf-noise-injection` is set.
-    fn inject_mrnf_noise(&self, refiner: &RefineRecord, mut splats: Splats) -> Splats {
-        // NOTE: refine runs on INNER (non-autodiff) splats — `train_stream`
-        // strips autodiff via `.valid()` after each train step and only
-        // re-lifts (`lift_splats_to_autodiff`) before the next one. So unlike
-        // the per-step noise block in `train_step` (autodiff splats: read via
-        // `.valid()`, re-lift via `from_inner().require_grad()`), everything
-        // here must stay on the inner backend. Calling `.valid()` / `.inner()`
-        // on already-inner FLOAT tensors panics in burn-dispatch
-        // ("Requires autodiff tensor", backend.rs:463). `detach_autodiff` is
-        // the checked passthrough for either backend variant.
-        use brush_render::burn_glue::detach_autodiff;
-
-        // Bounds-valid gate: skip until the robust per-axis bounds have a
-        // finite, positive median extent.
-        let median_scale = self.bounds.median_size();
-        if !(median_scale.is_finite() && median_scale > 0.0) {
-            return splats;
-        }
-
-        // inv_opac = 1 - sigmoid(raw_opacity), on the inner backend so the
-        // sigmoid never lands on an autodiff graph.
-        let inv_opac: Tensor<1> = 1.0 - detach_autodiff(splats.opacities());
-        // Low-opacity weight (pow 150, mrnf_kernels.cu:64) gated by the
-        // accumulated per-refine visibility (LFS `vis_count[idx] > 0`).
-        let vis_f = refiner.vis_mask().float();
-        let noise_weight = (inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * vis_f).unsqueeze_dim(1);
-
-        let samples = Tensor::random(
-            [splats.num_splats() as usize, 3],
-            Distribution::Normal(0.0, 1.0),
-            &splats.device(),
-        );
-
-        // weight = lr_mean * mean_noise_weight; `last_lr_mean` is the current
-        // stepped mean LR (already median-size-folded, as LFS's optimizer LR).
-        let noise_weight_means =
-            noise_weight * (self.last_lr_mean as f32 * self.config.mean_noise_weight);
-
-        splats.transforms = splats.transforms.map(|t| {
-            // Clamp travel to one robust median box (LFS clamps per-dim noise
-            // to +/- median_size).
-            let noise_m = (samples * noise_weight_means).clamp(-median_scale, median_scale);
-            // Stay inner: no `require_grad` re-lift here — the whole refine
-            // path returns inner params (see `map_splats_and_opt`) and the
-            // next train step re-lifts all of them.
-            let t = detach_autodiff(t);
-            let noised_means = t.clone().slice(s![.., 0..3]) + noise_m;
-            t.slice_assign(s![.., 0..3], noised_means)
-        });
-
-        splats
     }
 
     pub async fn refine(&mut self, iter: u32, splats: Splats) -> (Splats, RefineStats) {
@@ -1045,15 +1196,6 @@ impl SplatTrainer {
             .refine_record
             .take()
             .expect("Can only refine if refine stats are initialized");
-
-        // MRNF bounds-scaled noise injection (R2), flag-gated, PRE-refine.
-        // Runs on the pre-prune splat set so `refiner.vis_weight` (accumulated
-        // per-refine visibility) stays index-aligned with the means.
-        let splats = if self.config.mrnf_noise_injection {
-            self.inject_mrnf_noise(&refiner, splats)
-        } else {
-            splats
-        };
 
         // Track how many splats are visually large (the "big-low-α" failure
         // mode). `max_screen_size` is the larger 2D ellipse extent as a
@@ -1121,11 +1263,14 @@ impl SplatTrainer {
         let center = self.bounds.center;
         let bound_center =
             Tensor::<1>::from_floats([center.x, center.y, center.z], &device).reshape([1, 3]);
-        // Out-of-bounds prune. Default: legacy per-axis (L-inf / Chebyshev)
-        // test — a splat is culled if ANY axis' |distance from center| exceeds
-        // the bound. With `--radial-bounds-prune`, use the L2 radial distance
-        // instead, matching MRNF's `dist_from_center > max_extent*100`
-        // (mrnf.cpp:664-670).
+        // Out-of-bounds prune. Default: per-axis (L-inf / Chebyshev) test — a
+        // splat is culled if ANY axis' |distance from center| exceeds the
+        // bound. This per-axis default is what MRNF actually does: LFS computes
+        // `dist_from_center = (means - center).abs().max(1)` (L-inf) then culls
+        // `dist_from_center > max_allowed` (mrnf.cpp:663-669) — it is NOT
+        // radial. `--radial-bounds-prune` switches to the L2 radial distance
+        // instead; since L2 >= L-inf it prunes a superset, so it is a STRICTER
+        // divergence experiment, not MRNF parity.
         let bound_mask = if self.config.radial_bounds_prune {
             let diff = splats.means() - bound_center;
             let radial = diff.powi_scalar(2).sum_dim(1).sqrt().squeeze_dim(1);
@@ -1161,9 +1306,9 @@ impl SplatTrainer {
 
         // Optional min-scale degenerate prune (MRNF port, delta #3). MRNF culls
         // splats whose smallest log-scale axis drops below log(1e-10) (see
-        // mrnf.cpp:668, MRNF_LOG_MIN_SCALE_THRESHOLD). Brush deliberately omits
-        // this to keep thin "pancake" surface splats (see note above), so it is
-        // flag-gated and OFF by default. Tests the RAW log-scales
+        // mrnf.cpp:668, MRNF_LOG_MIN_SCALE_THRESHOLD). ON by default (LFS
+        // `mrnf_defaults` parity); disable with `--min-scale-prune=false` to
+        // keep thin "pancake" surface splats (see note above). Tests the RAW log-scales
         // (`log_scales().exp()`), NOT `scales()` which folds in the
         // Mip-Splatting min-scale floor; that floor keeps folded scales above
         // the threshold so the prune would never fire. Testing raw scales
@@ -1185,7 +1330,8 @@ impl SplatTrainer {
         // degenerate rotation. Mirrors compute_near_zero_rotation_mask
         // (mrnf.cpp:667; pruning_kernels.cu:64 `mag_sq = q.q < 1e-8`). Uses the
         // raw quaternion (`splats.rotations()` = transforms[.., 3..7]),
-        // matching LFS's `rotation_raw()`. Flag-gated (OFF by default).
+        // matching LFS's `rotation_raw()`. ON by default (LFS `mrnf_defaults`
+        // parity); disable with `--near-zero-rotation-prune=false`.
         let prune_mask = if self.config.near_zero_rotation_prune {
             let quat_norm_sq = splats.rotations().powi_scalar(2).sum_dim(1).squeeze_dim(1);
             let near_zero_rot = quat_norm_sq.lower_elem(1e-8f32);
@@ -1270,7 +1416,25 @@ impl SplatTrainer {
 
         let pre_high_grad = split_inds.len();
         if global_iter < self.config.growth_stop_iter {
-            let above_threshold = refiner.above_threshold(self.config.growth_grad_threshold);
+            // Growth signal selection (MRNF `use_error_map` port). When error-map
+            // densification is on, the growth candidate set + sampling weight come
+            // from the window-MAX error score `Σ T·α·ê` thresholded at τ_err
+            // (LFS `refine_candidates = _refine_weight_max > 0.003 && _vis_count>0`,
+            // mrnf.cpp:726) — the error signal REPLACES the gradient as the base
+            // signal. Off, this is exactly upstream's gradient-norm gate.
+            let (above_threshold, growth_base) = if self.config.error_map_densification {
+                (
+                    refiner
+                        .error_above_threshold(self.config.error_map_growth_threshold)
+                        .await,
+                    refiner.error_scores_median_normalized().await,
+                )
+            } else {
+                (
+                    refiner.above_threshold(self.config.growth_grad_threshold),
+                    refiner.refine_weight_norm.clone(),
+                )
+            };
 
             let threshold_count = above_threshold
                 .clone()
@@ -1294,7 +1458,13 @@ impl SplatTrainer {
 
             // If still growing, sample from indices which are over the threshold.
             if grow_count > 0 {
-                let weights = above_threshold.float() * refiner.refine_weight_norm.clone();
+                // Base sampling weight: gradient-norm, or the error score when
+                // error-map densification is on (both masked to the thresholded
+                // set). Edge guidance, when ALSO on, is a MULTIPLICATIVE bias
+                // layered on top — it only reweights WITHIN the thresholded set,
+                // never adds a gaussian the base signal missed (LFS: error is the
+                // base growth signal, edge is `factor = score·w + 1.0`).
+                let weights = above_threshold.float() * growth_base;
                 let mut weights = weights
                     .into_data_async()
                     .await
