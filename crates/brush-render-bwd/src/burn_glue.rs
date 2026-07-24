@@ -50,10 +50,9 @@ fn training_rasterizer() -> Rasterizer {
 
 /// Intermediate gradients from the rasterize backward pass.
 ///
-/// Sparse buffer of shape `[num_visible, 11]`, indexed by `compact_gid`.
-/// Slots 0..5 are xy + conic gradients, slots 5..8 the rgb gradient, slot 8
-/// the raw opacity gradient, slot 9 the refinement weight, slot 10 the
-/// expected-depth gradient (zero/unused when `render_depth` is false).
+/// Sparse buffer of shape `[num_visible, COMPACT_GRAD_LANES]`, indexed by
+/// `compact_gid`. Lanes: 0..=1 xy, 2..=4 conic, 5..=7 rgb, 8 alpha,
+/// 9 refine-weight, 10 expected-depth (see `kernels::rasterize_backwards`).
 #[derive(Debug, Clone)]
 pub struct RasterizeGrads<B: Backend> {
     pub v_combined: FloatTensor<B>,
@@ -80,7 +79,7 @@ pub struct DeferredSplatGrads<B: Backend> {
 /// Backward pass trait mirroring [`SplatOps`].
 pub trait SplatBwdOps: SplatOps {
     /// Backward pass for rasterization.
-    /// Returns sparse `v_combined` [`num_visible`, 11] indexed by `compact_gid`.
+    /// Returns sparse `v_combined` [`num_visible`, `COMPACT_GRAD_LANES`] indexed by `compact_gid`.
     #[allow(clippy::too_many_arguments)]
     fn rasterize_bwd(
         out_img: FloatTensor<Self>,
@@ -124,7 +123,7 @@ pub trait SplatBwdOps: SplatOps {
     }
 
     /// Backward pass for projection.
-    /// Reads sparse `v_combined` [`num_visible`, 11], writes dense outputs (scatter in kernel).
+    /// Reads sparse `v_combined` [`num_visible`, 9], writes dense outputs (scatter in kernel).
     /// `sh_coeffs` is the original (input) SH coefficient tensor — needed
     /// so the kernel can backprop `v_color` through the SH basis to the
     /// view direction and then to the mean.
@@ -735,11 +734,6 @@ async fn render_splats_with_pass_and_refine_weight(
     }
 }
 
-// Multiple independent compile/runtime render-mode flags for a GPU kernel
-// dispatch function (smooth_cutoff, compute_refine_weight, render_depth,
-// trusted_forward, ...) -- these are orthogonal switches, not related state
-// that would be clearer as an enum, so we allow this alongside the existing
-// too-many-arguments allow rather than force an artificial options struct.
 #[allow(clippy::fn_params_excessive_bools)]
 #[allow(clippy::too_many_arguments)]
 fn rasterize_bwd_fusion(
@@ -829,11 +823,15 @@ fn rasterize_bwd_fusion(
         compact_gid_from_isect,
         tile_offsets,
     ];
-    // Sparse [num_visible, 11] indexed by compact_gid. Lane 10 is the
-    // expected-depth gradient (zero/unused when render_depth is false).
+    // Sparse [num_visible, COMPACT_GRAD_LANES] indexed by compact_gid. Lane 10
+    // is the expected-depth gradient (zero/unused when render_depth is false).
+    // Stride owned by kernels::rasterize_backwards::COMPACT_GRAD_LANES.
     let v_combined_out = TensorIr::uninit(
         client.create_empty_handle(),
-        Shape::new([num_visible, 11]),
+        Shape::new([
+            num_visible,
+            crate::kernels::rasterize_backwards::COMPACT_GRAD_LANES as usize,
+        ]),
         DType::F32,
     );
     let desc = CustomOpIr::new(
