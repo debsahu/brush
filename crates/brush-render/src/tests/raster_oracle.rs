@@ -9,7 +9,6 @@ use crate::{
     camera::Camera,
     gaussian_splats::{RasterPass, Rasterizer, SplatRenderMode},
     kernels::camera_model::CameraModel,
-    kernels::helpers::PROJECTED_LANES_USIZE as PROJECTED_LANES,
 };
 use brush_cube::{MainBackendBase, Runtime};
 use burn::{
@@ -20,13 +19,16 @@ use burn_wgpu::{CubeTensor, WgpuDevice, WgpuRuntime};
 use glam::{UVec2, Vec3};
 use wasm_bindgen_test::wasm_bindgen_test;
 
-// PROJECTED_LANES is imported from kernels::helpers (currently 10: xy_x,
-// xy_y, conic_x, conic_y, conic_z, color_a, color_r, color_g, color_b,
-// depth) rather than redeclared here. A stale local copy of this constant
-// previously desynced from the real per-splat stride, which silently
-// misaligned every splat after the first when `chunks_exact`/`truncate`
-// walked the readback buffer -- producing wildly wrong composited colors
-// that looked like a rendering bug but was purely a test-side bug.
+// Must match the kernel's projected-splat stride. The buffer carries 10 lanes:
+//   0:xy_x 1:xy_y 2:conic_x 3:conic_y 4:conic_z 5:color_a
+//   6:color_r 7:color_g 8:color_b 9:depth
+// (see crate::kernels::helpers::PROJECTED_LANES). Sourced from that constant so
+// the oracle stride can never silently drift from the kernel layout again: a
+// hardcoded 9 here, stale after the depth lane was added (helpers.rs, gsplat
+// depth-loss merge), is exactly what misaligned this oracle's per-splat reads.
+// The RGBA forward composite below uses lanes 0..=8 only; the depth lane (9) is
+// carried in the buffer but not blended into the color output.
+const PROJECTED_LANES: usize = crate::kernels::helpers::PROJECTED_LANES as usize;
 const ALPHA_CUTOFF_MID: f32 = 1.0 / 255.0;
 const ALPHA_CUTOFF_BAND: f32 = 1.0e-3;
 
@@ -108,11 +110,7 @@ fn assert_close(label: &str, actual: &[f32], expected: &[f32], tolerance: f32) {
 
 #[test]
 fn oracle_composites_one_splat_and_clamps_negative_color() {
-    // Lanes: xy_x, xy_y, conic_x, conic_y, conic_z, color_a, color_r,
-    // color_g, color_b, depth. `depth` is unused by `rasterize_reference`
-    // (the caller is responsible for supplying pre-sorted splats), but the
-    // slot must still be present so `chunks_exact(PROJECTED_LANES)` lines up
-    // with the real per-splat stride.
+    // Trailing lane is the unused depth channel (see PROJECTED_LANES).
     let projected = [0.5, 0.5, 1.0, 0.0, 1.0, 0.5, 1.0, 0.5, -1.0, 0.0];
     let image = rasterize_reference(&projected, UVec2::ONE, Vec3::new(0.2, 0.4, 0.6), false);
     assert_close("one splat", &image, &[0.6, 0.45, 0.3, 0.5], 1.0e-6);
@@ -120,6 +118,7 @@ fn oracle_composites_one_splat_and_clamps_negative_color() {
 
 #[test]
 fn oracle_does_not_accumulate_the_early_out_splat() {
+    // Trailing lane per splat is the unused depth channel (see PROJECTED_LANES).
     let projected = [
         0.5, 0.5, 1.0, 0.0, 1.0, 0.999, 1.0, 0.0, 0.0, 0.0, // red
         0.5, 0.5, 1.0, 0.0, 1.0, 0.999, 0.0, 1.0, 0.0, 0.0, // green
@@ -130,6 +129,7 @@ fn oracle_does_not_accumulate_the_early_out_splat() {
 
 #[test]
 fn oracle_matches_hard_and_smooth_cutoff_definitions() {
+    // Trailing lane is the unused depth channel (see PROJECTED_LANES).
     let projected = [
         0.5,
         0.5,

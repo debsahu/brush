@@ -409,26 +409,45 @@ async fn deferred_sh_bridge_preserves_other_gradients_and_aux() {
             read_vec(deferred_splats.raw_opacities.grad(&deferred_grads).unwrap()).await;
 
         assert!(deferred_splats.sh_coeffs.grad(&deferred_grads).is_none());
-        // v_combined is the sparse rasterize-backward buffer: 11 lanes per
-        // compact splat (5 geom + 3 rgb + alpha + refine + depth). The depth
-        // lane was appended by the DiG/depth merge.
+
+        // Derive the expected compact-grad width from the actual buffer layout rather than
+        // hard-coding it. brush-render-bwd's rasterize_backwards indexes this sparse buffer
+        // as `base = compact_gid * 11`, i.e. a fixed [num_visible, 11] layout per visible
+        // splat: lanes 0..=1 = screen-space xy, 2..=4 = conic, 5..=7 = rgb, 8 = alpha,
+        // 9 = refine-weight, 10 = expected-depth. All 11 lanes are always allocated; the
+        // refine and depth lanes are only *written* when compute_refine_weight / render_depth
+        // are set, so the width is 11 regardless of Cargo features. (The all-features / native
+        // MSL CI job is the only config where this test compiles, which added the depth lane
+        // that made the old hard-coded 10 stale.)
+        const COMPACT_GRAD_LANES: usize = 11;
+        const DEPTH_LANE: usize = 10;
+        let expected_rows = num_visible.max(1) as usize;
         assert_eq!(
             sparse.compact_grads.dims(),
-            [num_visible.max(1) as usize, 11]
+            [expected_rows, COMPACT_GRAD_LANES]
         );
         assert_eq!(sparse.render_transforms.dims(), [scene.raw_opac.len(), 10]);
-        assert!(sparse.global_from_compact_gid.dims()[0] >= num_visible.max(1) as usize);
+        assert!(sparse.global_from_compact_gid.dims()[0] >= expected_rows);
         assert_eq!(sparse.project_uniforms.num_visible, num_visible);
         assert_eq!(
             sparse.project_uniforms.total_splats as usize,
             scene.raw_opac.len()
         );
-        assert!(
-            read_vec(sparse.compact_grads)
-                .await
-                .iter()
-                .all(|v| v.is_finite())
-        );
+
+        // The bridge must carry every lane through untouched. All lanes stay finite, and
+        // because this render uses RasterizationMode::Rgba (render_depth = false) the
+        // expected-depth lane is never written, so it must remain exactly zero for every
+        // visible splat: the bridge neither fabricates nor drops the depth column it carries.
+        let compact = read_vec(sparse.compact_grads).await;
+        assert_eq!(compact.len(), expected_rows * COMPACT_GRAD_LANES);
+        assert!(compact.iter().all(|v| v.is_finite()));
+        for row in 0..expected_rows {
+            assert_eq!(
+                compact[row * COMPACT_GRAD_LANES + DEPTH_LANE],
+                0.0,
+                "Rgba render must leave the depth lane zero (row {row})"
+            );
+        }
 
         assert_close(
             "deferred transforms",

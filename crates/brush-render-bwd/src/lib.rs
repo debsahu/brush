@@ -10,3 +10,9 @@ pub use burn_glue::{
     render_splats_with_refine_weight,
 };
 pub use features_bwd::render_splat_features;
+/// Stride of the compact per-splat backward-gradient buffer (`v_combined`),
+/// re-exported so downstream consumers of `DeferredShGrad::compact_grads` (e.g.
+/// the sparse SH Adam optimizer in brush-train) index it with the exact lane
+/// count the render backward writes, instead of a hand-copied literal that can
+/// drift when a lane is added. See `kernels::rasterize_backwards`.
+pub use kernels::rasterize_backwards::COMPACT_GRAD_LANES;
