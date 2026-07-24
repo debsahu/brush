@@ -110,10 +110,20 @@ fn rasterize_bwd_impl(
     let num_visible = projected_splats.shape()[0].max(1);
     let client = projected_splats.client.clone();
 
-    // Sparse [num_visible, 11] indexed by compact_gid. Lane 10 is the
-    // expected-depth gradient (zero/unused when render_depth is false).
-    let v_combined =
-        MainBackendBase::float_zeros([num_visible, 11].into(), &device, FloatDType::F32);
+    // Sparse [num_visible, COMPACT_GRAD_LANES] indexed by compact_gid. Lane 10
+    // is the expected-depth gradient (zero/unused when render_depth is false).
+    // The stride is owned by kernels::rasterize_backwards::COMPACT_GRAD_LANES so
+    // this allocation, the rasterize/project readers, and the coalesced SH-grad
+    // materializer can never disagree on the lane count.
+    let v_combined = MainBackendBase::float_zeros(
+        [
+            num_visible,
+            kernels::rasterize_backwards::COMPACT_GRAD_LANES as usize,
+        ]
+        .into(),
+        &device,
+        FloatDType::F32,
+    );
 
     let tile_width = rasterizer.tile_width();
     let tile_height = rasterizer.tile_height();
@@ -404,8 +414,9 @@ impl SplatBwdOps for MainBackendBase {
                 // SAFETY: the gate above proves total_splats == num_points,
                 // degree <= 4, and a fixed 32-lane plane. Every active plane
                 // therefore owns one in-bounds global row; compact+1 is either
-                // the zero sentinel or indexes the compact [num_visible, 10]
-                // gradient, and the three lane stores cover the entire SH row.
+                // the zero sentinel or indexes the compact
+                // [num_visible, COMPACT_GRAD_LANES] gradient, and the three lane
+                // stores cover the entire SH row.
                 unsafe {
                     kernels::sh_grad_materialize::materialize_sh_grad_kernel::launch_unchecked::<
                         WgpuRuntime,

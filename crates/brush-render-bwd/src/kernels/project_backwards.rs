@@ -12,6 +12,8 @@ use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
 
+use crate::kernels::rasterize_backwards::COMPACT_GRAD_LANES;
+
 pub const WG_SIZE: u32 = 256;
 
 /// Apply the VJP of `q -> q / |q|` to a downstream quaternion gradient.
@@ -125,7 +127,7 @@ pub fn project_backwards_kernel(
     // splats that contributed to a pixel; non-contributing splats leave
     // v_rasterize_grads at zero and (since the dense outputs are zero-
     // init) we can return without writing anything at all.
-    let rg_base = (compact_gid * 11u32) as usize;
+    let rg_base = (compact_gid * COMPACT_GRAD_LANES) as usize;
     let v_mean2d_x = v_rasterize_grads[rg_base];
     let v_mean2d_y = v_rasterize_grads[rg_base + 1];
     let v_conics_x = v_rasterize_grads[rg_base + 2];
