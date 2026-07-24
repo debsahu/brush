@@ -414,8 +414,9 @@ impl SplatBwdOps for MainBackendBase {
                 // SAFETY: the gate above proves total_splats == num_points,
                 // degree <= 4, and a fixed 32-lane plane. Every active plane
                 // therefore owns one in-bounds global row; compact+1 is either
-                // the zero sentinel or indexes the compact [num_visible, 10]
-                // gradient, and the three lane stores cover the entire SH row.
+                // the zero sentinel or indexes the compact
+                // [num_visible, COMPACT_GRAD_LANES] gradient, and the three lane
+                // stores cover the entire SH row.
                 unsafe {
                     kernels::sh_grad_materialize::materialize_sh_grad_kernel::launch_unchecked::<
                         WgpuRuntime,
