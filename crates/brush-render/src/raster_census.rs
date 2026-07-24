@@ -473,11 +473,18 @@ pub(crate) fn emit(report: &RasterCensusReport) {
 #[cfg(test)]
 mod tests {
     use super::{RasterCensusInput, RasterCensusRequest, analyze, request, take_request};
+    use crate::kernels::helpers::PROJECTED_LANES_USIZE;
 
     const LOW_ALPHA: f32 = 1.0e-4;
 
-    fn splat(alpha: f32) -> [f32; 9] {
-        [0.5, 0.5, 1.0, 0.0, 1.0, alpha, 1.0, 1.0, 1.0]
+    // Each hand-authored projected splat must carry the full PROJECTED_LANES
+    // layout that `analyze` reads back: lanes 0..=8 are xy/conic/color and lane
+    // 9 is the (composite-unused) depth channel. Tying the return type to
+    // PROJECTED_LANES_USIZE makes the array literal fail to compile if a lane is
+    // ever added or removed, so this can't silently desync from the kernel the
+    // way the old fixed `[f32; 9]` did after the depth lane landed.
+    fn splat(alpha: f32) -> [f32; PROJECTED_LANES_USIZE] {
+        [0.5, 0.5, 1.0, 0.0, 1.0, alpha, 1.0, 1.0, 1.0, 0.0]
     }
 
     #[test]
@@ -578,7 +585,9 @@ mod tests {
 
     #[test]
     fn sampled_replay_uses_rectangular_tile_height() {
-        let projected = [[0.5, 12.5, 1.0, 0.0, 1.0, 0.5, 1.0, 1.0, 1.0]].concat();
+        // Trailing lane is the (composite-unused) depth channel; see `splat`.
+        let projected: [f32; PROJECTED_LANES_USIZE] =
+            [0.5, 12.5, 1.0, 0.0, 1.0, 0.5, 1.0, 1.0, 1.0, 0.0];
         let compact = [0];
         let offsets = [0, 0, 0, 1];
         let report = analyze(&RasterCensusInput {
