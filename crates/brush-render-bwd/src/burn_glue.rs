@@ -823,11 +823,15 @@ fn rasterize_bwd_fusion(
         compact_gid_from_isect,
         tile_offsets,
     ];
-    // Sparse [num_visible, 11] indexed by compact_gid. Lane 10 is the
-    // expected-depth gradient (zero/unused when render_depth is false).
+    // Sparse [num_visible, COMPACT_GRAD_LANES] indexed by compact_gid. Lane 10
+    // is the expected-depth gradient (zero/unused when render_depth is false).
+    // Stride owned by kernels::rasterize_backwards::COMPACT_GRAD_LANES.
     let v_combined_out = TensorIr::uninit(
         client.create_empty_handle(),
-        Shape::new([num_visible, 11]),
+        Shape::new([
+            num_visible,
+            crate::kernels::rasterize_backwards::COMPACT_GRAD_LANES as usize,
+        ]),
         DType::F32,
     );
     let desc = CustomOpIr::new(

@@ -5,6 +5,7 @@
 //! every row is written exactly once, including exact zeros for
 //! non-contributors.
 
+use crate::kernels::rasterize_backwards::COMPACT_GRAD_LANES;
 use brush_render::kernels::sh::{num_sh_coeffs, sh_basis, sh_color_component};
 use brush_render::kernels::types::ProjectUniforms;
 use burn_cubecl::cubecl;
@@ -30,7 +31,8 @@ pub fn build_compact_sh_map_kernel(
         terminate!();
     }
 
-    let grad_base = (compact_gid * 10u32) as usize;
+    // v_combined is stride COMPACT_GRAD_LANES; rgb grads live at lanes 5..=7.
+    let grad_base = (compact_gid * COMPACT_GRAD_LANES) as usize;
     let v_color_r = v_combined[grad_base + 5];
     let v_color_g = v_combined[grad_base + 6];
     let v_color_b = v_combined[grad_base + 7];
@@ -83,8 +85,10 @@ pub fn materialize_sh_grad_kernel(
     }
 
     let mut field = 0.0f32;
+    // transforms is a dense [N, 10] param buffer; v_combined is the compact
+    // backward-grad buffer of stride COMPACT_GRAD_LANES (rgb at lanes 5..=7).
     let transform_base = (global_gid * 10u32) as usize;
-    let grad_base = (compact_gid * 10u32) as usize;
+    let grad_base = (compact_gid * COMPACT_GRAD_LANES) as usize;
     if lane == 0u32 {
         field = transforms[transform_base];
     } else if lane == 1u32 {

@@ -25,6 +25,20 @@ use brush_render::kernels::types::{RasterizeUniforms, Splat, Sym2};
 // sync_cube collapses to a SIMD-lockstep no-op on hardware.
 pub const SPLAT_BATCH: u32 = 32;
 
+/// Stride of the compact per-splat backward-gradient buffer (`v_combined`),
+/// indexed by `compact_gid`. The 11 lanes are:
+///   0..=1 screen-space xy, 2..=4 conic, 5..=7 rgb, 8 alpha,
+///   9 refine-weight, 10 expected-depth.
+///
+/// This is the single source of truth for that stride. Every kernel that
+/// indexes `v_combined` (this kernel, `project_backwards`, and the coalesced
+/// `sh_grad_materialize`) and the host buffer allocation in `render_bwd` MUST
+/// derive their stride from this constant. The depth lane (10) was appended
+/// after the coalesced materializer was written against a stride of 10, and a
+/// hard-coded `* 10` there silently wrongly indexed every `compact_gid >= 1` — a
+/// shared constant makes that class of drift impossible.
+pub const COMPACT_GRAD_LANES: u32 = 11;
+
 /// Per-splat gradient accumulator for the rasterize backward.
 #[derive(CubeType, Copy, Clone)]
 pub struct SplatGrad {
@@ -128,7 +142,7 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
             render_depth,
         );
         if splat_active {
-            let base = (compact_gid * 11u32) as usize;
+            let base = (compact_gid * COMPACT_GRAD_LANES) as usize;
             A::add(&v_splats[base], grad.xy_x);
             A::add(&v_splats[base + 1], grad.xy_y);
             A::add(&v_splats[base + 2], grad.conic_x);
