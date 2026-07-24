@@ -19,7 +19,16 @@ use burn_wgpu::{CubeTensor, WgpuDevice, WgpuRuntime};
 use glam::{UVec2, Vec3};
 use wasm_bindgen_test::wasm_bindgen_test;
 
-const PROJECTED_LANES: usize = 9;
+// Must match the kernel's projected-splat stride. The buffer carries 10 lanes:
+//   0:xy_x 1:xy_y 2:conic_x 3:conic_y 4:conic_z 5:color_a
+//   6:color_r 7:color_g 8:color_b 9:depth
+// (see crate::kernels::helpers::PROJECTED_LANES). Sourced from that constant so
+// the oracle stride can never silently drift from the kernel layout again: a
+// hardcoded 9 here, stale after the depth lane was added (helpers.rs, gsplat
+// depth-loss merge), is exactly what misaligned this oracle's per-splat reads.
+// The RGBA forward composite below uses lanes 0..=8 only; the depth lane (9) is
+// carried in the buffer but not blended into the color output.
+const PROJECTED_LANES: usize = crate::kernels::helpers::PROJECTED_LANES as usize;
 const ALPHA_CUTOFF_MID: f32 = 1.0 / 255.0;
 const ALPHA_CUTOFF_BAND: f32 = 1.0e-3;
 
@@ -101,16 +110,18 @@ fn assert_close(label: &str, actual: &[f32], expected: &[f32], tolerance: f32) {
 
 #[test]
 fn oracle_composites_one_splat_and_clamps_negative_color() {
-    let projected = [0.5, 0.5, 1.0, 0.0, 1.0, 0.5, 1.0, 0.5, -1.0];
+    // Trailing lane is the unused depth channel (see PROJECTED_LANES).
+    let projected = [0.5, 0.5, 1.0, 0.0, 1.0, 0.5, 1.0, 0.5, -1.0, 0.0];
     let image = rasterize_reference(&projected, UVec2::ONE, Vec3::new(0.2, 0.4, 0.6), false);
     assert_close("one splat", &image, &[0.6, 0.45, 0.3, 0.5], 1.0e-6);
 }
 
 #[test]
 fn oracle_does_not_accumulate_the_early_out_splat() {
+    // Trailing lane per splat is the unused depth channel (see PROJECTED_LANES).
     let projected = [
-        0.5, 0.5, 1.0, 0.0, 1.0, 0.999, 1.0, 0.0, 0.0, // red
-        0.5, 0.5, 1.0, 0.0, 1.0, 0.999, 0.0, 1.0, 0.0, // green
+        0.5, 0.5, 1.0, 0.0, 1.0, 0.999, 1.0, 0.0, 0.0, 0.0, // red
+        0.5, 0.5, 1.0, 0.0, 1.0, 0.999, 0.0, 1.0, 0.0, 0.0, // green
     ];
     let image = rasterize_reference(&projected, UVec2::ONE, Vec3::ZERO, false);
     assert_close("early out", &image, &[0.999, 0.0, 0.0, 0.999], 1.0e-6);
@@ -118,7 +129,19 @@ fn oracle_does_not_accumulate_the_early_out_splat() {
 
 #[test]
 fn oracle_matches_hard_and_smooth_cutoff_definitions() {
-    let projected = [0.5, 0.5, 1.0, 0.0, 1.0, ALPHA_CUTOFF_MID, 1.0, 0.0, 0.0];
+    // Trailing lane is the unused depth channel (see PROJECTED_LANES).
+    let projected = [
+        0.5,
+        0.5,
+        1.0,
+        0.0,
+        1.0,
+        ALPHA_CUTOFF_MID,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+    ];
     let hard = rasterize_reference(&projected, UVec2::ONE, Vec3::ZERO, false);
     let smooth = rasterize_reference(&projected, UVec2::ONE, Vec3::ZERO, true);
     assert_close(
