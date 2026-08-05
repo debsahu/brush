@@ -571,6 +571,16 @@ pub(crate) async fn train_stream(
                         .replace(".ply", &format!("_lod{current_lod}.ply"));
                     (lod_name, lod_refine_steps, lod_refine_steps)
                 };
+                // Resolve `{iter}` ONCE here so the PLY and its DiG sidecars agree.
+                // `export_checkpoint` substitutes internally but `export_dig` did not,
+                // so DiG tables landed as the literal `export_{iter}_dig_features.npy`
+                // and every checkpoint overwrote the previous one -- silently pairing a
+                // stale feature table with a newer PLY, even though rows must match the
+                // PLY exported at the SAME step. This replace is idempotent, so
+                // `export_checkpoint`'s own substitution below becomes a no-op.
+                let digits = ((exp_total as f64).log10().floor() as usize) + 1;
+                let name = name.replace("{iter}", &format!("{exp_iter:0digits$}"));
+
                 let res = export_checkpoint(
                     splats.clone(),
                     &export_path,

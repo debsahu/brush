@@ -17,6 +17,8 @@ use burn::{
     tensor::{Device, Int, TensorData, activation::relu},
 };
 
+use rayon::prelude::*;
+
 use crate::adam_scaled::{AdamScaled, AdamScaledConfig};
 
 /// MLP hidden width (fixed by the reference architecture).
@@ -287,11 +289,12 @@ fn grid_knn(pos: &[f32], k: usize) -> Vec<i64> {
         }
     }
 
-    let mut out = Vec::with_capacity(n * k);
-    let mut best: Vec<(f32, u32)> = Vec::with_capacity(64);
-    for i in 0..n {
+    // Parallel over gaussians, writing into a preallocated buffer so ordering is
+    // correct by construction (out[i*k + slot]) rather than relying on collect order.
+    let mut out = vec![0i64; n * k];
+    out.par_chunks_mut(k).enumerate().for_each(|(i, slot_out)| {
+        let mut best: Vec<(f32, u32)> = Vec::with_capacity(64);
         let q = p(i);
-        best.clear();
         for radius in 1..=2i64 {
             let (cx, cy, cz) = key(q);
             for dx in -radius..=radius {
@@ -319,11 +322,21 @@ fn grid_knn(pos: &[f32], k: usize) -> Vec<i64> {
                 break;
             }
         }
-        best.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        for slot in 0..k {
-            let idx = best.get(slot).map_or(i as i64, |&(_, j)| i64::from(j));
-            out.push(idx);
+        // Only the k smallest are ever read, so select rather than fully sort.
+        // A dense grid cell can put thousands of candidates in `best`; sorting all
+        // of them to take k=3 is what made this the dominant cost of DiG training
+        // (92% of profile samples, 174 min CPU without reaching 10k iters).
+        let cmp = |a: &(f32, u32), b: &(f32, u32)| {
+            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+        };
+        if best.len() > k {
+            best.select_nth_unstable_by(k - 1, cmp);
+            best.truncate(k);
         }
-    }
+        best.sort_by(cmp);
+        for slot in 0..k {
+            slot_out[slot] = best.get(slot).map_or(i as i64, |&(_, j)| i64::from(j));
+        }
+    });
     out
 }
