@@ -348,14 +348,37 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options", default_value = "5")]
     pub dino_rescale_factor: u32,
 
-    /// Start learning rate for the `DiG` features and decoder MLP.
+    /// Start learning rate for the `DiG` DECODER MLP.
+    ///
+    /// Note this used to drive the per-gaussian feature table as well, which
+    /// made `DiG` train nothing usable: the table is ~N rows touched only when
+    /// a gaussian is visible, while the decoder is shared and touched every
+    /// pixel of every step, so one value cannot serve both. At 1e-2 the decoder
+    /// trains and the table never leaves its N(0,1) init (measured top-1/4/16
+    /// explained variance 0.0223/0.0829/0.2880 vs 0.0156/0.0625/0.25 for
+    /// isotropic noise, unchanged at 6.5x more gradient per gaussian); at 1.0
+    /// the table forms structure but the decoder collapses to zero output.
+    /// The table now has its own `--dino-feature-lr`.
     #[arg(long, help_heading = "Training options", default_value = "1e-2")]
     pub dino_lr: f64,
 
-    /// Final learning rate for the `DiG` features and decoder MLP
+    /// Final learning rate for the `DiG` decoder MLP
     /// (exponential decay over 6000 steps, then held).
     #[arg(long, help_heading = "Training options", default_value = "1e-3")]
     pub dino_lr_end: f64,
+
+    /// Start learning rate for the per-gaussian `DiG` feature table.
+    ///
+    /// Much larger than the decoder LR on purpose: each row receives gradient
+    /// only on steps where its gaussian is visible, so its effective update
+    /// rate is orders of magnitude lower than the shared decoder's.
+    #[arg(long, help_heading = "Training options", default_value = "3e-1")]
+    pub dino_feature_lr: f64,
+
+    /// Final learning rate for the per-gaussian `DiG` feature table
+    /// (same exponential decay horizon as the decoder).
+    #[arg(long, help_heading = "Training options", default_value = "3e-2")]
+    pub dino_feature_lr_end: f64,
 
     /// Weight of the 3-nearest-neighbor feature-variance regularizer
     /// (enabled after step 1000; 0 disables).

@@ -1066,10 +1066,17 @@ impl SplatTrainer {
                     self.config.dino_lr,
                     self.config.dino_lr_end,
                 );
+                // Two parameter groups with opposite update characteristics, so
+                // they get separate schedules. `lr` above is the decoder's.
+                let feat_lr = dig::dig_lr(
+                    self.step_count,
+                    self.config.dino_feature_lr,
+                    self.config.dino_feature_lr_end,
+                );
                 let module = dig.module.clone();
                 let grad_feat =
                     GradientsParams::from_params(&mut grads, &module, &[module.features.id]);
-                let module = dig.optim.step(lr, module, grad_feat);
+                let module = dig.optim.step(feat_lr, module, grad_feat);
                 let grad_mlp =
                     GradientsParams::from_params(&mut grads, &module, &module.mlp_param_ids());
                 dig.module = dig.optim.step(lr, module, grad_mlp);
