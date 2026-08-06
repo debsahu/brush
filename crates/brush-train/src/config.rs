@@ -125,6 +125,41 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Refine options", default_value = "15000")]
     pub growth_stop_iter: u32,
 
+    /// Iteration after which the refine step is skipped ENTIRELY: no prune, no
+    /// dead-splat replacement, no oversized force-split. Topology is frozen and
+    /// the remaining iterations are pure photometric optimisation of a fixed
+    /// splat set. Mirrors LFS MRNF's `stop_refine` (mrnf.cpp `is_refining()`
+    /// requires `iter < stop_refine`, default 28500), which our port previously
+    /// had no equivalent for: `--growth-stop-iter` only stops NET growth, while
+    /// prune + 1:1 multinomial replacement keep churning the population every
+    /// `--refine-every` steps. At a saturated `--max-splats` cap that churn has
+    /// no sink for elongated splats, so spindle fraction rises monotonically.
+    /// 0 disables (previous behaviour). Set equal to `--growth-stop-iter` for
+    /// LFS-like semantics.
+    #[arg(long, help_heading = "Refine options", default_value = "0")]
+    pub stop_refine_iter: u32,
+
+    /// Iteration after which pruned splats are NO LONGER backfilled by
+    /// multinomial replacement, while prune itself keeps running. Growth is
+    /// governed separately by `--growth-stop-iter`.
+    ///
+    /// Motivation (measured on 0726hickorywood, 2026-08-05): the two halves of
+    /// refine pull in opposite directions once the `--max-splats` cap is
+    /// saturated. Replacement re-splits to hold the count, and MRNF's LAS split
+    /// gives BOTH children 0.6x the parent opacity, so the population drifts
+    /// translucent (median opacity fell to 0.08 on a 10M-cap run). Prune, on the
+    /// other hand, is the only sink for over-stretched splats, via its
+    /// `scale_max > extent * --prune-extent-factor` term. Freezing all of refine
+    /// with `--stop-refine-iter` therefore fixes the opacity dilution but
+    /// REMOVES the spindle sink: measured elongation slope rose from
+    /// +0.0029/1k iters to +0.0047/1k after the freeze.
+    ///
+    /// This flag separates them: keep the prune sink, drop the dilution. Splat
+    /// count decays gently from the cap instead of churning at it.
+    /// 0 disables (previous behaviour).
+    #[arg(long, help_heading = "Refine options", default_value = "0")]
+    pub stop_replace_iter: u32,
+
     /// Split any splat whose max screen-space extent exceeds this fraction of
     /// the image dimension, shrinking the children so they land at (at most)
     /// this size on screen. 0 disables.

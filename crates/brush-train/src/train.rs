@@ -1375,8 +1375,14 @@ impl SplatTrainer {
 
         let mut split_inds = HashSet::new();
 
-        // Always replace dead gaussians, so that the pruned budget is reused.
-        if pruned_count > 0 {
+        // Replace dead gaussians so the pruned budget is reused -- unless
+        // `--stop-replace-iter` has disabled backfill, in which case prune keeps
+        // culling (notably the over-stretched splats caught by the max-scale
+        // term) but the count is allowed to decay rather than being held at cap
+        // by opacity-diluting splits.
+        let replace_stopped = self.config.stop_replace_iter > 0
+            && global_iter >= self.config.stop_replace_iter;
+        if pruned_count > 0 && !replace_stopped {
             // Replacement weighting. By default opacity × visibility. With
             // `replace_by_gradient > 0`, interpolate toward the gradient-
             // weighted distribution (where error actually lives).

@@ -478,9 +478,11 @@ pub(crate) async fn train_stream(
         let phase_progress = (phase_iter as f32 / phase_total as f32).clamp(0.0, 1.0);
 
         let refine_start = Instant::now();
+        let stop_refine_iter = train_stream_config.train_config.stop_refine_iter;
         let refine = if phase_iter > 0
             && phase_iter.is_multiple_of(train_stream_config.train_config.refine_every)
             && phase_progress <= 0.95
+            && (stop_refine_iter == 0 || iter < stop_refine_iter)
         {
             let (new_splats, refine_stats) = trainer
                 .refine_for_phase(iter, phase_iter, phase_total, splats)
