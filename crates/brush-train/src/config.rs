@@ -136,6 +136,13 @@ pub struct TrainConfig {
     /// no sink for elongated splats, so spindle fraction rises monotonically.
     /// 0 disables (previous behaviour). Set equal to `--growth-stop-iter` for
     /// LFS-like semantics.
+    ///
+    /// MEASURED OUTCOME (0726hickorywood, 60k, 5M cap, SH2, three arms identical
+    /// but for this flag): this flag LOST to leaving refine alone. Control
+    /// PSNR 14.377 / SSIM 0.7884 / needle frac 0.1400; with this flag at 30k,
+    /// PSNR 13.978 / SSIM 0.7823 / needle frac 0.1618. It raised median opacity
+    /// 0.21 -> 0.23, but opacity moved OPPOSITE to PSNR/SSIM, so do not treat it
+    /// as a quality proxy. Kept for LFS parity and further study; NOT recommended.
     #[arg(long, help_heading = "Refine options", default_value = "0")]
     pub stop_refine_iter: u32,
 
@@ -157,6 +164,14 @@ pub struct TrainConfig {
     /// This flag separates them: keep the prune sink, drop the dilution. Splat
     /// count decays gently from the cap instead of churning at it.
     /// 0 disables (previous behaviour).
+    ///
+    /// MEASURED OUTCOME (same three-arm test): also LOST to the control --
+    /// PSNR 13.649 / SSIM 0.7779 / needle frac 0.1606, the worst PSNR of the
+    /// three. The premise that prune is the needle sink did not hold: needle
+    /// fraction was ~equal to the full-freeze arm (0.1606 vs 0.1618) despite
+    /// prune running throughout. Its one real effect is a 21% smaller asset
+    /// (3.94M vs 5.00M splats) at ~equal opacity, so it is a size lever, not a
+    /// quality lever. NOT recommended for quality.
     #[arg(long, help_heading = "Refine options", default_value = "0")]
     pub stop_replace_iter: u32,
 
