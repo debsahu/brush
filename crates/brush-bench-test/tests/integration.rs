@@ -269,7 +269,9 @@ async fn train_with_zero_visible_does_not_crash() {
         &device,
         BoundingBox::from_min_max(Vec3::splat(-2.0), Vec3::splat(2.0)),
     );
-    let (new_splats, _stats) = trainer.step_with_refine_weight(batch, splats, false).await;
+    let (new_splats, _stats) = trainer
+        .step_with_refine_weight(batch, splats, false, 0)
+        .await;
     // Should succeed; nothing visible means num_visible ≈ 0.
     assert!(new_splats.num_splats() > 0);
 }

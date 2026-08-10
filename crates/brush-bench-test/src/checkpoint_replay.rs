@@ -203,7 +203,12 @@ mod native {
             let current = splats.take().expect("replay always restores splats");
             let differentiable = lift_splats_to_autodiff(current);
             let (updated, stats) = trainer
-                .step_with_refine_weight(batch, differentiable, compute_refine_weight)
+                .step_with_refine_weight(
+                    batch,
+                    differentiable,
+                    compute_refine_weight,
+                    (step_offset + step) as u32,
+                )
                 .await;
             *splats = Some(updated.valid());
             last_loss = Some(stats.loss);

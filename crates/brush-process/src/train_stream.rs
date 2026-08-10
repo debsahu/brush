@@ -460,7 +460,10 @@ pub(crate) async fn train_stream(
         let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(splats);
         let compute_refine_weight = trainer.refinement_weight_needed(iter);
         let (new_diff_splats, stats) = trainer
-            .step_with_refine_weight(batch, diff_splats, compute_refine_weight)
+            // `iter` is the GLOBAL iteration (the loop starts at
+            // `process_config.start_iter`), so `--depth-normal-start-iter` does
+            // not restart its countdown on a resumed run.
+            .step_with_refine_weight(batch, diff_splats, compute_refine_weight, iter)
             .await;
         splats = new_diff_splats.valid();
 

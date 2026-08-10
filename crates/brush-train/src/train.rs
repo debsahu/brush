@@ -13,7 +13,8 @@ use crate::{
 use brush_appearance::{AppearanceConfig, AppearanceTrainState};
 use brush_dataset::scene::SceneBatch;
 use brush_loss::{
-    ImageLossConfig, depth_loss, depth_normal_loss, image_loss, normal_loss, normals_from_depth,
+    ImageLossConfig, depth_loss, depth_normal_loss, image_loss, normal_loss, normal_smooth_loss,
+    normals_from_depth,
 };
 use brush_render::camera::Camera;
 use brush_render::kernels::camera_model::CameraModel;
@@ -423,7 +424,12 @@ impl SplatTrainer {
     }
 
     pub async fn step(&mut self, batch: SceneBatch, splats: Splats) -> (Splats, TrainStepStats) {
-        self.step_with_refine_weight(batch, splats, true).await
+        // `step_count` is this trainer's own count, which equals the global
+        // iteration for a run that starts at 0. The stream path passes the true
+        // global iteration instead, so `--depth-normal-start-iter` behaves
+        // correctly on a resume.
+        let iter = self.step_count;
+        self.step_with_refine_weight(batch, splats, true, iter).await
     }
 
     /// Whether the refinement-only gradient statistic is still consumed by
@@ -624,6 +630,7 @@ impl SplatTrainer {
         batch: SceneBatch,
         splats: Splats,
         compute_refine_weight: bool,
+        global_iter: u32,
     ) -> (Splats, TrainStepStats) {
         let mut splats = splats;
 
@@ -682,8 +689,15 @@ impl SplatTrainer {
             // takes the same path it always did).
             let use_prior_normal =
                 self.config.normal_loss_weight > 0.0 && batch.normal.is_some();
-            let use_dn = self.config.depth_normal_weight > 0.0;
-            let use_normal_render = use_prior_normal || use_dn;
+            // 2DGS gates this term at 7k of 30k. Gating here rather than just
+            // zeroing the weight also skips the depth channel and the normal
+            // render pass entirely before the start iteration, so the gate costs
+            // nothing instead of rendering work that gets multiplied by zero.
+            let dn_started = self.config.depth_normal_start_iter == 0
+                || global_iter >= self.config.depth_normal_start_iter;
+            let use_dn = self.config.depth_normal_weight > 0.0 && dn_started;
+            let use_smooth = self.config.normal_smooth_weight > 0.0;
+            let use_normal_render = use_prior_normal || use_dn || use_smooth;
             let use_flatten = self.config.flatten_loss_weight > 0.0;
             // The depth/normal consistency term reads the rendered depth, so it
             // needs the depth channel even without any gt depth map.
@@ -966,6 +980,15 @@ impl SplatTrainer {
                     let gt_normal: Tensor<3> = Tensor::from_data(normal_data.clone(), &device);
                     loss = loss
                         + normal_loss(n_cam.clone(), gt_normal) * self.config.normal_loss_weight;
+                }
+
+                // TV smoothness on the rendered normal image. Needs no prior
+                // data and no depth channel, so it is deliberately NOT gated on
+                // an iteration: DN-Splatter runs its normal terms ungated.
+                if use_smooth {
+                    loss = loss
+                        + normal_smooth_loss(n_cam.clone(), normal_alpha.clone())
+                            * self.config.normal_smooth_weight;
                 }
 
                 if use_dn {

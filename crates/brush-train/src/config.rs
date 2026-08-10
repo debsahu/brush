@@ -457,6 +457,36 @@ pub struct TrainConfig {
     #[serde(default)]
     pub depth_normal_weight: f32,
 
+    /// Iteration at which `--depth-normal-weight` switches on. Before it the
+    /// consistency term contributes nothing AND its render work is skipped.
+    ///
+    /// 2DGS gates exactly this term (`lambda_normal = opt.lambda_normal if
+    /// iteration > 7000 else 0.0`, i.e. 7k of 30k, ~23% of the run) while
+    /// letting densification continue to 15k — so the gate is NOT about waiting
+    /// for topology to settle, it is about not enforcing self-consistency on
+    /// geometry that has barely formed. Counts GLOBAL iterations, so a resumed
+    /// run does not restart the countdown. 0 = never gate (previous behaviour).
+    ///
+    /// Note the asymmetry: `--flatten-loss-weight` deliberately has NO such
+    /// gate, because DN-Splatter runs the identical scale term ungated at 1.0
+    /// from step 0.
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    #[serde(default)]
+    pub depth_normal_start_iter: u32,
+
+    /// Weight of total-variation smoothness on the rendered normal image
+    /// (DN-Splatter's `L_smooth`). Needs no prior data.
+    ///
+    /// DN-Splatter weights this **0.5**, five times its normal data term (0.1),
+    /// making it the largest weight in their normal group. On a textureless wall
+    /// the per-pixel normal field can be noisy while still matching the prior on
+    /// average; the data term cannot see that and this can. Since textureless
+    /// walls are the reason these priors exist, this is the load-bearing one.
+    /// 0 disables.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub normal_smooth_weight: f32,
+
     /// Weight of the flattening term: the population mean of each gaussian's
     /// smallest activated scale, on the RAW (pre-3D-filter) scales. A soft
     /// 2DGS-style pressure toward surface-aligned gaussians — nothing is

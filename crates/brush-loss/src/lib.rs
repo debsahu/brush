@@ -1816,6 +1816,59 @@ pub fn depth_normal_loss(
     err.sum() / valid.sum().clamp_min(1.0)
 }
 
+/// Total-variation smoothness on a rendered camera-frame normal image,
+/// `[H, W, 3]` (DN-Splatter's `L_smooth`).
+///
+/// `Σ |N[i+1,j] - N[i,j]| + |N[i,j+1] - N[i,j]|`, meaned over the differences
+/// actually counted.
+///
+/// Why this exists at all: DN-Splatter weights this **0.5**, five times its
+/// normal data term (0.1), making it the largest weight in their normal group.
+/// On a low-texture surface the per-pixel normal field can be noisy while still
+/// matching the prior *on average* — the data term cannot see that, this can.
+/// Since textureless walls are the whole reason we added normal priors, dropping
+/// the smoothness term would have left the most load-bearing piece out.
+///
+/// Deliberate deviation from DN-Splatter's plain TV: a difference counts only
+/// when BOTH pixels are covered (`alpha > 0.5`) and carry a valid normal. Plain
+/// TV also penalises the step across a silhouette, where the neighbour is the
+/// `(0, 0, 0)` of an uncovered pixel rather than a surface measurement, and
+/// smoothing that boundary is exactly backwards. Same validity contract as
+/// `depth_normal_loss`.
+///
+/// `alpha` is `[H, W, 1]` and is expected to arrive already detached, so the term
+/// cannot lower its error by changing transparency.
+pub fn normal_smooth_loss(normal: Tensor<3>, alpha: Tensor<3>) -> Tensor<1> {
+    let [h, w, _] = normal.dims();
+    let device = normal.device();
+
+    if h < 2 || w < 2 {
+        return Tensor::zeros([1], &device);
+    }
+
+    let covered = alpha.greater_elem(0.5).float();
+    let len = normal.clone().powi_scalar(2).sum_dim(2).sqrt();
+    let valid = covered * len.greater_elem(0.5).float();
+
+    // Row differences: N[i+1, j] - N[i, j].
+    let d_row = (normal.clone().slice(s![1..h, .., ..]) - normal.clone().slice(s![0..h - 1, .., ..]))
+        .abs()
+        .sum_dim(2);
+    let v_row = valid.clone().slice(s![1..h, .., ..]) * valid.clone().slice(s![0..h - 1, .., ..]);
+
+    // Column differences: N[i, j+1] - N[i, j].
+    let d_col = (normal.clone().slice(s![.., 1..w, ..]) - normal.slice(s![.., 0..w - 1, ..]))
+        .abs()
+        .sum_dim(2);
+    let v_col = valid.clone().slice(s![.., 1..w, ..]) * valid.slice(s![.., 0..w - 1, ..]);
+
+    let err = (d_row * v_row.clone()).sum() + (d_col * v_col.clone()).sum();
+
+    // × 3 because `sum_dim(2)` already folded the three channels into each
+    // counted difference, matching `normal_loss`'s denominator.
+    err / (v_row.sum() + v_col.sum()).mul_scalar(3.0).clamp_min(1.0)
+}
+
 /// Decode `gt_packed` back to a `[H, W, 3]` f32 RGB tensor. `composite_bg =
 /// Some(bg)` folds in `gt + (1 - gt.a) * bg`; `None` skips that math.
 /// Materialising f32 GT defeats the whole point of the packed format, so
