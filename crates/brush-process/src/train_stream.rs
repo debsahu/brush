@@ -881,6 +881,12 @@ async fn run_eval(
 
     let mut psnr = 0.0;
     let mut ssim = 0.0;
+    // Masked counterparts, scored over the unmasked pixels only. `psnr`/`ssim`
+    // above count masked-out regions as error and are kept only so numbers
+    // recorded before 2026-08-10 stay comparable; these are the ones to gate on.
+    let mut psnr_masked = 0.0;
+    let mut ssim_masked = 0.0;
+    let mut valid_frac = 0.0;
     let mut count = 0;
     log::info!("Running evaluation for iteration {iter}");
 
@@ -910,6 +916,9 @@ async fn run_eval(
         count += 1;
         psnr += sample.psnr.clone().into_scalar_async::<f32>().await?;
         ssim += sample.ssim.clone().into_scalar_async::<f32>().await?;
+        psnr_masked += sample.psnr_masked.clone().into_scalar_async::<f32>().await?;
+        ssim_masked += sample.ssim_masked.clone().into_scalar_async::<f32>().await?;
+        valid_frac += sample.valid_frac;
 
         #[cfg(not(target_family = "wasm"))]
         if let Some(path) = &save_path {
@@ -929,6 +938,16 @@ async fn run_eval(
     }
     psnr /= count as f32;
     ssim /= count as f32;
+    psnr_masked /= count as f32;
+    ssim_masked /= count as f32;
+    valid_frac /= count as f32;
+    // Both figures, every time, with the coverage that separates them -- so the
+    // gap is visible in the log rather than inferred. The masked pair is the one
+    // to compare against the Stage 4 >= 24 dB gate.
+    log::info!(
+        "eval iter {iter}: masked PSNR {psnr_masked:.3} SSIM {ssim_masked:.4}          | unmasked (legacy) PSNR {psnr:.3} SSIM {ssim:.4}          | mean coverage {:.1}%",
+        valid_frac * 100.0
+    );
     visualize.log_eval_stats(iter, psnr, ssim)?;
     emitter
         .emit(ProcessMessage::TrainMessage(TrainMessage::EvalResult {
