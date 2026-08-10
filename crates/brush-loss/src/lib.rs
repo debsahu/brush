@@ -2189,6 +2189,57 @@ mod normal_loss_tests {
         }
     }
 
+    /// The same check on a plane tilted in BOTH axes, which is what actually
+    /// pins the estimator's handedness.
+    ///
+    /// `slanted_plane_matches_the_closed_form_normal` above tilts only in x, so
+    /// its expected normal is `(a, 0, -1)`: `ny` is identically zero. That blind
+    /// spot is bigger than it looks. Because the plane is flat in y, scaling the
+    /// `dP/dv` difference by any constant leaves the normalized cross product
+    /// unchanged — so `fy` can be wrong, or swapped with `fx`, and every
+    /// assertion still passes. A fronto-parallel plane is worse again, giving
+    /// `(0, 0, -1)` under nearly any convention and testing only the z sign.
+    ///
+    /// `z = z0 + a*x_cam + b*y_cam` has normal `(a, b, -1)/sqrt(1 + a^2 + b^2)`.
+    /// Depth is built from the plane's geometry — substituting `x_cam = z*a_u`
+    /// and `y_cam = z*b_v` and solving for z — not from the cross-product
+    /// formula under test, so this is an independent check rather than a
+    /// restatement. `a` and `b` differ in magnitude and sign, and `FX != FY`
+    /// with `W != H`, so an axis swap, an intrinsic swap, or a sign flip each
+    /// move the answer.
+    #[tokio::test]
+    async fn doubly_tilted_plane_pins_both_axes_and_intrinsics() {
+        let device = device().await;
+        let (z0, a, b) = (3.0f32, 0.35f32, -0.6f32);
+
+        let mut depth = vec![0.0f32; H * W];
+        for v in 0..H {
+            for u in 0..W {
+                let a_u = (u as f32 - CX) / FX;
+                let b_v = (v as f32 - CY) / FY;
+                depth[v * W + u] = z0 / (1.0 - a * a_u - b * b_v);
+            }
+        }
+        let depth = Tensor::<2>::from_data(TensorData::new(depth, [H, W]), &device);
+        let normals = read(normals_from_depth(depth, FX, FY, CX, CY)).await;
+
+        let inv = 1.0 / (1.0 + a * a + b * b).sqrt();
+        let want = [a * inv, b * inv, -inv];
+        for v in 0..H - 1 {
+            for u in 0..W - 1 {
+                let i = (v * W + u) * 3;
+                for c in 0..3 {
+                    assert!(
+                        (normals[i + c] - want[c]).abs() < 1e-4,
+                        "n[{c}] at ({u},{v}) = {}, want {}",
+                        normals[i + c],
+                        want[c]
+                    );
+                }
+            }
+        }
+    }
+
     /// Non-positive depths carry no geometry, so anything touching them is
     /// invalid.
     #[tokio::test]
