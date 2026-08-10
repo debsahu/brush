@@ -151,6 +151,7 @@ mod native {
                 alpha_mode: view.image.alpha_mode(),
                 features: None,
                 depth: None,
+                normal: None,
                 camera: view.camera,
                 view_index: index,
             };

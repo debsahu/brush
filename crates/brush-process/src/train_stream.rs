@@ -784,6 +784,7 @@ mod tests {
             camera,
             features: None,
             depth: None,
+            normal: None,
         }]);
         let cameras = mip_view_cameras(&scene).await;
         assert_eq!(cameras.len(), 1);

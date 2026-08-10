@@ -10,9 +10,9 @@ use crate::{
     config::LoadDatasetConfig,
     formats::{
         DatasetFileIndex, find_depth_path, find_features_path, find_image_by_name,
-        find_points3d_path, split_eval_every,
+        find_normal_path, find_points3d_path, split_eval_every,
     },
-    scene::{LoadDepth, LoadFeatures, LoadImage, SceneView},
+    scene::{LoadDepth, LoadFeatures, LoadImage, LoadNormal, SceneView},
 };
 use brush_render::kernels::camera_model::CameraModel;
 use brush_render::kernels::camera_model::CameraModel::{
@@ -218,6 +218,11 @@ async fn load_dataset_inner(
                 .map(|p| LoadFeatures::new(vfs.clone(), p.to_path_buf()));
             let depth =
                 find_depth_path(&vfs, path).map(|p| LoadDepth::new(vfs.clone(), p.to_path_buf()));
+            // Surface-normal prior, discovered exactly like depth. Carries no
+            // scale, so it is deliberately NOT part of the metric-scale
+            // estimation above.
+            let normal = find_normal_path(&vfs, path)
+                .map(|p| LoadNormal::new(vfs.clone(), p.to_path_buf()));
 
             // Convert w2c to c2w.
             let world_to_cam = glam::Affine3A::from_rotation_translation(
@@ -250,6 +255,7 @@ async fn load_dataset_inner(
                 image,
                 features,
                 depth,
+                normal,
             });
         }
 

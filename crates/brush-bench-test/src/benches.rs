@@ -134,6 +134,7 @@ fn generate_training_batch(resolution: (u32, u32), camera_pos: Vec3) -> SceneBat
         alpha_mode: AlphaMode::Transparent,
         features: None,
         depth: None,
+        normal: None,
         camera,
         view_index: 0,
     }

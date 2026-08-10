@@ -156,6 +156,7 @@ async fn read_dataset_inner(
             image,
             features: None,
             depth: None,
+            normal: None,
         });
     }
 
