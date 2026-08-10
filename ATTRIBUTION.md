@@ -14,6 +14,7 @@ through the merge history; this file records the provenance of each feature.
 | Per-view appearance compensation (bilateral grid + PPISP hybrid) | `--ppisp`, `--ppisp-grid`, `--bilateral-grid` | upstream PR [#483](https://github.com/ArthurBrussee/brush/pull/483) | [@gradeeterna](https://github.com/gradeeterna) |
 | gsplat-style depth loss + depth-map viewer | `--depth-loss-weight` | upstream PR [#497](https://github.com/ArthurBrussee/brush/pull/497) | [@Deepthought73](https://github.com/Deepthought73) (Kilian Northoff) |
 | DiG (DINO-embedded Gaussians) feature training | `--dino`, `--dino-view` | upstream PR [#511](https://github.com/ArthurBrussee/brush/pull/511) | [@connorsoohoo](https://github.com/connorsoohoo) (Connor Soohoo) |
+| Surface-normal geometry priors (prior-normal L1, depth/normal consistency, flattening) | `--normal-loss-weight`, `--depth-normal-weight`, `--flatten-loss-weight` | own implementation of the ideas in [DN-Splatter](https://github.com/maturk/dn-splatter) (Apache-2.0, WACV 2025) and PlanarGS (NeurIPS 2025) | this fork |
 | Rebase of #483 onto current `main`, hardening, macOS perf (native MSL preset + 16x8 raster tiles) | (build/runtime) | fork [@lanxinger/brush](https://github.com/lanxinger/brush) | [@lanxinger](https://github.com/lanxinger) |
 
 ## Integration notes
@@ -22,6 +23,7 @@ through the merge history; this file records the provenance of each feature.
   PR #497 (depth) and PR #511 (DiG) were merged in and their conflicts against the appearance
   rewrite resolved by hand.
 - The `--bilateral-grid` and `--ppisp` appearance models are mutually exclusive (upstream behavior).
+- The surface-normal priors are an independent Burn implementation of published ideas, not a port: no DN-Splatter or PlanarGS code is vendored, and no third-party weights are involved. All three flags default to `0.0`, so a run that does not pass them is unchanged. The depth/normal consistency term is Pinhole-only and warns once when skipped on a fisheye camera. Validated by unit + gradient tests (`cargo test -p brush-dataset -p brush-loss -p brush-train`) and the existing `brush-bench-test` suite; the first enabled-weight training A/B is still outstanding.
 - Backward/autodiff gradient math from each source PR was preserved unchanged; conflict resolution
   only re-threaded function signatures. The merged gradients were checked with the repo's own
   finite-difference test suite (`cargo test -p brush-bench-test --release finite_diff` +
