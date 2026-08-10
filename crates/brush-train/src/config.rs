@@ -744,8 +744,16 @@ mod tests {
         assert_eq!(def.normal_loss_weight, 0.0);
         assert_eq!(def.depth_normal_weight, 0.0);
         assert_eq!(def.flatten_loss_weight, 0.0);
+        assert_eq!(def.normal_smooth_weight, 0.0);
         // The depth half is untouched by this change.
         assert_eq!(def.depth_loss_weight, 0.0);
+
+        // 0 means "never gate", so the consistency term behaves exactly as it
+        // did before the gate existed. A nonzero default here would silently
+        // DISABLE the term for the first N iterations of every run that sets
+        // --depth-normal-weight, which is the opposite failure to the weights
+        // above and just as invisible.
+        assert_eq!(def.depth_normal_start_iter, 0);
 
         // Unrelated flags must not switch them on.
         let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
@@ -753,6 +761,8 @@ mod tests {
         assert_eq!(other.normal_loss_weight, 0.0);
         assert_eq!(other.depth_normal_weight, 0.0);
         assert_eq!(other.flatten_loss_weight, 0.0);
+        assert_eq!(other.normal_smooth_weight, 0.0);
+        assert_eq!(other.depth_normal_start_iter, 0);
 
         let on = TrainConfig::try_parse_from([
             "brush",
@@ -762,11 +772,22 @@ mod tests {
             "0.05",
             "--flatten-loss-weight",
             "1.0",
+            "--normal-smooth-weight",
+            "0.5",
+            "--depth-normal-start-iter",
+            "7000",
         ])
         .expect("geometry-prior flags must parse");
         assert!((on.normal_loss_weight - 0.2).abs() < 1e-9);
         assert!((on.depth_normal_weight - 0.05).abs() < 1e-9);
         assert!((on.flatten_loss_weight - 1.0).abs() < 1e-9);
+        assert!((on.normal_smooth_weight - 0.5).abs() < 1e-9);
+        assert_eq!(on.depth_normal_start_iter, 7000);
+
+        // There is deliberately NO --flatten-start-iter: DN-Splatter runs the
+        // identical scale term ungated at 1.0 from step 0, so a gate would be
+        // inventing a schedule no reference implementation uses.
+        assert!(TrainConfig::try_parse_from(["brush", "--flatten-start-iter", "7000"]).is_err());
     }
 
     #[test]
