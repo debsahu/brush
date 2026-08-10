@@ -1730,7 +1730,7 @@ pub fn normal_loss(pred_normal: Tensor<3>, gt_normal: Tensor<3>) -> Tensor<1> {
 /// Surface normals derived from a depth map by unprojecting to camera-frame
 /// points and taking finite differences, `[H, W]` -> `[H, W, 3]`.
 ///
-/// `P(u, v) = z * ((u - cx) / fx, (v - cy) / fy, 1)` in the OpenCV camera frame
+/// `P(u, v) = z * ((u - cx) / fx, (v - cy) / fy, 1)` in the `OpenCV` camera frame
 /// (+X right, +Y down, +Z forward); the normal is
 /// `normalize(dP/dv × dP/du)`, whose sign is camera-facing (`n.z <= 0`) for any
 /// depth graph — no data-dependent flip is needed. Forward differences, so the
@@ -1782,7 +1782,7 @@ pub fn normals_from_depth(depth: Tensor<2>, fx: f32, fy: f32, cx: f32, cy: f32) 
     // A degenerate (zero-length) cross product carries no orientation.
     let finite = len.greater_elem(1e-12).float();
     // All three contributing depths must be real measurements.
-    let d_pos = depth.clone().greater_elem(0.0).float().reshape([h, w, 1]);
+    let d_pos = depth.greater_elem(0.0).float().reshape([h, w, 1]);
     let valid = d_pos.clone().slice(s![0..h - 1, 0..w - 1, ..])
         * d_pos.clone().slice(s![0..h - 1, 1..w, ..])
         * d_pos.slice(s![1..h, 0..w - 1, ..])
@@ -1794,7 +1794,7 @@ pub fn normals_from_depth(depth: Tensor<2>, fx: f32, fy: f32, cx: f32, cy: f32) 
 }
 
 /// Depth/normal consistency: `1 - dot` between normals derived from the
-/// rendered depth and the rendered per-gaussian normals (PlanarGS `L_dn`).
+/// rendered depth and the rendered per-gaussian normals (`PlanarGS` `L_dn`).
 ///
 /// `alpha` is `[H, W, 1]` and is expected to arrive already detached — the
 /// consistency term must not be able to lower its error by changing
@@ -2144,7 +2144,7 @@ mod normal_loss_tests {
             );
         }
         // A pixel far from the hole is unaffected.
-        let i = (0 * W + 0) * 3;
+        let i = 0;
         assert!((normals[i + 2] + 1.0).abs() < 1e-5);
     }
 

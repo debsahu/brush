@@ -439,6 +439,33 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options", default_value = "0.0")]
     pub depth_loss_weight: f32,
 
+    /// Weight of the l1 loss between the rendered per-gaussian normal image and
+    /// an external normal prior (`normal/<stem>.tiff`, 3-channel float32,
+    /// camera-frame `OpenCV`-convention unit normals, `(0,0,0)` = invalid).
+    /// Needs prior data; inert without it. DN-Splatter's normal loss /
+    /// `PlanarGS` `L_rn`; `PlanarGS` ratio suggests ~0.2. 0 disables.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub normal_loss_weight: f32,
+
+    /// Weight of the depth/normal consistency term: `1 - dot` between normals
+    /// derived from the RENDERED depth and the rendered per-gaussian normals
+    /// (`PlanarGS` `L_dn`). Needs no prior data at all. Setting it forces the
+    /// depth render channel on. Pinhole cameras only — skipped with a warning
+    /// on fisheye models. `PlanarGS` ratio suggests ~0.05. 0 disables.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub depth_normal_weight: f32,
+
+    /// Weight of the flattening term: the population mean of each gaussian's
+    /// smallest activated scale, on the RAW (pre-3D-filter) scales. A soft
+    /// 2DGS-style pressure toward surface-aligned gaussians — nothing is
+    /// collapsed or re-parametrized. `PlanarGS` `L_s`; `PlanarGS` ratio suggests
+    /// ~1.0. 0 disables.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub flatten_loss_weight: f32,
+
     /// Base background color (R,G,B) used during training.
     #[arg(
         long,
@@ -675,6 +702,41 @@ mod tests {
             .err()
             .expect("stacked appearance flags must conflict");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// Inertness contract for the geometry-prior flags: a command line that
+    /// does not mention them must leave all three at exactly 0.0, which is what
+    /// the `use_*` gates in the train loop key on. Losing this default silently
+    /// changes every existing run.
+    #[test]
+    fn geometry_prior_weights_default_to_zero_and_parse() {
+        let def = TrainConfig::default();
+        assert_eq!(def.normal_loss_weight, 0.0);
+        assert_eq!(def.depth_normal_weight, 0.0);
+        assert_eq!(def.flatten_loss_weight, 0.0);
+        // The depth half is untouched by this change.
+        assert_eq!(def.depth_loss_weight, 0.0);
+
+        // Unrelated flags must not switch them on.
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert_eq!(other.normal_loss_weight, 0.0);
+        assert_eq!(other.depth_normal_weight, 0.0);
+        assert_eq!(other.flatten_loss_weight, 0.0);
+
+        let on = TrainConfig::try_parse_from([
+            "brush",
+            "--normal-loss-weight",
+            "0.2",
+            "--depth-normal-weight",
+            "0.05",
+            "--flatten-loss-weight",
+            "1.0",
+        ])
+        .expect("geometry-prior flags must parse");
+        assert!((on.normal_loss_weight - 0.2).abs() < 1e-9);
+        assert!((on.depth_normal_weight - 0.05).abs() < 1e-9);
+        assert!((on.flatten_loss_weight - 1.0).abs() < 1e-9);
     }
 
     #[test]

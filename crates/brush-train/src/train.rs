@@ -12,8 +12,11 @@ use crate::{
 };
 use brush_appearance::{AppearanceConfig, AppearanceTrainState};
 use brush_dataset::scene::SceneBatch;
-use brush_loss::{ImageLossConfig, depth_loss, image_loss};
+use brush_loss::{
+    ImageLossConfig, depth_loss, depth_normal_loss, image_loss, normal_loss, normals_from_depth,
+};
 use brush_render::camera::Camera;
+use brush_render::kernels::camera_model::CameraModel;
 use brush_render::gaussian_splats::{RasterizationMode, Splats, fold_min_scale};
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 use brush_render_bwd::{DeferredShGrad, render_splat_features, render_splats_for_training};
@@ -674,7 +677,18 @@ impl SplatTrainer {
             // the render path folds it in. Optimizer/refine work on raw params.
             let render_input = splats.clone();
             let use_depth = batch.depth.is_some() && self.config.depth_loss_weight > 0.0;
-            let raster_mode = if use_depth {
+            // Geometry-prior terms (all inert at their 0.0 defaults, gated
+            // exactly like `use_depth`, so a run that does not pass the flags
+            // takes the same path it always did).
+            let use_prior_normal =
+                self.config.normal_loss_weight > 0.0 && batch.normal.is_some();
+            let use_dn = self.config.depth_normal_weight > 0.0;
+            let use_normal_render = use_prior_normal || use_dn;
+            let use_flatten = self.config.flatten_loss_weight > 0.0;
+            // The depth/normal consistency term reads the rendered depth, so it
+            // needs the depth channel even without any gt depth map.
+            let has_depth_channel = use_depth || use_dn;
+            let raster_mode = if has_depth_channel {
                 RasterizationMode::RgbaAndDepth
             } else {
                 RasterizationMode::Rgba
@@ -698,13 +712,14 @@ impl SplatTrainer {
             //
             // Appearance correction (PPISP / bilateral grid) models only the
             // color/alpha response and its ISP kernel asserts a 3- or 4-channel
-            // input. When depth loss is active the render carries an extra
+            // input. When a depth-consuming term is active (depth loss, or the
+            // depth/normal consistency term) the render carries an extra
             // depth channel (index 4) that is geometry, not color: it must
             // bypass the correction. Split the RGBA channels off, correct
             // those, then re-attach the untouched depth so `pred_image` keeps
             // its [H, W, 5] layout for the depth-loss term below.
             let pred_image = match &active_appearance {
-                Some(active) if use_depth => {
+                Some(active) if has_depth_channel => {
                     let rgba = diff_out.img.clone().slice(s![.., .., 0..4]);
                     let depth = diff_out.img.slice(s![.., .., 4..5]);
                     Tensor::cat(vec![active.apply(rgba), depth], 2)
@@ -881,6 +896,114 @@ impl SplatTrainer {
                 let expected_depth =
                     (accumulated_depth / alpha.clamp_min(1e-10)).reshape([img_h, img_w]);
                 loss = loss + depth_loss(expected_depth, gt_depth) * self.config.depth_loss_weight;
+            }
+
+            // Geometry priors: the normal half of DN-Splatter / PlanarGS.
+            //
+            // The rendered normal image reuses `render_splat_features`, the same
+            // vehicle the DiG path uses: it detaches geometry internally and
+            // back-props into the FEATURE values, so feeding it per-splat
+            // normals derived from the quaternions makes this loss rotate
+            // gaussians. No new kernel is involved.
+            if use_normal_render {
+                let (t_fold, o_fold) = match &splats.min_scale {
+                    Some(f) => fold_min_scale(
+                        splats.transforms.val(),
+                        splats.raw_opacities.val(),
+                        f.clone(),
+                    ),
+                    None => (splats.transforms.val(), splats.raw_opacities.val()),
+                };
+                let render_mode = if splats.render_mip {
+                    brush_render::gaussian_splats::SplatRenderMode::Mip
+                } else {
+                    brush_render::gaussian_splats::SplatRenderMode::Default
+                };
+                let normals = splat_normals(t_fold.clone(), camera.position);
+                let normal_img = render_splat_features(
+                    t_fold,
+                    o_fold,
+                    normals,
+                    &camera,
+                    img_size,
+                    render_mode,
+                )
+                .instrument(trace_span!("Normal forward"))
+                .await;
+
+                // Same detached alpha normalization as the DiG and depth paths:
+                // the normal terms must not be able to lower their error by
+                // changing transparency.
+                let normal_alpha = normal_img.clone().slice(s![.., .., 3..4]).detach();
+                let n_world = normal_img.slice(s![.., .., 0..3]) / normal_alpha.clone().clamp_min(1e-10);
+                let n_len = n_world.clone().powi_scalar(2).sum_dim(2).sqrt().clamp_min(1e-6);
+                let n_world = n_world / n_len;
+
+                // World -> camera. Right-multiplying row vectors by Rᵀ is the
+                // same as left-multiplying column vectors by R.
+                let rot = camera.world_to_local().matrix3;
+                let r_t: Tensor<2> = Tensor::<1>::from_floats(
+                    [
+                        rot.x_axis.x,
+                        rot.x_axis.y,
+                        rot.x_axis.z,
+                        rot.y_axis.x,
+                        rot.y_axis.y,
+                        rot.y_axis.z,
+                        rot.z_axis.x,
+                        rot.z_axis.y,
+                        rot.z_axis.z,
+                    ],
+                    &device,
+                )
+                .reshape([3, 3]);
+                let n_cam = n_world
+                    .reshape([(img_h * img_w) as i32, 3])
+                    .matmul(r_t)
+                    .reshape([img_h, img_w, 3]);
+
+                if use_prior_normal && let Some(normal_data) = &batch.normal {
+                    let gt_normal: Tensor<3> = Tensor::from_data(normal_data.clone(), &device);
+                    loss = loss
+                        + normal_loss(n_cam.clone(), gt_normal) * self.config.normal_loss_weight;
+                }
+
+                if use_dn {
+                    // Unprojection is pinhole-only for now; our fisheye-split
+                    // path is KB4, interior cube faces are Pinhole. Skip with a
+                    // warning rather than silently supervising with wrong math.
+                    if matches!(camera.camera_model, CameraModel::Pinhole) {
+                        let accumulated_depth = pred_image.clone().slice(s![.., .., 4..5]);
+                        let alpha = pred_image.clone().slice(s![.., .., 3..4]).detach();
+                        let expected_depth = (accumulated_depth / alpha.clamp_min(1e-10))
+                            .reshape([img_h, img_w]);
+                        let focal = camera.focal(img_size);
+                        let center = camera.center(img_size);
+                        let n_from_depth = normals_from_depth(
+                            expected_depth,
+                            focal.x,
+                            focal.y,
+                            center.x,
+                            center.y,
+                        );
+                        loss = loss
+                            + depth_normal_loss(n_from_depth, n_cam, normal_alpha)
+                                * self.config.depth_normal_weight;
+                    } else {
+                        warn_depth_normal_needs_pinhole();
+                    }
+                }
+            }
+
+            // Flattening pressure (PlanarGS `L_s`): the mean smallest activated
+            // scale, on the RAW pre-3D-filter scales. The Mip filter floors the
+            // RENDERED thinness; the penalty deliberately acts on the learned
+            // scale so exports keep the thin axis and we do not fight the
+            // anti-aliasing floor. MRNF's prune keys on `scale_max`, so there is
+            // no interaction with it.
+            if use_flatten {
+                let scales = splats.transforms.val().slice(s![.., 7..10]).exp();
+                loss = loss + scales.min_dim(1).mean() * self.config.flatten_loss_weight;
             }
 
             // Strip the autodiff graph off the loss so consumers can read the
@@ -1893,6 +2016,72 @@ fn sample_background_color<R: rand::Rng + ?Sized>(
     (base + noise).clamp(glam::Vec3::ZERO, glam::Vec3::ONE)
 }
 
+/// Warn exactly once that `--depth-normal-weight` is being skipped because the
+/// camera is not a pinhole. Once, because it would otherwise fire every step of
+/// every view.
+fn warn_depth_normal_needs_pinhole() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "--depth-normal-weight is set but this camera is not Pinhole; the \
+             depth/normal consistency term is skipped for non-pinhole views \
+             (unprojection for fisheye models is not implemented yet)."
+        );
+    });
+}
+
+/// Per-splat world-space surface normal: the gaussian's thinnest local axis,
+/// rotated into world space and oriented toward the camera. `[N, 10]` ->
+/// `[N, 3]` unit vectors.
+///
+/// Two deliberately DETACHED discrete choices, both standard in the
+/// DN-Splatter / `PlanarGS` family:
+/// - which axis is thinnest (`argmin` over the log-scales), so the normal
+///   does not try to differentiate a permutation;
+/// - the camera-facing sign flip, so the loss cannot "fix" a wrong normal by
+///   toggling the sign instead of rotating the gaussian.
+///
+/// What remains live is the quaternion, so a normal loss rotates gaussians.
+/// The scales are read but not differentiated through.
+fn splat_normals(transforms: Tensor<2>, cam_pos: glam::Vec3) -> Tensor<2> {
+    let n = transforms.dims()[0];
+    let device = transforms.device();
+
+    let means = transforms.clone().slice(s![.., 0..3]);
+    let quats = transforms.clone().slice(s![.., 3..7]);
+    let log_scales = transforms.slice(s![.., 7..10]);
+
+    // One-hot over the thinnest axis. `exp` is monotone so argmin over the log
+    // scales is argmin over the scales; `argmin` picks a single index, which
+    // avoids the double-count an `equal`-mask tie would cause.
+    let min_idx: Tensor<2, Int> = log_scales.detach().argmin(1);
+    let axis: Tensor<2> = Tensor::zeros([n, 3], &device).scatter(
+        1,
+        min_idx,
+        Tensor::ones([n, 1], &device),
+        IndexingUpdateOp::Add,
+    );
+
+    // Rotating the local axis by the (normalized) quaternion is exactly the
+    // corresponding column of the rotation matrix, computed differentiably.
+    let q_len = quats.clone().powi_scalar(2).sum_dim(1).sqrt().clamp_min(1e-12);
+    let unit_quats = quats / q_len;
+    let normal = quaternion_vec_multiply(unit_quats, axis);
+    let n_len = normal.clone().powi_scalar(2).sum_dim(1).sqrt().clamp_min(1e-12);
+    let normal = normal / n_len;
+
+    // Face the camera: we want `n · (mean - cam) < 0`. `sign()` would emit 0 on
+    // an exactly perpendicular splat and annihilate its normal, so build the
+    // ±1 selector from a comparison instead.
+    let to_splat = (means - Tensor::<1>::from_floats([cam_pos.x, cam_pos.y, cam_pos.z], &device)
+        .reshape([1, 3]))
+    .detach();
+    let facing = (to_splat * normal.clone().detach()).sum_dim(1);
+    let sign = facing.lower_elem(0.0).float().mul_scalar(2.0).sub_scalar(1.0);
+
+    normal * sign
+}
+
 #[cfg(test)]
 mod seeded_rng_tests {
     use super::*;
@@ -2028,5 +2217,329 @@ mod depth_loss_grad_tests {
                 "depth loss must not push opacity, got {opac_grad_absmax}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod normal_prior_grad_tests {
+    use super::*;
+    use brush_render::gaussian_splats::SplatRenderMode;
+    use brush_render::kernels::camera_model::CameraModel;
+
+    const IMG: glam::UVec2 = glam::uvec2(48, 48);
+
+    /// A slab of overlapping gaussians filling the middle of the frame, all
+    /// tilted by the same rotation about +Y so their surface normal disagrees
+    /// with the (flat) rendered depth. Thinnest axis is local +Z.
+    fn tilted_plane_splats(device: &Device, tilt: f32) -> Splats {
+        let mut means = vec![];
+        let n_side = 7;
+        for iy in 0..n_side {
+            for ix in 0..n_side {
+                let f = |i: i32| (i as f32 / (n_side - 1) as f32) * 2.0 - 1.0;
+                means.extend_from_slice(&[f(ix), f(iy), 0.0]);
+            }
+        }
+        let n = means.len() / 3;
+        let q = glam::Quat::from_rotation_y(tilt);
+        let rotations: Vec<f32> = (0..n).flat_map(|_| [q.w, q.x, q.y, q.z]).collect();
+        // Thinnest axis is z, so `splat_normals` picks the local +Z column.
+        let log_scales: Vec<f32> = (0..n).flat_map(|_| [-1.6, -1.6, -2.5]).collect();
+        let sh: Vec<f32> = (0..n).flat_map(|_| [0.5, 0.5, 0.5]).collect();
+        let opac: Vec<f32> = vec![4.0; n];
+
+        Splats::from_raw(
+            means,
+            rotations,
+            log_scales,
+            sh,
+            opac,
+            SplatRenderMode::Default,
+            device,
+        )
+    }
+
+    fn test_camera() -> Camera {
+        Camera::new(
+            glam::vec3(0.0, 0.0, -5.0),
+            glam::Quat::IDENTITY,
+            0.7,
+            0.7,
+            glam::vec2(0.5, 0.5),
+            CameraModel::Pinhole,
+        )
+    }
+
+    async fn absmax(t: Tensor<2>) -> f32 {
+        t.abs()
+            .max()
+            .into_data_async()
+            .await
+            .expect("grad readback")
+            .to_vec::<f32>()
+            .expect("f32 grad")[0]
+    }
+
+    async fn opacity_absmax(splats: &Splats, grads: &Gradients) -> f32 {
+        match splats.raw_opacities.grad(grads) {
+            None => 0.0,
+            Some(g) => g
+                .abs()
+                .max()
+                .into_data_async()
+                .await
+                .expect("opacity grad readback")
+                .to_vec::<f32>()
+                .expect("f32 opacity grad")[0],
+        }
+    }
+
+    /// Render the per-gaussian normal image the training loop builds, in the
+    /// camera frame. Mirrors the `use_normal_render` block of `step()`.
+    async fn render_camera_normals(splats: &Splats, camera: &Camera) -> Tensor<3> {
+        let device = splats.device();
+        let transforms = splats.transforms.val();
+        let normals = splat_normals(transforms.clone(), camera.position);
+        let img = render_splat_features(
+            transforms,
+            splats.raw_opacities.val(),
+            normals,
+            camera,
+            IMG,
+            SplatRenderMode::Default,
+        )
+        .await;
+
+        let alpha = img.clone().slice(s![.., .., 3..4]).detach();
+        let n_world = img.slice(s![.., .., 0..3]) / alpha.clamp_min(1e-10);
+        let n_len = n_world.clone().powi_scalar(2).sum_dim(2).sqrt().clamp_min(1e-6);
+        let n_world = n_world / n_len;
+
+        let rot = camera.world_to_local().matrix3;
+        let r_t: Tensor<2> = Tensor::<1>::from_floats(
+            [
+                rot.x_axis.x,
+                rot.x_axis.y,
+                rot.x_axis.z,
+                rot.y_axis.x,
+                rot.y_axis.y,
+                rot.y_axis.z,
+                rot.z_axis.x,
+                rot.z_axis.y,
+                rot.z_axis.z,
+            ],
+            &device,
+        )
+        .reshape([3, 3]);
+
+        let [h, w, _] = n_world.dims();
+        n_world
+            .reshape([(h * w) as i32, 3])
+            .matmul(r_t)
+            .reshape([h, w, 3])
+    }
+
+    /// The prior-normal loss must rotate gaussians and nothing else.
+    ///
+    /// `render_splat_features` detaches geometry internally and back-props into
+    /// the feature VALUES, and `splat_normals` detaches both discrete choices
+    /// (thinnest axis, camera-facing sign). So the only live path from this loss
+    /// back into the model is the quaternion, transforms columns 3..7 — not
+    /// means, not scales, not opacity. That is the contract this test guards.
+    #[tokio::test]
+    async fn normal_loss_moves_rotations_only() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = tilted_plane_splats(&device, 0.5);
+        let camera = test_camera();
+
+        let n_cam = render_camera_normals(&splats, &camera).await;
+
+        // Fronto-parallel prior everywhere: disagrees with the tilted splats, so
+        // the error and its gradient are nonzero.
+        let mut gt = vec![0.0f32; (IMG.y * IMG.x) as usize * 3];
+        for px in gt.chunks_exact_mut(3) {
+            px[2] = -1.0;
+        }
+        let gt = Tensor::<3>::from_data(
+            TensorData::new(gt, [IMG.y as usize, IMG.x as usize, 3]),
+            &device,
+        );
+
+        let loss = normal_loss(n_cam, gt);
+        let loss_val = loss
+            .clone()
+            .into_data_async()
+            .await
+            .expect("loss readback")
+            .to_vec::<f32>()
+            .expect("f32 loss")[0];
+        assert!(
+            loss_val > 1e-6 && loss_val.is_finite(),
+            "expected a real normal loss, got {loss_val}"
+        );
+
+        let grads = splats.bwd_validate(loss).await;
+        let transforms_grad = splats
+            .transforms
+            .grad(&grads)
+            .expect("normal loss must reach the transforms");
+
+        let rot_grad = absmax(transforms_grad.clone().slice(s![.., 3..7])).await;
+        assert!(
+            rot_grad > 1e-8,
+            "expected a nonzero rotation gradient, got {rot_grad}"
+        );
+
+        let mean_grad = absmax(transforms_grad.clone().slice(s![.., 0..3])).await;
+        assert!(
+            mean_grad < 1e-8,
+            "prior-normal loss must not move means, got {mean_grad}"
+        );
+
+        let scale_grad = absmax(transforms_grad.slice(s![.., 7..10])).await;
+        assert!(
+            scale_grad < 1e-8,
+            "prior-normal loss must not move scales, got {scale_grad}"
+        );
+
+        let opac_grad = opacity_absmax(&splats, &grads).await;
+        assert!(
+            opac_grad < 1e-8,
+            "prior-normal loss must not push opacity, got {opac_grad}"
+        );
+    }
+
+    /// The flatten term is a pressure on scales alone.
+    #[tokio::test]
+    async fn flatten_loss_touches_scales_only() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = tilted_plane_splats(&device, 0.0);
+
+        let scales = splats.transforms.val().slice(s![.., 7..10]).exp();
+        let loss = scales.min_dim(1).mean();
+
+        let grads = splats.bwd_validate(loss).await;
+        let transforms_grad = splats
+            .transforms
+            .grad(&grads)
+            .expect("flatten loss must reach the transforms");
+
+        let scale_grad = absmax(transforms_grad.clone().slice(s![.., 7..10])).await;
+        assert!(
+            scale_grad > 1e-8,
+            "expected a nonzero scale gradient, got {scale_grad}"
+        );
+
+        let other_grad = absmax(transforms_grad.slice(s![.., 0..7])).await;
+        assert!(
+            other_grad < 1e-8,
+            "flatten loss must not move means or rotations, got {other_grad}"
+        );
+
+        let opac_grad = opacity_absmax(&splats, &grads).await;
+        assert!(
+            opac_grad < 1e-8,
+            "flatten loss must not push opacity, got {opac_grad}"
+        );
+    }
+
+    /// Depth/normal consistency: finite loss on a real render, and a live
+    /// gradient path back into the rotations.
+    #[tokio::test]
+    async fn depth_normal_consistency_has_grad() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = tilted_plane_splats(&device, 0.5);
+        let camera = test_camera();
+
+        let out = render_splats_for_training(
+            splats.clone(),
+            &camera,
+            IMG,
+            glam::Vec3::ZERO,
+            false,
+            RasterizationMode::RgbaAndDepth,
+            false,
+        )
+        .await;
+
+        let [h, w, _] = out.img.dims();
+        let alpha = out.img.clone().slice(s![.., .., 3..4]).detach();
+        let expected_depth = (out.img.clone().slice(s![.., .., 4..5]) / alpha.clone().clamp_min(1e-10))
+            .reshape([h, w]);
+
+        let focal = camera.focal(IMG);
+        let center = camera.center(IMG);
+        let n_from_depth = normals_from_depth(expected_depth, focal.x, focal.y, center.x, center.y);
+
+        let n_cam = render_camera_normals(&splats, &camera).await;
+        let loss = depth_normal_loss(n_from_depth, n_cam, alpha);
+
+        let loss_val = loss
+            .clone()
+            .into_data_async()
+            .await
+            .expect("loss readback")
+            .to_vec::<f32>()
+            .expect("f32 loss")[0];
+        assert!(
+            loss_val.is_finite() && loss_val > 1e-6,
+            "expected a real consistency loss on a tilted plane, got {loss_val}"
+        );
+
+        let grads = splats.bwd_validate(loss).await;
+        let transforms_grad = splats
+            .transforms
+            .grad(&grads)
+            .expect("consistency loss must reach the transforms");
+        let rot_grad = absmax(transforms_grad.slice(s![.., 3..7])).await;
+        assert!(
+            rot_grad > 1e-8,
+            "expected a nonzero rotation gradient, got {rot_grad}"
+        );
+    }
+
+    /// A fronto-parallel slab must report near-zero disagreement: this is the
+    /// sign/orientation check for the whole chain (splat normal -> rendered
+    /// feature -> camera frame -> depth-derived normal).
+    #[tokio::test]
+    async fn flat_slab_agrees_with_its_own_depth() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = tilted_plane_splats(&device, 0.0);
+        let camera = test_camera();
+
+        let out = render_splats_for_training(
+            splats.clone(),
+            &camera,
+            IMG,
+            glam::Vec3::ZERO,
+            false,
+            RasterizationMode::RgbaAndDepth,
+            false,
+        )
+        .await;
+        let [h, w, _] = out.img.dims();
+        let alpha = out.img.clone().slice(s![.., .., 3..4]).detach();
+        let expected_depth = (out.img.clone().slice(s![.., .., 4..5]) / alpha.clone().clamp_min(1e-10))
+            .reshape([h, w]);
+
+        let focal = camera.focal(IMG);
+        let center = camera.center(IMG);
+        let n_from_depth = normals_from_depth(expected_depth, focal.x, focal.y, center.x, center.y);
+        let n_cam = render_camera_normals(&splats, &camera).await;
+
+        let loss = depth_normal_loss(n_from_depth, n_cam, alpha)
+            .into_data_async()
+            .await
+            .expect("loss readback")
+            .to_vec::<f32>()
+            .expect("f32 loss")[0];
+        assert!(
+            loss < 0.05,
+            "a flat slab must agree with its own depth, got {loss}"
+        );
     }
 }

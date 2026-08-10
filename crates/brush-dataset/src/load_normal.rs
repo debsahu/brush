@@ -12,7 +12,7 @@ use tokio::io::AsyncReadExt;
 /// as `[H, W, 3]` in row-major, channel-interleaved order.
 ///
 /// Convention (must match whatever writes the priors):
-/// - normals live in the **camera frame**, OpenCV axes (+X right, +Y down,
+/// - normals live in the **camera frame**, `OpenCV` axes (+X right, +Y down,
 ///   +Z forward),
 /// - unit length, oriented toward the camera (`n.z <= 0`),
 /// - `(0, 0, 0)` marks an invalid / unobserved pixel.
@@ -122,7 +122,7 @@ mod tests {
     use std::io::Cursor;
     use tiff::encoder::{TiffEncoder, colortype};
 
-    /// Encode `[H, W, 3]` f32 samples as an uncompressed RGB32Float TIFF.
+    /// Encode `[H, W, 3]` f32 samples as an uncompressed `RGB32Float` TIFF.
     fn encode_rgb_f32(values: &[f32], w: u32, h: u32) -> Vec<u8> {
         let mut buf = Cursor::new(Vec::new());
         {
