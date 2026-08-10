@@ -31,7 +31,7 @@ use burn::{
         tensor::{FloatTensor, IntTensor},
         wgpu::WgpuRuntime,
     },
-    tensor::{DType, Int, Shape, Tensor},
+    tensor::{DType, Int, Shape, Tensor, s},
 };
 use burn_cubecl::{
     CubeRuntime, fusion::FusionCubeRuntime, kernel::into_contiguous, tensor::CubeTensor,
@@ -1708,6 +1708,114 @@ pub fn depth_loss(pred_depth: Tensor<2>, gt_depth: Tensor<2>) -> Tensor<1> {
     abs_err.sum() / valid.sum().clamp_min(1.0)
 }
 
+/// L1 loss between a rendered camera-frame normal image and an external normal
+/// prior, both `[H, W, 3]`.
+///
+/// Validity follows the prior: a pixel counts when `|gt| > 0.5`, i.e. the writer
+/// stored a unit normal there. `(0, 0, 0)` marks "no prior" and is skipped, the
+/// same contract `depth_loss` uses for `gt <= 0`. The mean is over valid
+/// pixels × 3 channels, with the denominator clamped so an all-invalid frame
+/// yields 0 rather than NaN.
+///
+/// L1 (not `1 - cos`) matches DN-Splatter's default normal loss.
+pub fn normal_loss(pred_normal: Tensor<3>, gt_normal: Tensor<3>) -> Tensor<1> {
+    let gt_len = gt_normal.clone().powi_scalar(2).sum_dim(2).sqrt();
+    let valid = gt_len.greater_elem(0.5).float();
+
+    let abs_err = (pred_normal - gt_normal).abs().sum_dim(2) * valid.clone();
+
+    abs_err.sum() / valid.sum().mul_scalar(3.0).clamp_min(1.0)
+}
+
+/// Surface normals derived from a depth map by unprojecting to camera-frame
+/// points and taking finite differences, `[H, W]` -> `[H, W, 3]`.
+///
+/// `P(u, v) = z * ((u - cx) / fx, (v - cy) / fy, 1)` in the OpenCV camera frame
+/// (+X right, +Y down, +Z forward); the normal is
+/// `normalize(dP/dv × dP/du)`, whose sign is camera-facing (`n.z <= 0`) for any
+/// depth graph — no data-dependent flip is needed. Forward differences, so the
+/// LAST row and column are invalid and emit `(0, 0, 0)`, as does any pixel whose
+/// three contributing depths are not all positive.
+///
+/// Differentiable through `depth`; the intrinsics are constants.
+pub fn normals_from_depth(depth: Tensor<2>, fx: f32, fy: f32, cx: f32, cy: f32) -> Tensor<3> {
+    let [h, w] = depth.dims();
+    let device = depth.device();
+
+    if h < 2 || w < 2 {
+        return Tensor::zeros([h, w, 3], &device);
+    }
+
+    // Pixel-centre grids. Built host-side (no `arange` in this burn rev) and
+    // broadcast against the depth map.
+    let us: Vec<f32> = (0..w).map(|u| (u as f32 - cx) / fx).collect();
+    let vs: Vec<f32> = (0..h).map(|v| (v as f32 - cy) / fy).collect();
+    let a_u: Tensor<2> = Tensor::<1>::from_floats(us.as_slice(), &device).reshape([1, w]);
+    let b_v: Tensor<2> = Tensor::<1>::from_floats(vs.as_slice(), &device).reshape([h, 1]);
+
+    let px = depth.clone() * a_u;
+    let py = depth.clone() * b_v;
+    let pz = depth.clone();
+    let p: Tensor<3> = Tensor::cat(
+        vec![px.reshape([h, w, 1]), py.reshape([h, w, 1]), pz.reshape([h, w, 1])],
+        2,
+    );
+
+    let base = p.clone().slice(s![0..h - 1, 0..w - 1, ..]);
+    let du = p.clone().slice(s![0..h - 1, 1..w, ..]) - base.clone();
+    let dv = p.slice(s![1..h, 0..w - 1, ..]) - base;
+
+    let comp = |t: &Tensor<3>, c: usize| t.clone().slice(s![.., .., c..c + 1]);
+    let (dux, duy, duz) = (comp(&du, 0), comp(&du, 1), comp(&du, 2));
+    let (dvx, dvy, dvz) = (comp(&dv, 0), comp(&dv, 1), comp(&dv, 2));
+
+    // dP/dv × dP/du: already camera-facing for a depth graph (a fronto-parallel
+    // plane gives exactly (0, 0, -1)).
+    let cx_ = dvy.clone() * duz.clone() - dvz.clone() * duy.clone();
+    let cy_ = dvz * dux.clone() - dvx.clone() * duz;
+    let cz = dvx * duy - dvy * dux;
+    let cross: Tensor<3> = Tensor::cat(vec![cx_, cy_, cz], 2);
+
+    let len = cross.clone().powi_scalar(2).sum_dim(2).sqrt();
+    let normal = cross / len.clone().clamp_min(1e-12);
+
+    // A degenerate (zero-length) cross product carries no orientation.
+    let finite = len.greater_elem(1e-12).float();
+    // All three contributing depths must be real measurements.
+    let d_pos = depth.clone().greater_elem(0.0).float().reshape([h, w, 1]);
+    let valid = d_pos.clone().slice(s![0..h - 1, 0..w - 1, ..])
+        * d_pos.clone().slice(s![0..h - 1, 1..w, ..])
+        * d_pos.slice(s![1..h, 0..w - 1, ..])
+        * finite;
+
+    let interior = normal * valid;
+
+    Tensor::zeros([h, w, 3], &device).slice_assign(s![0..h - 1, 0..w - 1, ..], interior)
+}
+
+/// Depth/normal consistency: `1 - dot` between normals derived from the
+/// rendered depth and the rendered per-gaussian normals (PlanarGS `L_dn`).
+///
+/// `alpha` is `[H, W, 1]` and is expected to arrive already detached — the
+/// consistency term must not be able to lower its error by changing
+/// transparency, exactly like the depth loss's detached denominator. Pixels
+/// with `alpha <= 0.5`, or with either normal invalid, are skipped.
+pub fn depth_normal_loss(
+    normal_from_depth: Tensor<3>,
+    normal_rendered: Tensor<3>,
+    alpha: Tensor<3>,
+) -> Tensor<1> {
+    let covered = alpha.greater_elem(0.5).float();
+    let len_d = normal_from_depth.clone().powi_scalar(2).sum_dim(2).sqrt();
+    let len_r = normal_rendered.clone().powi_scalar(2).sum_dim(2).sqrt();
+    let valid = covered * len_d.greater_elem(0.5).float() * len_r.greater_elem(0.5).float();
+
+    let dot = (normal_from_depth * normal_rendered).sum_dim(2);
+    let err = dot.neg().add_scalar(1.0) * valid.clone();
+
+    err.sum() / valid.sum().clamp_min(1.0)
+}
+
 /// Decode `gt_packed` back to a `[H, W, 3]` f32 RGB tensor. `composite_bg =
 /// Some(bg)` folds in `gt + (1 - gt.a) * bg`; `None` skips that math.
 /// Materialising f32 GT defeats the whole point of the packed format, so
@@ -1930,5 +2038,174 @@ mod tests {
             &saved_grad[alpha_offset..],
             "alpha VJP must remain bit-identical"
         );
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod normal_loss_tests {
+    use super::*;
+    use burn::tensor::TensorData;
+
+    const W: usize = 8;
+    const H: usize = 6;
+    const FX: f32 = 120.0;
+    const FY: f32 = 110.0;
+    const CX: f32 = W as f32 / 2.0;
+    const CY: f32 = H as f32 / 2.0;
+
+    async fn device() -> burn::tensor::Device {
+        brush_cube::test_helpers::test_device().await.into()
+    }
+
+    async fn read<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+        t.into_data_async()
+            .await
+            .expect("tensor readback")
+            .to_vec::<f32>()
+            .expect("f32 tensor")
+    }
+
+    /// Interior pixels of a constant-depth map must give exactly (0, 0, -1),
+    /// and the forward-difference border must be marked invalid.
+    #[tokio::test]
+    async fn fronto_parallel_plane_gives_minus_z() {
+        let device = device().await;
+        let depth = Tensor::<2>::ones([H, W], &device) * 2.0;
+        let normals = read(normals_from_depth(depth, FX, FY, CX, CY)).await;
+
+        for v in 0..H {
+            for u in 0..W {
+                let i = (v * W + u) * 3;
+                let n = [normals[i], normals[i + 1], normals[i + 2]];
+                if v + 1 == H || u + 1 == W {
+                    assert_eq!(n, [0.0, 0.0, 0.0], "border ({u},{v}) must be invalid");
+                } else {
+                    assert!(n[0].abs() < 1e-5, "nx at ({u},{v}) = {}", n[0]);
+                    assert!(n[1].abs() < 1e-5, "ny at ({u},{v}) = {}", n[1]);
+                    assert!((n[2] + 1.0).abs() < 1e-5, "nz at ({u},{v}) = {}", n[2]);
+                }
+            }
+        }
+    }
+
+    /// A plane `z = z0 + a * x_cam` has the closed-form camera-frame normal
+    /// `(a, 0, -1) / sqrt(1 + a^2)`. The finite-difference estimator must
+    /// recover it (exactly, up to float error: the plane is linear in the
+    /// unprojected coordinates the differences are taken in).
+    #[tokio::test]
+    async fn slanted_plane_matches_the_closed_form_normal() {
+        let device = device().await;
+        let (z0, a) = (3.0f32, 0.35f32);
+
+        let mut depth = vec![0.0f32; H * W];
+        for v in 0..H {
+            for u in 0..W {
+                let a_u = (u as f32 - CX) / FX;
+                depth[v * W + u] = z0 / (1.0 - a * a_u);
+            }
+        }
+        let depth = Tensor::<2>::from_data(TensorData::new(depth, [H, W]), &device);
+        let normals = read(normals_from_depth(depth, FX, FY, CX, CY)).await;
+
+        let inv = 1.0 / (1.0 + a * a).sqrt();
+        let want = [a * inv, 0.0, -inv];
+        for v in 0..H - 1 {
+            for u in 0..W - 1 {
+                let i = (v * W + u) * 3;
+                for c in 0..3 {
+                    assert!(
+                        (normals[i + c] - want[c]).abs() < 1e-4,
+                        "n[{c}] at ({u},{v}) = {}, want {}",
+                        normals[i + c],
+                        want[c]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Non-positive depths carry no geometry, so anything touching them is
+    /// invalid.
+    #[tokio::test]
+    async fn non_positive_depth_is_invalid() {
+        let device = device().await;
+        let mut depth = vec![2.0f32; H * W];
+        depth[2 * W + 3] = 0.0;
+        let depth = Tensor::<2>::from_data(TensorData::new(depth, [H, W]), &device);
+        let normals = read(normals_from_depth(depth, FX, FY, CX, CY)).await;
+
+        // The hole itself and the two pixels whose forward differences read it.
+        for (u, v) in [(3usize, 2usize), (2, 2), (3, 1)] {
+            let i = (v * W + u) * 3;
+            assert_eq!(
+                [normals[i], normals[i + 1], normals[i + 2]],
+                [0.0, 0.0, 0.0],
+                "({u},{v}) must be invalid"
+            );
+        }
+        // A pixel far from the hole is unaffected.
+        let i = (0 * W + 0) * 3;
+        assert!((normals[i + 2] + 1.0).abs() < 1e-5);
+    }
+
+    /// `normal_loss` averages |pred - gt| over valid pixels x 3 channels, and
+    /// skips `(0,0,0)` prior pixels entirely.
+    #[tokio::test]
+    async fn normal_loss_masks_invalid_prior_pixels() {
+        let device = device().await;
+        // 2 pixels: one valid prior (0,0,-1), one invalid (0,0,0).
+        let gt = Tensor::<3>::from_data(
+            TensorData::new(vec![0.0, 0.0, -1.0, 0.0, 0.0, 0.0], [1, 2, 3]),
+            &device,
+        );
+        // Predictions differ on BOTH pixels; only the first may count.
+        let pred = Tensor::<3>::from_data(
+            TensorData::new(vec![0.0, 0.3, -1.0, 5.0, 5.0, 5.0], [1, 2, 3]),
+            &device,
+        );
+
+        let loss = read(normal_loss(pred, gt)).await[0];
+        // |0.3| spread over 1 valid pixel * 3 channels.
+        assert!((loss - 0.1).abs() < 1e-6, "loss = {loss}");
+    }
+
+    /// An all-invalid prior yields 0, not NaN.
+    #[tokio::test]
+    async fn normal_loss_is_zero_with_no_valid_prior() {
+        let device = device().await;
+        let gt = Tensor::<3>::zeros([1, 2, 3], &device);
+        let pred = Tensor::<3>::ones([1, 2, 3], &device);
+        let loss = read(normal_loss(pred, gt)).await[0];
+        assert_eq!(loss, 0.0);
+    }
+
+    /// `depth_normal_loss` is 0 when the two normal fields agree, 2 when they
+    /// are opposed, and ignores uncovered pixels.
+    #[tokio::test]
+    async fn depth_normal_loss_scores_agreement_under_the_alpha_mask() {
+        let device = device().await;
+        let n_d = Tensor::<3>::from_data(
+            TensorData::new(vec![0.0, 0.0, -1.0, 0.0, 0.0, -1.0], [1, 2, 3]),
+            &device,
+        );
+        let n_r = Tensor::<3>::from_data(
+            TensorData::new(vec![0.0, 0.0, -1.0, 0.0, 0.0, 1.0], [1, 2, 3]),
+            &device,
+        );
+
+        // Both pixels covered: mean of (1 - 1) and (1 - (-1)) = 1.0.
+        let alpha = Tensor::<3>::ones([1, 2, 1], &device);
+        let both = read(depth_normal_loss(n_d.clone(), n_r.clone(), alpha)).await[0];
+        assert!((both - 1.0).abs() < 1e-6, "both = {both}");
+
+        // Only the agreeing pixel covered: 0.
+        let alpha = Tensor::<3>::from_data(TensorData::new(vec![1.0, 0.0], [1, 2, 1]), &device);
+        let first = read(depth_normal_loss(n_d.clone(), n_r.clone(), alpha)).await[0];
+        assert!(first.abs() < 1e-6, "first = {first}");
+
+        // Nothing covered: 0, not NaN.
+        let alpha = Tensor::<3>::zeros([1, 2, 1], &device);
+        let none = read(depth_normal_loss(n_d, n_r, alpha)).await[0];
+        assert_eq!(none, 0.0);
     }
 }
