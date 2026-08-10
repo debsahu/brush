@@ -20,10 +20,28 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::trace_span;
 
+/// Build stamp for this fork.
+///
+/// Upstream's bare `version` reports only `CARGO_PKG_VERSION`, so a stock Brush
+/// build and an EarthByte build are indistinguishable, as are two fork builds
+/// from different commits. This carries three things instead: the upstream crate
+/// version, a fork marker, and the exact `git describe` the binary was built
+/// from (suffixed `-dirty` when the tree had uncommitted changes).
+///
+/// Deliberately NOT a bump of `version` in `Cargo.toml`: that field is shared
+/// with upstream and would conflict on every merge, whereas this is additive.
+/// `BRUSH_BUILD_ID` comes from `build.rs`.
+const BRUSH_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "-earthbyte (",
+    env!("BRUSH_BUILD_ID"),
+    ")"
+);
+
 #[derive(Parser)]
 #[command(
     author,
-    version,
+    version = BRUSH_VERSION,
     arg_required_else_help = false,
     about = "Brush - universal splats"
 )]
