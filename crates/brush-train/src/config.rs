@@ -467,6 +467,10 @@ pub struct TrainConfig {
     /// geometry that has barely formed. Counts GLOBAL iterations, so a resumed
     /// run does not restart the countdown. 0 = never gate (previous behaviour).
     ///
+    /// Counting globally also means the gate does NOT re-close at an LOD
+    /// transition, even though the trainer is re-seeded there. That is
+    /// deliberate — by then the geometry it was waiting for exists.
+    ///
     /// Note the asymmetry: `--flatten-loss-weight` deliberately has NO such
     /// gate, because DN-Splatter runs the identical scale term ungated at 1.0
     /// from step 0.
@@ -483,6 +487,13 @@ pub struct TrainConfig {
     /// average; the data term cannot see that and this can. Since textureless
     /// walls are the reason these priors exist, this is the load-bearing one.
     /// 0 disables.
+    ///
+    /// CAVEAT on 0.5: DN-Splatter's RELEASED CODE never applies its
+    /// `normal_lambda`, so the runs behind their tables used smoothness:data at
+    /// 1:1, not 5:1. Our TV is also a pooled per-element mean where theirs is
+    /// `mean(|h|) + mean(|w|)` (~2x) and the paper normalises per-pixel (~3x), so
+    /// the same number does not mean the same strength. Order of magnitude to
+    /// sweep, not a validated setting.
     #[arg(long, help_heading = "Training options", default_value = "0.0")]
     #[serde(default)]
     pub normal_smooth_weight: f32,

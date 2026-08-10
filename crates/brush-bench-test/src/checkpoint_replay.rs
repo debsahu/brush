@@ -203,6 +203,12 @@ mod native {
             let current = splats.take().expect("replay always restores splats");
             let differentiable = lift_splats_to_autodiff(current);
             let (updated, stats) = trainer
+                // This replay trainer's OWN cumulative step, not the iteration
+                // the checkpoint was originally trained at. Correct for the
+                // gates as they stand (replay uses `TrainConfig::default()`, so
+                // `--depth-normal-start-iter` is inert here), but if a replay
+                // ever wants to exercise an iteration gate it needs the
+                // checkpoint's real clock, not this one.
                 .step_with_refine_weight(
                     batch,
                     differentiable,

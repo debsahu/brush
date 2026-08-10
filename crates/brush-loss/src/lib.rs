@@ -1836,6 +1836,18 @@ pub fn depth_normal_loss(
 /// smoothing that boundary is exactly backwards. Same validity contract as
 /// `depth_normal_loss`.
 ///
+/// The masking is load-bearing, not cosmetic: the caller builds this image as
+/// `normal_img / alpha.clamp_min(1e-10)` and then unit-normalises it, so an
+/// uncovered pixel holds amplified numerical noise pointing in an arbitrary
+/// direction — not a benign background colour. Plain TV would push that garbage
+/// into every silhouette-adjacent covered pixel. Note the mask drops only
+/// covered↔uncovered differences; covered↔covered ones still count right up to
+/// the edge, so smoothing survives where the noise actually is.
+///
+/// The `|n| > 0.5` validity check is near-vacuous for that caller (the input is
+/// already unit-length wherever alpha is high) and is kept for contract parity
+/// with `depth_normal_loss`, where it does real work on depth-derived normals.
+///
 /// `alpha` is `[H, W, 1]` and is expected to arrive already detached, so the term
 /// cannot lower its error by changing transparency.
 pub fn normal_smooth_loss(normal: Tensor<3>, alpha: Tensor<3>) -> Tensor<1> {
@@ -2260,5 +2272,76 @@ mod normal_loss_tests {
         let alpha = Tensor::<3>::zeros([1, 2, 1], &device);
         let none = read(depth_normal_loss(n_d, n_r, alpha)).await[0];
         assert_eq!(none, 0.0);
+    }
+
+    /// Hand-computed TV on a 2x3 grid of unit normals, all covered.
+    /// Row diffs (1x3): col1 = |(0,0,1)-(0,1,0)| = 2, others 0. count 3.
+    /// Col diffs (2x2): row0: 0, 2; row1: 2, 2. count 4.
+    /// err = 8, denom = (3+4)*3 = 21.
+    #[tokio::test]
+    async fn normal_smooth_loss_matches_hand_computed_tv() {
+        let device = device().await;
+        #[rustfmt::skip]
+        let n = Tensor::<3>::from_data(
+            TensorData::new(vec![
+                0.0, 0.0, 1.0,   0.0, 0.0, 1.0,   1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0,   0.0, 1.0, 0.0,   1.0, 0.0, 0.0,
+            ], [2, 3, 3]),
+            &device,
+        );
+        let alpha = Tensor::<3>::ones([2, 3, 1], &device);
+        let loss = read(normal_smooth_loss(n, alpha)).await[0];
+        assert!((loss - 8.0 / 21.0).abs() < 1e-6, "loss = {loss}");
+    }
+
+    /// Uncovering pixel (1,1) must drop every difference that touches it:
+    /// row count 3->2 (err 0), col count 4->2 (err 2). loss = 2/(4*3).
+    #[tokio::test]
+    async fn normal_smooth_loss_drops_diffs_touching_uncovered_pixels() {
+        let device = device().await;
+        #[rustfmt::skip]
+        let n = Tensor::<3>::from_data(
+            TensorData::new(vec![
+                0.0, 0.0, 1.0,   0.0, 0.0, 1.0,   1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0,   0.0, 1.0, 0.0,   1.0, 0.0, 0.0,
+            ], [2, 3, 3]),
+            &device,
+        );
+        let alpha = Tensor::<3>::from_data(
+            TensorData::new(vec![1.0, 1.0, 1.0, 1.0, 0.0, 1.0], [2, 3, 1]),
+            &device,
+        );
+        let loss = read(normal_smooth_loss(n, alpha)).await[0];
+        assert!((loss - 2.0 / 12.0).abs() < 1e-6, "loss = {loss}");
+    }
+
+    /// Zero-length (invalid) normals are skipped even when covered, and an
+    /// all-invalid frame yields 0, not NaN. A 1-pixel-tall frame returns 0.
+    #[tokio::test]
+    async fn normal_smooth_loss_edge_cases() {
+        let device = device().await;
+        // Covered but zero-length normal at (0,1) of a 2x2 grid.
+        #[rustfmt::skip]
+        let n = Tensor::<3>::from_data(
+            TensorData::new(vec![
+                0.0, 0.0, 1.0,   0.0, 0.0, 0.0,
+                0.0, 0.0, 1.0,   1.0, 0.0, 0.0,
+            ], [2, 2, 3]),
+            &device,
+        );
+        let alpha = Tensor::<3>::ones([2, 2, 1], &device);
+        // Valid diffs: row col0 (0), col row1 |(0,0,1)-(1,0,0)|=2. counts: row 1, col 1.
+        let loss = read(normal_smooth_loss(n, alpha)).await[0];
+        assert!((loss - 2.0 / 6.0).abs() < 1e-6, "loss = {loss}");
+
+        // Nothing covered: 0, not NaN.
+        let n2 = Tensor::<3>::ones([2, 2, 3], &device);
+        let a2 = Tensor::<3>::zeros([2, 2, 1], &device);
+        assert_eq!(read(normal_smooth_loss(n2, a2)).await[0], 0.0);
+
+        // Degenerate frame: too small for any difference.
+        let n3 = Tensor::<3>::ones([1, 5, 3], &device);
+        let a3 = Tensor::<3>::ones([1, 5, 1], &device);
+        assert_eq!(read(normal_smooth_loss(n3, a3)).await[0], 0.0);
     }
 }
