@@ -853,7 +853,13 @@ pub struct TrainConfig {
     /// Depth-opacity-reg softness: the width of the sigmoid ramp (in depth
     /// units) over which the penalty weight climbs from ~0 to ~1 as a Gaussian
     /// moves further in front of the surface. Smaller = sharper on/off boundary.
-    #[arg(long, help_heading = "TIDI options", default_value = "0.1")]
+    /// MUST stay `≪ margin`: the ramp is centred at `r = -margin` (p = 0.5
+    /// there), so `softness ≪ margin` is what keeps the penalty near 0 at the
+    /// surface (`r = 0`) and stops it fading correctly-reconstructed walls. At
+    /// the default 0.015 vs margin 0.05, `p(r=0) ≈ 0.034`. A `softness > margin`
+    /// would penalize on-surface splats at ~38% of full — do not set it there.
+    /// (Pass BOTH larger for a non-metric dataset, but keep this relationship.)
+    #[arg(long, help_heading = "TIDI options", default_value = "0.015")]
     #[serde(default = "default_depth_opacity_reg_softness")]
     pub depth_opacity_reg_softness: f32,
 }
@@ -1007,7 +1013,7 @@ fn default_depth_opacity_reg_margin() -> f32 {
     0.05
 }
 fn default_depth_opacity_reg_softness() -> f32 {
-    0.1
+    0.015
 }
 fn default_tidi_global_cap_frac() -> f32 {
     0.002
@@ -1218,7 +1224,13 @@ mod tests {
             "depth-opacity-reg must be off (weight 0) by default"
         );
         assert!((def.depth_opacity_reg_margin - 0.05).abs() < 1e-9);
-        assert!((def.depth_opacity_reg_softness - 0.1).abs() < 1e-9);
+        // softness MUST default to << margin so the ramp reaches ~0 by the
+        // surface (r=0); 0.015 vs margin 0.05 gives p(0) ~ 0.034 (BUG A).
+        assert!((def.depth_opacity_reg_softness - 0.015).abs() < 1e-9);
+        assert!(
+            def.depth_opacity_reg_softness < def.depth_opacity_reg_margin,
+            "softness must stay below margin or the ramp fades on-surface splats"
+        );
 
         // Unrelated flags must not switch it on.
         let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])

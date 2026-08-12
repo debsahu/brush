@@ -23,7 +23,7 @@
 //! Design decisions where the paper and the Brush internals had to be
 //! reconciled are called out inline with `NOTE:`.
 
-use brush_render::burn_glue::{detach_autodiff, match_backend};
+use brush_render::burn_glue::detach_autodiff;
 use brush_render::camera::Camera;
 use brush_render::kernels::camera_model::CameraModel;
 use burn::{
@@ -285,11 +285,13 @@ impl TidiState {
             return;
         }
 
-        // Everything runs on the accumulators' (inner) device; the shared
-        // projection detaches the means off the autodiff graph and moves them
-        // there, so no graph is retained and the elementwise math never touches a
-        // mismatched backend.
+        // Everything runs on the accumulators' (inner) device. `detach_autodiff`
+        // drops the means to the INNER backend (no graph retained) and places
+        // them on that device; the shared projection then builds gt/R/t there
+        // too, so the whole prune-path projection stays inner-kind — matching the
+        // inner accumulators it feeds.
         let device = self.valid_accum.device();
+        let means = detach_autodiff(means).to_device(&device);
         let Some((residual, valid)) =
             project_depth_residual(means, gt_depth, camera, img_size, &device)
         else {
@@ -522,19 +524,26 @@ impl TidiState {
 
 /// Shared pinhole projection + GT-depth lookup for BOTH depth-driven paths: the
 /// hard `accumulate_depth` prune counter and the smooth `depth_opacity_reg_loss`
-/// regularizer. Both need the identical geometry, so the projection lives here
-/// once.
+/// regularizer. Both need the identical geometry, so the MATH lives here once.
 ///
-/// Detaches `means` off the autodiff graph, moves everything to `device`,
-/// projects each Gaussian centre into the view, reads the GT depth `Z̃` at the
+/// The BACKEND is the caller's responsibility, because the two paths run on
+/// different backends and mixing them panics: the prune path detaches onto the
+/// INNER backend (its accumulators live there), while the loss path stays on the
+/// AUTODIFF backend (it multiplies the live opacity leaf). So the caller must
+/// grad-stop `means` and place it on `device`'s backend BEFORE calling — the
+/// prune path via `detach_autodiff(..).to_device(inner)`, the loss path via
+/// `means.detach()` (autodiff-native, grad-stopped, same backend). This helper
+/// builds `gt` / R / t on `device` and does the projection on `means` directly,
+/// so every tensor stays on `means`'s backend end to end.
+///
+/// Projects each Gaussian centre into the view, reads the GT depth `Z̃` at the
 /// projected pixel, and returns:
 ///   * `residual` `[N]` — the signed camera-space depth residual `r_i = z_i - Z̃`
 ///     (< -margin means the Gaussian floats in FRONT of the measured surface);
 ///   * `valid`    `[N]` — true where the projection is in-frame, in front of the
 ///     camera (`z > 0`), and lands on a finite positive depth return.
-/// The returned tensors are DETACHED (no autodiff node): the depth-residual math
-/// never needs a gradient through position. Callers guard pinhole themselves
-/// (each owns its warning); this returns `None` only for an empty depth map.
+/// Callers guard pinhole themselves (each owns its warning); this returns `None`
+/// only for an empty depth map.
 ///
 /// PROJECTION: the world→camera transform is Brush's own [`Camera::world_to_local`];
 /// the pixel projection is the pinhole model (matching
@@ -548,11 +557,9 @@ fn project_depth_residual(
     img_size: glam::UVec2,
     device: &Device,
 ) -> Option<(Tensor<1>, Tensor<1, Bool>)> {
-    // Detach the means off the autodiff graph and move them onto `device` so no
-    // graph is retained and the elementwise math never touches a mismatched
-    // backend.
-    let means = detach_autodiff(means).to_device(device);
-
+    // `means` arrives already grad-stopped and on `device`'s backend (see the
+    // doc above). Build gt + R + t on the SAME `device` so the whole projection
+    // stays on that one backend.
     let gt = Tensor::<2>::from_data(gt_depth, device);
     let [h, w] = gt.dims();
     if h == 0 || w == 0 {
@@ -605,7 +612,14 @@ fn project_depth_residual(
         .lower_elem(0.0)
         .bool_not()
         .bool_and(vr.clone().greater_elem((h - 1) as f32).bool_not());
-    let in_frame = in_front.bool_and(in_x).bool_and(in_y);
+    // Defensive finite gate on u/v: a `0 · ∞` (mean at x=0 AND z=0) or any other
+    // degenerate projection yields NaN u/v, and `NaN < 0` / `NaN > w-1` are both
+    // false, so `in_x`/`in_y` would spuriously read TRUE. Excluding non-finite
+    // u/v keeps such a row OUT of `valid`, which is what both callers rely on for
+    // NaN-safety (the loss path's penalty substitution and the prune path's
+    // bool_and both assume a NaN row is never valid).
+    let uv_finite = ur.clone().is_finite().bool_and(vr.clone().is_finite());
+    let in_frame = in_front.bool_and(in_x).bool_and(in_y).bool_and(uv_finite);
 
     // Flat pixel index (row-major, row = v = y, col = u = x). Clamp to a valid
     // range so the gather is always in-bounds even for the masked-out (NaN /
@@ -629,6 +643,45 @@ fn project_depth_residual(
     Some((residual, valid))
 }
 
+/// The DETACHED per-Gaussian float penalty weight `p_i` for the smooth opacity
+/// regularizer. Two properties the sibling prune path does not need but this one
+/// does, both verified by unit tests:
+///
+///  * RAMP CENTERING. `p_i = σ((-r_i - margin) / softness)` — 0.5 exactly at the
+///    margin boundary `r = -margin`, → 1 as the Gaussian floats further in
+///    front. For an on-surface splat (`r = 0`) NOT to be penalized, the ramp
+///    must reach ~0 by `r = 0`, which needs `softness ≪ margin` (with the
+///    defaults 0.05 / 0.015, `p(0) ≈ 0.034`). A `softness > margin` would fade
+///    correctly-reconstructed walls — hence the default relationship is pinned
+///    and unit-tested. `soft` is floored positive so a `0` never divides.
+///
+///  * NaN SAFETY. Invalid rows are zeroed by SUBSTITUTING a large positive
+///    residual BEFORE the sigmoid (not by multiplying the sigmoid output by the
+///    0/1 mask). A diverged mean gives a NaN residual, and `σ(NaN)·0 = NaN`
+///    (IEEE-754) would poison the whole shared scalar loss and every gradient
+///    this step. A NaN/inf residual is ALWAYS at an invalid row (a NaN `z`
+///    fails `z > 0`; the `uv_finite` gate in `project_depth_residual` excludes
+///    degenerate projections), so `mask_fill` on `!valid` replaces it with a
+///    finite value whose `σ` underflows to exactly 0. This mirrors the prune
+///    path's `bool_and(residual.lower_elem(..))`, where `NaN < x` is cleanly
+///    false. The trailing `· valid.float()` then pins invalid rows to EXACTLY 0.
+fn float_penalty(
+    residual: Tensor<1>,
+    valid: Tensor<1, Bool>,
+    margin: f32,
+    softness: f32,
+) -> Tensor<1> {
+    let soft = softness.max(1e-8);
+    // Substitute a large positive residual on invalid rows so a NaN/inf mean
+    // never reaches the sigmoid; `σ` of the resulting large-negative argument
+    // underflows to 0. `mask_fill` overwrites the value regardless of NaN.
+    let safe = residual.mask_fill(valid.clone().bool_not(), 1e4f32);
+    let p = sigmoid(safe.neg().sub_scalar(margin).div_scalar(soft));
+    // Pin invalid rows to EXACTLY 0 (belt-and-suspenders on top of the ~0 the
+    // substitution already yields). Multiply is now NaN-safe: `p` is finite.
+    p * valid.float()
+}
+
 /// Depth-coupled opacity regularizer — the SMOOTH, differentiable alternative to
 /// the hard `accumulate_depth`/depth-prune path. Instead of deleting a floating
 /// Gaussian (which orphans its load-bearing colour and leaves a black halo),
@@ -637,11 +690,18 @@ fn project_depth_residual(
 /// redistributes into on-surface Gaussians before they vanish.
 ///
 /// For every Gaussian projecting in front of a valid measured depth by more than
-/// `margin`, a DETACHED penalty weight
-/// `p_i = σ((-r_i - margin) / softness)` (a smooth ramp: ~0 on/behind the
-/// surface, → 1 as the Gaussian floats further in front), gated to 0 where the
-/// return is invalid, multiplies the ACTIVATED opacity `σ(raw_opacity_i)`. The
-/// term is `λ · mean_over_valid(p_i · σ(raw_opacity_i))`.
+/// `margin`, the DETACHED penalty weight `p_i` (see [`float_penalty`]) multiplies
+/// the ACTIVATED opacity `σ(raw_opacity_i)`. The term is
+/// `λ · mean_over_valid(p_i · σ(raw_opacity_i))`.
+///
+/// BACKEND: everything runs NATIVELY on the opacity leaf's autodiff backend,
+/// mirroring the Depth Disparity L1 loss (`train.rs`, which builds its gt via
+/// `Tensor::from_data(depth_data, &autodiff_device)`). `means.detach()` stops the
+/// gradient through position while STAYING on the autodiff backend — unlike
+/// `detach_autodiff`, which drops to the inner backend and then panics when
+/// multiplied against the autodiff opacity. So `residual` / `valid` / `p_i` are
+/// all autodiff-kind constants (no grad), `alpha` is autodiff WITH grad, and
+/// `p · alpha` is a clean autodiff×autodiff product — no cross-backend bridge.
 ///
 /// `raw_opacity` is the LIVE opacity leaf (`splats.raw_opacities.val()`), so it
 /// stays in the autodiff graph; `p_i` and the projection are detached. The only
@@ -651,8 +711,7 @@ fn project_depth_residual(
 ///
 /// Returns `None` (add no term) for an empty depth map, so the caller can skip
 /// cleanly. Pinhole is assumed — the caller guards non-pinhole + warns, mirroring
-/// the depth-prune and depth/normal terms. `softness` is floored to a tiny
-/// positive value so a `0` never divides.
+/// the depth-prune and depth/normal terms.
 pub fn depth_opacity_reg_loss(
     raw_opacity: Tensor<1>,
     means: Tensor<2>,
@@ -662,35 +721,25 @@ pub fn depth_opacity_reg_loss(
     margin: f32,
     softness: f32,
 ) -> Option<Tensor<1>> {
-    // Project on the opacity leaf's physical device. `project_depth_residual`
-    // detaches the means onto the INNER backend (the identical code the prune
-    // path runs), so `residual` / `valid` come back inner-kind and carry no
-    // gradient.
+    // Autodiff-native, mirroring the Depth Disparity L1 loss. `.detach()` stops
+    // the position gradient but STAYS on the autodiff backend (unlike
+    // `detach_autodiff`, which drops to the inner backend); `project_depth_residual`
+    // then builds gt/R/t on this same autodiff device via `Tensor::from_data`, so
+    // `residual`/`valid` are autodiff-kind and combine with the live opacity
+    // below with no bridging.
     let device = raw_opacity.device();
+    let means = means.detach();
     let (residual, valid) = project_depth_residual(means, gt_depth, camera, img_size, &device)?;
 
-    let valid_f = valid.float();
     // Mean over the valid set. `p_i` is ~0 for valid-but-on-surface Gaussians, so
     // they contribute ~0 to the numerator while still counting in the
     // denominator — a genuine mean over the constrained Gaussians. Floored at 1
     // so an all-invalid view (no valid returns) yields a 0 term, never a NaN.
-    let denom = valid_f.clone().sum().clamp_min(1.0);
+    let denom = valid.clone().float().sum().clamp_min(1.0);
 
-    // Detached smooth penalty weight: σ((-r - margin) / softness), 0 where the
-    // return is invalid. `p_i` inherits the detached projection (no gradient) and
-    // is still on the INNER backend at this point.
-    let soft = softness.max(1e-8);
-    let p = sigmoid(residual.neg().sub_scalar(margin).div_scalar(soft)) * valid_f;
-
-    // Bridge the detached penalty + denominator UP onto the opacity leaf's
-    // (autodiff) backend so they can combine with the live activated opacity
-    // without a cross-backend panic (project_depth_residual left them inner-kind
-    // for the prune path). `match_backend` lifts them as NO-GRAD constants when
-    // the reference (raw_opacity) is autodiff, so the ONLY gradient path is
-    // through `sigmoid(raw_opacity)` — mirroring how Brush folds the frozen
-    // 3D-filter floor against an autodiff param (see `match_backend`).
-    let p = match_backend(p, &raw_opacity);
-    let denom = match_backend(denom, &raw_opacity);
+    // Detached, NaN-safe smooth penalty weight (no gradient — built from the
+    // detached means + constant gt). See [`float_penalty`].
+    let p = float_penalty(residual, valid, margin, softness);
 
     // The ONLY graph-connected factor: the activated opacity of the live leaf.
     let alpha = sigmoid(raw_opacity);
@@ -1703,7 +1752,7 @@ mod device_tests {
         ))
         .require_grad();
 
-        let loss = depth_opacity_reg_loss(raw.clone(), means, gt, &camera, img, 0.05, 0.1)
+        let loss = depth_opacity_reg_loss(raw.clone(), means, gt, &camera, img, 0.05, 0.015)
             .expect("valid returns exist, so a term is produced");
         let grads = loss.backward();
         let g: Vec<f32> = raw
@@ -1735,5 +1784,89 @@ mod device_tests {
             g[2], 0.0,
             "a Gaussian over an unscanned pixel must get exactly zero opacity gradient"
         );
+    }
+
+    /// BUG A regression — ramp CENTERING. With the defaults `softness ≪ margin`,
+    /// the penalty must be ~0 at the surface (`r = 0`) so correctly-reconstructed
+    /// wall splats are NOT faded, exactly 0.5 at the margin boundary
+    /// (`r = -margin`), and ~0 just behind the surface. The old default
+    /// `softness > margin` gave `p(0) ≈ 0.38` and silently faded real geometry;
+    /// the earlier grad test only probed `r = +1` (a full metre behind) and so
+    /// missed this boundary — the boundary is the whole point of the term.
+    #[tokio::test]
+    async fn depth_opacity_reg_ramp_is_centered_on_margin() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let margin = 0.05f32;
+        let softness = 0.015f32;
+        // residuals: on-surface, at the ramp centre, just behind, floating far.
+        let residual = Tensor::<1>::from_data(
+            TensorData::new(vec![0.0f32, -margin, 0.05, -0.5], [4]),
+            &device,
+        );
+        let valid = Tensor::<1>::from_data(TensorData::new(vec![1.0f32; 4], [4]), &device)
+            .greater_elem(0.5);
+        let p: Vec<f32> = float_penalty(residual, valid, margin, softness)
+            .into_data_async()
+            .await
+            .expect("penalty readback")
+            .into_vec()
+            .expect("f32");
+        assert!(
+            p[0] < 0.05,
+            "on-surface (r=0) penalty must be <0.05 or it fades real walls, got {}",
+            p[0]
+        );
+        assert!(
+            (p[1] - 0.5).abs() < 1e-3,
+            "at the margin boundary (r=-margin) the ramp centre must be 0.5, got {}",
+            p[1]
+        );
+        assert!(
+            p[2] < 0.05,
+            "just-behind-surface (r=+0.05) penalty must be ~0, got {}",
+            p[2]
+        );
+        assert!(
+            p[3] > 0.95,
+            "a Gaussian floating far in front must be penalized near 1, got {}",
+            p[3]
+        );
+    }
+
+    /// BUG B regression — NaN SAFETY. A diverged mean gives a NaN residual at an
+    /// invalid row; `σ(NaN)·0 = NaN` (IEEE-754) would poison the whole shared
+    /// scalar loss and every gradient this step. `float_penalty` must substitute
+    /// the residual BEFORE the sigmoid so the invalid row is EXACTLY 0 and the
+    /// valid row is untouched — no NaN anywhere.
+    #[tokio::test]
+    async fn depth_opacity_reg_penalty_is_nan_safe() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        // Row 0: valid + floating. Row 1: invalid, with a NaN residual (diverged
+        // mean). Row 2: invalid, +inf residual. Both invalid rows must be 0.
+        let residual = Tensor::<1>::from_data(
+            TensorData::new(vec![-1.0f32, f32::NAN, f32::INFINITY], [3]),
+            &device,
+        );
+        let valid = Tensor::<1>::from_data(TensorData::new(vec![1.0f32, 0.0, 0.0], [3]), &device)
+            .greater_elem(0.5);
+        let p: Vec<f32> = float_penalty(residual, valid, 0.05, 0.015)
+            .into_data_async()
+            .await
+            .expect("penalty readback")
+            .into_vec()
+            .expect("f32");
+        assert!(
+            p.iter().all(|v| v.is_finite()),
+            "penalty must contain no NaN/inf, got {p:?}"
+        );
+        assert!(
+            p[0] > 0.5,
+            "the valid floating row must still be penalized, got {}",
+            p[0]
+        );
+        assert_eq!(p[1], 0.0, "an invalid NaN-residual row must be exactly 0");
+        assert_eq!(p[2], 0.0, "an invalid inf-residual row must be exactly 0");
     }
 }
