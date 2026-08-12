@@ -652,10 +652,13 @@ impl SplatTrainer {
         let device = splats.device();
 
         // TIDI-GS: allocate the floater-suppression state on the first step when
-        // enabled. `ω` is created on the autodiff device (it is a leaf that gets
-        // a photometric gradient each step); the count is kept in lockstep with
-        // the splats through `keep`/`split` at refine.
-        if self.config.tidi_prune && self.tidi.is_none() {
+        // EITHER the photometric (`--tidi-prune`) OR the depth
+        // (`--tidi-depth-prune`) path is enabled. `ω` is created on the autodiff
+        // device (it is a leaf that gets a photometric gradient each step, unused
+        // by the depth path); the counts are kept in lockstep with the splats
+        // through `keep`/`split` at refine. With NEITHER flag set the state is
+        // never allocated, so the whole family stays byte-inert.
+        if (self.config.tidi_prune || self.config.tidi_depth_prune) && self.tidi.is_none() {
             self.tidi = Some(TidiState::new(splats.num_splats(), global_iter, &device));
         }
         let has_alpha = batch.has_alpha;
@@ -1142,6 +1145,28 @@ impl SplatTrainer {
             )
             .await;
 
+            // TIDI depth / LiDAR-residual prune: fold THIS view's depth residual
+            // into the persistent float/valid counters (`TidiState::accumulate_depth`).
+            // Deliberately independent of `--depth-loss-weight` — it only reuses
+            // the same per-frame depth tensor the depth loss consumes, not the
+            // loss. No-op when the batch carries no depth (nerfstudio
+            // `depth: None`); a run that set `--tidi-depth-prune` with no depth at
+            // all warns once at prune time and stays inert.
+            if self.config.tidi_depth_prune
+                && let Some(depth_data) = &batch.depth
+            {
+                let margin = self.config.tidi_depth_margin;
+                if let Some(tidi) = self.tidi.as_mut() {
+                    tidi.accumulate_depth(
+                        splats.means(),
+                        depth_data.clone(),
+                        &camera,
+                        img_size,
+                        margin,
+                    );
+                }
+            }
+
             (
                 grads,
                 visible,
@@ -1275,9 +1300,13 @@ impl SplatTrainer {
 
         // TIDI-GS: one Adam step on the learned importance `ω` from the same
         // backward pass (photometric gate + L1 sparsity). `ω` participates in
-        // every step's graph via the opacity gate whenever TIDI is on, so its
-        // grad is always present here.
-        if let Some(tidi) = &mut self.tidi {
+        // every step's graph via the opacity gate ONLY on the photometric path
+        // (`--tidi-prune`), so its grad is present exactly then. Gate the step on
+        // `tidi_prune`: on a depth-only run (`--tidi-depth-prune` alone) the state
+        // exists but `ω` never entered the graph, so there is nothing to step.
+        if self.config.tidi_prune
+            && let Some(tidi) = &mut self.tidi
+        {
             trace_span!("TIDI importance step").in_scope(|| {
                 tidi.optimize(self.config.tidi_importance_lr, &mut grads);
             });
@@ -1567,14 +1596,22 @@ impl SplatTrainer {
         // an AND (see `tidi::select_prune_indices`) and is deliberately NOT
         // folded into the OR-based geometric culls above — only its final
         // isolation-selected output joins the union.
-        let prune_mask = if self.config.tidi_prune {
+        // Enter when EITHER path is enabled. `accumulate_window` folds the
+        // photometric (visibility + position-gradient) signals and only runs on
+        // the photometric path; the depth path's `float`/`valid` counters are
+        // folded per-step in `step_with_refine_weight`, not here. The prune
+        // cadence + start-iter gate are shared, and `select_prune_mask` internally
+        // runs whichever candidate path(s) `tidi_params` marked active.
+        let prune_mask = if self.config.tidi_prune || self.config.tidi_depth_prune {
             let params = tidi_params(&self.config);
             if let Some(tidi) = self.tidi.as_mut() {
-                tidi.accumulate_window(
-                    refiner.vis_weight.clone(),
-                    refiner.refine_weight_norm.clone(),
-                    self.config.tidi_grad_ema_beta,
-                );
+                if self.config.tidi_prune {
+                    tidi.accumulate_window(
+                        refiner.vis_weight.clone(),
+                        refiner.refine_weight_norm.clone(),
+                        self.config.tidi_grad_ema_beta,
+                    );
+                }
                 if tidi.should_prune(
                     global_iter,
                     self.config.tidi_prune_start_iter,
@@ -2093,6 +2130,7 @@ pub(crate) fn map_opt<const D: usize>(
 /// config-free params the pure selection logic consumes.
 fn tidi_params(config: &TrainConfig) -> TidiPruneParams {
     TidiPruneParams {
+        photometric: config.tidi_prune,
         vis_threshold: config.tidi_vis_threshold,
         opacity_threshold: config.tidi_opacity_threshold,
         importance_threshold: config.tidi_importance_threshold,
@@ -2105,6 +2143,10 @@ fn tidi_params(config: &TrainConfig) -> TidiPruneParams {
         knn_k: config.tidi_knn_k as usize,
         local_cap_frac: config.tidi_local_cap_frac,
         global_cap_frac: config.tidi_global_cap_frac,
+        depth_prune: config.tidi_depth_prune,
+        depth_float_frac: config.tidi_depth_float_frac,
+        depth_min_valid_views: config.tidi_depth_min_valid_views as f32,
+        depth_cap_frac: config.tidi_depth_cap_frac,
     }
 }
 

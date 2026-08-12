@@ -643,9 +643,11 @@ pub struct TrainConfig {
     // `research/indoor-360-haze-removal.md` and `crate::tidi`. Multi-signal +
     // isolation pruning for the translucent equilibrium floaters that grow on
     // textureless indoor walls (which opacity thresholds structurally cannot
-    // remove). The WHOLE family is default-OFF: with `--tidi-prune` unset the
-    // trainer never allocates TIDI state, so MRNF / depth-loss / PPISP /
-    // normal-prior runs take the identical path they always did.
+    // remove). The WHOLE family is default-OFF: with BOTH `--tidi-prune` and
+    // `--tidi-depth-prune` unset the trainer never allocates TIDI state, so MRNF
+    // / depth-loss / PPISP / normal-prior runs take the identical path they
+    // always did. `--tidi-depth-prune` (defined after the photometric knobs) is
+    // a SEPARATE, standalone path that runs even without `--tidi-prune`.
     // ------------------------------------------------------------------
     /// Master switch for TIDI-GS multi-signal + isolation floater pruning.
     #[arg(long, help_heading = "TIDI options", default_value = "false")]
@@ -762,6 +764,61 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "TIDI options", default_value = "0.002")]
     #[serde(default = "default_tidi_global_cap_frac")]
     pub tidi_global_cap_frac: f32,
+
+    // ------------------------------------------------------------------
+    // TIDI depth / LiDAR-residual prune (a SEPARATE, standalone path from the
+    // four photometric signals above -- deliberately NOT AND-gated with
+    // opacity/omega/grad). The four photometric signals structurally CANNOT
+    // remove indoor equilibrium wall-haze: the haze floaters are photometrically
+    // VALID (stuck at a cancelling-error equilibrium), so they pass
+    // opacity/omega/grad and are never candidates. The one signal that CAN
+    // distinguish haze from real surface is GEOMETRY: haze floats in empty space
+    // in FRONT of the measured LiDAR/depth surface; real geometry sits AT the
+    // surface. This path reuses the exact per-frame depth `--depth-loss-weight`
+    // consumes (`depth/<stem>.tiff`, 0 = no return) as a hard prune
+    // discriminator. Default OFF and byte-inert unless enabled.
+    // ------------------------------------------------------------------
+    /// Master switch for the depth/LiDAR-residual prune path. Independent of
+    /// `--tidi-prune`'s photometric path (both live under the same TIDI state);
+    /// if this is set but `--tidi-prune` is not, ONLY the depth path runs. Inert
+    /// (no state allocated, no per-step cost) when both are unset. Opt-in
+    /// (never auto-on) because it DELETES splats on a depth signal whose quality
+    /// varies: LiDAR-projected depth is trustworthy, a mono estimator (e.g. DA3)
+    /// on featureless walls is sparse/unreliable, and the code cannot tell them
+    /// apart -- so the operator opts into "use depth when present" deliberately.
+    #[arg(long, help_heading = "TIDI options", default_value = "false")]
+    #[serde(default)]
+    pub tidi_depth_prune: bool,
+
+    /// Depth-residual margin: a Gaussian counts as "floating" only when its
+    /// camera-space z is more than this in FRONT of the measured depth at its
+    /// projected pixel. Units are the DEPTH map's units -- metres for
+    /// LiDAR/metric depth (the default 0.05 = 5 cm); an SfM dataset's depth may
+    /// be non-metric, so scale this accordingly.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.05")]
+    #[serde(default = "default_tidi_depth_margin")]
+    pub tidi_depth_margin: f32,
+
+    /// Depth path: prune when a Gaussian floats in at least this fraction of the
+    /// views that carry a valid depth return behind it (default 0.5 = 50%).
+    #[arg(long, help_heading = "TIDI options", default_value = "0.5")]
+    #[serde(default = "default_tidi_depth_float_frac")]
+    pub tidi_depth_float_frac: f32,
+
+    /// Depth path SAFETY gate: never prune a Gaussian unless at least this many
+    /// views have a real depth return behind it. This is what keeps the depth
+    /// path from touching unscanned regions (no LiDAR return -> exempt).
+    #[arg(long, help_heading = "TIDI options", default_value = "4")]
+    #[serde(default = "default_tidi_depth_min_valid_views")]
+    pub tidi_depth_min_valid_views: u32,
+
+    /// Depth path per-cycle global cap: prune at most this fraction of ALL
+    /// Gaussians via the depth path per cleanup. Looser than the photometric
+    /// `--tidi-global-cap-frac` (0.002) because the LiDAR-gated depth signal is
+    /// trustworthy.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.02")]
+    #[serde(default = "default_tidi_depth_cap_frac")]
+    pub tidi_depth_cap_frac: f32,
 }
 
 impl Default for TrainConfig {
@@ -893,6 +950,18 @@ fn default_tidi_knn_k() -> u32 {
 }
 fn default_tidi_local_cap_frac() -> f32 {
     0.01
+}
+fn default_tidi_depth_margin() -> f32 {
+    0.05
+}
+fn default_tidi_depth_float_frac() -> f32 {
+    0.5
+}
+fn default_tidi_depth_min_valid_views() -> u32 {
+    4
+}
+fn default_tidi_depth_cap_frac() -> f32 {
+    0.02
 }
 fn default_tidi_global_cap_frac() -> f32 {
     0.002
@@ -1081,10 +1150,23 @@ mod tests {
         assert!((def.tidi_local_cap_frac - 0.01).abs() < 1e-9);
         assert!((def.tidi_global_cap_frac - 0.002).abs() < 1e-9);
 
+        // Depth-prune path: also OFF by default, with the documented depth
+        // constants. Byte-inertness of the whole TIDI family keys on BOTH master
+        // switches being false.
+        assert!(
+            !def.tidi_depth_prune,
+            "depth-prune must be off unless explicitly enabled"
+        );
+        assert!((def.tidi_depth_margin - 0.05).abs() < 1e-9);
+        assert!((def.tidi_depth_float_frac - 0.5).abs() < 1e-9);
+        assert_eq!(def.tidi_depth_min_valid_views, 4);
+        assert!((def.tidi_depth_cap_frac - 0.02).abs() < 1e-9);
+
         // Unrelated flags must not switch it on.
         let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
             .expect("unrelated flags must parse");
         assert!(!other.tidi_prune);
+        assert!(!other.tidi_depth_prune);
 
         // Bare `--tidi-prune` (a presence flag) enables it. There is deliberately
         // no `--tidi-prune=false` form: the master switch is SetTrue so that the
@@ -1092,6 +1174,15 @@ mod tests {
         let on = TrainConfig::try_parse_from(["brush", "--tidi-prune"])
             .expect("--tidi-prune must parse");
         assert!(on.tidi_prune);
+        // Enabling the photometric path must NOT enable the depth path.
+        assert!(!on.tidi_depth_prune);
+
+        // The depth path is independent: `--tidi-depth-prune` on its own enables
+        // ONLY the depth path (photometric stays off).
+        let depth_on = TrainConfig::try_parse_from(["brush", "--tidi-depth-prune"])
+            .expect("--tidi-depth-prune must parse");
+        assert!(depth_on.tidi_depth_prune);
+        assert!(!depth_on.tidi_prune, "depth path must not imply photometric");
     }
 
     #[test]

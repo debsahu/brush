@@ -24,6 +24,8 @@
 //! reconciled are called out inline with `NOTE:`.
 
 use brush_render::burn_glue::detach_autodiff;
+use brush_render::camera::Camera;
+use brush_render::kernels::camera_model::CameraModel;
 use burn::{
     Tensor,
     module::{Module, Param, ParamId},
@@ -98,6 +100,16 @@ pub struct TidiState {
     birth_iter: Tensor<1, Int>,
     /// Global iter of the last cleanup pass; gates the ~400-step cadence.
     last_prune_iter: Option<u32>,
+    /// `[N]` cumulative count of training VIEWS in which this Gaussian projected
+    /// in FRONT of a valid measured depth return by more than the margin (i.e.
+    /// "floated in empty space between the camera and the surface"). Depth-prune
+    /// path only; stays zero (and inert) unless `--tidi-depth-prune` is on.
+    float_accum: Tensor<1>,
+    /// `[N]` cumulative count of training VIEWS in which a VALID depth return
+    /// existed at this Gaussian's projected pixel (regardless of float). The
+    /// denominator for `float_frac`, and the safety gate: a Gaussian in an
+    /// unscanned region (few valid returns behind it) is never depth-pruned.
+    valid_accum: Tensor<1>,
 }
 
 /// The four per-Gaussian signals, read back to the host once per cleanup for the
@@ -121,6 +133,11 @@ struct HostSignals {
     dc_color: Vec<f32>,
     /// Age in steps since birth/last split, for the per-Gaussian warmup.
     age: Vec<i32>,
+    /// Depth-prune path (`float_accum` / `valid_accum`): per-Gaussian counts of
+    /// views it floated in front of a surface, and views a valid return existed
+    /// behind it. All-zero unless `--tidi-depth-prune` accumulated.
+    float_accum: Vec<f32>,
+    valid_accum: Vec<f32>,
 }
 
 impl TidiState {
@@ -138,6 +155,8 @@ impl TidiState {
             grad_ema: Tensor::<1>::zeros([n], &inner),
             birth_iter: Tensor::<1, Int>::full([n], cur_iter as i32, &inner),
             last_prune_iter: None,
+            float_accum: Tensor::<1>::zeros([n], &inner),
+            valid_accum: Tensor::<1>::zeros([n], &inner),
         }
     }
 
@@ -224,6 +243,135 @@ impl TidiState {
         self.grad_ema = self.grad_ema.clone().mul_scalar(beta) + grad.mul_scalar(1.0 - beta);
     }
 
+    /// Fold ONE training view's LiDAR/depth residual into the persistent
+    /// `float_accum` / `valid_accum` counters (the depth-prune path's signal).
+    /// Runs per step whenever `--tidi-depth-prune` is on and the batch carries a
+    /// depth map; NOT gated on `--depth-loss-weight` (this path is independent of
+    /// the depth *loss*, it only reuses the same per-frame depth tensor).
+    ///
+    /// For every Gaussian, project its centre `mu_i` into this view, read the
+    /// ground-truth depth `Z̃` at the projected pixel, and compare against the
+    /// Gaussian's own camera-space depth `z`:
+    ///   * `valid` when `Z̃` is a real return (`> 0`, finite) AND the projection
+    ///     lands in-frame in front of the camera (`z > 0`) → `valid_accum += 1`;
+    ///   * `floating` when additionally `z - Z̃ < -margin`, i.e. the Gaussian sits
+    ///     more than `margin` in FRONT of the measured surface → `float_accum +=
+    ///     1`. `margin` is in the depth map's own units (metres for LiDAR/metric
+    ///     depth; possibly non-metric for SfM depth).
+    ///
+    /// Everything is one GPU tensor pass on the inner backend (no host readback,
+    /// no autodiff graph) so an enabled run pays a handful of elementwise ops per
+    /// step and a disabled run pays nothing (the whole call is gated out).
+    ///
+    /// PROJECTION: the world→camera transform is Brush's own
+    /// [`Camera::world_to_local`]; the pixel projection is the pinhole model
+    /// (matching [`brush_render::kernels::camera_model::pinhole::project_pinhole`]:
+    /// `u = fx·x/z + cx`, `v = fy·y/z + cy`). Non-pinhole camera models
+    /// (fisheye / radial-tangential) are not implemented on this host-tensor path
+    /// — for them the call warns once and no-ops, exactly like the depth/normal
+    /// consistency term (`warn_depth_normal_needs_pinhole`).
+    pub fn accumulate_depth(
+        &mut self,
+        means: Tensor<2>,
+        gt_depth: TensorData,
+        camera: &Camera,
+        img_size: glam::UVec2,
+        margin: f32,
+    ) {
+        // Only pinhole projection is implemented here; other models unproject
+        // differently (see the depth/normal term's identical restriction).
+        if !matches!(camera.camera_model, CameraModel::Pinhole) {
+            warn_depth_prune_non_pinhole();
+            return;
+        }
+
+        // Everything runs on the accumulators' (inner) device; detach the means
+        // off the autodiff graph and move them there so no graph is retained and
+        // the elementwise math never touches a mismatched backend.
+        let device = self.valid_accum.device();
+        let means = detach_autodiff(means).to_device(&device);
+
+        let gt = Tensor::<2>::from_data(gt_depth, &device);
+        let [h, w] = gt.dims();
+        if h == 0 || w == 0 {
+            return;
+        }
+
+        // World → camera: `mean_cam = R·mu + t`, R/t from Brush's own camera.
+        // Building the [3,3] tensor from `matrix3.to_cols_array()` (glam is
+        // column-major) yields exactly Rᵀ in row-major, so `means @ Rᵀ` gives the
+        // rotated points as row vectors. The end-to-end projection + residual is
+        // verified on-device in `accumulate_depth_counts_front_surface_and_unscanned`.
+        let w2c = camera.world_to_local();
+        let cols = w2c.matrix3.to_cols_array();
+        let r_t = Tensor::<2>::from_data(TensorData::new(cols.to_vec(), [3, 3]), &device);
+        let t = w2c.translation;
+        let trans = Tensor::<1>::from_data(TensorData::new(vec![t.x, t.y, t.z], [3]), &device)
+            .reshape([1, 3]);
+        let mean_cam = means.matmul(r_t) + trans; // [N, 3]
+
+        let focal = camera.focal(img_size);
+        let center = camera.center(img_size);
+        let x = mean_cam.clone().slice(burn::tensor::s![.., 0..1]);
+        let y = mean_cam.clone().slice(burn::tensor::s![.., 1..2]);
+        let z = mean_cam.slice(burn::tensor::s![.., 2..3]);
+        let inv_z = z.clone().recip();
+        // project_pinhole: u = fx·x/z + cx, v = fy·y/z + cy.
+        let u = (x * inv_z.clone())
+            .mul_scalar(focal.x)
+            .add_scalar(center.x)
+            .squeeze_dim::<1>(1); // [N]
+        let v = (y * inv_z)
+            .mul_scalar(focal.y)
+            .add_scalar(center.y)
+            .squeeze_dim::<1>(1);
+        let z = z.squeeze_dim::<1>(1); // [N] camera-space depth
+        let ur = u.round();
+        let vr = v.round();
+
+        // In-frame: z > 0 and the rounded pixel lands inside [0, W-1]×[0, H-1].
+        // (`>= 0` is written as `!(<0)` since only strict comparators are used
+        // elsewhere in this module; NaN u/v from a behind-camera splat compare
+        // false here and are excluded — and masked out by `in_front` regardless.)
+        let in_front = z.clone().greater_elem(0.0);
+        let in_x = ur
+            .clone()
+            .lower_elem(0.0)
+            .bool_not()
+            .bool_and(ur.clone().greater_elem((w - 1) as f32).bool_not());
+        let in_y = vr
+            .clone()
+            .lower_elem(0.0)
+            .bool_not()
+            .bool_and(vr.clone().greater_elem((h - 1) as f32).bool_not());
+        let in_frame = in_front.bool_and(in_x).bool_and(in_y);
+
+        // Flat pixel index (row-major, row = v = y, col = u = x). Clamp to a valid
+        // range so the gather is always in-bounds even for the masked-out (NaN /
+        // behind-camera) rows we discard afterwards.
+        let uc = ur.clamp(0.0, (w - 1) as f32);
+        let vc = vr.clamp(0.0, (h - 1) as f32);
+        let flat = (vc.mul_scalar(w as f32) + uc)
+            .clamp(0.0, (h * w - 1) as f32)
+            .int(); // [N]
+        let gt_flat = gt.reshape([(h * w) as i32]);
+        // `select` on a 1-D source with a 1-D index is a per-element gather.
+        let z_tilde = gt_flat.select(0, flat); // [N]
+
+        // Valid return: a real, finite, positive depth AND an in-frame pixel.
+        let ret_valid = z_tilde
+            .clone()
+            .greater_elem(0.0)
+            .bool_and(z_tilde.clone().is_finite());
+        let valid = in_frame.bool_and(ret_valid);
+        // Floating: in front of the surface by more than the margin.
+        let residual = z - z_tilde; // z - Z̃ ; < -margin means "in front"
+        let floating = valid.clone().bool_and(residual.lower_elem(-margin));
+
+        self.valid_accum = self.valid_accum.clone() + valid.float();
+        self.float_accum = self.float_accum.clone() + floating.float();
+    }
+
     /// Reindex through a prune. `valid_inds` (autodiff) reindexes `ω` and its
     /// Adam state; `inner_valid_inds` reindexes the inner accumulators. Called
     /// from `prune_points` beside the DiG `keep`, so the tables can never
@@ -244,6 +392,9 @@ impl TidiState {
         self.vis_accum = self.vis_accum.clone().select(0, inner_valid_inds.clone());
         self.grad_ema = self.grad_ema.clone().select(0, inner_valid_inds.clone());
         self.birth_iter = self.birth_iter.clone().select(0, inner_valid_inds.clone());
+        // Depth-prune accumulators ride the identical inner reindex.
+        self.float_accum = self.float_accum.clone().select(0, inner_valid_inds.clone());
+        self.valid_accum = self.valid_accum.clone().select(0, inner_valid_inds.clone());
     }
 
     /// Reindex through a split. Children are APPENDED (matching `refine_splats`'
@@ -281,9 +432,15 @@ impl TidiState {
         }
         let zeros = Tensor::<1>::zeros([refine_count], inner_device);
         self.vis_accum = Tensor::cat(vec![self.vis_accum.clone(), zeros.clone()], 0);
-        self.grad_ema = Tensor::cat(vec![self.grad_ema.clone(), zeros], 0);
+        self.grad_ema = Tensor::cat(vec![self.grad_ema.clone(), zeros.clone()], 0);
         let births = Tensor::<1, Int>::full([refine_count], cur_iter as i32, inner_device);
         self.birth_iter = Tensor::cat(vec![self.birth_iter.clone(), births], 0);
+        // Children start with FRESH depth counters (zero float / zero valid): a
+        // split child cannot reach `min_valid_views` until it has actually been
+        // observed behind a surface again, which is exactly the per-Gaussian
+        // protection the photometric path gets from `birth_iter` + warmup.
+        self.float_accum = Tensor::cat(vec![self.float_accum.clone(), zeros.clone()], 0);
+        self.valid_accum = Tensor::cat(vec![self.valid_accum.clone(), zeros], 0);
     }
 
     /// Read every signal to the host for the cleanup decision. Runs only on
@@ -380,6 +537,8 @@ impl TidiState {
             pos: host2(means).await,
             dc_color: host2(dc_color).await,
             age,
+            float_accum: host1(self.float_accum.clone()).await,
+            valid_accum: host1(self.valid_accum.clone()).await,
         }
     }
 
@@ -402,6 +561,13 @@ impl TidiState {
         let s = self
             .read_signals(cur_iter, opacity, means, sh_coeffs, scales)
             .await;
+        // Depth-prune was requested but no view has ever produced a valid depth
+        // return: the dataset carries no per-frame depth (nerfstudio `depth:
+        // None`) or every map was empty. Warn ONCE and let the depth path no-op
+        // (all `valid_accum` are 0, so no depth candidate can form) — never panic.
+        if cfg.depth_prune && s.valid_accum.iter().all(|&v| v <= 0.0) {
+            warn_depth_prune_no_depth();
+        }
         let prune_idx = select_prune_indices(cfg, &s);
         if prune_idx.is_empty() {
             log::debug!("tidi iter={cur_iter}: 0 pruned (candidates gated out)");
@@ -427,6 +593,10 @@ impl TidiState {
 /// Thresholds + caps for the cleanup pass, snapshotted from `TrainConfig` so the
 /// pure selection logic below has no dependency on the config crate.
 pub struct TidiPruneParams {
+    /// Whether the four-signal PHOTOMETRIC candidate path is active
+    /// (`--tidi-prune`). When off, no Gaussian becomes a photometric candidate,
+    /// so only the depth path (if on) can contribute prunes.
+    pub photometric: bool,
     pub vis_threshold: f32,
     pub opacity_threshold: f32,
     pub importance_threshold: f32,
@@ -439,6 +609,18 @@ pub struct TidiPruneParams {
     pub knn_k: usize,
     pub local_cap_frac: f32,
     pub global_cap_frac: f32,
+    /// Whether the SEPARATE depth/LiDAR-residual candidate path is active
+    /// (`--tidi-depth-prune`).
+    pub depth_prune: bool,
+    /// Prune a Gaussian when it floated in front of the surface in at least this
+    /// fraction of the views that had a valid return behind it.
+    pub depth_float_frac: f32,
+    /// Safety gate: minimum number of views with a valid return behind a
+    /// Gaussian before the depth path may prune it (unscanned regions exempt).
+    pub depth_min_valid_views: f32,
+    /// Per-cycle global cap for the depth path, as a fraction of ALL Gaussians.
+    /// Looser than `global_cap_frac` because the LiDAR-gated signal is trusted.
+    pub depth_cap_frac: f32,
 }
 
 /// Host-side quantile of a slice (already the filtered subset). `q` in `[0,1]`;
@@ -453,28 +635,63 @@ fn quantile(mut v: Vec<f32>, q: f32) -> Option<f32> {
     Some(v[idx])
 }
 
-/// The pure TIDI selection: candidate rule (AND of four) → detail guards (set
-/// difference) → isolation k-NN with the two caps. Split out so it is unit
-/// testable without any GPU state.
+/// The pure TIDI selection. Two INDEPENDENT candidate paths, unioned at the end:
+///   * PHOTOMETRIC (`--tidi-prune`): the four-signal AND (vis ∧ opacity ∧ ω ∧
+///     grad) → detail guards → isolation k-NN with the local + global caps.
+///   * DEPTH (`--tidi-depth-prune`): a Gaussian that floats in front of the
+///     measured LiDAR/depth surface in ≥ `depth_float_frac` of the views that
+///     had a valid return behind it (≥ `depth_min_valid_views` of them) → the
+///     SAME detail guards → its own looser global cap.
+/// The depth path is deliberately NOT AND-gated with the photometric signals:
+/// equilibrium wall-haze is photometrically valid, so it would never survive the
+/// four-signal AND, yet it is exactly what the depth residual catches. Split out
+/// so it is unit testable without any GPU state.
 fn select_prune_indices(cfg: &TidiPruneParams, s: &HostSignals) -> Vec<u32> {
     let n = s.n;
     if n == 0 {
         return Vec::new();
     }
 
-    // -- C_base: a Gaussian is a candidate iff it FAILS ALL FOUR signal
-    // thresholds AND is past its per-Gaussian warmup. This is an AND, NOT the
-    // OR that Brush's five geometric culls use — a floater is only a candidate
-    // when every signal agrees it is idle. (paper §III-B, Table II)
+    // -- Photometric candidate: FAILS ALL FOUR signal thresholds AND is past its
+    // per-Gaussian warmup. This is an AND, NOT the OR that Brush's five geometric
+    // culls use — a floater is only a candidate when every signal agrees it is
+    // idle. (paper §III-B, Table II). Gated on `cfg.photometric` so a
+    // depth-only run (`--tidi-depth-prune` without `--tidi-prune`) forms no
+    // photometric candidates.
     let mut candidate = vec![false; n];
-    for i in 0..n {
-        let past_warmup = s.age[i] >= cfg.warmup_steps;
-        let fail_vis = s.vis[i] <= cfg.vis_threshold;
-        let fail_alpha = s.opacity[i] <= cfg.opacity_threshold;
-        let fail_omega = s.sigma_w[i] <= cfg.importance_threshold;
-        let fail_grad = s.grad_ema[i] <= cfg.grad_threshold;
-        candidate[i] = past_warmup && fail_vis && fail_alpha && fail_omega && fail_grad;
+    if cfg.photometric {
+        for i in 0..n {
+            let past_warmup = s.age[i] >= cfg.warmup_steps;
+            let fail_vis = s.vis[i] <= cfg.vis_threshold;
+            let fail_alpha = s.opacity[i] <= cfg.opacity_threshold;
+            let fail_omega = s.sigma_w[i] <= cfg.importance_threshold;
+            let fail_grad = s.grad_ema[i] <= cfg.grad_threshold;
+            candidate[i] = past_warmup && fail_vis && fail_alpha && fail_omega && fail_grad;
+        }
     }
+
+    // -- Depth candidate (standalone): enough views saw a valid return behind
+    // this Gaussian AND it floated in front of that surface in a high enough
+    // fraction of them. The `min_valid_views` gate is the safety net — a
+    // Gaussian in an unscanned region (too few valid returns) is NEVER a depth
+    // candidate. A split resets these counters, so a fresh child cannot reach
+    // `min_valid_views` until it has been re-observed, giving the same
+    // protection the photometric path gets from warmup.
+    let mut depth_candidate = vec![false; n];
+    if cfg.depth_prune {
+        for i in 0..n {
+            let valid = s.valid_accum[i];
+            if valid >= cfg.depth_min_valid_views {
+                let float_frac = s.float_accum[i] / valid.max(1.0);
+                depth_candidate[i] = float_frac >= cfg.depth_float_frac;
+            }
+        }
+    }
+
+    // Combined candidate set: the STABLE (guard-reference) distribution and the
+    // guards themselves apply to BOTH paths, so a thin/specular structure that
+    // reads as floating near a depth discontinuity is still protected.
+    let any_candidate: Vec<bool> = (0..n).map(|i| candidate[i] || depth_candidate[i]).collect();
 
     // -- Adaptive detail guards. Thresholds are a quantile of the STABLE
     // (non-candidate) distribution, recomputed each cycle — the paper gives no
@@ -483,8 +700,12 @@ fn select_prune_indices(cfg: &TidiPruneParams, s: &HostSignals) -> Vec<u32> {
     // energy (specular / view-dependent detail), an unusually thin smallest axis
     // (a thin structure), unusually high anisotropy `s₃/s₁` (an elongated sheet /
     // needle), or high local colour variance.
-    let stable_of =
-        |vals: &[f32]| -> Vec<f32> { (0..n).filter(|&i| !candidate[i]).map(|i| vals[i]).collect() };
+    let stable_of = |vals: &[f32]| -> Vec<f32> {
+        (0..n)
+            .filter(|&i| !any_candidate[i])
+            .map(|i| vals[i])
+            .collect()
+    };
 
     // Guard 1: SH high-frequency energy, exempt at/above the high quantile.
     let tau_h = (cfg.guard_sh_quantile > 0.0)
@@ -507,7 +728,7 @@ fn select_prune_indices(cfg: &TidiPruneParams, s: &HostSignals) -> Vec<u32> {
     // against the CANDIDATE distribution — a documented approximation, hence
     // off by default.
     let color_var: Option<(Vec<f32>, f32)> = if cfg.guard_color_var_quantile > 0.0 {
-        let cand_idx: Vec<u32> = (0..n as u32).filter(|&i| candidate[i as usize]).collect();
+        let cand_idx: Vec<u32> = (0..n as u32).filter(|&i| any_candidate[i as usize]).collect();
         let neigh = knn_neighbor_indices(&s.pos, &cand_idx, cfg.knn_k);
         let mut v = vec![0.0f32; cand_idx.len()];
         for (row, nbrs) in neigh.chunks(cfg.knn_k).enumerate() {
@@ -529,37 +750,122 @@ fn select_prune_indices(cfg: &TidiPruneParams, s: &HostSignals) -> Vec<u32> {
         None
     };
 
-    // C_prune = C_base \ M_detail.
-    let mut c_prune: Vec<u32> = Vec::new();
-    for i in 0..n {
-        if !candidate[i] {
-            continue;
-        }
+    // Apply the guards (a candidate survives iff it is NOT exempt), then keep
+    // the two paths' survivors SEPARATE so each gets its own cap. A Gaussian
+    // flagged by both paths lands in both lists; the final union dedups it.
+    let exempt = |i: usize| -> bool {
         let exempt_sh = tau_h.is_some_and(|t| s.sh_hf[i] >= t);
         let exempt_thin = tau_s.is_some_and(|t| s.min_scale[i] <= t);
         let exempt_aniso = tau_a.is_some_and(|t| s.aniso[i] >= t);
         let exempt_cv = color_var.as_ref().is_some_and(|(dense, t)| dense[i] >= *t);
-        if !(exempt_sh || exempt_thin || exempt_aniso || exempt_cv) {
-            c_prune.push(i as u32);
+        exempt_sh || exempt_thin || exempt_aniso || exempt_cv
+    };
+    let photo_prune: Vec<u32> = (0..n)
+        .filter(|&i| candidate[i] && !exempt(i))
+        .map(|i| i as u32)
+        .collect();
+    let depth_prune: Vec<u32> = (0..n)
+        .filter(|&i| depth_candidate[i] && !exempt(i))
+        .map(|i| i as u32)
+        .collect();
+
+    // -- PHOTOMETRIC isolation pruning: score survivors by mean distance to
+    // their k=16 nearest neighbours over the FULL point set. LARGE distance =
+    // isolated = floater. Two caps, DIFFERENT denominators, both applied (min):
+    // at most `local_cap_frac` of a spatial cell's candidates, and at most
+    // `global_cap_frac` of ALL Gaussians, per cycle.
+    let photo_selected = if photo_prune.is_empty() {
+        Vec::new()
+    } else {
+        isolation_select(
+            &s.pos,
+            &photo_prune,
+            n,
+            cfg.knn_k,
+            cfg.local_cap_frac,
+            cfg.global_cap_frac,
+        )
+    };
+
+    // -- DEPTH cap: this path is trusted (LiDAR-gated) and does NOT need spatial
+    // isolation — a haze splat in front of a measured surface is the signal,
+    // whether or not it is isolated. Cap by its own looser `depth_cap_frac` of
+    // ALL Gaussians, keeping the most-floating (highest `float_frac`) first.
+    let depth_selected = depth_cap_select(&depth_prune, s, n, cfg.depth_cap_frac);
+
+    // Union (dedup) the two paths.
+    if depth_selected.is_empty() {
+        return photo_selected;
+    }
+    let mut seen = vec![false; n];
+    let mut out = Vec::with_capacity(photo_selected.len() + depth_selected.len());
+    for i in photo_selected.into_iter().chain(depth_selected) {
+        if !seen[i as usize] {
+            seen[i as usize] = true;
+            out.push(i);
         }
     }
-    if c_prune.is_empty() {
+    out
+}
+
+/// Depth-path cap: keep the most-floating survivors up to `cap_frac` of ALL
+/// Gaussians. Trusted (LiDAR-gated) so no isolation scoring — ranked purely by
+/// `float_frac = float_accum / max(valid_accum, 1)` so the most-confidently
+/// floating Gaussians are pruned first when the cap bites.
+fn depth_cap_select(
+    depth_prune: &[u32],
+    s: &HostSignals,
+    n_total: usize,
+    cap_frac: f32,
+) -> Vec<u32> {
+    if depth_prune.is_empty() || cap_frac <= 0.0 {
         return Vec::new();
     }
+    let cap = (n_total as f32 * cap_frac).floor() as usize;
+    if cap == 0 {
+        return Vec::new();
+    }
+    let mut ranked: Vec<(u32, f32)> = depth_prune
+        .iter()
+        .map(|&i| {
+            let valid = s.valid_accum[i as usize].max(1.0);
+            (i, s.float_accum[i as usize] / valid)
+        })
+        .collect();
+    // Most-floating first; the cap keeps the head.
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    ranked.truncate(cap);
+    ranked.into_iter().map(|(i, _)| i).collect()
+}
 
-    // -- Isolation pruning: score survivors by mean distance to their k=16
-    // nearest neighbours over the FULL point set. LARGE distance = isolated =
-    // floater. Two caps, DIFFERENT denominators, both applied (min): at most
-    // `local_cap_frac` of a spatial cell's candidates, and at most
-    // `global_cap_frac` of ALL Gaussians, per cycle.
-    isolation_select(
-        &s.pos,
-        &c_prune,
-        n,
-        cfg.knn_k,
-        cfg.local_cap_frac,
-        cfg.global_cap_frac,
-    )
+/// Warn exactly once that `--tidi-depth-prune` is on but the active camera is
+/// not a pinhole, so the depth accumulation is skipped for those views. Once,
+/// because it would otherwise fire every step of every non-pinhole view.
+fn warn_depth_prune_non_pinhole() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "--tidi-depth-prune is set but this camera is not Pinhole; the depth \
+             residual accumulation is skipped for non-pinhole views (the pinhole \
+             projection is the only model implemented on this path, matching the \
+             --depth-normal-weight restriction). The depth prune will be inert \
+             unless pinhole views are present."
+        );
+    });
+}
+
+/// Warn exactly once that `--tidi-depth-prune` is on but NO view ever produced a
+/// valid depth return (dataset has no per-frame depth, or every map was empty).
+/// The depth path then no-ops (no candidate can form); it never panics.
+fn warn_depth_prune_no_depth() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "--tidi-depth-prune is set but no per-frame depth was found (no view \
+             produced a valid depth return). The depth-residual prune path is \
+             inert for this run; load depth maps (depth/<stem>.tiff) to enable it."
+        );
+    });
 }
 
 /// Uniform-grid bucketing shared by the isolation scorer and the colour-variance
@@ -784,6 +1090,7 @@ mod tests {
 
     fn base_params() -> TidiPruneParams {
         TidiPruneParams {
+            photometric: true,
             vis_threshold: 2.0,
             opacity_threshold: 0.04,
             importance_threshold: 0.35,
@@ -796,6 +1103,10 @@ mod tests {
             knn_k: 16,
             local_cap_frac: 1.0,
             global_cap_frac: 1.0,
+            depth_prune: false,
+            depth_float_frac: 0.5,
+            depth_min_valid_views: 4.0,
+            depth_cap_frac: 1.0,
         }
     }
 
@@ -857,6 +1168,9 @@ mod tests {
             pos,
             dc_color: dc,
             age,
+            // Depth path off in these photometric-path fixtures.
+            float_accum: vec![0.0; n],
+            valid_accum: vec![0.0; n],
         }
     }
 
@@ -965,6 +1279,140 @@ mod tests {
     // BUG-2 (windowed visibility) is exercised at the tensor level by
     // `windowed_visibility_counts_windows_not_steps` below, which runs the real
     // `accumulate_window` on a device rather than hand-injecting `vis` values.
+
+    // ---- Depth / LiDAR-residual prune path (pure selection) ----------------
+    //
+    // These build a HostSignals directly on the accumulator counts
+    // (`float_accum` / `valid_accum`), the way `accumulate_depth` would have left
+    // them, and check the depth candidate rule + safety gate. The geometry →
+    // counts mapping itself (including "unscanned even if in front → never a
+    // valid, so never a float") is checked on-device in
+    // `accumulate_depth_counts_front_surface_and_unscanned`.
+
+    /// A DEPTH-ONLY run (photometric path off): a Gaussian that floated in front
+    /// of a valid surface in enough views is selected purely by the depth path.
+    #[test]
+    fn depth_path_selects_floating_gaussian() {
+        let mut s = scene_with_floater();
+        let f = s.n - 1;
+        // The floater has been seen behind a real return in 10 views and floated
+        // in 8 of them (float_frac 0.8 >= 0.5), well past min_valid_views = 4.
+        s.valid_accum[f] = 10.0;
+        s.float_accum[f] = 8.0;
+        let mut p = base_params();
+        p.photometric = false; // depth path stands alone
+        p.depth_prune = true;
+        let idx = select_prune_indices(&p, &s);
+        assert_eq!(
+            idx,
+            vec![f as u32],
+            "a Gaussian floating in front of the surface must be depth-pruned"
+        );
+    }
+
+    /// A Gaussian sitting AT the surface (valid returns behind it, but it rarely
+    /// floats) is below `depth_float_frac` and is exempt.
+    #[test]
+    fn depth_path_exempts_surface_gaussian() {
+        let mut s = scene_with_floater();
+        let f = s.n - 1;
+        s.valid_accum[f] = 10.0;
+        s.float_accum[f] = 1.0; // float_frac 0.1 < 0.5
+        let mut p = base_params();
+        p.photometric = false;
+        p.depth_prune = true;
+        assert!(
+            select_prune_indices(&p, &s).is_empty(),
+            "a Gaussian at the measured surface must not be depth-pruned"
+        );
+    }
+
+    /// SAFETY GATE: a Gaussian in an unscanned region (too few valid returns
+    /// behind it) is exempt even when it floats in every view it was seen —
+    /// `valid_accum < min_valid_views` short-circuits the candidate rule.
+    #[test]
+    fn depth_path_exempts_unscanned_region() {
+        let mut s = scene_with_floater();
+        let f = s.n - 1;
+        // Only 2 valid returns (< min_valid_views = 4), floated in both.
+        s.valid_accum[f] = 2.0;
+        s.float_accum[f] = 2.0; // float_frac 1.0, but valid too low
+        let mut p = base_params();
+        p.photometric = false;
+        p.depth_prune = true;
+        assert!(
+            select_prune_indices(&p, &s).is_empty(),
+            "an under-observed (unscanned) Gaussian must never be depth-pruned"
+        );
+    }
+
+    /// The depth path honours the SAME detail guards as the photometric path: a
+    /// floating candidate with unusually high SH energy (specular detail near a
+    /// depth discontinuity) is exempted.
+    #[test]
+    fn depth_path_respects_detail_guards() {
+        let mut s = scene_with_floater();
+        let f = s.n - 1;
+        s.valid_accum[f] = 10.0;
+        s.float_accum[f] = 10.0;
+        s.sh_hf[f] = 100.0; // above the stable 0.95 quantile
+        let mut p = base_params();
+        p.photometric = false;
+        p.depth_prune = true;
+        assert!(
+            select_prune_indices(&p, &s).is_empty(),
+            "a high-SH-energy floating candidate is guarded on the depth path too"
+        );
+    }
+
+    /// The depth path has its OWN cap: a zero `depth_cap_frac` prunes nothing
+    /// even with valid floating candidates.
+    #[test]
+    fn depth_cap_frac_zero_prunes_nothing() {
+        let mut s = scene_with_floater();
+        let f = s.n - 1;
+        s.valid_accum[f] = 10.0;
+        s.float_accum[f] = 10.0;
+        let mut p = base_params();
+        p.photometric = false;
+        p.depth_prune = true;
+        p.depth_cap_frac = 0.0;
+        assert!(
+            select_prune_indices(&p, &s).is_empty(),
+            "a zero depth cap prunes nothing"
+        );
+    }
+
+    /// The two paths UNION: with both on, a photometric floater and a distinct
+    /// depth floater are both pruned (dedup handles overlap).
+    #[test]
+    fn photometric_and_depth_paths_union() {
+        // Two isolated floaters: index n-1 (the existing photometric one) and a
+        // NEW point we tag depth-floating. Build on scene_with_floater and make a
+        // stable interior point into a depth-only candidate.
+        let mut s = scene_with_floater();
+        let photo = (s.n - 1) as u32;
+        let depth_only = 0usize; // a stable grid point, NOT a photometric candidate
+        s.valid_accum[depth_only] = 10.0;
+        s.float_accum[depth_only] = 10.0;
+        let mut p = base_params();
+        p.depth_prune = true; // photometric also on (base default)
+        // Disable the detail guards: `depth_only` is a copy of a stable grid
+        // point, so its SH/thinness values sit exactly at the stable quantiles
+        // and the guards would (correctly) exempt it. This test isolates the
+        // union of the two candidate PATHS, not the guard behaviour (covered by
+        // `depth_path_respects_detail_guards`).
+        p.guard_sh_quantile = 0.0;
+        p.guard_thin_quantile = 0.0;
+        p.guard_aniso_quantile = 0.0;
+        let mut idx = select_prune_indices(&p, &s);
+        idx.sort_unstable();
+        assert!(idx.contains(&photo), "photometric floater pruned");
+        assert!(
+            idx.contains(&(depth_only as u32)),
+            "depth floater pruned via the standalone path"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1011,6 +1459,80 @@ mod device_tests {
             got,
             vec![2.0, 0.0, 1.0],
             "vis_accum must count windows-seen, not steps-seen"
+        );
+    }
+
+    /// The real geometry → counts mapping in `accumulate_depth`, covering the
+    /// three spec cases in ONE view against a 4×4 pinhole camera at the origin
+    /// looking down +z (identity world→cam, so camera-space z == world z):
+    ///   * G0 in FRONT of a valid surface  → valid += 1, float += 1;
+    ///   * G1 AT the surface                → valid += 1, float += 0;
+    ///   * G2 over an INVALID (unscanned)   → valid += 0, float += 0 (never a
+    ///     float, even though it is geometrically in front of the camera).
+    #[tokio::test]
+    async fn accumulate_depth_counts_front_surface_and_unscanned() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let inner = device.clone().inner();
+        let mut tidi = TidiState::new(3, 0, &device);
+
+        // 4×4 pinhole, 90° fov → fx = fy = 2, cx = cy = 2 (center_uv 0.5).
+        let img = glam::UVec2::new(4, 4);
+        let camera = Camera::new(
+            glam::Vec3::ZERO,
+            glam::Quat::IDENTITY,
+            std::f64::consts::FRAC_PI_2,
+            std::f64::consts::FRAC_PI_2,
+            glam::vec2(0.5, 0.5),
+            CameraModel::Pinhole,
+        );
+
+        // Camera-space (== world here) positions, all at z = 5:
+        //   G0 (0,0,5)    → pixel (u=2, v=2)
+        //   G1 (2.5,0,5)  → pixel (u=3, v=2)
+        //   G2 (-2.5,0,5) → pixel (u=1, v=2)
+        let means = Tensor::<2>::from_data(
+            TensorData::new(
+                vec![0.0f32, 0.0, 5.0, 2.5, 0.0, 5.0, -2.5, 0.0, 5.0],
+                [3, 3],
+            ),
+            &inner,
+        );
+
+        // Depth map [H=4, W=4], row-major (row = v, col = u), 0 = invalid:
+        //   (2,2) = 10  (surface 5 behind G0's z=5 → G0 floats)
+        //   (2,3) = 5   (surface at G1's z=5      → G1 at surface)
+        //   (2,1) = 0   (no return                → G2 unscanned)
+        let mut depth = vec![0.0f32; 16];
+        depth[2 * 4 + 2] = 10.0;
+        depth[2 * 4 + 3] = 5.0;
+        depth[2 * 4 + 1] = 0.0;
+        let gt = TensorData::new(depth, [4, 4]);
+
+        tidi.accumulate_depth(means, gt, &camera, img, 0.05);
+
+        let valid: Vec<f32> = tidi
+            .valid_accum
+            .clone()
+            .into_data_async()
+            .await
+            .expect("valid_accum readback")
+            .into_vec()
+            .expect("f32");
+        let floating: Vec<f32> = tidi
+            .float_accum
+            .clone()
+            .into_data_async()
+            .await
+            .expect("float_accum readback")
+            .into_vec()
+            .expect("f32");
+
+        assert_eq!(valid, vec![1.0, 1.0, 0.0], "valid: front, surface, unscanned");
+        assert_eq!(
+            floating,
+            vec![1.0, 0.0, 0.0],
+            "float: only the Gaussian in front of a valid surface"
         );
     }
 }
