@@ -18,8 +18,8 @@ use brush_loss::{
     normals_from_depth,
 };
 use brush_render::camera::Camera;
-use brush_render::kernels::camera_model::CameraModel;
 use brush_render::gaussian_splats::{RasterizationMode, Splats, fold_min_scale};
+use brush_render::kernels::camera_model::CameraModel;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 use brush_render_bwd::{DeferredShGrad, render_splat_features, render_splats_for_training};
 use burn::{
@@ -435,7 +435,8 @@ impl SplatTrainer {
         // global iteration instead, so `--depth-normal-start-iter` behaves
         // correctly on a resume.
         let iter = self.step_count;
-        self.step_with_refine_weight(batch, splats, true, iter).await
+        self.step_with_refine_weight(batch, splats, true, iter)
+            .await
     }
 
     /// Whether the refinement-only gradient statistic is still consumed by
@@ -722,8 +723,7 @@ impl SplatTrainer {
             // Geometry-prior terms (all inert at their 0.0 defaults, gated
             // exactly like `use_depth`, so a run that does not pass the flags
             // takes the same path it always did).
-            let use_prior_normal =
-                self.config.normal_loss_weight > 0.0 && batch.normal.is_some();
+            let use_prior_normal = self.config.normal_loss_weight > 0.0 && batch.normal.is_some();
             // 2DGS gates this term at 7k of 30k. Gating here rather than just
             // zeroing the weight also skips the depth channel and the normal
             // render pass entirely before the start iteration, so the gate costs
@@ -959,6 +959,37 @@ impl SplatTrainer {
                 loss = loss + depth_loss(expected_depth, gt_depth) * self.config.depth_loss_weight;
             }
 
+            // TIDI depth-coupled opacity regularizer: the SMOOTH, differentiable
+            // alternative to the hard `--tidi-depth-prune`. For every Gaussian
+            // floating in front of a valid LiDAR/depth return, add a per-step
+            // penalty whose ONLY gradient path is the activated opacity, so
+            // floating splats fade out smoothly (their colour redistributes into
+            // on-surface splats) instead of being hard-deleted (which orphans
+            // that colour and leaves a black halo). Positions/weights detached.
+            // Independent of `--depth-loss-weight` and of the TIDI prune state —
+            // it only reuses the same per-frame depth tensor. Pinhole-only, like
+            // the depth-prune; warn-once + skip otherwise. Inert (no projection,
+            // no term) when the weight is 0.
+            if self.config.depth_opacity_reg_weight > 0.0 {
+                match &batch.depth {
+                    Some(depth_data) if matches!(camera.camera_model, CameraModel::Pinhole) => {
+                        if let Some(term) = crate::tidi::depth_opacity_reg_loss(
+                            splats.raw_opacities.val(),
+                            splats.means(),
+                            depth_data.clone(),
+                            &camera,
+                            img_size,
+                            self.config.depth_opacity_reg_margin,
+                            self.config.depth_opacity_reg_softness,
+                        ) {
+                            loss = loss + term * self.config.depth_opacity_reg_weight;
+                        }
+                    }
+                    Some(_) => warn_depth_opacity_reg_needs_pinhole(),
+                    None => warn_depth_opacity_reg_no_depth(),
+                }
+            }
+
             // Geometry priors: the normal half of DN-Splatter / PlanarGS.
             //
             // The rendered normal image reuses `render_splat_features`, the same
@@ -981,23 +1012,23 @@ impl SplatTrainer {
                     brush_render::gaussian_splats::SplatRenderMode::Default
                 };
                 let normals = splat_normals(t_fold.clone(), camera.position);
-                let normal_img = render_splat_features(
-                    t_fold,
-                    o_fold,
-                    normals,
-                    &camera,
-                    img_size,
-                    render_mode,
-                )
-                .instrument(trace_span!("Normal forward"))
-                .await;
+                let normal_img =
+                    render_splat_features(t_fold, o_fold, normals, &camera, img_size, render_mode)
+                        .instrument(trace_span!("Normal forward"))
+                        .await;
 
                 // Same detached alpha normalization as the DiG and depth paths:
                 // the normal terms must not be able to lower their error by
                 // changing transparency.
                 let normal_alpha = normal_img.clone().slice(s![.., .., 3..4]).detach();
-                let n_world = normal_img.slice(s![.., .., 0..3]) / normal_alpha.clone().clamp_min(1e-10);
-                let n_len = n_world.clone().powi_scalar(2).sum_dim(2).sqrt().clamp_min(1e-6);
+                let n_world =
+                    normal_img.slice(s![.., .., 0..3]) / normal_alpha.clone().clamp_min(1e-10);
+                let n_len = n_world
+                    .clone()
+                    .powi_scalar(2)
+                    .sum_dim(2)
+                    .sqrt()
+                    .clamp_min(1e-6);
                 let n_world = n_world / n_len;
 
                 // World -> camera. Right-multiplying row vectors by Rᵀ is the
@@ -1045,8 +1076,8 @@ impl SplatTrainer {
                     if matches!(camera.camera_model, CameraModel::Pinhole) {
                         let accumulated_depth = pred_image.clone().slice(s![.., .., 4..5]);
                         let alpha = pred_image.clone().slice(s![.., .., 3..4]).detach();
-                        let expected_depth = (accumulated_depth / alpha.clamp_min(1e-10))
-                            .reshape([img_h, img_w]);
+                        let expected_depth =
+                            (accumulated_depth / alpha.clamp_min(1e-10)).reshape([img_h, img_w]);
                         let focal = camera.focal(img_size);
                         let center = camera.center(img_size);
                         let n_from_depth = normals_from_depth(
@@ -1672,8 +1703,8 @@ impl SplatTrainer {
         // culling (notably the over-stretched splats caught by the max-scale
         // term) but the count is allowed to decay rather than being held at cap
         // by opacity-diluting splits.
-        let replace_stopped = self.config.stop_replace_iter > 0
-            && global_iter >= self.config.stop_replace_iter;
+        let replace_stopped =
+            self.config.stop_replace_iter > 0 && global_iter >= self.config.stop_replace_iter;
         if pruned_count > 0 && !replace_stopped {
             // Replacement weighting. By default opacity × visibility. With
             // `replace_by_gradient > 0`, interpolate toward the gradient-
@@ -2247,6 +2278,36 @@ fn warn_depth_normal_needs_pinhole() {
     });
 }
 
+/// Warn exactly once that `--depth-opacity-reg-weight` is set but the active
+/// camera is not a pinhole, so the regularizer is skipped for those views (the
+/// pinhole projection is the only model implemented, matching the depth-prune
+/// and depth/normal restrictions). Once, so it does not fire every step.
+fn warn_depth_opacity_reg_needs_pinhole() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "--depth-opacity-reg-weight is set but this camera is not Pinhole; the \
+             depth-coupled opacity regularizer is skipped for non-pinhole views \
+             (the pinhole projection is the only model implemented on this path)."
+        );
+    });
+}
+
+/// Warn exactly once that `--depth-opacity-reg-weight` is set but the batch
+/// carries no per-frame depth (nerfstudio `depth: None`). The regularizer then
+/// no-ops for the run; it never panics. In practice depth is a dataset-level
+/// property, so this fires at most once at the start of a depthless run.
+fn warn_depth_opacity_reg_no_depth() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "--depth-opacity-reg-weight is set but no per-frame depth was found; the \
+             depth-coupled opacity regularizer is inert for this run. Load depth \
+             maps (depth/<stem>.tiff) to enable it."
+        );
+    });
+}
+
 /// Per-splat world-space surface normal: the gaussian's thinnest local axis,
 /// rotated into world space and oriented toward the camera. `[N, 10]` ->
 /// `[N, 3]` unit vectors.
@@ -2281,20 +2342,34 @@ fn splat_normals(transforms: Tensor<2>, cam_pos: glam::Vec3) -> Tensor<2> {
 
     // Rotating the local axis by the (normalized) quaternion is exactly the
     // corresponding column of the rotation matrix, computed differentiably.
-    let q_len = quats.clone().powi_scalar(2).sum_dim(1).sqrt().clamp_min(1e-12);
+    let q_len = quats
+        .clone()
+        .powi_scalar(2)
+        .sum_dim(1)
+        .sqrt()
+        .clamp_min(1e-12);
     let unit_quats = quats / q_len;
     let normal = quaternion_vec_multiply(unit_quats, axis);
-    let n_len = normal.clone().powi_scalar(2).sum_dim(1).sqrt().clamp_min(1e-12);
+    let n_len = normal
+        .clone()
+        .powi_scalar(2)
+        .sum_dim(1)
+        .sqrt()
+        .clamp_min(1e-12);
     let normal = normal / n_len;
 
     // Face the camera: we want `n · (mean - cam) < 0`. `sign()` would emit 0 on
     // an exactly perpendicular splat and annihilate its normal, so build the
     // ±1 selector from a comparison instead.
-    let to_splat = (means - Tensor::<1>::from_floats([cam_pos.x, cam_pos.y, cam_pos.z], &device)
-        .reshape([1, 3]))
+    let to_splat = (means
+        - Tensor::<1>::from_floats([cam_pos.x, cam_pos.y, cam_pos.z], &device).reshape([1, 3]))
     .detach();
     let facing = (to_splat * normal.clone().detach()).sum_dim(1);
-    let sign = facing.lower_elem(0.0).float().mul_scalar(2.0).sub_scalar(1.0);
+    let sign = facing
+        .lower_elem(0.0)
+        .float()
+        .mul_scalar(2.0)
+        .sub_scalar(1.0);
 
     normal * sign
 }
@@ -2529,7 +2604,12 @@ mod normal_prior_grad_tests {
 
         let alpha = img.clone().slice(s![.., .., 3..4]).detach();
         let n_world = img.slice(s![.., .., 0..3]) / alpha.clamp_min(1e-10);
-        let n_len = n_world.clone().powi_scalar(2).sum_dim(2).sqrt().clamp_min(1e-6);
+        let n_len = n_world
+            .clone()
+            .powi_scalar(2)
+            .sum_dim(2)
+            .sqrt()
+            .clamp_min(1e-6);
         let n_world = n_world / n_len;
 
         let rot = camera.world_to_local().matrix3;
@@ -2684,8 +2764,9 @@ mod normal_prior_grad_tests {
 
         let [h, w, _] = out.img.dims();
         let alpha = out.img.clone().slice(s![.., .., 3..4]).detach();
-        let expected_depth = (out.img.clone().slice(s![.., .., 4..5]) / alpha.clone().clamp_min(1e-10))
-            .reshape([h, w]);
+        let expected_depth = (out.img.clone().slice(s![.., .., 4..5])
+            / alpha.clone().clamp_min(1e-10))
+        .reshape([h, w]);
 
         let focal = camera.focal(IMG);
         let center = camera.center(IMG);
@@ -2740,8 +2821,9 @@ mod normal_prior_grad_tests {
         .await;
         let [h, w, _] = out.img.dims();
         let alpha = out.img.clone().slice(s![.., .., 3..4]).detach();
-        let expected_depth = (out.img.clone().slice(s![.., .., 4..5]) / alpha.clone().clamp_min(1e-10))
-            .reshape([h, w]);
+        let expected_depth = (out.img.clone().slice(s![.., .., 4..5])
+            / alpha.clone().clamp_min(1e-10))
+        .reshape([h, w]);
 
         let focal = camera.focal(IMG);
         let center = camera.center(IMG);

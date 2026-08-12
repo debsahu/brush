@@ -819,6 +819,43 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "TIDI options", default_value = "0.02")]
     #[serde(default = "default_tidi_depth_cap_frac")]
     pub tidi_depth_cap_frac: f32,
+
+    // ------------------------------------------------------------------
+    // Depth-coupled opacity regularizer -- the SMOOTH, differentiable
+    // alternative to the hard `--tidi-depth-prune`. Instead of deleting a
+    // floater in one step (which orphans its load-bearing colour and leaves a
+    // black halo), this adds a per-step loss whose ONLY gradient path is the
+    // Gaussian's activated opacity, fading off-surface splats out SMOOTHLY so
+    // the optimizer redistributes their colour into on-surface splats BEFORE
+    // they vanish. Reuses the exact per-frame depth + pinhole projection the
+    // depth-prune uses. Independent of `--depth-loss-weight` and of the TIDI
+    // prune state; needs no persistent accumulators. Default OFF and byte-inert
+    // (no projection, no loss term) when the weight is 0.
+    // ------------------------------------------------------------------
+    /// Depth-coupled opacity-regularizer weight (lambda). 0 = OFF (inert).
+    /// >0 adds `lambda * mean_over_valid(p_i * sigmoid(opacity_i))` to the loss,
+    /// where `p_i` is a DETACHED smooth ramp that is ~1 for a Gaussian floating
+    /// well in front of a valid LiDAR/depth return and 0 on/behind the surface
+    /// (or where no return exists). The gradient reaches ONLY the opacity leaf,
+    /// so floating splats fade smoothly rather than being hard-deleted.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.0")]
+    #[serde(default = "default_depth_opacity_reg_weight")]
+    pub depth_opacity_reg_weight: f32,
+
+    /// Depth-opacity-reg margin: a Gaussian must sit more than this in FRONT of
+    /// the measured depth before its opacity starts being penalized. Units are
+    /// the DEPTH map's units -- metres for LiDAR/metric depth (default 0.05 =
+    /// 5 cm); an SfM dataset's depth may be non-metric, so scale accordingly.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.05")]
+    #[serde(default = "default_depth_opacity_reg_margin")]
+    pub depth_opacity_reg_margin: f32,
+
+    /// Depth-opacity-reg softness: the width of the sigmoid ramp (in depth
+    /// units) over which the penalty weight climbs from ~0 to ~1 as a Gaussian
+    /// moves further in front of the surface. Smaller = sharper on/off boundary.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.1")]
+    #[serde(default = "default_depth_opacity_reg_softness")]
+    pub depth_opacity_reg_softness: f32,
 }
 
 impl Default for TrainConfig {
@@ -962,6 +999,15 @@ fn default_tidi_depth_min_valid_views() -> u32 {
 }
 fn default_tidi_depth_cap_frac() -> f32 {
     0.02
+}
+fn default_depth_opacity_reg_weight() -> f32 {
+    0.0
+}
+fn default_depth_opacity_reg_margin() -> f32 {
+    0.05
+}
+fn default_depth_opacity_reg_softness() -> f32 {
+    0.1
 }
 fn default_tidi_global_cap_frac() -> f32 {
     0.002
@@ -1139,7 +1185,10 @@ mod tests {
     #[test]
     fn tidi_flags_default_off_and_match_paper() {
         let def = TrainConfig::default();
-        assert!(!def.tidi_prune, "TIDI must be off unless explicitly enabled");
+        assert!(
+            !def.tidi_prune,
+            "TIDI must be off unless explicitly enabled"
+        );
         // paper Table II constants
         assert!((def.tidi_vis_threshold - 2.0).abs() < 1e-9);
         assert!((def.tidi_opacity_threshold - 0.04).abs() < 1e-9);
@@ -1162,11 +1211,21 @@ mod tests {
         assert_eq!(def.tidi_depth_min_valid_views, 4);
         assert!((def.tidi_depth_cap_frac - 0.02).abs() < 1e-9);
 
+        // Depth-coupled opacity regularizer: OFF (weight 0 = inert, no loss
+        // term / no projection) by default, with the documented ramp constants.
+        assert!(
+            (def.depth_opacity_reg_weight - 0.0).abs() < 1e-9,
+            "depth-opacity-reg must be off (weight 0) by default"
+        );
+        assert!((def.depth_opacity_reg_margin - 0.05).abs() < 1e-9);
+        assert!((def.depth_opacity_reg_softness - 0.1).abs() < 1e-9);
+
         // Unrelated flags must not switch it on.
         let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
             .expect("unrelated flags must parse");
         assert!(!other.tidi_prune);
         assert!(!other.tidi_depth_prune);
+        assert!((other.depth_opacity_reg_weight - 0.0).abs() < 1e-9);
 
         // Bare `--tidi-prune` (a presence flag) enables it. There is deliberately
         // no `--tidi-prune=false` form: the master switch is SetTrue so that the
@@ -1182,7 +1241,31 @@ mod tests {
         let depth_on = TrainConfig::try_parse_from(["brush", "--tidi-depth-prune"])
             .expect("--tidi-depth-prune must parse");
         assert!(depth_on.tidi_depth_prune);
-        assert!(!depth_on.tidi_prune, "depth path must not imply photometric");
+        assert!(
+            !depth_on.tidi_prune,
+            "depth path must not imply photometric"
+        );
+
+        // The depth-coupled opacity regularizer is a value flag, independent of
+        // both prune switches: setting its weight enables it alone.
+        let opacreg = TrainConfig::try_parse_from([
+            "brush",
+            "--depth-opacity-reg-weight",
+            "0.5",
+            "--depth-opacity-reg-margin",
+            "0.15",
+        ])
+        .expect("--depth-opacity-reg-weight must parse");
+        assert!((opacreg.depth_opacity_reg_weight - 0.5).abs() < 1e-9);
+        assert!((opacreg.depth_opacity_reg_margin - 0.15).abs() < 1e-9);
+        assert!(
+            !opacreg.tidi_prune,
+            "opacity-reg must not imply photometric"
+        );
+        assert!(
+            !opacreg.tidi_depth_prune,
+            "opacity-reg must not imply depth-prune"
+        );
     }
 
     #[test]

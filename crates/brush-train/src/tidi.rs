@@ -285,87 +285,17 @@ impl TidiState {
             return;
         }
 
-        // Everything runs on the accumulators' (inner) device; detach the means
-        // off the autodiff graph and move them there so no graph is retained and
-        // the elementwise math never touches a mismatched backend.
+        // Everything runs on the accumulators' (inner) device; the shared
+        // projection detaches the means off the autodiff graph and moves them
+        // there, so no graph is retained and the elementwise math never touches a
+        // mismatched backend.
         let device = self.valid_accum.device();
-        let means = detach_autodiff(means).to_device(&device);
-
-        let gt = Tensor::<2>::from_data(gt_depth, &device);
-        let [h, w] = gt.dims();
-        if h == 0 || w == 0 {
+        let Some((residual, valid)) =
+            project_depth_residual(means, gt_depth, camera, img_size, &device)
+        else {
             return;
-        }
-
-        // World → camera: `mean_cam = R·mu + t`, R/t from Brush's own camera.
-        // Building the [3,3] tensor from `matrix3.to_cols_array()` (glam is
-        // column-major) yields exactly Rᵀ in row-major, so `means @ Rᵀ` gives the
-        // rotated points as row vectors. The end-to-end projection + residual is
-        // verified on-device in `accumulate_depth_counts_front_surface_and_unscanned`.
-        let w2c = camera.world_to_local();
-        let cols = w2c.matrix3.to_cols_array();
-        let r_t = Tensor::<2>::from_data(TensorData::new(cols.to_vec(), [3, 3]), &device);
-        let t = w2c.translation;
-        let trans = Tensor::<1>::from_data(TensorData::new(vec![t.x, t.y, t.z], [3]), &device)
-            .reshape([1, 3]);
-        let mean_cam = means.matmul(r_t) + trans; // [N, 3]
-
-        let focal = camera.focal(img_size);
-        let center = camera.center(img_size);
-        let x = mean_cam.clone().slice(burn::tensor::s![.., 0..1]);
-        let y = mean_cam.clone().slice(burn::tensor::s![.., 1..2]);
-        let z = mean_cam.slice(burn::tensor::s![.., 2..3]);
-        let inv_z = z.clone().recip();
-        // project_pinhole: u = fx·x/z + cx, v = fy·y/z + cy.
-        let u = (x * inv_z.clone())
-            .mul_scalar(focal.x)
-            .add_scalar(center.x)
-            .squeeze_dim::<1>(1); // [N]
-        let v = (y * inv_z)
-            .mul_scalar(focal.y)
-            .add_scalar(center.y)
-            .squeeze_dim::<1>(1);
-        let z = z.squeeze_dim::<1>(1); // [N] camera-space depth
-        let ur = u.round();
-        let vr = v.round();
-
-        // In-frame: z > 0 and the rounded pixel lands inside [0, W-1]×[0, H-1].
-        // (`>= 0` is written as `!(<0)` since only strict comparators are used
-        // elsewhere in this module; NaN u/v from a behind-camera splat compare
-        // false here and are excluded — and masked out by `in_front` regardless.)
-        let in_front = z.clone().greater_elem(0.0);
-        let in_x = ur
-            .clone()
-            .lower_elem(0.0)
-            .bool_not()
-            .bool_and(ur.clone().greater_elem((w - 1) as f32).bool_not());
-        let in_y = vr
-            .clone()
-            .lower_elem(0.0)
-            .bool_not()
-            .bool_and(vr.clone().greater_elem((h - 1) as f32).bool_not());
-        let in_frame = in_front.bool_and(in_x).bool_and(in_y);
-
-        // Flat pixel index (row-major, row = v = y, col = u = x). Clamp to a valid
-        // range so the gather is always in-bounds even for the masked-out (NaN /
-        // behind-camera) rows we discard afterwards.
-        let uc = ur.clamp(0.0, (w - 1) as f32);
-        let vc = vr.clamp(0.0, (h - 1) as f32);
-        let flat = (vc.mul_scalar(w as f32) + uc)
-            .clamp(0.0, (h * w - 1) as f32)
-            .int(); // [N]
-        let gt_flat = gt.reshape([(h * w) as i32]);
-        // `select` on a 1-D source with a 1-D index is a per-element gather.
-        let z_tilde = gt_flat.select(0, flat); // [N]
-
-        // Valid return: a real, finite, positive depth AND an in-frame pixel.
-        let ret_valid = z_tilde
-            .clone()
-            .greater_elem(0.0)
-            .bool_and(z_tilde.clone().is_finite());
-        let valid = in_frame.bool_and(ret_valid);
+        };
         // Floating: in front of the surface by more than the margin.
-        let residual = z - z_tilde; // z - Z̃ ; < -margin means "in front"
         let floating = valid.clone().bool_and(residual.lower_elem(-margin));
 
         self.valid_accum = self.valid_accum.clone() + valid.float();
@@ -590,6 +520,172 @@ impl TidiState {
     }
 }
 
+/// Shared pinhole projection + GT-depth lookup for BOTH depth-driven paths: the
+/// hard `accumulate_depth` prune counter and the smooth `depth_opacity_reg_loss`
+/// regularizer. Both need the identical geometry, so the projection lives here
+/// once.
+///
+/// Detaches `means` off the autodiff graph, moves everything to `device`,
+/// projects each Gaussian centre into the view, reads the GT depth `Z̃` at the
+/// projected pixel, and returns:
+///   * `residual` `[N]` — the signed camera-space depth residual `r_i = z_i - Z̃`
+///     (< -margin means the Gaussian floats in FRONT of the measured surface);
+///   * `valid`    `[N]` — true where the projection is in-frame, in front of the
+///     camera (`z > 0`), and lands on a finite positive depth return.
+/// The returned tensors are DETACHED (no autodiff node): the depth-residual math
+/// never needs a gradient through position. Callers guard pinhole themselves
+/// (each owns its warning); this returns `None` only for an empty depth map.
+///
+/// PROJECTION: the world→camera transform is Brush's own [`Camera::world_to_local`];
+/// the pixel projection is the pinhole model (matching
+/// [`brush_render::kernels::camera_model::pinhole::project_pinhole`]:
+/// `u = fx·x/z + cx`, `v = fy·y/z + cy`). The end-to-end projection + residual is
+/// verified on-device in `accumulate_depth_counts_front_surface_and_unscanned`.
+fn project_depth_residual(
+    means: Tensor<2>,
+    gt_depth: TensorData,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    device: &Device,
+) -> Option<(Tensor<1>, Tensor<1, Bool>)> {
+    // Detach the means off the autodiff graph and move them onto `device` so no
+    // graph is retained and the elementwise math never touches a mismatched
+    // backend.
+    let means = detach_autodiff(means).to_device(device);
+
+    let gt = Tensor::<2>::from_data(gt_depth, device);
+    let [h, w] = gt.dims();
+    if h == 0 || w == 0 {
+        return None;
+    }
+
+    // World → camera: `mean_cam = R·mu + t`, R/t from Brush's own camera.
+    // Building the [3,3] tensor from `matrix3.to_cols_array()` (glam is
+    // column-major) yields exactly Rᵀ in row-major, so `means @ Rᵀ` gives the
+    // rotated points as row vectors.
+    let w2c = camera.world_to_local();
+    let cols = w2c.matrix3.to_cols_array();
+    let r_t = Tensor::<2>::from_data(TensorData::new(cols.to_vec(), [3, 3]), device);
+    let t = w2c.translation;
+    let trans =
+        Tensor::<1>::from_data(TensorData::new(vec![t.x, t.y, t.z], [3]), device).reshape([1, 3]);
+    let mean_cam = means.matmul(r_t) + trans; // [N, 3]
+
+    let focal = camera.focal(img_size);
+    let center = camera.center(img_size);
+    let x = mean_cam.clone().slice(burn::tensor::s![.., 0..1]);
+    let y = mean_cam.clone().slice(burn::tensor::s![.., 1..2]);
+    let z = mean_cam.slice(burn::tensor::s![.., 2..3]);
+    let inv_z = z.clone().recip();
+    // project_pinhole: u = fx·x/z + cx, v = fy·y/z + cy.
+    let u = (x * inv_z.clone())
+        .mul_scalar(focal.x)
+        .add_scalar(center.x)
+        .squeeze_dim::<1>(1); // [N]
+    let v = (y * inv_z)
+        .mul_scalar(focal.y)
+        .add_scalar(center.y)
+        .squeeze_dim::<1>(1);
+    let z = z.squeeze_dim::<1>(1); // [N] camera-space depth
+    let ur = u.round();
+    let vr = v.round();
+
+    // In-frame: z > 0 and the rounded pixel lands inside [0, W-1]×[0, H-1].
+    // (`>= 0` is written as `!(<0)` since only strict comparators are used
+    // elsewhere in this module; NaN u/v from a behind-camera splat compare
+    // false here and are excluded — and masked out by `in_front` regardless.)
+    let in_front = z.clone().greater_elem(0.0);
+    let in_x = ur
+        .clone()
+        .lower_elem(0.0)
+        .bool_not()
+        .bool_and(ur.clone().greater_elem((w - 1) as f32).bool_not());
+    let in_y = vr
+        .clone()
+        .lower_elem(0.0)
+        .bool_not()
+        .bool_and(vr.clone().greater_elem((h - 1) as f32).bool_not());
+    let in_frame = in_front.bool_and(in_x).bool_and(in_y);
+
+    // Flat pixel index (row-major, row = v = y, col = u = x). Clamp to a valid
+    // range so the gather is always in-bounds even for the masked-out (NaN /
+    // behind-camera) rows we discard afterwards.
+    let uc = ur.clamp(0.0, (w - 1) as f32);
+    let vc = vr.clamp(0.0, (h - 1) as f32);
+    let flat = (vc.mul_scalar(w as f32) + uc)
+        .clamp(0.0, (h * w - 1) as f32)
+        .int(); // [N]
+    let gt_flat = gt.reshape([(h * w) as i32]);
+    // `select` on a 1-D source with a 1-D index is a per-element gather.
+    let z_tilde = gt_flat.select(0, flat); // [N]
+
+    // Valid return: a real, finite, positive depth AND an in-frame pixel.
+    let ret_valid = z_tilde
+        .clone()
+        .greater_elem(0.0)
+        .bool_and(z_tilde.clone().is_finite());
+    let valid = in_frame.bool_and(ret_valid);
+    let residual = z - z_tilde; // z - Z̃ ; < -margin means "in front"
+    Some((residual, valid))
+}
+
+/// Depth-coupled opacity regularizer — the SMOOTH, differentiable alternative to
+/// the hard `accumulate_depth`/depth-prune path. Instead of deleting a floating
+/// Gaussian (which orphans its load-bearing colour and leaves a black halo),
+/// this adds a per-step loss whose ONLY gradient path is the activated opacity,
+/// so the optimizer fades off-surface Gaussians out SMOOTHLY and their colour
+/// redistributes into on-surface Gaussians before they vanish.
+///
+/// For every Gaussian projecting in front of a valid measured depth by more than
+/// `margin`, a DETACHED penalty weight
+/// `p_i = σ((-r_i - margin) / softness)` (a smooth ramp: ~0 on/behind the
+/// surface, → 1 as the Gaussian floats further in front), gated to 0 where the
+/// return is invalid, multiplies the ACTIVATED opacity `σ(raw_opacity_i)`. The
+/// term is `λ · mean_over_valid(p_i · σ(raw_opacity_i))`.
+///
+/// `raw_opacity` is the LIVE opacity leaf (`splats.raw_opacities.val()`), so it
+/// stays in the autodiff graph; `p_i` and the projection are detached. The only
+/// gradient is therefore
+/// `∂L/∂raw_opacity_i = λ · p_i · σ'(raw_opacity_i)`, which drives floating
+/// Gaussians' opacity toward 0 and touches nothing else.
+///
+/// Returns `None` (add no term) for an empty depth map, so the caller can skip
+/// cleanly. Pinhole is assumed — the caller guards non-pinhole + warns, mirroring
+/// the depth-prune and depth/normal terms. `softness` is floored to a tiny
+/// positive value so a `0` never divides.
+pub fn depth_opacity_reg_loss(
+    raw_opacity: Tensor<1>,
+    means: Tensor<2>,
+    gt_depth: TensorData,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    margin: f32,
+    softness: f32,
+) -> Option<Tensor<1>> {
+    // Run the projection on the OPACITY leaf's (autodiff) device so `p_i` lands
+    // there and can multiply the graph-tracked activated opacity directly. The
+    // projection detaches internally, so `residual` / `valid` carry no gradient.
+    let device = raw_opacity.device();
+    let (residual, valid) = project_depth_residual(means, gt_depth, camera, img_size, &device)?;
+
+    let valid_f = valid.float();
+    // Mean over the valid set. `p_i` is ~0 for valid-but-on-surface Gaussians, so
+    // they contribute ~0 to the numerator while still counting in the
+    // denominator — a genuine mean over the constrained Gaussians. Floored at 1
+    // so an all-invalid view (no valid returns) yields a 0 term, never a NaN.
+    let denom = valid_f.clone().sum().clamp_min(1.0);
+
+    // Detached smooth penalty weight: σ((-r - margin) / softness), 0 where the
+    // return is invalid. `p_i` inherits the detached projection, so it carries no
+    // gradient — it is a fixed per-Gaussian weight this step.
+    let soft = softness.max(1e-8);
+    let p = sigmoid(residual.neg().sub_scalar(margin).div_scalar(soft)) * valid_f;
+
+    // The ONLY graph-connected factor: the activated opacity of the live leaf.
+    let alpha = sigmoid(raw_opacity);
+    Some((p * alpha).sum() / denom)
+}
+
 /// Thresholds + caps for the cleanup pass, snapshotted from `TrainConfig` so the
 /// pure selection logic below has no dependency on the config crate.
 pub struct TidiPruneParams {
@@ -728,7 +824,9 @@ fn select_prune_indices(cfg: &TidiPruneParams, s: &HostSignals) -> Vec<u32> {
     // against the CANDIDATE distribution — a documented approximation, hence
     // off by default.
     let color_var: Option<(Vec<f32>, f32)> = if cfg.guard_color_var_quantile > 0.0 {
-        let cand_idx: Vec<u32> = (0..n as u32).filter(|&i| any_candidate[i as usize]).collect();
+        let cand_idx: Vec<u32> = (0..n as u32)
+            .filter(|&i| any_candidate[i as usize])
+            .collect();
         let neigh = knn_neighbor_indices(&s.pos, &cand_idx, cfg.knn_k);
         let mut v = vec![0.0f32; cand_idx.len()];
         for (row, nbrs) in neigh.chunks(cfg.knn_k).enumerate() {
@@ -1528,11 +1626,103 @@ mod device_tests {
             .into_vec()
             .expect("f32");
 
-        assert_eq!(valid, vec![1.0, 1.0, 0.0], "valid: front, surface, unscanned");
+        assert_eq!(
+            valid,
+            vec![1.0, 1.0, 0.0],
+            "valid: front, surface, unscanned"
+        );
         assert_eq!(
             floating,
             vec![1.0, 0.0, 0.0],
             "float: only the Gaussian in front of a valid surface"
+        );
+    }
+
+    /// The depth-coupled opacity regularizer routes a gradient to the opacity
+    /// leaf ONLY for a Gaussian floating in front of a valid depth return, and
+    /// leaves the leaf's other rows (a Gaussian at/behind the surface, and one
+    /// over an unscanned pixel) with ~0 / exactly-0 gradient. Same 4×4 pinhole
+    /// at the origin looking down +z as the accumulate test (identity
+    /// world→cam, so camera z == world z). Proves (1) the activated opacity is
+    /// the live leaf the term differentiates, (2) positions/`p_i` are detached
+    /// (no other row moves), and (3) the invalid-return gate zeroes the penalty.
+    #[tokio::test]
+    async fn depth_opacity_reg_grads_only_floating_gaussian() {
+        use brush_render::burn_glue::lift_to_autodiff;
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+
+        let img = glam::UVec2::new(4, 4);
+        let camera = Camera::new(
+            glam::Vec3::ZERO,
+            glam::Quat::IDENTITY,
+            std::f64::consts::FRAC_PI_2,
+            std::f64::consts::FRAC_PI_2,
+            glam::vec2(0.5, 0.5),
+            CameraModel::Pinhole,
+        );
+
+        // Camera-space (== world here) positions, all at z = 5:
+        //   G0 (0,0,5)    → pixel (u=2, v=2)  floats FAR in front of the surface
+        //   G1 (2.5,0,5)  → pixel (u=3, v=2)  sits at/behind the surface
+        //   G2 (-2.5,0,5) → pixel (u=1, v=2)  projects over an UNSCANNED pixel
+        let means = Tensor::<2>::from_data(
+            TensorData::new(
+                vec![0.0f32, 0.0, 5.0, 2.5, 0.0, 5.0, -2.5, 0.0, 5.0],
+                [3, 3],
+            ),
+            &device,
+        );
+
+        // Depth map [H=4, W=4], row-major (row = v, col = u), 0 = invalid:
+        //   (2,2) = 10  surface 5 BEHIND G0 (residual -5 ≪ -margin → floats, p≈1)
+        //   (2,3) = 4   surface 1 IN FRONT of G1 (residual +1 → p≈0, not floating)
+        //   (2,1) = 0   no return over G2 (valid mask 0 → p gated to exactly 0)
+        let mut depth = vec![0.0f32; 16];
+        depth[2 * 4 + 2] = 10.0;
+        depth[2 * 4 + 3] = 4.0;
+        depth[2 * 4 + 1] = 0.0;
+        let gt = TensorData::new(depth, [4, 4]);
+
+        // Opacity leaf; σ'(0) = 0.25, a clean nonzero derivative on every row so
+        // a zero gradient can only come from a zero penalty weight.
+        let raw = lift_to_autodiff(Tensor::<1>::from_data(
+            TensorData::new(vec![0.0f32, 0.0, 0.0], [3]),
+            &device,
+        ))
+        .require_grad();
+
+        let loss = depth_opacity_reg_loss(raw.clone(), means, gt, &camera, img, 0.05, 0.1)
+            .expect("valid returns exist, so a term is produced");
+        let grads = loss.backward();
+        let g: Vec<f32> = raw
+            .grad(&grads)
+            .expect("the opacity leaf must receive a gradient")
+            .into_data_async()
+            .await
+            .expect("grad readback")
+            .into_vec()
+            .expect("f32");
+
+        // Floating Gaussian: penalized, so a clearly POSITIVE gradient (descent
+        // lowers its opacity). This is the whole point of the term.
+        assert!(
+            g[0] > 1e-4,
+            "floating Gaussian must get a positive opacity gradient, got {}",
+            g[0]
+        );
+        // At/behind the surface: penalty weight ≈ 0 → negligible gradient vs the
+        // floater (proves positions are detached — only the penalty scales it).
+        assert!(
+            g[1].abs() < g[0] * 1e-2,
+            "at/behind-surface Gaussian gradient must be ~0 vs the floater, got {} (floater {})",
+            g[1],
+            g[0]
+        );
+        // Unscanned pixel: valid mask 0 → penalty gated to exactly 0 → no grad.
+        assert_eq!(
+            g[2], 0.0,
+            "a Gaussian over an unscanned pixel must get exactly zero opacity gradient"
         );
     }
 }
