@@ -32,6 +32,7 @@ use burn::{
     optim::{GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
     tensor::{Bool, Device, Gradients, Int, TensorData, activation::sigmoid},
 };
+use rand::{Rng, RngExt, SeedableRng};
 use rayon::prelude::*;
 
 use crate::adam_scaled::{AdamScaled, AdamScaledConfig};
@@ -683,6 +684,502 @@ const MAX_VOXELS: usize = 24_000_000;
 /// spuriously penalized by quantisation.
 const HALF_DIAG: f32 = 0.866_025_4;
 
+// ---- LiDAR plane priors (RANSAC on the seed cloud) ---------------------------
+//
+// The LiDAR version of PlanarGS. The seed/LiDAR cloud is SPARSE, so a genuine
+// wall splat that sits BETWEEN cloud points reads "far from every cloud point"
+// on the point-only distance field and is wrongly penalized (FIX 1 / see-through
+// holes). A PLANE fit to the wall's inliers INTERPOLATES those gaps: any splat
+// within the plane's bounded extent and near the plane is on-surface, even where
+// no individual cloud point is nearby. A mid-air floater is far from EVERY plane,
+// so it is still cleanly caught.
+//
+// Detection is geometric, NOT a VLM: iterative RANSAC on the point cloud. Runs
+// ONCE on the host at init (over the ~1M seed points), so it is CPU + rayon; the
+// planes it finds feed both FIX 1 (the augmented distance field) and FIX 2 (the
+// co-planarity geometry constraint).
+
+/// Iterations of the RANSAC minimal-sample loop per extracted plane. Each
+/// iteration samples 3 points, fits a plane, and counts inliers; the best over
+/// all iterations is refined and kept. 1000 is ample for a wall that occupies a
+/// meaningful fraction of the cloud (the hit probability per sample is high).
+const RANSAC_ITERS_PER_PLANE: usize = 1000;
+/// Max planes to extract. Walls + floor + ceiling of a room is ~6; 8 leaves slack.
+const RANSAC_MAX_PLANES: usize = 8;
+/// Keep an extracted plane only if its inliers are at least this fraction of the
+/// (original) cloud. Below it, the "plane" is noise/detail, so extraction stops.
+const RANSAC_MIN_INLIER_FRAC: f32 = 0.02;
+/// RANSAC inlier band = this multiple of the estimated nearest-neighbour spacing.
+/// Wide enough that a slightly noisy wall is one plane, tight enough that two
+/// parallel walls a few spacings apart are not merged.
+const RANSAC_THRESH_SPACING_MULT: f32 = 2.5;
+
+/// One extracted plane. The plane is `n · x = d` with `n` a unit normal; the
+/// bounded extent is stored as an in-plane orthonormal basis `(u, v)` plus the
+/// axis-aligned bounds of the inliers' `(u, v)` projections, so membership is a
+/// cheap "does the query project inside `[u_min,u_max] × [v_min,v_max]`" test.
+/// This keeps the plane finite (the actual wall), not the infinite plane.
+#[derive(Clone, Debug)]
+pub struct Plane {
+    /// Unit normal `n`.
+    pub normal: [f32; 3],
+    /// Offset `d` in `n · x = d`.
+    pub offset: f32,
+    /// In-plane orthonormal basis vector `u`.
+    pub u_axis: [f32; 3],
+    /// In-plane orthonormal basis vector `v` (`= n × u`).
+    pub v_axis: [f32; 3],
+    /// Inlier `u`-projection bounds.
+    pub u_min: f32,
+    pub u_max: f32,
+    /// Inlier `v`-projection bounds.
+    pub v_min: f32,
+    pub v_max: f32,
+    /// Inlier count as a fraction of the whole cloud (for logging).
+    pub inlier_frac: f32,
+}
+
+/// The planes extracted from a seed cloud, stored on the trainer so BOTH the
+/// augmented distance field (FIX 1) and the co-planarity constraint (FIX 2) read
+/// the same geometry. Cheap + device-independent (≤ 8 planes), so it carries
+/// across an LOD boundary verbatim like the distance grid.
+#[derive(Clone, Debug)]
+pub struct PlaneSet {
+    pub planes: Vec<Plane>,
+    /// Estimated nearest-neighbour spacing of the cloud (logging / provenance).
+    pub spacing: f32,
+    /// RANSAC inlier band actually used (`= spacing · RANSAC_THRESH_SPACING_MULT`).
+    pub threshold: f32,
+}
+
+/// Estimate the cloud's nearest-neighbour spacing from a random sample. Buckets
+/// points into a hash grid sized to ≈1 point per cell (cell = mean inter-point
+/// spacing from the bbox volume), then for a sample of points finds the nearest
+/// OTHER point within a 5×5×5 cell neighbourhood and returns the MEDIAN of those
+/// nearest distances. `None` when there are < 2 finite points.
+fn estimate_nn_spacing(pos: &[f32]) -> Option<f32> {
+    let n = pos.len() / 3;
+    if n < 2 {
+        return None;
+    }
+    let p = |i: usize| [pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]];
+    let mut mn = [f32::INFINITY; 3];
+    let mut mx = [f32::NEG_INFINITY; 3];
+    let mut finite = 0usize;
+    for i in 0..n {
+        let q = p(i);
+        if q.iter().all(|v| v.is_finite()) {
+            finite += 1;
+            for d in 0..3 {
+                mn[d] = mn[d].min(q[d]);
+                mx[d] = mx[d].max(q[d]);
+            }
+        }
+    }
+    if finite < 2 || !mn.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let vol = (0..3).map(|d| (mx[d] - mn[d]).max(1e-9)).product::<f32>();
+    // Mean inter-point spacing estimate: (volume / n)^(1/3). Guarded > 0.
+    let cell = (vol / finite as f32).cbrt().max(1e-9);
+    let key = |q: [f32; 3]| -> (i64, i64, i64) {
+        (
+            ((q[0] - mn[0]) / cell) as i64,
+            ((q[1] - mn[1]) / cell) as i64,
+            ((q[2] - mn[2]) / cell) as i64,
+        )
+    };
+    let mut grid: hashbrown::HashMap<(i64, i64, i64), Vec<u32>> = hashbrown::HashMap::new();
+    for i in 0..n {
+        let q = p(i);
+        if q.iter().all(|v| v.is_finite()) {
+            grid.entry(key(q)).or_default().push(i as u32);
+        }
+    }
+    // Deterministic stride sample of up to ~3000 points.
+    let sample_target = 3000usize.min(finite);
+    let stride = (finite / sample_target).max(1);
+    let mut dists: Vec<f32> = Vec::new();
+    let mut taken = 0usize;
+    for i in (0..n).step_by(stride) {
+        let q = p(i);
+        if !q.iter().all(|v| v.is_finite()) {
+            continue;
+        }
+        let (cx, cy, cz) = key(q);
+        let mut best = f32::INFINITY;
+        for dx in -2..=2i64 {
+            for dy in -2..=2i64 {
+                for dz in -2..=2i64 {
+                    if let Some(ids) = grid.get(&(cx + dx, cy + dy, cz + dz)) {
+                        for &j in ids {
+                            if j as usize == i {
+                                continue;
+                            }
+                            let r = p(j as usize);
+                            let d2 = (0..3).map(|d| (q[d] - r[d]).powi(2)).sum::<f32>();
+                            if d2 < best {
+                                best = d2;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if best.is_finite() {
+            dists.push(best.sqrt());
+        }
+        taken += 1;
+        if taken >= sample_target {
+            break;
+        }
+    }
+    if dists.is_empty() {
+        // Sparse relative to the grid: fall back to the mean spacing estimate.
+        return Some(cell);
+    }
+    dists.sort_by(|a, b| a.total_cmp(b));
+    Some(dists[dists.len() / 2].max(1e-9))
+}
+
+/// Symmetric-3×3 eigendecomposition by cyclic Jacobi rotations (no external
+/// linear-algebra dependency). Returns the three eigenvalues and the matching
+/// eigenvectors as columns of `vecs`. Used to refit a plane's normal as the
+/// smallest-eigenvalue eigenvector (the least-squares total-least-squares fit)
+/// of the inliers' covariance, which is far more stable than the minimal-sample
+/// normal. Converges in a handful of sweeps for a 3×3.
+fn symmetric_eig3(mut a: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
+    let mut v = [[0.0f64; 3]; 3];
+    for (i, row) in v.iter_mut().enumerate() {
+        row[i] = 1.0;
+    }
+    for _ in 0..50 {
+        // Largest off-diagonal magnitude.
+        let (mut p, mut q, mut off) = (0usize, 1usize, 0.0f64);
+        for i in 0..3 {
+            for j in (i + 1)..3 {
+                if a[i][j].abs() > off {
+                    off = a[i][j].abs();
+                    p = i;
+                    q = j;
+                }
+            }
+        }
+        if off < 1e-12 {
+            break;
+        }
+        let app = a[p][p];
+        let aqq = a[q][q];
+        let apq = a[p][q];
+        // Jacobi rotation angle (numerically stable atan2 form of cot(2θ)).
+        let theta = 0.5 * (2.0 * apq).atan2(app - aqq);
+        let (s, c) = theta.sin_cos();
+        // Symmetric Jacobi rotation A' = JᵀAJ, all updates from ORIGINAL values
+        // (temporaries), so the 2×2 pivot block is never double-applied.
+        // Off-block rows/cols k ∉ {p,q}: keep symmetry a[k][p] == a[p][k].
+        for k in 0..3 {
+            if k == p || k == q {
+                continue;
+            }
+            let akp = a[k][p];
+            let akq = a[k][q];
+            let new_kp = c * akp - s * akq;
+            let new_kq = s * akp + c * akq;
+            a[k][p] = new_kp;
+            a[p][k] = new_kp;
+            a[k][q] = new_kq;
+            a[q][k] = new_kq;
+        }
+        // 2×2 pivot block (from originals); a[p][q] is annihilated.
+        let app = a[p][p];
+        let aqq = a[q][q];
+        let apq = a[p][q];
+        a[p][p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
+        a[q][q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
+        a[p][q] = 0.0;
+        a[q][p] = 0.0;
+        // Accumulate the eigenvectors (columns p, q of V).
+        for k in 0..3 {
+            let vkp = v[k][p];
+            let vkq = v[k][q];
+            v[k][p] = c * vkp - s * vkq;
+            v[k][q] = s * vkp + c * vkq;
+        }
+    }
+    ([a[0][0], a[1][1], a[2][2]], v)
+}
+
+/// Build an in-plane orthonormal basis `(u, v)` for a unit normal `n`, choosing
+/// the reference axis least parallel to `n` so `u` is well-conditioned.
+fn plane_basis(n: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let nv = glam::Vec3::from(n);
+    let refv = if n[0].abs() < 0.9 {
+        glam::Vec3::X
+    } else {
+        glam::Vec3::Y
+    };
+    let u = nv.cross(refv).normalize_or_zero();
+    let u = if u.length_squared() < 1e-12 {
+        // n parallel to both fallbacks is impossible, but stay safe.
+        glam::Vec3::Z
+    } else {
+        u
+    };
+    let v = nv.cross(u).normalize_or_zero();
+    (u.to_array(), v.to_array())
+}
+
+/// Refit a plane to a set of inlier points by total least squares: the normal is
+/// the smallest-eigenvalue eigenvector of the (mean-centred) covariance, and the
+/// offset passes through the centroid. Returns `(normal, offset)`.
+fn refit_plane(pos: &[f32], inliers: &[u32]) -> Option<([f32; 3], f32)> {
+    if inliers.len() < 3 {
+        return None;
+    }
+    let inv = 1.0 / inliers.len() as f64;
+    let mut c = [0.0f64; 3];
+    for &i in inliers {
+        for d in 0..3 {
+            c[d] += pos[i as usize * 3 + d] as f64;
+        }
+    }
+    for d in &mut c {
+        *d *= inv;
+    }
+    let mut cov = [[0.0f64; 3]; 3];
+    for &i in inliers {
+        let dx = [
+            pos[i as usize * 3] as f64 - c[0],
+            pos[i as usize * 3 + 1] as f64 - c[1],
+            pos[i as usize * 3 + 2] as f64 - c[2],
+        ];
+        for a in 0..3 {
+            for b in 0..3 {
+                cov[a][b] += dx[a] * dx[b];
+            }
+        }
+    }
+    let (vals, vecs) = symmetric_eig3(cov);
+    // Smallest-eigenvalue eigenvector = plane normal.
+    let mut mi = 0usize;
+    for i in 1..3 {
+        if vals[i] < vals[mi] {
+            mi = i;
+        }
+    }
+    let n = glam::vec3(vecs[0][mi] as f32, vecs[1][mi] as f32, vecs[2][mi] as f32);
+    let n = n.normalize_or_zero();
+    if n.length_squared() < 1e-12 {
+        return None;
+    }
+    let d = n.dot(glam::vec3(c[0] as f32, c[1] as f32, c[2] as f32));
+    Some((n.to_array(), d))
+}
+
+/// Extract up to [`RANSAC_MAX_PLANES`] planes from a flat `[N*3]` cloud by
+/// iterative RANSAC: find the largest plane, refit + record it with its bounded
+/// extent, remove its inliers, repeat until the next plane is below the inlier
+/// floor. Pure host logic (deterministic given `seed`), unit-testable without a
+/// device. `None`/empty when the cloud is too small or planar structure is absent.
+///
+/// Inlier counting inside the minimal-sample loop is parallel (rayon); the outer
+/// loop is sequential (each plane depends on the previous removal). One-time init
+/// cost on ~1M points is a few seconds on the build box.
+fn extract_planes(pos: &[f32], seed: u64) -> PlaneSet {
+    let n = pos.len() / 3;
+    let spacing = estimate_nn_spacing(pos).unwrap_or(1e-3);
+    let threshold = (spacing * RANSAC_THRESH_SPACING_MULT).max(1e-6);
+    let mut planes = Vec::new();
+    if n < 3 {
+        return PlaneSet {
+            planes,
+            spacing,
+            threshold,
+        };
+    }
+    let min_inliers = ((RANSAC_MIN_INLIER_FRAC * n as f32).ceil() as usize).max(3);
+
+    // Remaining (not-yet-assigned) point indices; RANSAC operates on these.
+    let mut remaining: Vec<u32> = (0..n as u32).collect();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+
+    for _plane_i in 0..RANSAC_MAX_PLANES {
+        if remaining.len() < min_inliers {
+            break;
+        }
+        let dist = |nrm: glam::Vec3, off: f32, idx: u32| -> f32 {
+            let q = glam::vec3(
+                pos[idx as usize * 3],
+                pos[idx as usize * 3 + 1],
+                pos[idx as usize * 3 + 2],
+            );
+            (nrm.dot(q) - off).abs()
+        };
+
+        // Minimal-sample loop: sample 3 remaining points, fit, count inliers.
+        // Parallelised across iterations; each returns (inlier_count, plane).
+        let samples: Vec<(u32, u32, u32)> = (0..RANSAC_ITERS_PER_PLANE)
+            .map(|_| {
+                let a = rng.random_range(0..remaining.len());
+                let b = rng.random_range(0..remaining.len());
+                let c = rng.random_range(0..remaining.len());
+                (remaining[a], remaining[b], remaining[c])
+            })
+            .collect();
+        let best = samples
+            .par_iter()
+            .filter_map(|&(ia, ib, ic)| {
+                if ia == ib || ib == ic || ia == ic {
+                    return None;
+                }
+                let pa = glam::vec3(
+                    pos[ia as usize * 3],
+                    pos[ia as usize * 3 + 1],
+                    pos[ia as usize * 3 + 2],
+                );
+                let pb = glam::vec3(
+                    pos[ib as usize * 3],
+                    pos[ib as usize * 3 + 1],
+                    pos[ib as usize * 3 + 2],
+                );
+                let pc = glam::vec3(
+                    pos[ic as usize * 3],
+                    pos[ic as usize * 3 + 1],
+                    pos[ic as usize * 3 + 2],
+                );
+                let nrm = (pb - pa).cross(pc - pa);
+                if nrm.length_squared() < 1e-20 {
+                    return None; // collinear sample
+                }
+                let nrm = nrm.normalize();
+                let off = nrm.dot(pa);
+                let count = remaining
+                    .iter()
+                    .filter(|&&idx| dist(nrm, off, idx) < threshold)
+                    .count();
+                Some((count, nrm.to_array(), off))
+            })
+            .max_by_key(|(count, _, _)| *count);
+
+        let Some((count, nrm0, off0)) = best else {
+            break;
+        };
+        if count < min_inliers {
+            break;
+        }
+
+        // Collect the minimal-sample inliers, refit the plane to them (TLS), then
+        // recollect inliers against the refined plane for a stable extent.
+        let nrm0 = glam::Vec3::from(nrm0);
+        let inliers0: Vec<u32> = remaining
+            .iter()
+            .copied()
+            .filter(|&idx| dist(nrm0, off0, idx) < threshold)
+            .collect();
+        let (nrm, off) = refit_plane(pos, &inliers0).unwrap_or((nrm0.to_array(), off0));
+        let nrm = glam::Vec3::from(nrm);
+        let inliers: Vec<u32> = remaining
+            .iter()
+            .copied()
+            .filter(|&idx| dist(nrm, off, idx) < threshold)
+            .collect();
+        if inliers.len() < min_inliers {
+            break;
+        }
+
+        // Bounded extent: project inliers onto the in-plane basis, take min/max.
+        let (u_axis, v_axis) = plane_basis(nrm.to_array());
+        let uv = glam::Vec3::from(u_axis);
+        let vv = glam::Vec3::from(v_axis);
+        let (mut u_min, mut u_max, mut v_min, mut v_max) = (
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        );
+        for &idx in &inliers {
+            let q = glam::vec3(
+                pos[idx as usize * 3],
+                pos[idx as usize * 3 + 1],
+                pos[idx as usize * 3 + 2],
+            );
+            let uu = uv.dot(q);
+            let vvv = vv.dot(q);
+            u_min = u_min.min(uu);
+            u_max = u_max.max(uu);
+            v_min = v_min.min(vvv);
+            v_max = v_max.max(vvv);
+        }
+
+        let inlier_frac = inliers.len() as f32 / n as f32;
+        planes.push(Plane {
+            normal: nrm.to_array(),
+            offset: off,
+            u_axis,
+            v_axis,
+            u_min,
+            u_max,
+            v_min,
+            v_max,
+            inlier_frac,
+        });
+
+        // Remove this plane's inliers and continue on the rest.
+        let inlier_set: hashbrown::HashSet<u32> = inliers.into_iter().collect();
+        remaining.retain(|idx| !inlier_set.contains(idx));
+    }
+
+    PlaneSet {
+        planes,
+        spacing,
+        threshold,
+    }
+}
+
+/// Read a seed cloud to the host and extract its planes by RANSAC (FIX 1 + FIX
+/// 2's shared infra). Runs ONCE at init when `--plane-gate` or
+/// `--plane-coplanarity-weight` is on. `None` for an empty cloud; an all-non-
+/// planar cloud returns an empty `PlaneSet` (both features then no-op).
+pub async fn extract_planes_from_cloud(cloud_means: Tensor<2>, seed: u64) -> Option<PlaneSet> {
+    if cloud_means.dims()[0] == 0 {
+        return None;
+    }
+    let host: Vec<f32> = detach_autodiff(cloud_means)
+        .into_data_async()
+        .await
+        .ok()?
+        .into_vec()
+        .ok()?;
+    Some(extract_planes(&host, seed))
+}
+
+/// Conservative distance from a voxel CENTRE to the nearest bounded plane, or
+/// `+inf` if the centre projects outside every plane's extent. Mirrors the
+/// point-distance path's `HALF_DIAG · vox` bias so a splat sitting on a plane
+/// reads ~0 after the same quantisation correction. Used ONLY when `--plane-gate`
+/// augments the distance field.
+fn nearest_plane_distance(center: [f32; 3], planes: &[Plane], vox: f32) -> f32 {
+    let c = glam::Vec3::from(center);
+    let mut best = f32::INFINITY;
+    for pl in planes {
+        let nrm = glam::Vec3::from(pl.normal);
+        let uu = glam::Vec3::from(pl.u_axis).dot(c);
+        let vv = glam::Vec3::from(pl.v_axis).dot(c);
+        if uu < pl.u_min || uu > pl.u_max || vv < pl.v_min || vv > pl.v_max {
+            continue; // outside the bounded wall
+        }
+        let d = (nrm.dot(c) - pl.offset).abs();
+        if d < best {
+            best = d;
+        }
+    }
+    if best.is_finite() {
+        (best - HALF_DIAG * vox).max(0.0)
+    } else {
+        best
+    }
+}
+
 /// Host-side product of [`build_distance_field`]: a dense truncated distance
 /// field plus the geometry needed to map a world point to a flat voxel index.
 struct DistanceFieldData {
@@ -704,7 +1201,22 @@ struct DistanceFieldData {
 /// then computes each candidate's nearest-point distance in parallel (each
 /// candidate is written exactly once, so there is no write race). Empty space is
 /// never visited. On a house-scale LiDAR cloud this is seconds on the build box.
-fn build_distance_field(pos: &[f32], margin: f32, softness: f32) -> Option<DistanceFieldData> {
+///
+/// PLANE AUGMENTATION (FIX 1, `--plane-gate`): when `planes` is `Some`, the stored
+/// value is `min(distance-to-nearest-cloud-point, distance-to-nearest-bounded-plane)`.
+/// This INTERPOLATES the sparse cloud: a voxel between cloud points but inside a
+/// wall's extent reads ~0 (on-surface) instead of `max_dist`, so genuine wall
+/// splats in the gaps are no longer penalised, while a mid-air voxel (far from
+/// every cloud point AND outside every plane's extent) still reads `max_dist`.
+/// The plane pass sweeps ALL voxels (parallel, one write each), because a
+/// plane-covered voxel need not be near any occupied voxel — that is the whole
+/// point of the fill. `None` reproduces the exact point-only field (byte-inert).
+fn build_distance_field(
+    pos: &[f32],
+    margin: f32,
+    softness: f32,
+    planes: Option<&[Plane]>,
+) -> Option<DistanceFieldData> {
     let n = pos.len() / 3;
     if n == 0 {
         return None;
@@ -833,6 +1345,30 @@ fn build_distance_field(pos: &[f32], margin: f32, softness: f32) -> Option<Dista
     for (idx, dist) in updates {
         field[idx] = dist;
     }
+
+    // FIX 1: augment with distance-to-nearest-bounded-plane (min with the
+    // point-distance already stored). Sweeps every voxel in parallel because a
+    // plane-covered voxel in a sparse gap need not be a point-distance candidate.
+    if let Some(planes) = planes
+        && !planes.is_empty()
+    {
+        field.par_iter_mut().enumerate().for_each(|(idx, cell)| {
+            let i = idx / (ny * nz);
+            let rem = idx % (ny * nz);
+            let j = rem / nz;
+            let k = rem % nz;
+            let center = [
+                origin[0] + (i as f32 + 0.5) * vox,
+                origin[1] + (j as f32 + 0.5) * vox,
+                origin[2] + (k as f32 + 0.5) * vox,
+            ];
+            let pd = nearest_plane_distance(center, planes, vox).min(max_dist);
+            if pd < *cell {
+                *cell = pd;
+            }
+        });
+    }
+
     Some(DistanceFieldData {
         field,
         origin,
@@ -860,10 +1396,15 @@ impl CloudDistanceGrid {
     /// Read the cloud to the host, build the distance field, upload it to
     /// `device`. `None` when the cloud has no finite point (e.g. a random-init
     /// run with no seed) — the caller then warns once and no-ops the reg.
+    ///
+    /// `planes` (FIX 1, `--plane-gate`) augments the stored field with
+    /// distance-to-nearest-bounded-plane; pass `None` for the exact point-only
+    /// field (identical to the pre-plane behaviour).
     pub async fn build(
         cloud_means: Tensor<2>,
         margin: f32,
         softness: f32,
+        planes: Option<&[Plane]>,
         device: &Device,
     ) -> Option<Self> {
         if cloud_means.dims()[0] == 0 {
@@ -877,7 +1418,7 @@ impl CloudDistanceGrid {
             .ok()?
             .into_vec()
             .ok()?;
-        let data = build_distance_field(&host, margin, softness)?;
+        let data = build_distance_field(&host, margin, softness, planes)?;
         let num = data.field.len();
         let field = Tensor::<1>::from_data(TensorData::new(data.field, [num]), device);
         Some(Self {
@@ -1003,6 +1544,151 @@ pub fn depth_opacity_reg_loss(
     let p = p.mask_fill(nonfinite.squeeze_dim::<1>(1), 1.0);
     let alpha = sigmoid(raw_opacity);
     (p * alpha).mean()
+}
+
+// ---- FIX 2: co-planarity geometry constraint ---------------------------------
+//
+// A STRONGER, separate opt-in (`--plane-coplanarity-weight`). Unlike the opacity
+// gate (which only fades far-from-cloud splats via an opacity gradient), this is a
+// real GEOMETRY constraint with a gradient on POSITION and SCALE (and, as a
+// byproduct of the projected-variance form, on rotation): for each Gaussian
+// ASSIGNED to a plane it (a) pulls the centre onto the plane and (b) flattens the
+// Gaussian against the plane. This directly removes the photometric rank
+// deficiency on a featureless wall.
+//
+// ASSIGNMENT is detached and recomputed each step: a Gaussian is assigned to the
+// nearest plane whose perpendicular distance is `< assign_dist` AND whose bounded
+// extent contains the Gaussian's projection. The plane params `(n, d)` are
+// detached constants; only `means` / `scales` / `rotations` carry gradient.
+
+/// Co-planarity loss (FIX 2). `means` `[N,3]`, `rotations` `[N,4]` (w,x,y,z), and
+/// `scales` `[N,3]` (world std-devs) are the LIVE autodiff leaves. Returns `None`
+/// when there are no planes (so the caller adds nothing). The term is
+///   `mean over assigned i of [ (n_i·mu_i − d_i)² + Σ_k (s_ik · w_ik)² ]`
+/// where `w_i = R_iᵀ n_i` is the plane normal expressed in the Gaussian's local
+/// frame, so `Σ_k (s_ik w_ik)²` is exactly the Gaussian's variance ALONG the
+/// plane normal — driving it to zero flattens the Gaussian onto the plane.
+///
+/// BACKEND: everything is built on `means.device()` (autodiff). The plane
+/// constants are `from_data` on that device (autodiff-kind constants, no grad),
+/// and assignment uses `means.detach()` (stays autodiff-kind, no position grad
+/// through the mask) — mirroring the opacity gate's discipline. The live product
+/// `(proj − d)²` and the projected variance keep `means` / `scales` / `rotations`
+/// on the graph, so the gradient reaches geometry without a backend cross-kind
+/// panic.
+pub fn plane_coplanarity_loss(
+    means: Tensor<2>,
+    rotations: Tensor<2>,
+    scales: Tensor<2>,
+    planes: &PlaneSet,
+    assign_dist: f32,
+    device: &Device,
+) -> Option<Tensor<1>> {
+    let p = planes.planes.len();
+    if p == 0 {
+        return None;
+    }
+    let n = means.dims()[0];
+    if n == 0 {
+        return None;
+    }
+
+    // Plane constants as device tensors (autodiff-kind, no grad): normals [P,3],
+    // offsets [P], and the in-plane basis + bounds for the extent test.
+    let mut normals = Vec::with_capacity(p * 3);
+    let mut offsets = Vec::with_capacity(p);
+    let mut u_ax = Vec::with_capacity(p * 3);
+    let mut v_ax = Vec::with_capacity(p * 3);
+    let mut u_lo = Vec::with_capacity(p);
+    let mut u_hi = Vec::with_capacity(p);
+    let mut v_lo = Vec::with_capacity(p);
+    let mut v_hi = Vec::with_capacity(p);
+    for pl in &planes.planes {
+        normals.extend_from_slice(&pl.normal);
+        offsets.push(pl.offset);
+        u_ax.extend_from_slice(&pl.u_axis);
+        v_ax.extend_from_slice(&pl.v_axis);
+        u_lo.push(pl.u_min);
+        u_hi.push(pl.u_max);
+        v_lo.push(pl.v_min);
+        v_hi.push(pl.v_max);
+    }
+    let normals_t = Tensor::<2>::from_data(TensorData::new(normals, [p, 3]), device);
+    let offsets_t = Tensor::<1>::from_data(TensorData::new(offsets.clone(), [p]), device);
+    let u_ax_t = Tensor::<2>::from_data(TensorData::new(u_ax, [p, 3]), device);
+    let v_ax_t = Tensor::<2>::from_data(TensorData::new(v_ax, [p, 3]), device);
+
+    // -- Detached assignment. For each plane, the per-Gaussian perpendicular
+    // distance, masked to +LARGE outside the assign band or the bounded extent.
+    // Stacked to [N, P]; the argmin/min over P give the nearest valid plane.
+    const LARGE: f32 = 1e30;
+    let md = means.clone().detach(); // [N,3], autodiff-kind, no grad
+    let mut cand_cols: Vec<Tensor<2>> = Vec::with_capacity(p);
+    for pi in 0..p {
+        let nrm = normals_t.clone().slice(burn::tensor::s![pi..pi + 1, ..]); // [1,3]
+        let off = offsets.get(pi).copied().unwrap_or(0.0);
+        // signed = md·n − d ; perp = |signed|  → [N,1]
+        let signed = (md.clone() * nrm.clone()).sum_dim(1).sub_scalar(off);
+        let perp = signed.abs();
+        // In-plane projections and the extent test.
+        let uu = (md.clone() * u_ax_t.clone().slice(burn::tensor::s![pi..pi + 1, ..])).sum_dim(1); // [N,1]
+        let vv = (md.clone() * v_ax_t.clone().slice(burn::tensor::s![pi..pi + 1, ..])).sum_dim(1);
+        // Bounded-extent test with strict comparators only (matching this
+        // module's style): `x >= lo` is `!(x < lo)`, `x <= hi` is `!(x > hi)`.
+        let ge_ulo = uu.clone().lower_elem(u_lo[pi]).bool_not();
+        let le_uhi = uu.greater_elem(u_hi[pi]).bool_not();
+        let ge_vlo = vv.clone().lower_elem(v_lo[pi]).bool_not();
+        let le_vhi = vv.greater_elem(v_hi[pi]).bool_not();
+        let inside = ge_ulo.bool_and(le_uhi).bool_and(ge_vlo).bool_and(le_vhi);
+        let near = perp.clone().lower_elem(assign_dist);
+        let valid = inside.bool_and(near);
+        // Distance where valid, +LARGE elsewhere.
+        let col = perp.mask_fill(valid.bool_not(), LARGE);
+        cand_cols.push(col);
+    }
+    let cand = Tensor::cat(cand_cols, 1); // [N, P]
+    let best_dist = cand.clone().min_dim(1); // [N,1]
+    let best_plane = cand.argmin(1); // [N,1] Int
+    // Assigned iff some plane was within band+extent (min < LARGE).
+    let assigned = best_dist.lower_elem(LARGE * 0.5); // [N,1] Bool
+    let assigned_f = assigned.clone().float(); // [N,1]
+    let best_idx = best_plane.squeeze_dim::<1>(1); // [N] Int
+
+    // Per-Gaussian assigned plane params (detached constants).
+    let n_i = normals_t.select(0, best_idx.clone()); // [N,3]
+    let d_i = offsets_t.select(0, best_idx); // [N]
+
+    // -- Position pull: (n_i·mu_i − d_i)² with LIVE means.
+    let proj = (means * n_i.clone()).sum_dim(1).squeeze_dim::<1>(1); // [N]
+    let pos_term = (proj - d_i).powi_scalar(2); // [N]
+
+    // -- Flatten: variance of the Gaussian along the plane normal. Express the
+    // (unit) normal in the Gaussian's local frame via the conjugate of the
+    // normalised quaternion (Rᵀ n), then Σ_k (s_k · w_k)² = nᵀ R S² Rᵀ n.
+    let qnorm = rotations
+        .clone()
+        .powi_scalar(2)
+        .sum_dim(1)
+        .sqrt()
+        .clamp_min(1e-12); // [N,1]
+    let qunit = rotations.div(qnorm); // [N,4] unit
+    // Conjugate = (w, −x, −y, −z): flips the vector part.
+    let sign = Tensor::<2>::from_data(
+        TensorData::new(vec![1.0f32, -1.0, -1.0, -1.0], [1, 4]),
+        device,
+    );
+    let qconj = qunit * sign; // [N,4]
+    let w_local = crate::quat_vec::quaternion_vec_multiply(qconj, n_i); // [N,3] = Rᵀ n
+    let flatten_term = (scales * w_local)
+        .powi_scalar(2)
+        .sum_dim(1)
+        .squeeze_dim::<1>(1); // [N]
+
+    // -- Masked mean over the assigned Gaussians.
+    let assigned_f1 = assigned_f.squeeze_dim::<1>(1); // [N]
+    let per = (pos_term + flatten_term) * assigned_f1.clone(); // [N]
+    let count = assigned_f1.sum().clamp_min(1.0); // scalar-as-[1]
+    Some(per.sum() / count)
 }
 
 /// Thresholds + caps for the cleanup pass, snapshotted from `TrainConfig` so the
@@ -1830,6 +2516,126 @@ mod tests {
             "depth floater pruned via the standalone path"
         );
     }
+
+    // ---- Plane priors (RANSAC + FIX 1 augmentation), pure host --------------
+
+    /// TEST (a): RANSAC recovers a synthetic plane's normal and offset. A dense
+    /// z=0 grid dominates the cloud (plus a few off-plane outliers); the top plane
+    /// must have a ~±z normal, ~0 offset, and hold the bulk of the points.
+    #[test]
+    fn ransac_finds_synthetic_plane() {
+        let mut pos = Vec::new();
+        for i in 0..20 {
+            for j in 0..20 {
+                pos.extend_from_slice(&[i as f32 * 0.1, j as f32 * 0.1, 0.0]);
+            }
+        }
+        // Off-plane outliers (z = 1) well outside the inlier band.
+        for k in 0..10 {
+            pos.extend_from_slice(&[k as f32 * 0.1, 0.5, 1.0]);
+        }
+        let ps = extract_planes(&pos, 42);
+        assert!(!ps.planes.is_empty(), "RANSAC must find the dominant plane");
+        let p = &ps.planes[0];
+        assert!(
+            p.normal[2].abs() > 0.99,
+            "normal should be ~±z, got {:?}",
+            p.normal
+        );
+        assert!(
+            p.normal[0].abs() < 0.05 && p.normal[1].abs() < 0.05,
+            "normal should be axis-aligned, got {:?}",
+            p.normal
+        );
+        assert!(
+            p.offset.abs() < 0.05,
+            "plane passes through z=0, offset ~0, got {}",
+            p.offset
+        );
+        assert!(
+            p.inlier_frac > 0.5,
+            "the grid plane dominates the cloud, got frac {}",
+            p.inlier_frac
+        );
+        // Extent covers the grid span [0, 1.9] on both in-plane axes.
+        assert!(p.u_max - p.u_min > 1.5 && p.v_max - p.v_min > 1.5);
+    }
+
+    /// TEST (b): plane-gate fills the gap between SPARSE cloud points. Four wall
+    /// corners 2 units apart leave the on-wall centre (1,1,0) far from every point
+    /// (beyond the search reach), so the point-only field marks it a floater
+    /// (`max_dist`) — the exact see-through hole. With the plane, the same voxel
+    /// reads ~0 (on-surface). The `nearest_plane_distance` helper is checked
+    /// directly for the two other cases: outside the bounded extent → no plane
+    /// distance; well off the plane → a large distance (still caught).
+    #[test]
+    fn plane_gate_fills_gaps_between_sparse_points() {
+        let margin = 0.15f32;
+        let softness = 0.05f32;
+        let pos = vec![
+            0.0, 0.0, 0.0, //
+            2.0, 0.0, 0.0, //
+            0.0, 2.0, 0.0, //
+            2.0, 2.0, 0.0,
+        ];
+        let plane = Plane {
+            normal: [0.0, 0.0, 1.0],
+            offset: 0.0,
+            u_axis: [1.0, 0.0, 0.0],
+            v_axis: [0.0, 1.0, 0.0],
+            u_min: 0.0,
+            u_max: 2.0,
+            v_min: 0.0,
+            v_max: 2.0,
+            inlier_frac: 1.0,
+        };
+        let max_dist = margin + FAR_SPAN * softness.max(1e-6);
+
+        // Point-only: the between-points on-wall voxel is a hole (max_dist).
+        let none = build_distance_field(&pos, margin, softness, None).expect("field");
+        let [nx, ny, nz] = none.dims;
+        let flat = |i: usize, j: usize, k: usize| (i * ny + j) * nz + k;
+        let vidx = |p: f32, o: f32| (((p - o) / none.vox).floor() as usize);
+        let (gi, gj, gk) = (
+            vidx(1.0, none.origin[0]),
+            vidx(1.0, none.origin[1]),
+            vidx(0.0, none.origin[2]),
+        );
+        let _ = nx;
+        assert!(
+            (none.field[flat(gi, gj, gk)] - max_dist).abs() < 1e-6,
+            "point-only: the on-wall gap voxel is a hole (max_dist), got {}",
+            none.field[flat(gi, gj, gk)]
+        );
+
+        // Plane-gated: same geometry (planes don't change the bbox), gap filled.
+        let aug =
+            build_distance_field(&pos, margin, softness, Some(&[plane.clone()])).expect("field");
+        assert_eq!(
+            aug.dims, none.dims,
+            "planes must not change the grid geometry"
+        );
+        assert!(
+            aug.field[flat(gi, gj, gk)] < 0.05,
+            "plane-gate fills the gap: on-wall voxel reads ~0, got {}",
+            aug.field[flat(gi, gj, gk)]
+        );
+
+        // Helper: inside-extent near voxel ~0; outside-extent → +inf; off-plane →
+        // ~1.0 (still a floater).
+        let on = nearest_plane_distance([1.0, 1.0, 0.0], std::slice::from_ref(&plane), 0.05);
+        assert!(on < 0.05, "on-wall centre ~0, got {on}");
+        let outside = nearest_plane_distance([5.0, 5.0, 0.0], std::slice::from_ref(&plane), 0.05);
+        assert!(
+            !outside.is_finite(),
+            "a point outside the wall extent has no plane distance, got {outside}"
+        );
+        let above = nearest_plane_distance([1.0, 1.0, 1.0], std::slice::from_ref(&plane), 0.05);
+        assert!(
+            above > 0.9,
+            "a point 1 unit off the plane is not filled, got {above}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1981,7 +2787,7 @@ mod device_tests {
         cloud.extend_from_slice(&[2.0, 2.0, 2.0]);
         let m = cloud.len() / 3;
         let cloud = Tensor::<2>::from_data(TensorData::new(cloud, [m, 3]), &device);
-        let grid = CloudDistanceGrid::build(cloud, margin, softness, &device)
+        let grid = CloudDistanceGrid::build(cloud, margin, softness, None, &device)
             .await
             .expect("a non-empty cloud builds a grid");
 
@@ -2046,7 +2852,7 @@ mod device_tests {
             TensorData::new(vec![0.0f32, 0.0, 0.0, 0.0, 0.0, 3.0], [2, 3]),
             &device,
         );
-        let grid = CloudDistanceGrid::build(cloud, margin, softness, &device)
+        let grid = CloudDistanceGrid::build(cloud, margin, softness, None, &device)
             .await
             .expect("a non-empty cloud builds a grid");
 
@@ -2104,7 +2910,7 @@ mod device_tests {
         let margin = 0.15f32;
         let softness = 0.05f32;
         // Two points 2 units apart: the gap between them is genuinely empty.
-        let data = build_distance_field(&[0.0, 0.0, 0.0, 2.0, 0.0, 0.0], margin, softness)
+        let data = build_distance_field(&[0.0, 0.0, 0.0, 2.0, 0.0, 0.0], margin, softness, None)
             .expect("a finite point builds a field");
         let [nx, ny, nz] = data.dims;
         let flat = |i: usize, j: usize, k: usize| (i * ny + j) * nz + k;
@@ -2186,7 +2992,7 @@ mod device_tests {
         }
         let m = cloud.len() / 3;
         let cloud = Tensor::<2>::from_data(TensorData::new(cloud, [m, 3]), &device);
-        let grid = CloudDistanceGrid::build(cloud, margin, softness, &device)
+        let grid = CloudDistanceGrid::build(cloud, margin, softness, None, &device)
             .await
             .expect("a non-empty cloud builds a grid");
 
@@ -2223,6 +3029,120 @@ mod device_tests {
             g[1] > 1e-4,
             "a divergent (NaN-centre) Gaussian must be fully penalized, got {}",
             g[1]
+        );
+    }
+
+    /// TEST (c): the co-planarity constraint (FIX 2) routes a real GEOMETRY
+    /// gradient. Build one bounded plane at z=0; probe an off-plane Gaussian
+    /// (0,0,0.3) inside the assign band and an on-plane Gaussian (0.5,0.5,0). The
+    /// off-plane one must get a POSITIVE z position-gradient (descent pulls it onto
+    /// the plane) and a nonzero SCALE gradient on its normal-aligned axis (the
+    /// flatten term); the on-plane one's position gradient must be ~0. This also
+    /// proves the term reaches means AND scales without a backend cross-kind panic.
+    #[tokio::test]
+    async fn coplanarity_pulls_off_plane_gaussian_and_spares_on_plane() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let plane = Plane {
+            normal: [0.0, 0.0, 1.0],
+            offset: 0.0,
+            u_axis: [1.0, 0.0, 0.0],
+            v_axis: [0.0, 1.0, 0.0],
+            u_min: -2.0,
+            u_max: 2.0,
+            v_min: -2.0,
+            v_max: 2.0,
+            inlier_frac: 1.0,
+        };
+        let planes = PlaneSet {
+            planes: vec![plane],
+            spacing: 0.05,
+            threshold: 0.1,
+        };
+
+        // G0 off-plane (z=0.3, within assign_dist=1.0); G1 on-plane.
+        let means = lift_to_autodiff(Tensor::<2>::from_data(
+            TensorData::new(vec![0.0f32, 0.0, 0.3, 0.5, 0.5, 0.0], [2, 3]),
+            &device,
+        ))
+        .require_grad();
+        // Identity quaternions (w,x,y,z) = (1,0,0,0): local frame == world.
+        let rots = Tensor::<2>::from_data(
+            TensorData::new(vec![1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], [2, 4]),
+            &device,
+        );
+        let scales = lift_to_autodiff(Tensor::<2>::from_data(
+            TensorData::new(vec![0.1f32, 0.1, 0.1, 0.1, 0.1, 0.1], [2, 3]),
+            &device,
+        ))
+        .require_grad();
+
+        let term =
+            plane_coplanarity_loss(means.clone(), rots, scales.clone(), &planes, 1.0, &device)
+                .expect("a non-empty plane set with assigned gaussians yields a term");
+        let grads = term.backward();
+
+        let gm: Vec<f32> = means
+            .grad(&grads)
+            .expect("means must receive a position gradient")
+            .into_data_async()
+            .await
+            .expect("grad readback")
+            .into_vec()
+            .expect("f32");
+        // G0 z-gradient positive (pull onto the plane); G1 z-gradient ~0.
+        assert!(
+            gm[2] > 1e-3,
+            "off-plane Gaussian must be pulled toward the plane (+z grad), got {}",
+            gm[2]
+        );
+        assert!(
+            gm[5].abs() < 1e-4,
+            "on-plane Gaussian must have ~0 position gradient, got {}",
+            gm[5]
+        );
+
+        let gs: Vec<f32> = scales
+            .grad(&grads)
+            .expect("scales must receive a flatten gradient")
+            .into_data_async()
+            .await
+            .expect("grad readback")
+            .into_vec()
+            .expect("f32");
+        // The flatten term penalizes the normal-aligned (z) scale axis of the
+        // assigned Gaussian — a nonzero, POSITIVE gradient there (shrinks it).
+        assert!(
+            gs[2] > 1e-4,
+            "the flatten term must reach the normal-aligned scale axis, got {}",
+            gs[2]
+        );
+    }
+
+    /// TEST (d, part): an empty plane set makes the co-planarity term inert
+    /// (returns `None`, so the caller adds nothing) — the byte-inert path when no
+    /// planar structure is found. The config-level test covers the flags defaulting
+    /// off; this covers the loss guard.
+    #[tokio::test]
+    async fn coplanarity_empty_planeset_is_none() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let means =
+            Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 0.0, 0.0], [1, 3]), &device);
+        let rots = Tensor::<2>::from_data(
+            TensorData::new(vec![1.0f32, 0.0, 0.0, 0.0], [1, 4]),
+            &device,
+        );
+        let scales =
+            Tensor::<2>::from_data(TensorData::new(vec![0.1f32, 0.1, 0.1], [1, 3]), &device);
+        let empty = PlaneSet {
+            planes: vec![],
+            spacing: 0.05,
+            threshold: 0.1,
+        };
+        assert!(
+            plane_coplanarity_loss(means, rots, scales, &empty, 0.15, &device).is_none(),
+            "an empty plane set must produce no term"
         );
     }
 }

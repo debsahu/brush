@@ -209,20 +209,30 @@ pub(crate) async fn train_stream(
     // ONCE from the seed point cloud (the measured surface the run is seeded
     // from). View-independent, so it needs no per-frame depth. Skipped (and the
     // reg no-ops with a warning) when the weight is 0 or the seed cloud is empty.
-    if train_stream_config.train_config.depth_opacity_reg_weight > 0.0 {
+    // Also runs the one-time RANSAC plane extraction when `--plane-gate` or
+    // `--plane-coplanarity-weight` is set (the LiDAR-PlanarGS priors). When
+    // `--plane-gate` is on, those planes are baked into the grid's field.
+    let cfg = &train_stream_config.train_config;
+    if cfg.depth_opacity_reg_weight > 0.0 || cfg.plane_gate || cfg.plane_coplanarity_weight > 0.0 {
         trainer
-            .init_opacity_reg_grid(init_splats.means(), &device)
+            .init_plane_priors(init_splats.means(), &device)
             .await;
-        if trainer.has_opacity_reg_grid() {
-            log::info!(
-                "Depth-opacity-reg: built distance-to-cloud grid from {} seed points",
-                init_splats.num_splats()
-            );
-        } else {
-            log::warn!(
-                "--depth-opacity-reg-weight set but the seed cloud is empty; the \
-                 regularizer is inert for this run"
-            );
+        if cfg.depth_opacity_reg_weight > 0.0 {
+            if trainer.has_opacity_reg_grid() {
+                log::info!(
+                    "Depth-opacity-reg: built distance-to-cloud grid from {} seed points{}",
+                    init_splats.num_splats(),
+                    if cfg.plane_gate { " (plane-gated)" } else { "" }
+                );
+            } else {
+                log::warn!(
+                    "--depth-opacity-reg-weight set but the seed cloud is empty; the \
+                     regularizer is inert for this run"
+                );
+            }
+        }
+        if let Some(summary) = trainer.plane_summary() {
+            log::info!("Plane priors: RANSAC found {summary}");
         }
     }
 
@@ -454,6 +464,8 @@ pub(crate) async fn train_stream(
             // The distance-to-cloud grid is static (built from the seed cloud), so
             // carry it across the LOD boundary verbatim rather than recomputing.
             let opacity_reg_grid = trainer.take_opacity_reg_grid();
+            // Planes are static (seed-cloud RANSAC), so carry them verbatim too.
+            let plane_set = trainer.take_plane_set();
             let bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
             trainer = SplatTrainer::new_seeded(
                 &train_stream_config.train_config,
@@ -464,6 +476,7 @@ pub(crate) async fn train_stream(
             trainer.set_view_cams(lod_view_cams);
             trainer.set_appearance(appearance);
             trainer.set_opacity_reg_grid(opacity_reg_grid);
+            trainer.set_plane_set(plane_set);
 
             log::info!(
                 "LOD {current_lod}/{lod_levels}: Training for {lod_refine_steps} steps (image scale {:.0}%)",

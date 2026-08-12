@@ -874,6 +874,40 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "TIDI options", default_value = "0")]
     #[serde(default = "default_depth_opacity_reg_start_iter")]
     pub depth_opacity_reg_start_iter: u32,
+
+    /// PLANE-GATE (FIX 1): augment the distance-to-cloud opacity field with
+    /// distance-to-nearest-PLANE, so a wall splat sitting BETWEEN sparse cloud
+    /// points (inside the wall's extent) reads on-surface instead of being
+    /// penalised as a floater, while a mid-air splat far from every plane is still
+    /// caught. Planes are extracted by RANSAC from the seed/LiDAR cloud (NOT a
+    /// VLM) once at init. Only meaningful alongside `--depth-opacity-reg-weight`
+    /// (it changes what that regularizer's field stores). `false` = the exact
+    /// point-only field (byte-identical to the pre-plane behaviour); no RANSAC
+    /// runs unless this or `--plane-coplanarity-weight` is set.
+    #[arg(long, help_heading = "TIDI options", default_value = "false")]
+    #[serde(default)]
+    pub plane_gate: bool,
+
+    /// CO-PLANARITY (FIX 2): weight of the plane geometry constraint. 0 = OFF
+    /// (inert, no RANSAC on its own). >0 adds, for every Gaussian assigned to a
+    /// RANSAC plane, `weight * mean[(n·mu − d)² + variance-along-n]`, which pulls
+    /// the centre onto the plane AND flattens it against the plane. Unlike the
+    /// opacity gate this carries a real gradient on POSITION and SCALE, so it
+    /// removes the geometric ambiguity on featureless walls directly. Riskier than
+    /// the gate (it moves geometry); keep it small (e.g. 0.05). Independent of
+    /// `--plane-gate`.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.0")]
+    #[serde(default = "default_plane_coplanarity_weight")]
+    pub plane_coplanarity_weight: f32,
+
+    /// CO-PLANARITY assignment band: a Gaussian is assigned to a plane only when
+    /// its perpendicular distance is below this (in scene 3D-distance units) AND
+    /// it projects inside the plane's bounded extent. `<= 0` (the default) means
+    /// "use `--depth-opacity-reg-margin`", so the band matches the opacity gate's
+    /// on-surface margin unless overridden.
+    #[arg(long, help_heading = "TIDI options", default_value = "-1.0")]
+    #[serde(default = "default_plane_coplanarity_assign_dist")]
+    pub plane_coplanarity_assign_dist: f32,
 }
 
 impl Default for TrainConfig {
@@ -1029,6 +1063,12 @@ fn default_depth_opacity_reg_softness() -> f32 {
 }
 fn default_depth_opacity_reg_start_iter() -> u32 {
     0
+}
+fn default_plane_coplanarity_weight() -> f32 {
+    0.0
+}
+fn default_plane_coplanarity_assign_dist() -> f32 {
+    -1.0
 }
 fn default_tidi_global_cap_frac() -> f32 {
     0.002
@@ -1251,6 +1291,17 @@ mod tests {
         // The start-iter gate defaults to 0 (active from step 0 = unchanged).
         assert_eq!(def.depth_opacity_reg_start_iter, 0);
 
+        // Plane priors (FIX 1 + FIX 2): both OFF by default and byte-inert. With
+        // --plane-gate false AND --plane-coplanarity-weight 0, no RANSAC runs and
+        // the run is identical to the pre-plane branch.
+        assert!(!def.plane_gate, "plane-gate must default off");
+        assert!(
+            (def.plane_coplanarity_weight - 0.0).abs() < 1e-9,
+            "co-planarity must default off (weight 0)"
+        );
+        // assign-dist sentinel <= 0 means "fall back to the opacity-reg margin".
+        assert!(def.plane_coplanarity_assign_dist <= 0.0);
+
         // Unrelated flags must not switch it on.
         let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
             .expect("unrelated flags must parse");
@@ -1309,6 +1360,26 @@ mod tests {
         ])
         .expect("--depth-opacity-reg-start-iter must parse");
         assert_eq!(gated.depth_opacity_reg_start_iter, 15000);
+
+        // Plane flags parse independently and do not imply any other switch.
+        let plane = TrainConfig::try_parse_from([
+            "brush",
+            "--plane-gate",
+            "--plane-coplanarity-weight",
+            "0.05",
+        ])
+        .expect("--plane-gate / --plane-coplanarity-weight must parse");
+        assert!(plane.plane_gate);
+        assert!((plane.plane_coplanarity_weight - 0.05).abs() < 1e-9);
+        assert!(!plane.tidi_prune, "plane flags must not imply photometric");
+        assert!(
+            (plane.depth_opacity_reg_weight - 0.0).abs() < 1e-9,
+            "plane flags must not imply the opacity regularizer"
+        );
+        // --plane-gate is a presence flag; absence leaves it off.
+        let no_plane = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert!(!no_plane.plane_gate);
     }
 
     #[test]

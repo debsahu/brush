@@ -9,7 +9,10 @@ use crate::{
     quat_vec::quaternion_vec_multiply,
     splat_init::bounds_from_pos,
     stats::RefineRecord,
-    tidi::{CloudDistanceGrid, TidiPruneParams, TidiState, opacity_reg_active},
+    tidi::{
+        CloudDistanceGrid, PlaneSet, TidiPruneParams, TidiState, extract_planes_from_cloud,
+        opacity_reg_active, plane_coplanarity_loss,
+    },
 };
 use brush_appearance::{AppearanceConfig, AppearanceTrainState};
 use brush_dataset::scene::SceneBatch;
@@ -128,6 +131,8 @@ pub struct SplatTrainer {
     step_count: u32,
     max_sh_degree: u32,
     rng: rand::rngs::StdRng,
+    /// Run seed, kept so the one-time RANSAC plane extraction is deterministic.
+    seed: u64,
     /// Per-train-view (world center, focal in px at native res) for the
     /// Mip-Splatting 3D filter. Empty disables it. The floor itself lives on
     /// the splats (recomputed at each refine), not here.
@@ -144,6 +149,11 @@ pub struct SplatTrainer {
     /// training start (see `train_stream`), carried across LOD boundaries, and
     /// `None` (inert) when the regularizer is off or there is no seed cloud.
     opacity_reg_grid: Option<CloudDistanceGrid>,
+    /// RANSAC planes extracted ONCE from the seed cloud (shared infra for the
+    /// plane-gated distance field, FIX 1, and the co-planarity constraint, FIX
+    /// 2). `None` unless `--plane-gate` or `--plane-coplanarity-weight` is set.
+    /// Cheap + device-independent, so it carries across LOD boundaries verbatim.
+    plane_set: Option<PlaneSet>,
     #[cfg(not(target_family = "wasm"))]
     lpips: Option<lpips::LpipsModel>,
 }
@@ -295,10 +305,12 @@ impl SplatTrainer {
             step_count: 0,
             max_sh_degree: 0,
             rng: rand::rngs::StdRng::seed_from_u64(seed),
+            seed,
             view_cams: Vec::new(),
             dig: None,
             tidi: None,
             opacity_reg_grid: None,
+            plane_set: None,
             #[cfg(not(target_family = "wasm"))]
             lpips,
         }
@@ -384,15 +396,72 @@ impl SplatTrainer {
     /// A no-op (leaves the grid `None`, regularizer inert) when the cloud is
     /// empty — e.g. a random-init run with no seed points.
     pub async fn init_opacity_reg_grid(&mut self, cloud_means: Tensor<2>, device: &Device) {
+        self.init_plane_priors(cloud_means, device).await;
+    }
+
+    /// Build the seed-cloud priors ONCE at training start: the distance-to-cloud
+    /// grid (when `--depth-opacity-reg-weight > 0`) and the RANSAC planes (when
+    /// `--plane-gate` or `--plane-coplanarity-weight` is set). When `--plane-gate`
+    /// is on, the extracted planes are baked into the grid's field (FIX 1). The
+    /// planes are also stored on the trainer for the co-planarity constraint (FIX
+    /// 2). All view-independent, so nothing here is rebuilt as training proceeds.
+    pub async fn init_plane_priors(&mut self, cloud_means: Tensor<2>, device: &Device) {
         let margin = self.config.depth_opacity_reg_margin;
         let softness = self.config.depth_opacity_reg_softness;
-        self.opacity_reg_grid =
-            CloudDistanceGrid::build(cloud_means, margin, softness, device).await;
+        let need_planes = self.config.plane_gate || self.config.plane_coplanarity_weight > 0.0;
+
+        // RANSAC planes (shared by both features), extracted once from the cloud.
+        let planes = if need_planes {
+            extract_planes_from_cloud(cloud_means.clone(), self.seed).await
+        } else {
+            None
+        };
+
+        // Distance-to-cloud grid, plane-augmented only when --plane-gate is set.
+        if self.config.depth_opacity_reg_weight > 0.0 {
+            let plane_slice = if self.config.plane_gate {
+                planes.as_ref().map(|p| p.planes.as_slice())
+            } else {
+                None
+            };
+            self.opacity_reg_grid =
+                CloudDistanceGrid::build(cloud_means, margin, softness, plane_slice, device).await;
+        }
+        self.plane_set = planes;
     }
 
     /// Whether the opacity-reg cloud grid is built (for logging).
     pub fn has_opacity_reg_grid(&self) -> bool {
         self.opacity_reg_grid.is_some()
+    }
+
+    /// Summary of the extracted planes (for logging): count + inlier fractions,
+    /// or `None` when plane priors are off / no planar structure was found.
+    pub fn plane_summary(&self) -> Option<String> {
+        self.plane_set.as_ref().map(|ps| {
+            let fracs: Vec<String> = ps
+                .planes
+                .iter()
+                .map(|p| format!("{:.1}%", p.inlier_frac * 100.0))
+                .collect();
+            format!(
+                "{} planes (spacing {:.4}, band {:.4}), inliers: [{}]",
+                ps.planes.len(),
+                ps.spacing,
+                ps.threshold,
+                fracs.join(", ")
+            )
+        })
+    }
+
+    /// Move the RANSAC plane set out, to carry across an LOD boundary (the cloud
+    /// never changes, so the planes are reused verbatim rather than recomputed).
+    pub fn take_plane_set(&mut self) -> Option<PlaneSet> {
+        self.plane_set.take()
+    }
+
+    pub fn set_plane_set(&mut self, planes: Option<PlaneSet>) {
+        self.plane_set = planes;
     }
 
     /// Move the (static) opacity-reg grid out, to carry across an LOD boundary
@@ -1026,6 +1095,34 @@ impl SplatTrainer {
                         loss = loss + term * self.config.depth_opacity_reg_weight;
                     }
                     None => warn_depth_opacity_reg_no_cloud(),
+                }
+            }
+
+            // Co-planarity constraint (FIX 2, `--plane-coplanarity-weight`): for
+            // every Gaussian assigned to a RANSAC seed-cloud plane, pull its centre
+            // onto the plane and flatten it against the plane. Unlike the opacity
+            // gate above this is a real GEOMETRY gradient (position + scale +
+            // rotation), so it directly removes the photometric rank deficiency on
+            // featureless walls. Assignment is detached; only means/scales/rotations
+            // carry gradient. Inert (no term) when the weight is 0 or no planes were
+            // extracted.
+            if self.config.plane_coplanarity_weight > 0.0
+                && let Some(planes) = &self.plane_set
+            {
+                let assign = if self.config.plane_coplanarity_assign_dist > 0.0 {
+                    self.config.plane_coplanarity_assign_dist
+                } else {
+                    self.config.depth_opacity_reg_margin
+                };
+                if let Some(term) = plane_coplanarity_loss(
+                    splats.means(),
+                    splats.rotations(),
+                    splats.scales(),
+                    planes,
+                    assign,
+                    &device,
+                ) {
+                    loss = loss + term * self.config.plane_coplanarity_weight;
                 }
             }
 
