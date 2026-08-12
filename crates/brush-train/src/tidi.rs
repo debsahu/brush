@@ -871,8 +871,14 @@ fn symmetric_eig3(mut a: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
         let app = a[p][p];
         let aqq = a[q][q];
         let apq = a[p][q];
-        // Jacobi rotation angle (numerically stable atan2 form of cot(2θ)).
-        let theta = 0.5 * (2.0 * apq).atan2(app - aqq);
+        // Jacobi rotation angle. Annihilating a_pq requires
+        // tan(2θ) = 2·apq / (aqq − app), i.e. θ = ½·atan2(2·apq, aqq − app).
+        // NOTE: the x-argument is `aqq − app`, NOT `app − aqq`; the flipped sign
+        // gives a θ that does NOT zero a_pq, yet the block below hardcodes it to
+        // 0, corrupting the matrix (it stops being similar to the original) and
+        // returning wrong eigenvectors for any non-axis-aligned covariance — i.e.
+        // every real (tilted) wall.
+        let theta = 0.5 * (2.0 * apq).atan2(aqq - app);
         let (s, c) = theta.sin_cos();
         // Symmetric Jacobi rotation A' = JᵀAJ, all updates from ORIGINAL values
         // (temporaries), so the 2×2 pivot block is never double-applied.
@@ -1658,13 +1664,36 @@ pub fn plane_coplanarity_loss(
     let n_i = normals_t.select(0, best_idx.clone()); // [N,3]
     let d_i = offsets_t.select(0, best_idx); // [N]
 
-    // -- Position pull: (n_i·mu_i − d_i)² with LIVE means.
+    // NaN-guard (the same class the sibling `depth_opacity_reg_loss` fixed once).
+    // A divergent (NaN/±inf) mean, scale, or quaternion would make a row's term
+    // non-finite. Assignment on the RAW detached means already EXCLUDES such a row
+    // (`perp` compares false → `assigned_f1[i] = 0`), but masking the term only in
+    // the FORWARD pass is not enough: the row's derivative is still NaN, and
+    // `0 · NaN = NaN` poisons the BACKWARD too — and unlike the opacity gate the
+    // means here are a LIVE leaf, so that NaN reaches means/scales/rotations for
+    // EVERY Gaussian. The fix sanitizes the LIVE inputs BEFORE the differentiable
+    // ops: `mask_fill` replaces a non-finite entry with a constant 0 (grad 0 there,
+    // identity elsewhere), so finite rows are unaffected and a divergent row
+    // contributes a finite 0 that assignment then zeroes out anyway.
+    let means = means
+        .clone()
+        .mask_fill(means.clone().is_finite().bool_not(), 0.0); // [N,3]
+    let scales = scales
+        .clone()
+        .mask_fill(scales.clone().is_finite().bool_not(), 0.0); // [N,3]
+    let rotations = rotations
+        .clone()
+        .mask_fill(rotations.clone().is_finite().bool_not(), 0.0); // [N,4]
+
+    // -- Position pull: (n_i·mu_i − d_i)² with LIVE (sanitized) means.
     let proj = (means * n_i.clone()).sum_dim(1).squeeze_dim::<1>(1); // [N]
     let pos_term = (proj - d_i).powi_scalar(2); // [N]
 
     // -- Flatten: variance of the Gaussian along the plane normal. Express the
     // (unit) normal in the Gaussian's local frame via the conjugate of the
-    // normalised quaternion (Rᵀ n), then Σ_k (s_k · w_k)² = nᵀ R S² Rᵀ n.
+    // normalised quaternion (Rᵀ n), then Σ_k (s_k · w_k)² = nᵀ R S² Rᵀ n. A
+    // sanitized (zeroed) quaternion has norm 0 → clamp_min keeps the divide finite
+    // → w_local = 0 → flatten 0 for that (already-excluded) row.
     let qnorm = rotations
         .clone()
         .powi_scalar(2)
@@ -1684,7 +1713,7 @@ pub fn plane_coplanarity_loss(
         .sum_dim(1)
         .squeeze_dim::<1>(1); // [N]
 
-    // -- Masked mean over the assigned Gaussians.
+    // -- Masked mean over the assigned Gaussians (all terms finite by now).
     let assigned_f1 = assigned_f.squeeze_dim::<1>(1); // [N]
     let per = (pos_term + flatten_term) * assigned_f1.clone(); // [N]
     let count = assigned_f1.sum().clamp_min(1.0); // scalar-as-[1]
@@ -2636,6 +2665,70 @@ mod tests {
             "a point 1 unit off the plane is not filled, got {above}"
         );
     }
+
+    /// The Jacobi symmetric-3×3 eigensolver on a NON-diagonal matrix — the case
+    /// `ransac_finds_synthetic_plane` structurally cannot reach (its axis-aligned
+    /// grid gives a diagonal covariance, so the `off < 1e-12` check fires on
+    /// iteration 0 and the rotation code never runs). This exercises the rotation:
+    /// each returned eigenpair must satisfy `A·v = λ·v` (a wrong rotation angle
+    /// corrupts `A` and breaks this), and the smallest eigenvalue must be the true
+    /// ~1.697 (the sign-flipped angle converged to a stable-but-wrong ~2.807).
+    #[test]
+    fn symmetric_eig3_diagonalizes_non_diagonal() {
+        let a = [[2.0, 1.0, 0.0], [1.0, 5.0, 0.0], [0.0, 0.0, 9.0]];
+        let (vals, vecs) = symmetric_eig3(a);
+        for j in 0..3 {
+            let v = [vecs[0][j], vecs[1][j], vecs[2][j]];
+            let av = [
+                a[0][0] * v[0] + a[0][1] * v[1] + a[0][2] * v[2],
+                a[1][0] * v[0] + a[1][1] * v[1] + a[1][2] * v[2],
+                a[2][0] * v[0] + a[2][1] * v[1] + a[2][2] * v[2],
+            ];
+            let resid: f64 = (0..3)
+                .map(|k| (av[k] - vals[j] * v[k]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!(resid < 1e-6, "eigenpair {j}: A·v = λ·v residual {resid}");
+            let vnorm: f64 = (0..3).map(|k| v[k] * v[k]).sum::<f64>().sqrt();
+            assert!(
+                (vnorm - 1.0).abs() < 1e-6,
+                "eigenvector {j} not unit: {vnorm}"
+            );
+        }
+        let mn = vals.iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(
+            (mn - 1.697).abs() < 0.01,
+            "smallest eigenvalue must be ~1.697 (sign bug gives ~2.807), got {mn}"
+        );
+    }
+
+    /// BUG-1 regression: `refit_plane` on a deliberately TILTED (non-axis-aligned)
+    /// planar patch must recover the ground-truth normal. The tilted grid gives a
+    /// non-diagonal covariance, so the Jacobi rotation actually runs; the flipped
+    /// angle returned a normal with cosine-similarity ~0.14 to truth (essentially
+    /// the wrong direction), corrupting both FIX 1's field and FIX 2's pull.
+    #[test]
+    fn refit_plane_recovers_tilted_normal() {
+        let n_gt = glam::Vec3::new(0.3, 0.4, 0.8).normalize();
+        let (u, v) = plane_basis(n_gt.to_array());
+        let (u, v) = (glam::Vec3::from(u), glam::Vec3::from(v));
+        let mut pos = Vec::new();
+        let mut inliers: Vec<u32> = Vec::new();
+        for i in -5..=5 {
+            for j in -5..=5 {
+                let p = u * (i as f32 * 0.1) + v * (j as f32 * 0.1);
+                pos.extend_from_slice(&[p.x, p.y, p.z]);
+                inliers.push(inliers.len() as u32);
+            }
+        }
+        let (n, d) = refit_plane(&pos, &inliers).expect("refit a tilted plane");
+        let cos = glam::Vec3::from(n).dot(n_gt).abs();
+        assert!(
+            cos > 0.999,
+            "tilted-plane normal cos-sim {cos} to ground truth (the sign bug gives ~0.14)"
+        );
+        assert!(d.abs() < 1e-4, "plane through origin → offset ~0, got {d}");
+    }
 }
 
 #[cfg(test)]
@@ -3143,6 +3236,99 @@ mod device_tests {
         assert!(
             plane_coplanarity_loss(means, rots, scales, &empty, 0.15, &device).is_none(),
             "an empty plane set must produce no term"
+        );
+    }
+
+    /// BUG-2 regression: a Gaussian with a divergent (NaN) centre must NOT poison
+    /// the co-planarity loss or its backward. Assignment already excludes the NaN
+    /// row, but `0 · NaN = NaN` in BOTH forward and backward would have NaN-ed the
+    /// gradient for EVERY Gaussian (means is a live leaf here). The input
+    /// sanitization must keep the loss and all geometry gradients finite while the
+    /// on-plane Gaussian is still pulled normally.
+    #[tokio::test]
+    async fn coplanarity_nan_mean_does_not_poison_loss() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let plane = Plane {
+            normal: [0.0, 0.0, 1.0],
+            offset: 0.0,
+            u_axis: [1.0, 0.0, 0.0],
+            v_axis: [0.0, 1.0, 0.0],
+            u_min: -2.0,
+            u_max: 2.0,
+            v_min: -2.0,
+            v_max: 2.0,
+            inlier_frac: 1.0,
+        };
+        let planes = PlaneSet {
+            planes: vec![plane],
+            spacing: 0.05,
+            threshold: 0.1,
+        };
+
+        // G0 on-plane (assigned, pulled); G1 with a NaN centre (excluded — must
+        // not poison the loss/gradients).
+        let means = lift_to_autodiff(Tensor::<2>::from_data(
+            TensorData::new(vec![0.0f32, 0.0, 0.3, f32::NAN, f32::NAN, f32::NAN], [2, 3]),
+            &device,
+        ))
+        .require_grad();
+        let rots = Tensor::<2>::from_data(
+            TensorData::new(vec![1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], [2, 4]),
+            &device,
+        );
+        let scales = lift_to_autodiff(Tensor::<2>::from_data(
+            TensorData::new(vec![0.1f32, 0.1, 0.1, 0.1, 0.1, 0.1], [2, 3]),
+            &device,
+        ))
+        .require_grad();
+
+        let term =
+            plane_coplanarity_loss(means.clone(), rots, scales.clone(), &planes, 1.0, &device)
+                .expect("a non-empty plane set with an assigned gaussian yields a term");
+        // The loss value itself must be finite.
+        let lv: Vec<f32> = term
+            .clone()
+            .into_data_async()
+            .await
+            .expect("loss readback")
+            .into_vec()
+            .expect("f32");
+        assert!(
+            lv.iter().all(|v| v.is_finite()),
+            "a NaN-centre Gaussian must not poison the loss value, got {lv:?}"
+        );
+
+        let grads = term.backward();
+        let gm: Vec<f32> = means
+            .grad(&grads)
+            .expect("means gradient")
+            .into_data_async()
+            .await
+            .expect("grad readback")
+            .into_vec()
+            .expect("f32");
+        let gs: Vec<f32> = scales
+            .grad(&grads)
+            .expect("scales gradient")
+            .into_data_async()
+            .await
+            .expect("grad readback")
+            .into_vec()
+            .expect("f32");
+        assert!(
+            gm.iter().all(|v| v.is_finite()),
+            "means gradients must stay finite despite the NaN centre, got {gm:?}"
+        );
+        assert!(
+            gs.iter().all(|v| v.is_finite()),
+            "scales gradients must stay finite despite the NaN centre, got {gs:?}"
+        );
+        // The on-plane Gaussian is still pulled (finite, positive +z position grad).
+        assert!(
+            gm[2] > 1e-3,
+            "the finite on-plane Gaussian must still be pulled, got {}",
+            gm[2]
         );
     }
 }
