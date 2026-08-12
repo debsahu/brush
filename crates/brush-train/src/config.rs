@@ -1086,13 +1086,12 @@ mod tests {
             .expect("unrelated flags must parse");
         assert!(!other.tidi_prune);
 
-        // Enabling parses, and the =false disable form works too.
+        // Bare `--tidi-prune` (a presence flag) enables it. There is deliberately
+        // no `--tidi-prune=false` form: the master switch is SetTrue so that the
+        // common `brush --tidi-prune` (no value) works; absence is the off state.
         let on = TrainConfig::try_parse_from(["brush", "--tidi-prune"])
             .expect("--tidi-prune must parse");
         assert!(on.tidi_prune);
-        let off = TrainConfig::try_parse_from(["brush", "--tidi-prune=false"])
-            .expect("--tidi-prune=false must parse");
-        assert!(!off.tidi_prune);
     }
 
     #[test]
