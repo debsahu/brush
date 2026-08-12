@@ -9,7 +9,7 @@ use crate::{
     quat_vec::quaternion_vec_multiply,
     splat_init::bounds_from_pos,
     stats::RefineRecord,
-    tidi::{TidiPruneParams, TidiState},
+    tidi::{CloudDistanceGrid, TidiPruneParams, TidiState, opacity_reg_active},
 };
 use brush_appearance::{AppearanceConfig, AppearanceTrainState};
 use brush_dataset::scene::SceneBatch;
@@ -139,6 +139,11 @@ pub struct SplatTrainer {
     /// visibility / gradient-EMA / birth-iter accumulators). Created lazily on
     /// the first step when `--tidi-prune` is set; `None` (and inert) otherwise.
     tidi: Option<TidiState>,
+    /// Static distance-to-cloud grid for the depth-coupled opacity regularizer
+    /// (`--depth-opacity-reg-weight`). Built ONCE from the seed point cloud at
+    /// training start (see `train_stream`), carried across LOD boundaries, and
+    /// `None` (inert) when the regularizer is off or there is no seed cloud.
+    opacity_reg_grid: Option<CloudDistanceGrid>,
     #[cfg(not(target_family = "wasm"))]
     lpips: Option<lpips::LpipsModel>,
 }
@@ -293,6 +298,7 @@ impl SplatTrainer {
             view_cams: Vec::new(),
             dig: None,
             tidi: None,
+            opacity_reg_grid: None,
             #[cfg(not(target_family = "wasm"))]
             lpips,
         }
@@ -368,6 +374,36 @@ impl SplatTrainer {
 
     pub fn set_appearance(&mut self, appearance: Option<AppearanceTrainState>) {
         self.appearance = appearance;
+    }
+
+    /// Build the static distance-to-cloud grid for the depth-coupled opacity
+    /// regularizer from the seed point cloud (`cloud_means` = the seed splats'
+    /// centres — the measured surface the run is seeded from). Called ONCE at
+    /// training start when `--depth-opacity-reg-weight > 0`; the grid is
+    /// view-independent, so it never needs rebuilding as training proceeds.
+    /// A no-op (leaves the grid `None`, regularizer inert) when the cloud is
+    /// empty — e.g. a random-init run with no seed points.
+    pub async fn init_opacity_reg_grid(&mut self, cloud_means: Tensor<2>, device: &Device) {
+        let margin = self.config.depth_opacity_reg_margin;
+        let softness = self.config.depth_opacity_reg_softness;
+        self.opacity_reg_grid =
+            CloudDistanceGrid::build(cloud_means, margin, softness, device).await;
+    }
+
+    /// Whether the opacity-reg cloud grid is built (for logging).
+    pub fn has_opacity_reg_grid(&self) -> bool {
+        self.opacity_reg_grid.is_some()
+    }
+
+    /// Move the (static) opacity-reg grid out, to carry across an LOD boundary
+    /// where the trainer is rebuilt. The cloud never changes, so the grid is
+    /// reused verbatim rather than recomputed.
+    pub fn take_opacity_reg_grid(&mut self) -> Option<CloudDistanceGrid> {
+        self.opacity_reg_grid.take()
+    }
+
+    pub fn set_opacity_reg_grid(&mut self, grid: Option<CloudDistanceGrid>) {
+        self.opacity_reg_grid = grid;
     }
 
     /// Magnitude summary of the learned appearance parameters (`None` when
@@ -959,34 +995,37 @@ impl SplatTrainer {
                 loss = loss + depth_loss(expected_depth, gt_depth) * self.config.depth_loss_weight;
             }
 
-            // TIDI depth-coupled opacity regularizer: the SMOOTH, differentiable
-            // alternative to the hard `--tidi-depth-prune`. For every Gaussian
-            // floating in front of a valid LiDAR/depth return, add a per-step
-            // penalty whose ONLY gradient path is the activated opacity, so
-            // floating splats fade out smoothly (their colour redistributes into
-            // on-surface splats) instead of being hard-deleted (which orphans
-            // that colour and leaves a black halo). Positions/weights detached.
-            // Independent of `--depth-loss-weight` and of the TIDI prune state —
-            // it only reuses the same per-frame depth tensor. Pinhole-only, like
-            // the depth-prune; warn-once + skip otherwise. Inert (no projection,
-            // no term) when the weight is 0.
-            if self.config.depth_opacity_reg_weight > 0.0 {
-                match &batch.depth {
-                    Some(depth_data) if matches!(camera.camera_model, CameraModel::Pinhole) => {
-                        if let Some(term) = crate::tidi::depth_opacity_reg_loss(
+            // Depth-coupled opacity regularizer (3D distance-to-cloud gate). For
+            // every Gaussian whose centre sits FAR (> margin) from the seed/LiDAR
+            // point cloud in 3D, add a per-step penalty whose ONLY gradient path
+            // is the activated opacity, so floaters in empty space fade out
+            // smoothly (their colour redistributes into on-surface splats) instead
+            // of being hard-deleted (which orphans that colour and leaves a black
+            // halo). Positions/field detached. VIEW-INDEPENDENT — no per-frame
+            // depth or camera projection, just the static cloud grid (built once
+            // from the seed cloud in `train_stream`); this replaces the old
+            // per-view z-buffer residual, which leaked background through
+            // foreground gaps and marked surface splats as floating. Gated on
+            // `--depth-opacity-reg-start-iter` so densification can finish
+            // backfilling opacity-faded regions first. Inert (no lookup, no term)
+            // when the weight is 0 or before the start iter.
+            if opacity_reg_active(
+                global_iter,
+                self.config.depth_opacity_reg_start_iter,
+                self.config.depth_opacity_reg_weight,
+            ) {
+                match &self.opacity_reg_grid {
+                    Some(grid) => {
+                        let term = crate::tidi::depth_opacity_reg_loss(
                             splats.raw_opacities.val(),
                             splats.means(),
-                            depth_data.clone(),
-                            &camera,
-                            img_size,
+                            grid,
                             self.config.depth_opacity_reg_margin,
                             self.config.depth_opacity_reg_softness,
-                        ) {
-                            loss = loss + term * self.config.depth_opacity_reg_weight;
-                        }
+                        );
+                        loss = loss + term * self.config.depth_opacity_reg_weight;
                     }
-                    Some(_) => warn_depth_opacity_reg_needs_pinhole(),
-                    None => warn_depth_opacity_reg_no_depth(),
+                    None => warn_depth_opacity_reg_no_cloud(),
                 }
             }
 
@@ -2278,32 +2317,18 @@ fn warn_depth_normal_needs_pinhole() {
     });
 }
 
-/// Warn exactly once that `--depth-opacity-reg-weight` is set but the active
-/// camera is not a pinhole, so the regularizer is skipped for those views (the
-/// pinhole projection is the only model implemented, matching the depth-prune
-/// and depth/normal restrictions). Once, so it does not fire every step.
-fn warn_depth_opacity_reg_needs_pinhole() {
+/// Warn exactly once that `--depth-opacity-reg-weight` is set but no distance-to-
+/// cloud grid was built (the run has no seed point cloud — e.g. a random-init run
+/// with no COLMAP/LiDAR points). The regularizer then no-ops for the run; it never
+/// panics. The grid is a dataset-level property, so this fires at most once.
+fn warn_depth_opacity_reg_no_cloud() {
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
         log::warn!(
-            "--depth-opacity-reg-weight is set but this camera is not Pinhole; the \
-             depth-coupled opacity regularizer is skipped for non-pinhole views \
-             (the pinhole projection is the only model implemented on this path)."
-        );
-    });
-}
-
-/// Warn exactly once that `--depth-opacity-reg-weight` is set but the batch
-/// carries no per-frame depth (nerfstudio `depth: None`). The regularizer then
-/// no-ops for the run; it never panics. In practice depth is a dataset-level
-/// property, so this fires at most once at the start of a depthless run.
-fn warn_depth_opacity_reg_no_depth() {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        log::warn!(
-            "--depth-opacity-reg-weight is set but no per-frame depth was found; the \
-             depth-coupled opacity regularizer is inert for this run. Load depth \
-             maps (depth/<stem>.tiff) to enable it."
+            "--depth-opacity-reg-weight is set but no seed point cloud was available \
+             to build the distance-to-cloud grid; the depth-coupled opacity \
+             regularizer is inert for this run. Seed the run from a point cloud \
+             (COLMAP points3D / LiDAR ply) to enable it."
         );
     });
 }

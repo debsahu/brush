@@ -205,6 +205,27 @@ pub(crate) async fn train_stream(
     );
     trainer.set_view_cams(view_cams.clone());
 
+    // Depth-coupled opacity regularizer: build the static distance-to-cloud grid
+    // ONCE from the seed point cloud (the measured surface the run is seeded
+    // from). View-independent, so it needs no per-frame depth. Skipped (and the
+    // reg no-ops with a warning) when the weight is 0 or the seed cloud is empty.
+    if train_stream_config.train_config.depth_opacity_reg_weight > 0.0 {
+        trainer
+            .init_opacity_reg_grid(init_splats.means(), &device)
+            .await;
+        if trainer.has_opacity_reg_grid() {
+            log::info!(
+                "Depth-opacity-reg: built distance-to-cloud grid from {} seed points",
+                init_splats.num_splats()
+            );
+        } else {
+            log::warn!(
+                "--depth-opacity-reg-weight set but the seed cloud is empty; the \
+                 regularizer is inert for this run"
+            );
+        }
+    }
+
     // The trainer owns its working `splats` locally and publishes a
     // clone to the `Slot` after every modification (train
     // step, refine, LOD decimation).
@@ -430,6 +451,9 @@ pub(crate) async fn train_stream(
             );
 
             let appearance = trainer.take_appearance();
+            // The distance-to-cloud grid is static (built from the seed cloud), so
+            // carry it across the LOD boundary verbatim rather than recomputing.
+            let opacity_reg_grid = trainer.take_opacity_reg_grid();
             let bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
             trainer = SplatTrainer::new_seeded(
                 &train_stream_config.train_config,
@@ -439,6 +463,7 @@ pub(crate) async fn train_stream(
             );
             trainer.set_view_cams(lod_view_cams);
             trainer.set_appearance(appearance);
+            trainer.set_opacity_reg_grid(opacity_reg_grid);
 
             log::info!(
                 "LOD {current_lod}/{lod_levels}: Training for {lod_refine_steps} steps (image scale {:.0}%)",
@@ -916,8 +941,16 @@ async fn run_eval(
         count += 1;
         psnr += sample.psnr.clone().into_scalar_async::<f32>().await?;
         ssim += sample.ssim.clone().into_scalar_async::<f32>().await?;
-        psnr_masked += sample.psnr_masked.clone().into_scalar_async::<f32>().await?;
-        ssim_masked += sample.ssim_masked.clone().into_scalar_async::<f32>().await?;
+        psnr_masked += sample
+            .psnr_masked
+            .clone()
+            .into_scalar_async::<f32>()
+            .await?;
+        ssim_masked += sample
+            .ssim_masked
+            .clone()
+            .into_scalar_async::<f32>()
+            .await?;
         valid_frac += sample.valid_frac;
 
         #[cfg(not(target_family = "wasm"))]

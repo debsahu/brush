@@ -842,26 +842,35 @@ pub struct TrainConfig {
     #[serde(default = "default_depth_opacity_reg_weight")]
     pub depth_opacity_reg_weight: f32,
 
-    /// Depth-opacity-reg margin: a Gaussian must sit more than this in FRONT of
-    /// the measured depth before its opacity starts being penalized. Units are
-    /// the DEPTH map's units -- metres for LiDAR/metric depth (default 0.05 =
-    /// 5 cm); an SfM dataset's depth may be non-metric, so scale accordingly.
-    #[arg(long, help_heading = "TIDI options", default_value = "0.05")]
+    /// Depth-opacity-reg margin: a Gaussian is penalized once its centre is more
+    /// than this far from the nearest seed/LiDAR cloud point in 3D. Units are
+    /// SCENE 3D-distance units (metres for a LiDAR-metric scene; possibly
+    /// non-metric for SfM). Set it a few times the cloud's nearest-neighbour
+    /// spacing so on-surface splats stay safe -- e.g. spacing ~0.024 -> margin
+    /// ~0.1-0.2. (Was a per-view depth residual; it is now a 3D distance.)
+    #[arg(long, help_heading = "TIDI options", default_value = "0.15")]
     #[serde(default = "default_depth_opacity_reg_margin")]
     pub depth_opacity_reg_margin: f32,
 
-    /// Depth-opacity-reg softness: the width of the sigmoid ramp (in depth
-    /// units) over which the penalty weight climbs from ~0 to ~1 as a Gaussian
-    /// moves further in front of the surface. Smaller = sharper on/off boundary.
-    /// MUST stay `≪ margin`: the ramp is centred at `r = -margin` (p = 0.5
-    /// there), so `softness ≪ margin` is what keeps the penalty near 0 at the
-    /// surface (`r = 0`) and stops it fading correctly-reconstructed walls. At
-    /// the default 0.015 vs margin 0.05, `p(r=0) ≈ 0.034`. A `softness > margin`
-    /// would penalize on-surface splats at ~38% of full — do not set it there.
-    /// (Pass BOTH larger for a non-metric dataset, but keep this relationship.)
-    #[arg(long, help_heading = "TIDI options", default_value = "0.015")]
+    /// Depth-opacity-reg softness: the width of the sigmoid ramp (in the same 3D
+    /// distance units as margin) over which the penalty climbs from ~0 to ~1 as a
+    /// Gaussian moves farther from the cloud. Smaller = sharper on/off boundary.
+    /// Keep it `< margin`: the ramp is centred at `d = margin` (p = 0.5), so a
+    /// smaller softness keeps the penalty near 0 for on-surface splats (`d ~ 0`)
+    /// and stops it fading correctly-reconstructed walls. At the default 0.05 vs
+    /// margin 0.15, `p(d=0) ≈ 0.047`.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.05")]
     #[serde(default = "default_depth_opacity_reg_softness")]
     pub depth_opacity_reg_softness: f32,
+
+    /// Global iteration before which the depth-coupled opacity regularizer is
+    /// inert (skipped, no cost). The densifier backfills opacity-faded regions,
+    /// so firing the reg before densification stops (`--growth-stop-iter`,
+    /// default 15000) fights that backfill loop; start after it (e.g. 15000).
+    /// Default 0 = active from the first step (behaviour unchanged).
+    #[arg(long, help_heading = "TIDI options", default_value = "0")]
+    #[serde(default = "default_depth_opacity_reg_start_iter")]
+    pub depth_opacity_reg_start_iter: u32,
 }
 
 impl Default for TrainConfig {
@@ -1010,10 +1019,13 @@ fn default_depth_opacity_reg_weight() -> f32 {
     0.0
 }
 fn default_depth_opacity_reg_margin() -> f32 {
-    0.05
+    0.15
 }
 fn default_depth_opacity_reg_softness() -> f32 {
-    0.015
+    0.05
+}
+fn default_depth_opacity_reg_start_iter() -> u32 {
+    0
 }
 fn default_tidi_global_cap_frac() -> f32 {
     0.002
@@ -1223,14 +1235,18 @@ mod tests {
             (def.depth_opacity_reg_weight - 0.0).abs() < 1e-9,
             "depth-opacity-reg must be off (weight 0) by default"
         );
-        assert!((def.depth_opacity_reg_margin - 0.05).abs() < 1e-9);
-        // softness MUST default to << margin so the ramp reaches ~0 by the
-        // surface (r=0); 0.015 vs margin 0.05 gives p(0) ~ 0.034 (BUG A).
-        assert!((def.depth_opacity_reg_softness - 0.015).abs() < 1e-9);
+        // margin / softness are now in SCENE 3D-distance units (distance-to-cloud
+        // gate), defaulting to 0.15 / 0.05.
+        assert!((def.depth_opacity_reg_margin - 0.15).abs() < 1e-9);
+        // softness MUST default to < margin so the ramp reaches ~0 by the surface
+        // (d=0); 0.05 vs margin 0.15 gives p(0) ~ 0.047.
+        assert!((def.depth_opacity_reg_softness - 0.05).abs() < 1e-9);
         assert!(
             def.depth_opacity_reg_softness < def.depth_opacity_reg_margin,
             "softness must stay below margin or the ramp fades on-surface splats"
         );
+        // The start-iter gate defaults to 0 (active from step 0 = unchanged).
+        assert_eq!(def.depth_opacity_reg_start_iter, 0);
 
         // Unrelated flags must not switch it on.
         let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
@@ -1278,6 +1294,18 @@ mod tests {
             !opacreg.tidi_depth_prune,
             "opacity-reg must not imply depth-prune"
         );
+
+        // The start-iter gate parses and is honoured (used to defer the term
+        // until densification stops).
+        let gated = TrainConfig::try_parse_from([
+            "brush",
+            "--depth-opacity-reg-weight",
+            "0.1",
+            "--depth-opacity-reg-start-iter",
+            "15000",
+        ])
+        .expect("--depth-opacity-reg-start-iter must parse");
+        assert_eq!(gated.depth_opacity_reg_start_iter, 15000);
     }
 
     #[test]

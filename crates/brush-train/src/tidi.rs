@@ -23,7 +23,7 @@
 //! Design decisions where the paper and the Brush internals had to be
 //! reconciled are called out inline with `NOTE:`.
 
-use brush_render::burn_glue::detach_autodiff;
+use brush_render::burn_glue::{detach_autodiff, lift_to_autodiff};
 use brush_render::camera::Camera;
 use brush_render::kernels::camera_model::CameraModel;
 use burn::{
@@ -522,19 +522,19 @@ impl TidiState {
     }
 }
 
-/// Shared pinhole projection + GT-depth lookup for BOTH depth-driven paths: the
-/// hard `accumulate_depth` prune counter and the smooth `depth_opacity_reg_loss`
-/// regularizer. Both need the identical geometry, so the MATH lives here once.
+/// Pinhole projection + GT-depth lookup for the hard `accumulate_depth` prune
+/// counter (`--tidi-depth-prune`). The smooth opacity regularizer no longer uses
+/// this: it moved to a VIEW-INDEPENDENT 3D distance-to-cloud gate
+/// ([`CloudDistanceGrid`] + [`depth_opacity_reg_loss`]), which needs no per-view
+/// projection at all. This helper stays for the prune path, which still counts
+/// per-view "floated in front of the measured surface" events.
 ///
-/// The BACKEND is the caller's responsibility, because the two paths run on
-/// different backends and mixing them panics: the prune path detaches onto the
-/// INNER backend (its accumulators live there), while the loss path stays on the
-/// AUTODIFF backend (it multiplies the live opacity leaf). So the caller must
-/// grad-stop `means` and place it on `device`'s backend BEFORE calling — the
-/// prune path via `detach_autodiff(..).to_device(inner)`, the loss path via
-/// `means.detach()` (autodiff-native, grad-stopped, same backend). This helper
-/// builds `gt` / R / t on `device` and does the projection on `means` directly,
-/// so every tensor stays on `means`'s backend end to end.
+/// The BACKEND is the caller's responsibility: the prune path detaches onto the
+/// INNER backend (its accumulators live there), so the caller must grad-stop
+/// `means` and place it on `device`'s backend BEFORE calling — via
+/// `detach_autodiff(..).to_device(inner)`. This helper builds `gt` / R / t on
+/// `device` and does the projection on `means` directly, so every tensor stays
+/// on `means`'s backend end to end.
 ///
 /// Projects each Gaussian centre into the view, reads the GT depth `Z̃` at the
 /// projected pixel, and returns:
@@ -643,107 +643,342 @@ fn project_depth_residual(
     Some((residual, valid))
 }
 
-/// The DETACHED per-Gaussian float penalty weight `p_i` for the smooth opacity
-/// regularizer. Two properties the sibling prune path does not need but this one
-/// does, both verified by unit tests:
-///
-///  * RAMP CENTERING. `p_i = σ((-r_i - margin) / softness)` — 0.5 exactly at the
-///    margin boundary `r = -margin`, → 1 as the Gaussian floats further in
-///    front. For an on-surface splat (`r = 0`) NOT to be penalized, the ramp
-///    must reach ~0 by `r = 0`, which needs `softness ≪ margin` (with the
-///    defaults 0.05 / 0.015, `p(0) ≈ 0.034`). A `softness > margin` would fade
-///    correctly-reconstructed walls — hence the default relationship is pinned
-///    and unit-tested. `soft` is floored positive so a `0` never divides.
-///
-///  * NaN SAFETY. Invalid rows are zeroed by SUBSTITUTING a large positive
-///    residual BEFORE the sigmoid (not by multiplying the sigmoid output by the
-///    0/1 mask). A diverged mean gives a NaN residual, and `σ(NaN)·0 = NaN`
-///    (IEEE-754) would poison the whole shared scalar loss and every gradient
-///    this step. A NaN/inf residual is ALWAYS at an invalid row (a NaN `z`
-///    fails `z > 0`; the `uv_finite` gate in `project_depth_residual` excludes
-///    degenerate projections), so `mask_fill` on `!valid` replaces it with a
-///    finite value whose `σ` underflows to exactly 0. This mirrors the prune
-///    path's `bool_and(residual.lower_elem(..))`, where `NaN < x` is cleanly
-///    false. The trailing `· valid.float()` then pins invalid rows to EXACTLY 0.
-fn float_penalty(
-    residual: Tensor<1>,
-    valid: Tensor<1, Bool>,
-    margin: f32,
-    softness: f32,
-) -> Tensor<1> {
-    let soft = softness.max(1e-8);
-    // Substitute a large positive residual on invalid rows so a NaN/inf mean
-    // never reaches the sigmoid; `σ` of the resulting large-negative argument
-    // underflows to 0. `mask_fill` overwrites the value regardless of NaN.
-    let safe = residual.mask_fill(valid.clone().bool_not(), 1e4f32);
-    let p = sigmoid(safe.neg().sub_scalar(margin).div_scalar(soft));
-    // Pin invalid rows to EXACTLY 0 (belt-and-suspenders on top of the ~0 the
-    // substitution already yields). Multiply is now NaN-safe: `p` is finite.
-    p * valid.float()
+// ---- 3D distance-to-cloud opacity regularizer --------------------------------
+//
+// FIX (2026-08): the depth-coupled opacity regularizer was gated on a PER-VIEW
+// z-buffer residual (project each Gaussian, compare its depth to the projected
+// LiDAR z-buffer). That z-buffer is sparse + dilated, so background leaks through
+// foreground gaps ("see-through") and marks on-surface splats as floating — no
+// margin fixes it, and it fades real surface.
+//
+// The gate is now VIEW-INDEPENDENT: a Gaussian is a floater when its centre is
+// FAR from the seed/LiDAR point cloud in 3D. The cloud IS the measured surface,
+// so distance-to-nearest-cloud-point is the honest floater signal, with no camera
+// and no z-buffer to leak through. It is a per-step O(1) grid lookup against a
+// static distance field built ONCE from the cloud (see [`CloudDistanceGrid`]).
+//
+// Note the SIGN flip vs the old residual version: now FAR-from-cloud is penalized
+// (`d > margin`); before, IN-FRONT-of-surface was penalized (`r < -margin`).
+
+/// Voxels per `margin` along an axis for the distance field. Finer (larger)
+/// keeps the on-surface quantisation error a small fraction of `margin`, so
+/// correctly-reconstructed surface splats read `d ~ 0` (penalty ~ 0); coarser
+/// blows the grid up cubically. 3 keeps the worst in-voxel error ~0.29·margin.
+const VOX_PER_MARGIN: f32 = 3.0;
+/// The field is computed accurately out to `margin + REACH_SOFT·softness`; every
+/// voxel farther than that reads `max_dist` (below), where the ramp is already
+/// saturated so the exact distance is irrelevant. Bounds the per-voxel search.
+const REACH_SOFT: f32 = 2.0;
+/// Far-field / truncation distance, in `softness` units past `margin`. A voxel
+/// with no nearby cloud point stores `margin + FAR_SPAN·softness`, whose
+/// `p = σ(FAR_SPAN) ≈ 1`, so genuinely empty space is fully penalized.
+const FAR_SPAN: f32 = 6.0;
+/// Hard cap on total voxels (~4 bytes each): `vox` is grown until the padded
+/// grid fits. 24e6 ≈ 96 MB. Raise on a big-VRAM box for finer far scenes.
+const MAX_VOXELS: usize = 24_000_000;
+/// Half the voxel space-diagonal (√3/2). The stored field is the voxel-CENTRE to
+/// nearest-point distance, but the queried Gaussian can sit up to this·vox from
+/// its voxel centre; subtracting it makes the stored value a conservative LOWER
+/// bound on the true Gaussian→cloud distance, so a surface splat is never
+/// spuriously penalized by quantisation.
+const HALF_DIAG: f32 = 0.866_025_4;
+
+/// Host-side product of [`build_distance_field`]: a dense truncated distance
+/// field plus the geometry needed to map a world point to a flat voxel index.
+struct DistanceFieldData {
+    /// `[nx*ny*nz]` truncated world-space distance, flat `(i·ny + j)·nz + k`.
+    field: Vec<f32>,
+    origin: [f32; 3],
+    vox: f32,
+    dims: [usize; 3],
 }
 
-/// Depth-coupled opacity regularizer — the SMOOTH, differentiable alternative to
-/// the hard `accumulate_depth`/depth-prune path. Instead of deleting a floating
-/// Gaussian (which orphans its load-bearing colour and leaves a black halo),
-/// this adds a per-step loss whose ONLY gradient path is the activated opacity,
-/// so the optimizer fades off-surface Gaussians out SMOOTHLY and their colour
-/// redistributes into on-surface Gaussians before they vanish.
+/// Build the truncated distance field on the host from a flat `[N*3]` cloud.
+/// Pure (no device) so it is unit-testable. `None` when the cloud has no finite
+/// point. The field stores, per voxel, a conservative distance from the voxel to
+/// the nearest cloud point, clamped to `max_dist`; voxels with no cloud point
+/// within the search reach keep `max_dist`.
 ///
-/// For every Gaussian projecting in front of a valid measured depth by more than
-/// `margin`, the DETACHED penalty weight `p_i` (see [`float_penalty`]) multiplies
-/// the ACTIVATED opacity `σ(raw_opacity_i)`. The term is
-/// `λ · mean_over_valid(p_i · σ(raw_opacity_i))`.
+/// COST (one-time, at training start): buckets the cloud by voxel, dilates the
+/// occupied set by the search radius `r = ceil(reach/vox)` into a candidate set,
+/// then computes each candidate's nearest-point distance in parallel (each
+/// candidate is written exactly once, so there is no write race). Empty space is
+/// never visited. On a house-scale LiDAR cloud this is seconds on the build box.
+fn build_distance_field(pos: &[f32], margin: f32, softness: f32) -> Option<DistanceFieldData> {
+    let n = pos.len() / 3;
+    if n == 0 {
+        return None;
+    }
+    let soft = softness.max(1e-6);
+    let margin = margin.max(0.0);
+    let reach = margin + REACH_SOFT * soft; // accurate-distance radius
+    let max_dist = margin + FAR_SPAN * soft; // far / truncation value
+
+    // Finite bounding box over the cloud.
+    let mut mn = [f32::INFINITY; 3];
+    let mut mx = [f32::NEG_INFINITY; 3];
+    for i in 0..n {
+        let p = [pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]];
+        if p.iter().all(|v| v.is_finite()) {
+            for d in 0..3 {
+                mn[d] = mn[d].min(p[d]);
+                mx[d] = mx[d].max(p[d]);
+            }
+        }
+    }
+    if !mn.iter().all(|v| v.is_finite()) {
+        return None; // no finite point in the cloud
+    }
+
+    // Pad so a shell of `reach` around the cloud has real voxels.
+    let pad = reach;
+    let mut vox = (margin / VOX_PER_MARGIN).max(1e-6);
+    let dims_for = |vox: f32| -> [usize; 3] {
+        let mut d = [0usize; 3];
+        for a in 0..3 {
+            let ext = (mx[a] - mn[a]) + 2.0 * pad;
+            d[a] = ((ext / vox).ceil() as usize).max(1) + 1;
+        }
+        d
+    };
+    let mut dims = dims_for(vox);
+    // Grow the voxel until the grid fits the memory cap (big scenes get coarser).
+    while dims[0].saturating_mul(dims[1]).saturating_mul(dims[2]) > MAX_VOXELS {
+        vox *= 1.5;
+        dims = dims_for(vox);
+    }
+    let origin = [mn[0] - pad, mn[1] - pad, mn[2] - pad];
+    let [nx, ny, nz] = dims;
+    let num_vox = nx * ny * nz;
+    let flat = |i: usize, j: usize, k: usize| -> usize { (i * ny + j) * nz + k };
+    let vkey = |p: [f32; 3]| -> [i64; 3] {
+        [
+            ((p[0] - origin[0]) / vox).floor() as i64,
+            ((p[1] - origin[1]) / vox).floor() as i64,
+            ((p[2] - origin[2]) / vox).floor() as i64,
+        ]
+    };
+
+    // Point buckets keyed by voxel.
+    let mut buckets: hashbrown::HashMap<[i64; 3], Vec<u32>> = hashbrown::HashMap::new();
+    for i in 0..n {
+        let p = [pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]];
+        if p.iter().all(|v| v.is_finite()) {
+            buckets.entry(vkey(p)).or_default().push(i as u32);
+        }
+    }
+
+    // Candidate voxels = occupied voxels dilated by the search radius (in voxels).
+    let r = ((reach / vox).ceil() as i64).max(1);
+    let mut cand: hashbrown::HashSet<[i64; 3]> = hashbrown::HashSet::new();
+    for key in buckets.keys() {
+        for dx in -r..=r {
+            for dy in -r..=r {
+                for dz in -r..=r {
+                    let c = [key[0] + dx, key[1] + dy, key[2] + dz];
+                    if c[0] >= 0
+                        && c[1] >= 0
+                        && c[2] >= 0
+                        && (c[0] as usize) < nx
+                        && (c[1] as usize) < ny
+                        && (c[2] as usize) < nz
+                    {
+                        cand.insert(c);
+                    }
+                }
+            }
+        }
+    }
+
+    // Per-candidate nearest-point distance (parallel; each written once → race
+    // free). Searching ±r from a candidate that is itself within r of an occupied
+    // voxel reaches every point within `reach`, so distances up to `reach` are
+    // exact; farther candidates saturate to `max_dist`.
+    let cand: Vec<[i64; 3]> = cand.into_iter().collect();
+    let updates: Vec<(usize, f32)> = cand
+        .par_iter()
+        .map(|&c| {
+            let center = [
+                origin[0] + (c[0] as f32 + 0.5) * vox,
+                origin[1] + (c[1] as f32 + 0.5) * vox,
+                origin[2] + (c[2] as f32 + 0.5) * vox,
+            ];
+            let mut best2 = f32::INFINITY;
+            for dx in -r..=r {
+                for dy in -r..=r {
+                    for dz in -r..=r {
+                        if let Some(ids) = buckets.get(&[c[0] + dx, c[1] + dy, c[2] + dz]) {
+                            for &pi in ids {
+                                let pi = pi as usize;
+                                let d2 = (center[0] - pos[pi * 3]).powi(2)
+                                    + (center[1] - pos[pi * 3 + 1]).powi(2)
+                                    + (center[2] - pos[pi * 3 + 2]).powi(2);
+                                if d2 < best2 {
+                                    best2 = d2;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Conservative bias (subtract half the voxel diagonal), clamped to
+            // [0, max_dist]: report the SMALLEST distance the queried Gaussian
+            // could have given voxel quantisation, so a surface splat reads ~0.
+            let dist = (best2.sqrt() - HALF_DIAG * vox).clamp(0.0, max_dist);
+            (flat(c[0] as usize, c[1] as usize, c[2] as usize), dist)
+        })
+        .collect();
+
+    let mut field = vec![max_dist; num_vox];
+    for (idx, dist) in updates {
+        field[idx] = dist;
+    }
+    Some(DistanceFieldData {
+        field,
+        origin,
+        vox,
+        dims,
+    })
+}
+
+/// A static, view-independent distance-to-cloud lookup, built ONCE at training
+/// start from the seed/LiDAR point cloud (the measured surface the run is seeded
+/// from). Holds a dense truncated distance field as a device tensor plus the
+/// geometry to map a Gaussian centre to a flat voxel index; the per-step query is
+/// a single gather. The cloud does not move, so this is never rebuilt.
+pub struct CloudDistanceGrid {
+    /// `[nx*ny*nz]` truncated world-distance field, on the trainer device. The
+    /// per-voxel value already saturates at the far/truncation distance, so the
+    /// query needs only the field + geometry, not the scalar `max_dist`.
+    field: Tensor<1>,
+    origin: [f32; 3],
+    vox: f32,
+    dims: [usize; 3],
+}
+
+impl CloudDistanceGrid {
+    /// Read the cloud to the host, build the distance field, upload it to
+    /// `device`. `None` when the cloud has no finite point (e.g. a random-init
+    /// run with no seed) — the caller then warns once and no-ops the reg.
+    pub async fn build(
+        cloud_means: Tensor<2>,
+        margin: f32,
+        softness: f32,
+        device: &Device,
+    ) -> Option<Self> {
+        if cloud_means.dims()[0] == 0 {
+            return None;
+        }
+        // `detach_autodiff` is a passthrough on an already-inner tensor and drops
+        // the graph on an autodiff one; either way we just want the raw values.
+        let host: Vec<f32> = detach_autodiff(cloud_means)
+            .into_data_async()
+            .await
+            .ok()?
+            .into_vec()
+            .ok()?;
+        let data = build_distance_field(&host, margin, softness)?;
+        let num = data.field.len();
+        let field = Tensor::<1>::from_data(TensorData::new(data.field, [num]), device);
+        Some(Self {
+            field,
+            origin: data.origin,
+            vox: data.vox,
+            dims: data.dims,
+        })
+    }
+}
+
+/// Whether the depth-coupled opacity regularizer contributes a term this step:
+/// its weight is positive AND the global iteration has reached `start_iter`.
+/// Pulled out so the start-iter gate is unit-testable without a GPU or trainer.
+/// Before `start_iter` the term is skipped entirely (no projection, no cost), so
+/// densification can finish backfilling opacity-faded regions first.
+pub fn opacity_reg_active(global_iter: u32, start_iter: u32, weight: f32) -> bool {
+    weight > 0.0 && global_iter >= start_iter
+}
+
+/// Depth-coupled opacity regularizer — the SMOOTH, differentiable floater fade,
+/// now gated on 3D distance-to-cloud (see the module note above). Instead of
+/// deleting a floating Gaussian (which orphans its load-bearing colour and leaves
+/// a black halo), this adds a per-step loss whose ONLY gradient path is the
+/// activated opacity, so the optimizer fades far-from-cloud Gaussians out SMOOTHLY
+/// and their colour redistributes into on-surface Gaussians before they vanish.
 ///
-/// BACKEND: everything runs NATIVELY on the opacity leaf's autodiff backend,
-/// mirroring the Depth Disparity L1 loss (`train.rs`, which builds its gt via
-/// `Tensor::from_data(depth_data, &autodiff_device)`). `means.detach()` stops the
-/// gradient through position while STAYING on the autodiff backend — unlike
-/// `detach_autodiff`, which drops to the inner backend and then panics when
-/// multiplied against the autodiff opacity. So `residual` / `valid` / `p_i` are
-/// all autodiff-kind constants (no grad), `alpha` is autodiff WITH grad, and
-/// `p · alpha` is a clean autodiff×autodiff product — no cross-backend bridge.
+/// For each Gaussian centre `mu_i` it gathers the DETACHED distance-to-cloud
+/// `d_i` from the static grid, then `p_i = σ((d_i - margin) / softness)`: ~0 for
+/// `d_i ≤ margin` (on / near the surface), 0.5 at `d_i = margin`, ~1 for
+/// `d_i ≫ margin` (a floater in empty space). The term is
+/// `λ · mean_i(p_i · σ(raw_opacity_i))`.
 ///
-/// `raw_opacity` is the LIVE opacity leaf (`splats.raw_opacities.val()`), so it
-/// stays in the autodiff graph; `p_i` and the projection are detached. The only
-/// gradient is therefore
-/// `∂L/∂raw_opacity_i = λ · p_i · σ'(raw_opacity_i)`, which drives floating
-/// Gaussians' opacity toward 0 and touches nothing else.
+/// BACKEND: everything runs on the opacity leaf's autodiff backend, built on
+/// `raw_opacity.device()`. `means.detach()` stops the position gradient while
+/// STAYING on the autodiff backend (unlike `detach_autodiff`, which drops to the
+/// inner backend and then panics when multiplied against the autodiff opacity),
+/// and the static field is `lift_to_autodiff`-ed into the graph as a CONSTANT.
+/// So `d_i` / `p_i` are autodiff-kind constants (no grad), `alpha` is autodiff
+/// WITH grad, and `p · alpha` is a clean autodiff×autodiff product.
 ///
-/// Returns `None` (add no term) for an empty depth map, so the caller can skip
-/// cleanly. Pinhole is assumed — the caller guards non-pinhole + warns, mirroring
-/// the depth-prune and depth/normal terms.
+/// `raw_opacity` is the LIVE opacity leaf (`splats.raw_opacities.val()`), so the
+/// only gradient is `∂L/∂raw_opacity_i = λ · p_i · σ'(raw_opacity_i)` — it drives
+/// far-from-cloud Gaussians' opacity toward 0 and touches nothing else. The mean
+/// is over ALL Gaussians: on-surface ones carry `p_i ~ 0`, so they sit in the
+/// denominator but contribute ~0 to the numerator.
 pub fn depth_opacity_reg_loss(
     raw_opacity: Tensor<1>,
     means: Tensor<2>,
-    gt_depth: TensorData,
-    camera: &Camera,
-    img_size: glam::UVec2,
+    grid: &CloudDistanceGrid,
     margin: f32,
     softness: f32,
-) -> Option<Tensor<1>> {
-    // Autodiff-native, mirroring the Depth Disparity L1 loss. `.detach()` stops
-    // the position gradient but STAYS on the autodiff backend (unlike
-    // `detach_autodiff`, which drops to the inner backend); `project_depth_residual`
-    // then builds gt/R/t on this same autodiff device via `Tensor::from_data`, so
-    // `residual`/`valid` are autodiff-kind and combine with the live opacity
-    // below with no bridging.
+) -> Tensor<1> {
     let device = raw_opacity.device();
+    // Grad-stopped positions, STAYING on the autodiff backend (see the doc above).
     let means = means.detach();
-    let (residual, valid) = project_depth_residual(means, gt_depth, camera, img_size, &device)?;
+    let [nx, ny, nz] = grid.dims;
+    let num_vox = nx * ny * nz;
 
-    // Mean over the valid set. `p_i` is ~0 for valid-but-on-surface Gaussians, so
-    // they contribute ~0 to the numerator while still counting in the
-    // denominator — a genuine mean over the constrained Gaussians. Floored at 1
-    // so an all-invalid view (no valid returns) yields a 0 term, never a NaN.
-    let denom = valid.clone().float().sum().clamp_min(1.0);
+    // Voxel coord = floor((mu - origin) / vox), clamped per axis into the grid.
+    let origin = Tensor::<2>::from_data(
+        TensorData::new(vec![grid.origin[0], grid.origin[1], grid.origin[2]], [1, 3]),
+        &device,
+    );
+    let coord = means.sub(origin).div_scalar(grid.vox.max(1e-8)).floor();
+    let ci = coord
+        .clone()
+        .slice(burn::tensor::s![.., 0..1])
+        .clamp(0.0, (nx - 1) as f32);
+    let cj = coord
+        .clone()
+        .slice(burn::tensor::s![.., 1..2])
+        .clamp(0.0, (ny - 1) as f32);
+    let ck = coord
+        .slice(burn::tensor::s![.., 2..3])
+        .clamp(0.0, (nz - 1) as f32);
+    // Flat index `(i·ny + j)·nz + k`, matching `build_distance_field`.
+    let flat = ci
+        .mul_scalar((ny * nz) as f32)
+        .add(cj.mul_scalar(nz as f32))
+        .add(ck)
+        .squeeze_dim::<1>(1);
+    // NaN safety: a diverged mean yields a NaN coord; map it to voxel 0 (a far
+    // corner voxel whose field is `max_dist`, so the row is simply penalized as a
+    // floater — never NaN). Then clamp into range defensively before the gather.
+    let finite = flat.clone().is_finite();
+    let flat = flat
+        .mask_fill(finite.bool_not(), 0.0)
+        .clamp(0.0, (num_vox - 1) as f32)
+        .int();
 
-    // Detached, NaN-safe smooth penalty weight (no gradient — built from the
-    // detached means + constant gt). See [`float_penalty`].
-    let p = float_penalty(residual, valid, margin, softness);
+    // Detached per-Gaussian distance-to-cloud, gathered from the static field.
+    // Lift the field into the autodiff graph as a CONSTANT so it shares the
+    // opacity leaf's backend for the multiply, with no gradient path of its own.
+    let d = lift_to_autodiff(grid.field.clone()).select(0, flat);
 
-    // The ONLY graph-connected factor: the activated opacity of the live leaf.
+    // p_i ramps UP with distance from the cloud; detached (no gradient), so the
+    // ONLY graph-connected factor below is the activated opacity of the live leaf.
+    let p = sigmoid(d.sub_scalar(margin).div_scalar(softness.max(1e-8)));
     let alpha = sigmoid(raw_opacity);
-    Some((p * alpha).sum() / denom)
+    (p * alpha).mean()
 }
 
 /// Thresholds + caps for the cleanup pass, snapshotted from `TrainConfig` so the
@@ -1698,62 +1933,49 @@ mod device_tests {
         );
     }
 
-    /// The depth-coupled opacity regularizer routes a gradient to the opacity
-    /// leaf ONLY for a Gaussian floating in front of a valid depth return, and
-    /// leaves the leaf's other rows (a Gaussian at/behind the surface, and one
-    /// over an unscanned pixel) with ~0 / exactly-0 gradient. Same 4×4 pinhole
-    /// at the origin looking down +z as the accumulate test (identity
-    /// world→cam, so camera z == world z). Proves (1) the activated opacity is
-    /// the live leaf the term differentiates, (2) positions/`p_i` are detached
-    /// (no other row moves), and (3) the invalid-return gate zeroes the penalty.
+    /// FIX 1 — the 3D distance-to-cloud gate routes an opacity gradient to a
+    /// Gaussian FAR from the cloud and leaves an on-surface one ~0. Build a small
+    /// planar cloud patch near the origin (plus a distant background point), then
+    /// probe two opacity rows. Proves (1) the activated opacity is the live leaf
+    /// the term differentiates, (2) the field/positions are detached (the loss is
+    /// finite and only opacity moves), and (3) the SIGN is right: far = penalized.
     #[tokio::test]
-    async fn depth_opacity_reg_grads_only_floating_gaussian() {
-        use brush_render::burn_glue::lift_to_autodiff;
+    async fn opacity_reg_3d_gate_grads_far_not_on_surface() {
         let device =
             burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let margin = 0.15f32;
+        let softness = 0.05f32;
 
-        let img = glam::UVec2::new(4, 4);
-        let camera = Camera::new(
-            glam::Vec3::ZERO,
-            glam::Quat::IDENTITY,
-            std::f64::consts::FRAC_PI_2,
-            std::f64::consts::FRAC_PI_2,
-            glam::vec2(0.5, 0.5),
-            CameraModel::Pinhole,
-        );
+        // Cloud: a 3×3 patch of points in the z = 0 plane (spacing 0.05) = the
+        // measured surface, plus one distant background point at (2, 2, 2).
+        let mut cloud = Vec::new();
+        for i in -1..=1 {
+            for j in -1..=1 {
+                cloud.extend_from_slice(&[i as f32 * 0.05, j as f32 * 0.05, 0.0]);
+            }
+        }
+        cloud.extend_from_slice(&[2.0, 2.0, 2.0]);
+        let m = cloud.len() / 3;
+        let cloud = Tensor::<2>::from_data(TensorData::new(cloud, [m, 3]), &device);
+        let grid = CloudDistanceGrid::build(cloud, margin, softness, &device)
+            .await
+            .expect("a non-empty cloud builds a grid");
 
-        // Camera-space (== world here) positions, all at z = 5:
-        //   G0 (0,0,5)    → pixel (u=2, v=2)  floats FAR in front of the surface
-        //   G1 (2.5,0,5)  → pixel (u=3, v=2)  sits at/behind the surface
-        //   G2 (-2.5,0,5) → pixel (u=1, v=2)  projects over an UNSCANNED pixel
+        // G0 ON the surface (coincident with a cloud point) → d ~ 0 → p ~ 0.
+        // G1 FAR in empty space (1,1,1), ~1.7 from either cluster → d = max_dist → p ~ 1.
         let means = Tensor::<2>::from_data(
-            TensorData::new(
-                vec![0.0f32, 0.0, 5.0, 2.5, 0.0, 5.0, -2.5, 0.0, 5.0],
-                [3, 3],
-            ),
+            TensorData::new(vec![0.0f32, 0.0, 0.0, 1.0, 1.0, 1.0], [2, 3]),
             &device,
         );
-
-        // Depth map [H=4, W=4], row-major (row = v, col = u), 0 = invalid:
-        //   (2,2) = 10  surface 5 BEHIND G0 (residual -5 ≪ -margin → floats, p≈1)
-        //   (2,3) = 4   surface 1 IN FRONT of G1 (residual +1 → p≈0, not floating)
-        //   (2,1) = 0   no return over G2 (valid mask 0 → p gated to exactly 0)
-        let mut depth = vec![0.0f32; 16];
-        depth[2 * 4 + 2] = 10.0;
-        depth[2 * 4 + 3] = 4.0;
-        depth[2 * 4 + 1] = 0.0;
-        let gt = TensorData::new(depth, [4, 4]);
-
-        // Opacity leaf; σ'(0) = 0.25, a clean nonzero derivative on every row so
-        // a zero gradient can only come from a zero penalty weight.
+        // Opacity leaf; σ'(0) = 0.25, a clean nonzero derivative on every row so a
+        // zero gradient can only come from a zero penalty weight.
         let raw = lift_to_autodiff(Tensor::<1>::from_data(
-            TensorData::new(vec![0.0f32, 0.0, 0.0], [3]),
+            TensorData::new(vec![0.0f32, 0.0], [2]),
             &device,
         ))
         .require_grad();
 
-        let loss = depth_opacity_reg_loss(raw.clone(), means, gt, &camera, img, 0.05, 0.015)
-            .expect("valid returns exist, so a term is produced");
+        let loss = depth_opacity_reg_loss(raw.clone(), means, &grid, margin, softness);
         let grads = loss.backward();
         let g: Vec<f32> = raw
             .grad(&grads)
@@ -1764,109 +1986,133 @@ mod device_tests {
             .into_vec()
             .expect("f32");
 
-        // Floating Gaussian: penalized, so a clearly POSITIVE gradient (descent
-        // lowers its opacity). This is the whole point of the term.
+        // Far-from-cloud Gaussian: penalized, so a clearly POSITIVE gradient
+        // (descent lowers its opacity). This is the whole point of the term.
         assert!(
-            g[0] > 1e-4,
-            "floating Gaussian must get a positive opacity gradient, got {}",
+            g[1] > 1e-4,
+            "far-from-cloud Gaussian must get a positive opacity gradient, got {}",
+            g[1]
+        );
+        // On the surface: penalty weight ~0 → negligible gradient vs the floater
+        // (also proves positions are detached — only the penalty scales it).
+        assert!(
+            g[0].abs() < g[1] * 0.2,
+            "on-surface Gaussian gradient must be ~0 vs the floater, got {} (floater {})",
+            g[0],
+            g[1]
+        );
+    }
+
+    /// FIX 1 — immunity to the SEE-THROUGH case the per-pixel z-buffer failed on.
+    /// A surface Gaussian sitting just in front of a cloud point stays SAFE even
+    /// though a far background point exists "behind" it — which a naive projected
+    /// depth would have let leak through a foreground gap, flagging the surface
+    /// splat as floating. The 3D gate has no camera and no z-buffer, so only
+    /// proximity to the cloud matters: the background point cannot mark it.
+    #[tokio::test]
+    async fn opacity_reg_3d_gate_immune_to_see_through() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let margin = 0.15f32;
+        let softness = 0.05f32;
+
+        // One foreground surface point at the origin and a far background point
+        // 3 units behind it (the "see-through" background).
+        let cloud = Tensor::<2>::from_data(
+            TensorData::new(vec![0.0f32, 0.0, 0.0, 0.0, 0.0, 3.0], [2, 3]),
+            &device,
+        );
+        let grid = CloudDistanceGrid::build(cloud, margin, softness, &device)
+            .await
+            .expect("a non-empty cloud builds a grid");
+
+        // The surface Gaussian sits 0.02 in front of the foreground point (well
+        // within margin), with the background point 3 units further along +z.
+        let means =
+            Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 0.0, 0.02], [1, 3]), &device);
+        let raw = lift_to_autodiff(Tensor::<1>::from_data(
+            TensorData::new(vec![0.0f32], [1]),
+            &device,
+        ))
+        .require_grad();
+
+        let loss = depth_opacity_reg_loss(raw.clone(), means, &grid, margin, softness);
+        let grads = loss.backward();
+        let g: Vec<f32> = raw
+            .grad(&grads)
+            .expect("the opacity leaf must receive a gradient")
+            .into_data_async()
+            .await
+            .expect("grad readback")
+            .into_vec()
+            .expect("f32");
+
+        // A floater at this opacity would get ~0.25; the surface splat's grad must
+        // stay small (~p·0.25 with p ≈ 0.05), i.e. it is NOT treated as floating.
+        assert!(
+            g[0] < 0.05,
+            "a surface Gaussian near a cloud point must stay safe (small opacity \
+             gradient) despite a far background point, got {}",
             g[0]
         );
-        // At/behind the surface: penalty weight ≈ 0 → negligible gradient vs the
-        // floater (proves positions are detached — only the penalty scales it).
-        assert!(
-            g[1].abs() < g[0] * 1e-2,
-            "at/behind-surface Gaussian gradient must be ~0 vs the floater, got {} (floater {})",
-            g[1],
-            g[0]
+    }
+
+    /// FIX 2 — the start-iter gate: no term before `start_iter` (and none when the
+    /// weight is 0); it fires at/after it. Pure logic, so no device needed.
+    #[test]
+    fn opacity_reg_start_iter_gates_term() {
+        // Weight 0 → never active, regardless of iter.
+        assert!(!opacity_reg_active(20_000, 15_000, 0.0));
+        // Before start_iter → inactive (no cost, lets densification finish).
+        assert!(!opacity_reg_active(14_999, 15_000, 0.1));
+        // At and after start_iter → active.
+        assert!(opacity_reg_active(15_000, 15_000, 0.1));
+        assert!(opacity_reg_active(30_000, 15_000, 0.1));
+        // Default start 0 → active from the first step (unchanged behaviour).
+        assert!(opacity_reg_active(0, 0, 0.1));
+    }
+
+    /// The host distance-field build: an on-cloud voxel reads ~0 (conservative
+    /// bias), a voxel in genuinely-empty space saturates to `max_dist`, and the
+    /// field is dense over the padded grid. Pure host logic, no device.
+    #[test]
+    fn build_distance_field_on_cloud_zero_far_saturated() {
+        let margin = 0.15f32;
+        let softness = 0.05f32;
+        // Two points 2 units apart: the gap between them is genuinely empty.
+        let data = build_distance_field(&[0.0, 0.0, 0.0, 2.0, 0.0, 0.0], margin, softness)
+            .expect("a finite point builds a field");
+        let [nx, ny, nz] = data.dims;
+        let flat = |i: usize, j: usize, k: usize| (i * ny + j) * nz + k;
+        let vidx = |p: f32, o: f32| (((p - o) / data.vox).floor() as usize);
+
+        // The voxel holding a cloud point reads ~0.
+        let (i, j, k) = (
+            vidx(0.0, data.origin[0]),
+            vidx(0.0, data.origin[1]),
+            vidx(0.0, data.origin[2]),
         );
-        // Unscanned pixel: valid mask 0 → penalty gated to exactly 0 → no grad.
+        assert!(
+            data.field[flat(i, j, k)] < 0.02,
+            "on-cloud voxel must read ~0, got {}",
+            data.field[flat(i, j, k)]
+        );
+        // A voxel in the empty gap (x ≈ 1) is beyond the search reach → max_dist.
+        let expected_max = margin + FAR_SPAN * softness.max(1e-6);
+        let (gi, gj, gk) = (
+            vidx(1.0, data.origin[0]),
+            vidx(0.0, data.origin[1]),
+            vidx(0.0, data.origin[2]),
+        );
+        assert!(
+            (data.field[flat(gi, gj, gk)] - expected_max).abs() < 1e-6,
+            "an empty-space voxel must read the truncation max_dist ({expected_max}), got {}",
+            data.field[flat(gi, gj, gk)]
+        );
         assert_eq!(
-            g[2], 0.0,
-            "a Gaussian over an unscanned pixel must get exactly zero opacity gradient"
+            data.field.len(),
+            nx * ny * nz,
+            "field is dense over the grid"
         );
-    }
-
-    /// BUG A regression — ramp CENTERING. With the defaults `softness ≪ margin`,
-    /// the penalty must be ~0 at the surface (`r = 0`) so correctly-reconstructed
-    /// wall splats are NOT faded, exactly 0.5 at the margin boundary
-    /// (`r = -margin`), and ~0 just behind the surface. The old default
-    /// `softness > margin` gave `p(0) ≈ 0.38` and silently faded real geometry;
-    /// the earlier grad test only probed `r = +1` (a full metre behind) and so
-    /// missed this boundary — the boundary is the whole point of the term.
-    #[tokio::test]
-    async fn depth_opacity_reg_ramp_is_centered_on_margin() {
-        let device =
-            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
-        let margin = 0.05f32;
-        let softness = 0.015f32;
-        // residuals: on-surface, at the ramp centre, just behind, floating far.
-        let residual = Tensor::<1>::from_data(
-            TensorData::new(vec![0.0f32, -margin, 0.05, -0.5], [4]),
-            &device,
-        );
-        let valid = Tensor::<1>::from_data(TensorData::new(vec![1.0f32; 4], [4]), &device)
-            .greater_elem(0.5);
-        let p: Vec<f32> = float_penalty(residual, valid, margin, softness)
-            .into_data_async()
-            .await
-            .expect("penalty readback")
-            .into_vec()
-            .expect("f32");
-        assert!(
-            p[0] < 0.05,
-            "on-surface (r=0) penalty must be <0.05 or it fades real walls, got {}",
-            p[0]
-        );
-        assert!(
-            (p[1] - 0.5).abs() < 1e-3,
-            "at the margin boundary (r=-margin) the ramp centre must be 0.5, got {}",
-            p[1]
-        );
-        assert!(
-            p[2] < 0.05,
-            "just-behind-surface (r=+0.05) penalty must be ~0, got {}",
-            p[2]
-        );
-        assert!(
-            p[3] > 0.95,
-            "a Gaussian floating far in front must be penalized near 1, got {}",
-            p[3]
-        );
-    }
-
-    /// BUG B regression — NaN SAFETY. A diverged mean gives a NaN residual at an
-    /// invalid row; `σ(NaN)·0 = NaN` (IEEE-754) would poison the whole shared
-    /// scalar loss and every gradient this step. `float_penalty` must substitute
-    /// the residual BEFORE the sigmoid so the invalid row is EXACTLY 0 and the
-    /// valid row is untouched — no NaN anywhere.
-    #[tokio::test]
-    async fn depth_opacity_reg_penalty_is_nan_safe() {
-        let device =
-            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
-        // Row 0: valid + floating. Row 1: invalid, with a NaN residual (diverged
-        // mean). Row 2: invalid, +inf residual. Both invalid rows must be 0.
-        let residual = Tensor::<1>::from_data(
-            TensorData::new(vec![-1.0f32, f32::NAN, f32::INFINITY], [3]),
-            &device,
-        );
-        let valid = Tensor::<1>::from_data(TensorData::new(vec![1.0f32, 0.0, 0.0], [3]), &device)
-            .greater_elem(0.5);
-        let p: Vec<f32> = float_penalty(residual, valid, 0.05, 0.015)
-            .into_data_async()
-            .await
-            .expect("penalty readback")
-            .into_vec()
-            .expect("f32");
-        assert!(
-            p.iter().all(|v| v.is_finite()),
-            "penalty must contain no NaN/inf, got {p:?}"
-        );
-        assert!(
-            p[0] > 0.5,
-            "the valid floating row must still be penalized, got {}",
-            p[0]
-        );
-        assert_eq!(p[1], 0.0, "an invalid NaN-residual row must be exactly 0");
-        assert_eq!(p[2], 0.0, "an invalid inf-residual row must be exactly 0");
     }
 }
