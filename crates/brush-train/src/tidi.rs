@@ -942,32 +942,54 @@ pub fn depth_opacity_reg_loss(
         TensorData::new(vec![grid.origin[0], grid.origin[1], grid.origin[2]], [1, 3]),
         &device,
     );
-    let coord = means.sub(origin).div_scalar(grid.vox.max(1e-8)).floor();
-    let ci = coord
+    let coord = means.sub(origin).div_scalar(grid.vox.max(1e-6)).floor();
+
+    // BUG-2 guard: a diverged (NaN/±inf) mean gives a non-finite coord on at least
+    // one axis. Do NOT route such a row through a real voxel index — the far value
+    // of any particular voxel (e.g. index 0) is an implementation detail, so a
+    // divergent Gaussian could silently read as on-surface. Instead flag the row
+    // here (before the clamp turns ±inf into a finite in-range index) and FORCE
+    // `p = 1` for it below, so divergent Gaussians are always fully penalized.
+    let nonfinite = coord
+        .clone()
+        .is_finite()
+        .float()
+        .sum_dim(1) // [N, 1]: 3.0 iff all three axes are finite
+        .greater_elem(2.5)
+        .bool_not(); // [N, 1] Bool, true = divergent row
+
+    // Per-axis voxel coord, clamped into the grid; divergent rows are zeroed so
+    // the Int cast is well defined (their `p` is overridden regardless).
+    let cx = coord
         .clone()
         .slice(burn::tensor::s![.., 0..1])
-        .clamp(0.0, (nx - 1) as f32);
-    let cj = coord
+        .clamp(0.0, (nx - 1) as f32)
+        .mask_fill(nonfinite.clone(), 0.0)
+        .int();
+    let cy = coord
         .clone()
         .slice(burn::tensor::s![.., 1..2])
-        .clamp(0.0, (ny - 1) as f32);
-    let ck = coord
-        .slice(burn::tensor::s![.., 2..3])
-        .clamp(0.0, (nz - 1) as f32);
-    // Flat index `(i·ny + j)·nz + k`, matching `build_distance_field`.
-    let flat = ci
-        .mul_scalar((ny * nz) as f32)
-        .add(cj.mul_scalar(nz as f32))
-        .add(ck)
-        .squeeze_dim::<1>(1);
-    // NaN safety: a diverged mean yields a NaN coord; map it to voxel 0 (a far
-    // corner voxel whose field is `max_dist`, so the row is simply penalized as a
-    // floater — never NaN). Then clamp into range defensively before the gather.
-    let finite = flat.clone().is_finite();
-    let flat = flat
-        .mask_fill(finite.bool_not(), 0.0)
-        .clamp(0.0, (num_vox - 1) as f32)
+        .clamp(0.0, (ny - 1) as f32)
+        .mask_fill(nonfinite.clone(), 0.0)
         .int();
+    let cz = coord
+        .slice(burn::tensor::s![.., 2..3])
+        .clamp(0.0, (nz - 1) as f32)
+        .mask_fill(nonfinite.clone(), 0.0)
+        .int();
+
+    // BUG-1 fix: build the flat index `(i·ny + j)·nz + k` in INTEGER arithmetic,
+    // matching the exact host `usize` index used in `build_distance_field`. f32 is
+    // exact only to 2^24, but a grid can ship up to MAX_VOXELS (> 2^24) voxels, so
+    // an f32 `ci·(ny·nz)+…` would round ~half the Gaussians onto an ADJACENT voxel
+    // and gather the wrong distance. Int mul/add is exact (the largest term is
+    // < num_vox ≤ MAX_VOXELS < 2^31). Clamp defensively, then gather.
+    let flat = cx
+        .mul_scalar((ny * nz) as i64)
+        .add(cy.mul_scalar(nz as i64))
+        .add(cz)
+        .clamp(0i64, (num_vox - 1) as i64)
+        .squeeze_dim::<1>(1); // [N] Int
 
     // Detached per-Gaussian distance-to-cloud, gathered from the static field.
     // Lift the field into the autodiff graph as a CONSTANT so it shares the
@@ -976,7 +998,9 @@ pub fn depth_opacity_reg_loss(
 
     // p_i ramps UP with distance from the cloud; detached (no gradient), so the
     // ONLY graph-connected factor below is the activated opacity of the live leaf.
-    let p = sigmoid(d.sub_scalar(margin).div_scalar(softness.max(1e-8)));
+    let p = sigmoid(d.sub_scalar(margin).div_scalar(softness.max(1e-6)));
+    // BUG-2: force full penalty on divergent (non-finite-mean) rows.
+    let p = p.mask_fill(nonfinite.squeeze_dim::<1>(1), 1.0);
     let alpha = sigmoid(raw_opacity);
     (p * alpha).mean()
 }
@@ -2113,6 +2137,92 @@ mod device_tests {
             data.field.len(),
             nx * ny * nz,
             "field is dense over the grid"
+        );
+    }
+
+    /// BUG-1 regression: the flat voxel index MUST be computed in integer
+    /// arithmetic. A grid can ship up to MAX_VOXELS (> 2^24) voxels, and f32 is
+    /// exact only to 2^24, so an f32 `i·(ny·nz)+…` rounds a large index onto an
+    /// adjacent voxel — the device gather would then read the wrong distance for
+    /// ~half the Gaussians. This encodes the contract the loss now relies on: the
+    /// integer formula is exact where the f32 formula collides, at an index the
+    /// production cap can actually reach.
+    #[test]
+    fn flat_index_stays_exact_beyond_f32_mantissa() {
+        // A realistic ~100 m corridor at margin 0.15 (vox 0.05) reaches ~20 M
+        // voxels — under the 24 M cap, so it ships without growing `vox`.
+        let (ny, nz) = (300usize, 300usize); // ny*nz = 90_000
+        let (i, j, k) = (233usize, 7usize, 3usize); // i*ny*nz = 20_970_000 > 2^24
+        let exact = (i as i64) * (ny as i64) * (nz as i64) + (j as i64) * (nz as i64) + k as i64;
+        assert!(
+            exact > (1i64 << 24) && (exact as usize) < MAX_VOXELS,
+            "test index must be in the lossy zone yet under the cap"
+        );
+        // The f32 computation the OLD code used collides with a different index.
+        let as_f32 = (i as f32) * (ny * nz) as f32 + (j as f32) * (nz as f32) + k as f32;
+        assert_ne!(
+            as_f32 as i64, exact,
+            "f32 index must round above 2^24 (this is the bug the int fix avoids)"
+        );
+    }
+
+    /// BUG-2 regression: a Gaussian with a divergent (NaN) centre must be FULLY
+    /// penalized (large opacity gradient), never silently spared by whatever
+    /// voxel a garbage index happens to land on. The non-finite-row mask forces
+    /// `p = 1` for it.
+    #[tokio::test]
+    async fn opacity_reg_3d_gate_penalizes_divergent_mean() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let margin = 0.15f32;
+        let softness = 0.05f32;
+
+        // A small surface patch so the grid is well-formed.
+        let mut cloud = Vec::new();
+        for i in -1..=1 {
+            for j in -1..=1 {
+                cloud.extend_from_slice(&[i as f32 * 0.05, j as f32 * 0.05, 0.0]);
+            }
+        }
+        let m = cloud.len() / 3;
+        let cloud = Tensor::<2>::from_data(TensorData::new(cloud, [m, 3]), &device);
+        let grid = CloudDistanceGrid::build(cloud, margin, softness, &device)
+            .await
+            .expect("a non-empty cloud builds a grid");
+
+        // G0 on the surface (safe); G1 with a NaN centre (divergent → must be
+        // penalized regardless of which voxel the zeroed index resolves to).
+        let means = Tensor::<2>::from_data(
+            TensorData::new(vec![0.0f32, 0.0, 0.0, f32::NAN, f32::NAN, f32::NAN], [2, 3]),
+            &device,
+        );
+        let raw = lift_to_autodiff(Tensor::<1>::from_data(
+            TensorData::new(vec![0.0f32, 0.0], [2]),
+            &device,
+        ))
+        .require_grad();
+
+        let loss = depth_opacity_reg_loss(raw.clone(), means, &grid, margin, softness);
+        let grads = loss.backward();
+        let g: Vec<f32> = raw
+            .grad(&grads)
+            .expect("the opacity leaf must receive a gradient")
+            .into_data_async()
+            .await
+            .expect("grad readback")
+            .into_vec()
+            .expect("f32");
+
+        // The loss must stay finite (no NaN poison) and the divergent row must be
+        // penalized (p forced to 1 → the largest opacity gradient here).
+        assert!(
+            g.iter().all(|v| v.is_finite()),
+            "a NaN-centre Gaussian must not poison the loss/gradients, got {g:?}"
+        );
+        assert!(
+            g[1] > 1e-4,
+            "a divergent (NaN-centre) Gaussian must be fully penalized, got {}",
+            g[1]
         );
     }
 }

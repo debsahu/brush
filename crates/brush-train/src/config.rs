@@ -827,17 +827,20 @@ pub struct TrainConfig {
     // black halo), this adds a per-step loss whose ONLY gradient path is the
     // Gaussian's activated opacity, fading off-surface splats out SMOOTHLY so
     // the optimizer redistributes their colour into on-surface splats BEFORE
-    // they vanish. Reuses the exact per-frame depth + pinhole projection the
-    // depth-prune uses. Independent of `--depth-loss-weight` and of the TIDI
-    // prune state; needs no persistent accumulators. Default OFF and byte-inert
-    // (no projection, no loss term) when the weight is 0.
+    // they vanish. Gated on a VIEW-INDEPENDENT 3D test: a Gaussian is penalized
+    // when its centre is FAR from the seed/LiDAR point cloud, looked up in a
+    // static distance-to-cloud grid built once from the seed cloud. No per-frame
+    // depth and no camera projection (unlike the old per-view z-buffer residual).
+    // Independent of `--depth-loss-weight` and of the TIDI prune state; needs no
+    // persistent accumulators. Default OFF and byte-inert (no lookup, no loss
+    // term) when the weight is 0.
     // ------------------------------------------------------------------
     /// Depth-coupled opacity-regularizer weight (lambda). 0 = OFF (inert).
-    /// >0 adds `lambda * mean_over_valid(p_i * sigmoid(opacity_i))` to the loss,
-    /// where `p_i` is a DETACHED smooth ramp that is ~1 for a Gaussian floating
-    /// well in front of a valid LiDAR/depth return and 0 on/behind the surface
-    /// (or where no return exists). The gradient reaches ONLY the opacity leaf,
-    /// so floating splats fade smoothly rather than being hard-deleted.
+    /// >0 adds `lambda * mean_i(p_i * sigmoid(opacity_i))` to the loss,
+    /// where `p_i` is a DETACHED smooth ramp that is ~1 for a Gaussian whose
+    /// centre is FAR (> margin) from the nearest seed/LiDAR cloud point and ~0
+    /// for one on/near the cloud. The gradient reaches ONLY the opacity leaf,
+    /// so far-from-cloud splats fade smoothly rather than being hard-deleted.
     #[arg(long, help_heading = "TIDI options", default_value = "0.0")]
     #[serde(default = "default_depth_opacity_reg_weight")]
     pub depth_opacity_reg_weight: f32,
