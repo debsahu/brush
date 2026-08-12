@@ -672,8 +672,11 @@ pub struct TrainConfig {
     #[serde(default = "default_tidi_warmup_steps")]
     pub tidi_warmup_steps: u32,
 
-    /// Visibility signal: candidate iff cumulative observed-window count <= this
-    /// (paper τ_vis = 2.0).
+    /// Visibility signal: candidate iff the number of refine WINDOWS in which
+    /// this gaussian was ever visible is <= this (paper τ_vis = 2.0). NOTE: the
+    /// unit is refine windows, not steps -- see `TidiState::accumulate_window`,
+    /// which collapses each window to a 0/1 "seen" indicator so this threshold is
+    /// reachable (raw per-step counts scale with training length).
     #[arg(long, help_heading = "TIDI options", default_value = "2.0")]
     #[serde(default = "default_tidi_vis_threshold")]
     pub tidi_vis_threshold: f32,
@@ -727,6 +730,14 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "TIDI options", default_value = "0.10")]
     #[serde(default = "default_tidi_guard_thin_quantile")]
     pub tidi_guard_thin_quantile: f32,
+
+    /// Anisotropy detail-guard quantile: exempt a candidate whose scale ratio
+    /// s3/s1 is at/above this quantile of the STABLE set (an elongated sheet /
+    /// needle the thinness guard misses when s1 is not small). 0 disables.
+    /// ADAPTIVE.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.95")]
+    #[serde(default = "default_tidi_guard_aniso_quantile")]
+    pub tidi_guard_aniso_quantile: f32,
 
     /// Local colour-variance detail-guard quantile (needs an extra candidate
     /// k-NN pass; off by default for cost). Thresholded against the CANDIDATE
@@ -870,6 +881,9 @@ fn default_tidi_guard_sh_quantile() -> f32 {
 }
 fn default_tidi_guard_thin_quantile() -> f32 {
     0.10
+}
+fn default_tidi_guard_aniso_quantile() -> f32 {
+    0.95
 }
 fn default_tidi_guard_color_var_quantile() -> f32 {
     0.0

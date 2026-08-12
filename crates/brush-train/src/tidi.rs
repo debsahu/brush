@@ -75,6 +75,16 @@ fn create_importance_optimizer() -> ImportanceOptimizer {
 /// `omega` lives on the autodiff backend (it is a leaf that gets a photometric
 /// gradient every step); the three accumulators are pure data on the inner
 /// backend, matching the `RefineRecord` tensors they are fed from.
+///
+/// GAP-5 (LOD): "persists across cycles" holds WITHIN a training phase. Under
+/// `--lod-levels > 0` the process rebuilds `SplatTrainer` at each LOD boundary
+/// (see `train_stream`), and — unlike `appearance`, which is carried via
+/// `set_appearance` — TIDI state is NOT carried, so `vis_accum` / `grad_ema` /
+/// `omega` reset and the per-Gaussian warmup restarts on the decimated splats.
+/// This fails safe (no crash; TIDI simply re-warms and re-learns per phase), but
+/// a floater surviving decimation loses its accumulated history. Carrying it
+/// across the boundary would need the LOD decimation to expose surviving indices
+/// for a `keep`-style reindex; not done here.
 pub struct TidiState {
     importance: ImportanceModule,
     optim: ImportanceOptimizer,
@@ -100,8 +110,11 @@ struct HostSignals {
     sigma_w: Vec<f32>,
     /// Non-DC SH energy `‖f_rest‖₂` per Gaussian (guard 1).
     sh_hf: Vec<f32>,
-    /// Smallest scale axis `s₁` per Gaussian (guard 3, thinness).
+    /// Smallest scale axis `s₁` per Gaussian (thinness guard).
     min_scale: Vec<f32>,
+    /// Anisotropy `s₃/s₁` (largest / smallest scale axis) per Gaussian
+    /// (anisotropy guard — protects elongated sheet / needle structures).
+    aniso: Vec<f32>,
     /// Positions `[N*3]` for the isolation k-NN.
     pos: Vec<f32>,
     /// DC colour `[N*3]` for the optional local-colour-variance guard.
@@ -189,14 +202,25 @@ impl TidiState {
     /// window position-gradient signal), both inner and aligned to the current
     /// (pre-prune) splats.
     ///
-    /// NOTE: the paper's β=0.99 EMA is defined per training step over
-    /// `‖∇_x L‖₂`. Brush only materialises a per-refine-window position-gradient
-    /// signal (`RefineRecord::refine_weight_norm`, the same quantity the growth
-    /// gate thresholds), so the EMA here advances once per refine window, not
-    /// per step. β is exposed so the operator can compensate for the coarser
-    /// cadence.
+    /// NOTE (visibility scale): `RefineRecord::vis_weight` is `+= visible` on
+    /// EVERY training step (one view/step), so it already scales with the number
+    /// of steps in a window (tens-to-hundreds). Summing that raw across windows
+    /// would put `vis_accum` in the hundreds-to-thousands, and `τ_vis = 2.0`
+    /// (`fail_vis` = `vis ≤ 2`) would be unreachable for any persistently
+    /// rendered gaussian — signal (a) would never fire. So we collapse each
+    /// window to a 0/1 "seen at least once this window" indicator and sum THAT:
+    /// `vis_accum` is "number of refine windows in which this gaussian was ever
+    /// visible", and `τ_vis` is on that window scale.
+    ///
+    /// NOTE (gradient EMA cadence): the paper's β=0.99 EMA is defined per
+    /// training step over `‖∇_x L‖₂`. Brush only materialises a per-refine-window
+    /// position-gradient signal (`RefineRecord::refine_weight_norm`, the same
+    /// quantity the growth gate thresholds), so the EMA here advances once per
+    /// refine window, not per step. β is exposed so the operator can compensate
+    /// for the coarser cadence.
     pub fn accumulate_window(&mut self, vis: Tensor<1>, grad: Tensor<1>, beta: f32) {
-        self.vis_accum = self.vis_accum.clone() + vis;
+        let seen = vis.greater_elem(0.0).float();
+        self.vis_accum = self.vis_accum.clone() + seen;
         self.grad_ema = self.grad_ema.clone().mul_scalar(beta) + grad.mul_scalar(1.0 - beta);
     }
 
@@ -293,10 +317,6 @@ impl TidiState {
         } else {
             Tensor::<1>::zeros([n], &opacity.device())
         };
-        // s₁ = smallest scale axis. NOTE: Brush scales are XYZ axes, NOT
-        // rank-ordered, so a min-reduction (not a fixed column) is what gives the
-        // smallest axis; likewise max/min for anisotropy if a caller wants it.
-        let min_scale = scales.clone().min_dim(1).squeeze_dim::<1>(1);
         // DC colour (SH band 0) for the optional local-colour-variance guard.
         let dc_color = sh_coeffs
             .slice(burn::tensor::s![.., 0..1, ..])
@@ -329,6 +349,25 @@ impl TidiState {
             .expect("i32");
         let age: Vec<i32> = birth.iter().map(|&b| cur_iter as i32 - b).collect();
 
+        // Per-axis scales `[N*3]` read to the host once; the thinness guard wants
+        // the smallest axis `s₁` and the anisotropy guard wants `s₃/s₁`. NOTE:
+        // Brush scales are XYZ axes, NOT rank-ordered, so min/max over the three
+        // (not a fixed column) is what gives `s₁` / `s₃`.
+        let scales_host = host2(scales).await;
+        let mut min_scale = vec![0.0f32; n];
+        let mut aniso = vec![1.0f32; n];
+        for i in 0..n {
+            let s = [
+                scales_host[i * 3],
+                scales_host[i * 3 + 1],
+                scales_host[i * 3 + 2],
+            ];
+            let mn = s.iter().copied().fold(f32::INFINITY, f32::min);
+            let mx = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            min_scale[i] = mn;
+            aniso[i] = if mn > 1e-20 { mx / mn } else { f32::INFINITY };
+        }
+
         HostSignals {
             n,
             vis: host1(self.vis_accum.clone()).await,
@@ -336,7 +375,8 @@ impl TidiState {
             opacity: host1(opacity).await,
             sigma_w: host1(sigma_w).await,
             sh_hf: host1(sh_hf).await,
-            min_scale: host1(min_scale).await,
+            min_scale,
+            aniso,
             pos: host2(means).await,
             dc_color: host2(dc_color).await,
             age,
@@ -394,6 +434,7 @@ pub struct TidiPruneParams {
     pub warmup_steps: i32,
     pub guard_sh_quantile: f32,
     pub guard_thin_quantile: f32,
+    pub guard_aniso_quantile: f32,
     pub guard_color_var_quantile: f32,
     pub knn_k: usize,
     pub local_cap_frac: f32,
@@ -440,7 +481,8 @@ fn select_prune_indices(cfg: &TidiPruneParams, s: &HostSignals) -> Vec<u32> {
     // fixed numbers, so the flags set the quantile, not the value. A candidate
     // is exempted (kept) if it passes ANY guard (OR): unusually high non-DC SH
     // energy (specular / view-dependent detail), an unusually thin smallest axis
-    // (a thin structure), or high local colour variance.
+    // (a thin structure), unusually high anisotropy `s₃/s₁` (an elongated sheet /
+    // needle), or high local colour variance.
     let stable_of =
         |vals: &[f32]| -> Vec<f32> { (0..n).filter(|&i| !candidate[i]).map(|i| vals[i]).collect() };
 
@@ -448,9 +490,15 @@ fn select_prune_indices(cfg: &TidiPruneParams, s: &HostSignals) -> Vec<u32> {
     let tau_h = (cfg.guard_sh_quantile > 0.0)
         .then(|| quantile(stable_of(&s.sh_hf), cfg.guard_sh_quantile))
         .flatten();
-    // Guard 3: thinness, exempt at/below the low quantile of s₁.
+    // Guard 2 (thinness): exempt at/below the low quantile of s₁ (thin sliver).
     let tau_s = (cfg.guard_thin_quantile > 0.0)
         .then(|| quantile(stable_of(&s.min_scale), cfg.guard_thin_quantile))
+        .flatten();
+    // Guard 3 (anisotropy): exempt at/above the high quantile of s₃/s₁ (an
+    // elongated structure the thinness guard misses when s₁ itself is not small,
+    // e.g. a wide, flat sheet). GAP-4 fix.
+    let tau_a = (cfg.guard_aniso_quantile > 0.0)
+        .then(|| quantile(stable_of(&s.aniso), cfg.guard_aniso_quantile))
         .flatten();
 
     // Guard 2 (optional, default off): local colour variance among a candidate's
@@ -489,8 +537,9 @@ fn select_prune_indices(cfg: &TidiPruneParams, s: &HostSignals) -> Vec<u32> {
         }
         let exempt_sh = tau_h.is_some_and(|t| s.sh_hf[i] >= t);
         let exempt_thin = tau_s.is_some_and(|t| s.min_scale[i] <= t);
+        let exempt_aniso = tau_a.is_some_and(|t| s.aniso[i] >= t);
         let exempt_cv = color_var.as_ref().is_some_and(|(dense, t)| dense[i] >= *t);
-        if !(exempt_sh || exempt_thin || exempt_cv) {
+        if !(exempt_sh || exempt_thin || exempt_aniso || exempt_cv) {
             c_prune.push(i as u32);
         }
     }
@@ -602,9 +651,14 @@ fn knn_mean_dist(pos: &[f32], query: &[u32], k: usize) -> Vec<f32> {
                 return f32::INFINITY; // fully isolated → maximally prunable.
             }
             let take = k.min(best.len());
+            // Partition by SQUARED distance to isolate the k nearest (sqrt is
+            // monotone, so the k-smallest set is identical).
             best.select_nth_unstable_by(take - 1, |a, b| a.total_cmp(b));
-            let mean_sq = best[..take].iter().sum::<f32>() / take as f32;
-            mean_sq.sqrt()
+            // Isolation score = MEAN of the k neighbour DISTANCES (spec + the
+            // docstring above), i.e. `mean(d)`. NOT `sqrt(mean(d²))` = RMS, which
+            // is ≥ mean and reads a 15-close-1-far cluster as spuriously
+            // isolated. So take sqrt of each squared distance BEFORE averaging.
+            best[..take].iter().map(|d2| d2.sqrt()).sum::<f32>() / take as f32
         })
         .collect()
 }
@@ -698,11 +752,22 @@ fn isolation_select(
         by_cell.entry(key).or_default().push((gi, dists[row]));
     }
 
-    // Local cap: per cell, keep only the most-isolated `local_frac` (floor).
+    // Local cap: per cell, keep only the most-isolated `local_frac`. NOTE:
+    // `build_grid` sizes cells to ≈8 points, so a cell holds only a handful of
+    // candidates. A plain `floor(count * 0.01)` would be 0 for any cell with
+    // < 100 candidates — i.e. essentially always, and WORST for the paper's lone
+    // isolated floater (lowest per-cell count). So round UP and allow at least
+    // one prune from a non-empty cell; the global cap below is the real budget.
     let mut pool: Vec<(u32, f32)> = Vec::new();
     for (_, mut members) in by_cell {
         members.sort_by(|a, b| b.1.total_cmp(&a.1)); // isolation descending
-        let cap = (members.len() as f32 * local_frac).floor() as usize;
+        let cap = if members.is_empty() {
+            0
+        } else {
+            ((members.len() as f32 * local_frac).ceil() as usize)
+                .max(1)
+                .min(members.len())
+        };
         pool.extend(members.into_iter().take(cap));
     }
 
@@ -726,6 +791,7 @@ mod tests {
             warmup_steps: 500,
             guard_sh_quantile: 0.95,
             guard_thin_quantile: 0.10,
+            guard_aniso_quantile: 0.95,
             guard_color_var_quantile: 0.0,
             knn_k: 16,
             local_cap_frac: 1.0,
@@ -743,9 +809,11 @@ mod tests {
         let mut sw = Vec::new();
         let mut sh = Vec::new();
         let mut ms = Vec::new();
+        let mut an = Vec::new();
         let mut dc = Vec::new();
         let mut age = Vec::new();
-        // 27 stable points, well observed, opaque, important, still moving.
+        // 27 stable points, well observed, opaque, important, still moving, and
+        // moderately elongated.
         for x in 0..3 {
             for y in 0..3 {
                 for z in 0..3 {
@@ -756,6 +824,7 @@ mod tests {
                     sw.push(0.99);
                     sh.push(0.1);
                     ms.push(0.05);
+                    an.push(2.0);
                     dc.extend_from_slice(&[0.5, 0.5, 0.5]);
                     age.push(5000);
                 }
@@ -763,7 +832,8 @@ mod tests {
         }
         // One isolated floater far away, failing all four signals. Its smallest
         // scale axis is LARGER than the stable set (a blobby floater, not a thin
-        // structure), so the thinness guard does not exempt it.
+        // structure) and it is near-isotropic (aniso below the stable set), so
+        // neither the thinness nor the anisotropy guard exempts it.
         pos.extend_from_slice(&[100.0, 100.0, 100.0]);
         vis.push(1.0);
         grad.push(1e-5);
@@ -771,6 +841,7 @@ mod tests {
         sw.push(0.1);
         sh.push(0.01);
         ms.push(0.10);
+        an.push(1.0);
         dc.extend_from_slice(&[0.5, 0.5, 0.5]);
         age.push(5000);
         let n = vis.len();
@@ -782,6 +853,7 @@ mod tests {
             sigma_w: sw,
             sh_hf: sh,
             min_scale: ms,
+            aniso: an,
             pos,
             dc_color: dc,
             age,
@@ -838,5 +910,107 @@ mod tests {
         p.global_cap_frac = 1.0;
         let _ = &mut s;
         assert_eq!(select_prune_indices(&p, &s).len(), 1);
+    }
+
+    /// BUG-1 regression: at the REAL default `--tidi-local-cap-frac = 0.01`, a
+    /// lone isolated floater (the paper's headline case, and the lowest per-cell
+    /// count) must still be selected. The pre-fix `floor(1 * 0.01) = 0` dropped
+    /// it. Uses a full global cap so this isolates the local-cap path (the
+    /// global floor only bites sub-500-gaussian scenes, never real ones).
+    #[test]
+    fn default_local_cap_still_selects_lone_floater() {
+        let s = scene_with_floater();
+        let mut p = base_params();
+        p.local_cap_frac = 0.01; // production default
+        p.global_cap_frac = 1.0;
+        let idx = select_prune_indices(&p, &s);
+        assert_eq!(
+            idx,
+            vec![(s.n - 1) as u32],
+            "default local cap must not floor a lone floater to zero"
+        );
+    }
+
+    /// GAP-4: the anisotropy guard exempts an elongated (sheet / needle)
+    /// candidate whose s3/s1 is above the stable set's high quantile, even when
+    /// its smallest axis is not thin (so the thinness guard would miss it).
+    #[test]
+    fn anisotropy_guard_exempts_elongated_structure() {
+        let mut s = scene_with_floater();
+        let f = s.n - 1;
+        s.aniso[f] = 100.0; // far above the stable 0.95 quantile (2.0)
+        let idx = select_prune_indices(&base_params(), &s);
+        assert!(idx.is_empty(), "highly anisotropic candidate is guarded");
+    }
+
+    /// BUG-3 regression: the isolation score is the MEAN of the k neighbour
+    /// distances, not the RMS. Two neighbours at distances 0 and 4 must score
+    /// mean = 2.0, not RMS = sqrt((0+16)/2) = 2.83.
+    #[test]
+    fn isolation_score_is_mean_not_rms() {
+        // Query at origin; neighbours at distance 0 (coincident) and 4.
+        let pos = vec![
+            0.0, 0.0, 0.0, // query (index 0)
+            0.0, 0.0, 0.0, // neighbour at distance 0
+            4.0, 0.0, 0.0, // neighbour at distance 4
+        ];
+        let d = knn_mean_dist(&pos, &[0u32], 2);
+        assert!(
+            (d[0] - 2.0).abs() < 1e-5,
+            "expected mean(0,4)=2.0, got {} (RMS would be ~2.83)",
+            d[0]
+        );
+    }
+
+    // BUG-2 (windowed visibility) is exercised at the tensor level by
+    // `windowed_visibility_counts_windows_not_steps` below, which runs the real
+    // `accumulate_window` on a device rather than hand-injecting `vis` values.
+}
+
+#[cfg(test)]
+mod device_tests {
+    // Mirrors the sibling `tests` module and train.rs's test module: the glob
+    // brings in tidi's `Tensor` / `TensorData` / `Device` imports plus `TidiState`.
+    use super::*;
+
+    /// BUG-2 regression: `accumulate_window` must count the NUMBER OF WINDOWS a
+    /// gaussian was seen (a 0/1-per-window indicator summed), NOT the raw
+    /// per-step visibility count. Two windows with per-step counts [10, 0, 3]
+    /// then [5, 0, 0] must give vis_accum [2, 0, 1] (windows seen), not [15, 0,
+    /// 3] (steps seen) — otherwise `fail_vis` (<= τ_vis = 2) is unreachable for
+    /// any persistently rendered gaussian. Runs the real tensor path on a test
+    /// device (GPU harness on the build box).
+    #[tokio::test]
+    async fn windowed_visibility_counts_windows_not_steps() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let mut tidi = TidiState::new(3, 0, &device);
+        let inner = device.clone().inner();
+        let zero_grad = Tensor::<1>::zeros([3], &inner);
+
+        tidi.accumulate_window(
+            Tensor::<1>::from_data(TensorData::new(vec![10.0f32, 0.0, 3.0], [3]), &inner),
+            zero_grad.clone(),
+            0.99,
+        );
+        tidi.accumulate_window(
+            Tensor::<1>::from_data(TensorData::new(vec![5.0f32, 0.0, 0.0], [3]), &inner),
+            zero_grad,
+            0.99,
+        );
+
+        let got: Vec<f32> = tidi
+            .vis_accum
+            .clone()
+            .into_data_async()
+            .await
+            .expect("vis_accum readback")
+            .into_vec()
+            .expect("f32");
+        assert_eq!(
+            got,
+            vec![2.0, 0.0, 1.0],
+            "vis_accum must count windows-seen, not steps-seen"
+        );
     }
 }

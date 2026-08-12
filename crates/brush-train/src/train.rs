@@ -2100,6 +2100,7 @@ fn tidi_params(config: &TrainConfig) -> TidiPruneParams {
         warmup_steps: config.tidi_warmup_steps as i32,
         guard_sh_quantile: config.tidi_guard_sh_quantile,
         guard_thin_quantile: config.tidi_guard_thin_quantile,
+        guard_aniso_quantile: config.tidi_guard_aniso_quantile,
         guard_color_var_quantile: config.tidi_guard_color_var_quantile,
         knn_k: config.tidi_knn_k as usize,
         local_cap_frac: config.tidi_local_cap_frac,
