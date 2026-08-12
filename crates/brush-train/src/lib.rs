@@ -5,6 +5,7 @@ pub mod dig;
 pub mod eval;
 pub mod lod;
 pub mod msg;
+pub mod tidi;
 pub mod train;
 
 mod adam_scaled;

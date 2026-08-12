@@ -637,6 +637,120 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Appearance options", default_value = "1.0")]
     #[serde(default = "default_ppisp_reg_scale")]
     pub ppisp_reg_scale: f32,
+
+    // ------------------------------------------------------------------
+    // TIDI-GS floater / haze suppression (arXiv 2601.09291). See
+    // `research/indoor-360-haze-removal.md` and `crate::tidi`. Multi-signal +
+    // isolation pruning for the translucent equilibrium floaters that grow on
+    // textureless indoor walls (which opacity thresholds structurally cannot
+    // remove). The WHOLE family is default-OFF: with `--tidi-prune` unset the
+    // trainer never allocates TIDI state, so MRNF / depth-loss / PPISP /
+    // normal-prior runs take the identical path they always did.
+    // ------------------------------------------------------------------
+    /// Master switch for TIDI-GS multi-signal + isolation floater pruning.
+    #[arg(long, help_heading = "TIDI options", default_value = "false")]
+    #[serde(default)]
+    pub tidi_prune: bool,
+
+    /// Global iter at which TIDI pruning may begin (paper: a warmup so the scene
+    /// has formed). Signals accumulate from the first refine regardless; only
+    /// the prune is gated.
+    #[arg(long, help_heading = "TIDI options", default_value = "500")]
+    #[serde(default = "default_tidi_prune_start_iter")]
+    pub tidi_prune_start_iter: u32,
+
+    /// Minimum global-iter gap between TIDI cleanup passes (paper: every 400
+    /// steps). Effective cadence is rounded up to the next refine cycle, since
+    /// TIDI runs inside the refine hook.
+    #[arg(long, help_heading = "TIDI options", default_value = "400")]
+    #[serde(default = "default_tidi_prune_every")]
+    pub tidi_prune_every: u32,
+
+    /// Per-Gaussian warmup: a splat younger than this many steps (since birth /
+    /// last split) is never a prune candidate, protecting fresh detail.
+    #[arg(long, help_heading = "TIDI options", default_value = "500")]
+    #[serde(default = "default_tidi_warmup_steps")]
+    pub tidi_warmup_steps: u32,
+
+    /// Visibility signal: candidate iff cumulative observed-window count <= this
+    /// (paper τ_vis = 2.0).
+    #[arg(long, help_heading = "TIDI options", default_value = "2.0")]
+    #[serde(default = "default_tidi_vis_threshold")]
+    pub tidi_vis_threshold: f32,
+
+    /// Opacity signal: candidate iff opacity <= this (paper τ_α = 0.04).
+    #[arg(long, help_heading = "TIDI options", default_value = "0.04")]
+    #[serde(default = "default_tidi_opacity_threshold")]
+    pub tidi_opacity_threshold: f32,
+
+    /// Learned-importance signal: candidate iff sigmoid(omega_i) <= this
+    /// (paper τ_ω = 0.35).
+    #[arg(long, help_heading = "TIDI options", default_value = "0.35")]
+    #[serde(default = "default_tidi_importance_threshold")]
+    pub tidi_importance_threshold: f32,
+
+    /// Position-gradient EMA signal: candidate iff EMA <= this (paper
+    /// τ_grad = 5e-4).
+    #[arg(long, help_heading = "TIDI options", default_value = "5e-4")]
+    #[serde(default = "default_tidi_grad_threshold")]
+    pub tidi_grad_threshold: f32,
+
+    /// EMA decay for the per-refine position-gradient signal (paper β = 0.99).
+    /// NOTE: advances once per refine window, not per step (Brush only exposes a
+    /// window position-gradient signal).
+    #[arg(long, help_heading = "TIDI options", default_value = "0.99")]
+    #[serde(default = "default_tidi_grad_ema_beta")]
+    pub tidi_grad_ema_beta: f32,
+
+    /// L1 sparsity weight on sigmoid(omega). 0 keeps omega alive on the
+    /// photometric gradient only (importance never falls -> effectively a
+    /// 3-signal gate); >0 lets persistently idle Gaussians decay into the pool.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.01")]
+    #[serde(default = "default_tidi_importance_reg")]
+    pub tidi_importance_reg: f32,
+
+    /// Adam LR for the omega importance leaf parameter.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.05")]
+    #[serde(default = "default_tidi_importance_lr")]
+    pub tidi_importance_lr: f64,
+
+    /// SH high-frequency-energy detail-guard quantile: exempt a candidate whose
+    /// ||f_rest|| is at/above this quantile of the STABLE set (specular/detail).
+    /// 0 disables. ADAPTIVE: the flag sets the quantile, not a fixed threshold.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.95")]
+    #[serde(default = "default_tidi_guard_sh_quantile")]
+    pub tidi_guard_sh_quantile: f32,
+
+    /// Thinness detail-guard quantile: exempt a candidate whose smallest scale
+    /// axis is at/below this quantile of the STABLE set (thin structure). 0
+    /// disables. ADAPTIVE.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.10")]
+    #[serde(default = "default_tidi_guard_thin_quantile")]
+    pub tidi_guard_thin_quantile: f32,
+
+    /// Local colour-variance detail-guard quantile (needs an extra candidate
+    /// k-NN pass; off by default for cost). Thresholded against the CANDIDATE
+    /// distribution rather than the stable set. 0 disables (default).
+    #[arg(long, help_heading = "TIDI options", default_value = "0.0")]
+    #[serde(default = "default_tidi_guard_color_var_quantile")]
+    pub tidi_guard_color_var_quantile: f32,
+
+    /// k for the isolation k-NN (paper k = 16).
+    #[arg(long, help_heading = "TIDI options", default_value = "16")]
+    #[serde(default = "default_tidi_knn_k")]
+    pub tidi_knn_k: u32,
+
+    /// Isolation local cap: prune at most this fraction of a spatial cell's
+    /// candidates per cycle (paper 1.0%).
+    #[arg(long, help_heading = "TIDI options", default_value = "0.01")]
+    #[serde(default = "default_tidi_local_cap_frac")]
+    pub tidi_local_cap_frac: f32,
+
+    /// Isolation global cap: prune at most this fraction of ALL Gaussians per
+    /// cycle (paper 0.2%).
+    #[arg(long, help_heading = "TIDI options", default_value = "0.002")]
+    #[serde(default = "default_tidi_global_cap_frac")]
+    pub tidi_global_cap_frac: f32,
 }
 
 impl Default for TrainConfig {
@@ -717,6 +831,57 @@ fn default_ppisp_reg_scale() -> f32 {
 
 fn default_edge_score_weight() -> f32 {
     0.25
+}
+
+// TIDI-GS serde defaults, kept in sync with the clap `default_value`s above so a
+// config that omits these fields deserializes to the same values the CLI uses.
+fn default_tidi_prune_start_iter() -> u32 {
+    500
+}
+fn default_tidi_prune_every() -> u32 {
+    400
+}
+fn default_tidi_warmup_steps() -> u32 {
+    500
+}
+fn default_tidi_vis_threshold() -> f32 {
+    2.0
+}
+fn default_tidi_opacity_threshold() -> f32 {
+    0.04
+}
+fn default_tidi_importance_threshold() -> f32 {
+    0.35
+}
+fn default_tidi_grad_threshold() -> f32 {
+    5e-4
+}
+fn default_tidi_grad_ema_beta() -> f32 {
+    0.99
+}
+fn default_tidi_importance_reg() -> f32 {
+    0.01
+}
+fn default_tidi_importance_lr() -> f64 {
+    0.05
+}
+fn default_tidi_guard_sh_quantile() -> f32 {
+    0.95
+}
+fn default_tidi_guard_thin_quantile() -> f32 {
+    0.10
+}
+fn default_tidi_guard_color_var_quantile() -> f32 {
+    0.0
+}
+fn default_tidi_knn_k() -> u32 {
+    16
+}
+fn default_tidi_local_cap_frac() -> f32 {
+    0.01
+}
+fn default_tidi_global_cap_frac() -> f32 {
+    0.002
 }
 
 /// Serde default for MRNF flags that are ON by default (LFS `mrnf_defaults`
@@ -882,6 +1047,38 @@ mod tests {
         assert!(on.error_map_densification);
         assert!(on.min_scale_prune);
         assert!(on.near_zero_rotation_prune);
+    }
+
+    /// Inertness contract for the TIDI-GS family: a command line that does not
+    /// mention `--tidi-prune` leaves the master switch OFF (so the trainer never
+    /// allocates TIDI state and the render/refine paths are byte-identical), and
+    /// the paper's Table II constants are the shipped defaults.
+    #[test]
+    fn tidi_flags_default_off_and_match_paper() {
+        let def = TrainConfig::default();
+        assert!(!def.tidi_prune, "TIDI must be off unless explicitly enabled");
+        // paper Table II constants
+        assert!((def.tidi_vis_threshold - 2.0).abs() < 1e-9);
+        assert!((def.tidi_opacity_threshold - 0.04).abs() < 1e-9);
+        assert!((def.tidi_importance_threshold - 0.35).abs() < 1e-9);
+        assert!((def.tidi_grad_threshold - 5e-4).abs() < 1e-12);
+        assert!((def.tidi_grad_ema_beta - 0.99).abs() < 1e-9);
+        assert_eq!(def.tidi_knn_k, 16);
+        assert!((def.tidi_local_cap_frac - 0.01).abs() < 1e-9);
+        assert!((def.tidi_global_cap_frac - 0.002).abs() < 1e-9);
+
+        // Unrelated flags must not switch it on.
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert!(!other.tidi_prune);
+
+        // Enabling parses, and the =false disable form works too.
+        let on = TrainConfig::try_parse_from(["brush", "--tidi-prune"])
+            .expect("--tidi-prune must parse");
+        assert!(on.tidi_prune);
+        let off = TrainConfig::try_parse_from(["brush", "--tidi-prune=false"])
+            .expect("--tidi-prune=false must parse");
+        assert!(!off.tidi_prune);
     }
 
     #[test]

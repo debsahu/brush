@@ -9,6 +9,7 @@ use crate::{
     quat_vec::quaternion_vec_multiply,
     splat_init::bounds_from_pos,
     stats::RefineRecord,
+    tidi::{TidiPruneParams, TidiState},
 };
 use brush_appearance::{AppearanceConfig, AppearanceTrainState};
 use brush_dataset::scene::SceneBatch;
@@ -134,6 +135,10 @@ pub struct SplatTrainer {
     /// `DiG` feature-training state; created lazily on the first batch that
     /// carries feature maps.
     dig: Option<DigTrainState>,
+    /// TIDI-GS floater-suppression state (learned importance `ω` + persistent
+    /// visibility / gradient-EMA / birth-iter accumulators). Created lazily on
+    /// the first step when `--tidi-prune` is set; `None` (and inert) otherwise.
+    tidi: Option<TidiState>,
     #[cfg(not(target_family = "wasm"))]
     lpips: Option<lpips::LpipsModel>,
 }
@@ -287,6 +292,7 @@ impl SplatTrainer {
             rng: rand::rngs::StdRng::seed_from_u64(seed),
             view_cams: Vec::new(),
             dig: None,
+            tidi: None,
             #[cfg(not(target_family = "wasm"))]
             lpips,
         }
@@ -644,6 +650,14 @@ impl SplatTrainer {
         let camera = batch.camera;
 
         let device = splats.device();
+
+        // TIDI-GS: allocate the floater-suppression state on the first step when
+        // enabled. `ω` is created on the autodiff device (it is a leaf that gets
+        // a photometric gradient each step); the count is kept in lockstep with
+        // the splats through `keep`/`split` at refine.
+        if self.config.tidi_prune && self.tidi.is_none() {
+            self.tidi = Some(TidiState::new(splats.num_splats(), global_iter, &device));
+        }
         let has_alpha = batch.has_alpha;
         // GT lives on the GPU as packed `[H, W]` u32 (RGBA u8). All mixing
         // (bg compositing, alpha matching, mask) is folded into the loss
@@ -682,7 +696,25 @@ impl SplatTrainer {
         let (mut grads, visible, num_visible, loss_inner, deferred_sh_grad) = {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
-            let render_input = splats.clone();
+            //
+            // TIDI-GS learned-importance gate: when enabled, the render sees each
+            // opacity multiplied by `σ(ω)` (paper signal (c)). This is what gives
+            // `ω` a photometric gradient — a Gaussian that matters to the image
+            // is pushed to `σ(ω)→1`, while the L1 sparsity term lets idle ones
+            // decay toward the candidate pool. The gate maps the raw opacity
+            // through `logit(σ(raw)·σ(ω))`, so grad still flows to the ORIGINAL
+            // opacity leaf (queried by id below); `ω` is exported nowhere. The
+            // gate starts near-identity (`σ(ω)≈0.998`), so enabling TIDI barely
+            // perturbs the scene, and it is skipped entirely when `--tidi-prune`
+            // is off.
+            let render_input = match self.tidi.as_ref() {
+                Some(tidi) if self.config.tidi_prune => {
+                    let mut ri = splats.clone();
+                    ri.raw_opacities = ri.raw_opacities.map(|ro| tidi.gate_opacity(ro));
+                    ri
+                }
+                _ => splats.clone(),
+            };
             let use_depth = batch.depth.is_some() && self.config.depth_loss_weight > 0.0;
             // Geometry-prior terms (all inert at their 0.0 defaults, gated
             // exactly like `use_depth`, so a run that does not pass the flags
@@ -807,6 +839,18 @@ impl SplatTrainer {
                 && let Some(reg) = active.reg_loss()
             {
                 loss = loss + reg;
+            }
+
+            // TIDI-GS: L1 sparsity on the learned importance `σ(ω)`. Balances
+            // against the photometric gradient the opacity gate feeds `ω`, so
+            // contributing Gaussians settle at `σ(ω)→1` and persistently idle
+            // ones decay toward `τ_ω`. Weight 0 leaves `ω` on the photometric
+            // gradient only (a 3-signal gate); inert when `--tidi-prune` is off.
+            if self.config.tidi_prune
+                && self.config.tidi_importance_reg > 0.0
+                && let Some(tidi) = self.tidi.as_ref()
+            {
+                loss = loss + tidi.sparsity_loss() * self.config.tidi_importance_reg;
             }
 
             // DiG: DINO feature MSE on a rendered feature image (geometry
@@ -1229,6 +1273,16 @@ impl SplatTrainer {
             });
         }
 
+        // TIDI-GS: one Adam step on the learned importance `ω` from the same
+        // backward pass (photometric gate + L1 sparsity). `ω` participates in
+        // every step's graph via the opacity gate whenever TIDI is on, so its
+        // grad is always present here.
+        if let Some(tidi) = &mut self.tidi {
+            trace_span!("TIDI importance step").in_scope(|| {
+                tidi.optimize(self.config.tidi_importance_lr, &mut grads);
+            });
+        }
+
         // Add random noise to the means of low-opacity gaussians. Only do this
         // in the growth phase, otherwise let the splats settle in without
         // noise — not much point exploring regions anymore. The noise gate is
@@ -1503,8 +1557,63 @@ impl SplatTrainer {
             prune_mask
         };
 
-        let (mut splats, refiner, pruned_count) =
-            prune_points(splats, &mut record, refiner, prune_mask, self.dig.as_mut()).await;
+        // TIDI-GS floater pruning (opt-in). Every refine window folds this
+        // window's visibility + position-gradient into the persistent
+        // accumulators; on a cleanup cycle (≈ every `--tidi-prune-every` steps,
+        // past the start iter) the isolation-selected floater set is unioned
+        // into `prune_mask`. Built here as ONE combined mask before the single
+        // `prune_points` call, on the pre-prune tensor snapshot, so there is no
+        // double-prune / index invalidation. The four-signal candidate rule is
+        // an AND (see `tidi::select_prune_indices`) and is deliberately NOT
+        // folded into the OR-based geometric culls above — only its final
+        // isolation-selected output joins the union.
+        let prune_mask = if self.config.tidi_prune {
+            let params = tidi_params(&self.config);
+            if let Some(tidi) = self.tidi.as_mut() {
+                tidi.accumulate_window(
+                    refiner.vis_weight.clone(),
+                    refiner.refine_weight_norm.clone(),
+                    self.config.tidi_grad_ema_beta,
+                );
+                if tidi.should_prune(
+                    global_iter,
+                    self.config.tidi_prune_start_iter,
+                    self.config.tidi_prune_every,
+                ) {
+                    match tidi
+                        .select_prune_mask(
+                            &params,
+                            global_iter,
+                            splats.opacities(),
+                            splats.means(),
+                            splats.sh_coeffs.val(),
+                            splats.scales(),
+                            &device,
+                        )
+                        .await
+                    {
+                        Some(tidi_mask) => prune_mask.bool_or(tidi_mask),
+                        None => prune_mask,
+                    }
+                } else {
+                    prune_mask
+                }
+            } else {
+                prune_mask
+            }
+        } else {
+            prune_mask
+        };
+
+        let (mut splats, refiner, pruned_count) = prune_points(
+            splats,
+            &mut record,
+            refiner,
+            prune_mask,
+            self.dig.as_mut(),
+            self.tidi.as_mut(),
+        )
+        .await;
 
         // Edge-guidance factor (MRNF port, delta #4), aligned to the post-prune
         // splat order. Multiplies into both the dead-slot replacement and the
@@ -1662,6 +1771,7 @@ impl SplatTrainer {
             splats,
             split_inds,
             screen_sizes,
+            global_iter,
             phase_iter,
             phase_total,
         );
@@ -1699,6 +1809,7 @@ impl SplatTrainer {
         mut splats: Splats,
         split_inds: HashSet<i32>,
         screen_sizes: Tensor<1>,
+        global_iter: u32,
         phase_iter: u32,
         phase_total: u32,
     ) -> Splats {
@@ -1837,6 +1948,21 @@ impl SplatTrainer {
                 dig.split(&refine_inds, &refine_inds_opt, &opt_device);
             }
 
+            // TIDI state splits alongside. Children are APPENDED (matching the
+            // `cat` order below) and get a FRESH state (importance ≈ 1, zero
+            // visibility / grad-EMA, birth = this global iter) so new detail is
+            // never inherited into the candidate pool and is protected by the
+            // per-Gaussian warmup — see `TidiState::split`.
+            if let Some(tidi) = &mut self.tidi {
+                tidi.split(
+                    refine_count,
+                    &refine_inds_opt,
+                    &opt_device,
+                    &device.clone().inner(),
+                    global_iter,
+                );
+            }
+
             // Both halves of a split start with zero Adam moments.
             //
             // Burn's scatter bridge
@@ -1963,6 +2089,24 @@ pub(crate) fn map_opt<const D: usize>(
     record.insert(param_id, AdaptorRecord::from_state(state));
 }
 
+/// Snapshot the TIDI thresholds/caps from the training config into the
+/// config-free params the pure selection logic consumes.
+fn tidi_params(config: &TrainConfig) -> TidiPruneParams {
+    TidiPruneParams {
+        vis_threshold: config.tidi_vis_threshold,
+        opacity_threshold: config.tidi_opacity_threshold,
+        importance_threshold: config.tidi_importance_threshold,
+        grad_threshold: config.tidi_grad_threshold,
+        warmup_steps: config.tidi_warmup_steps as i32,
+        guard_sh_quantile: config.tidi_guard_sh_quantile,
+        guard_thin_quantile: config.tidi_guard_thin_quantile,
+        guard_color_var_quantile: config.tidi_guard_color_var_quantile,
+        knn_k: config.tidi_knn_k as usize,
+        local_cap_frac: config.tidi_local_cap_frac,
+        global_cap_frac: config.tidi_global_cap_frac,
+    }
+}
+
 // Prunes points based on the given mask.
 //
 // Args:
@@ -1973,6 +2117,7 @@ async fn prune_points(
     mut refiner: RefineRecord,
     prune: Tensor<1, Bool>,
     dig: Option<&mut DigTrainState>,
+    tidi: Option<&mut TidiState>,
 ) -> (Splats, RefineRecord, u32) {
     assert_eq!(
         prune.dims()[0] as u32,
@@ -2015,6 +2160,12 @@ async fn prune_points(
         );
         if let Some(dig) = dig {
             dig.keep(&valid_inds);
+        }
+        // Reindex the TIDI accumulators + `ω` in lockstep. `ω`/its Adam state
+        // ride the autodiff `valid_inds`; the inner accumulators use the inner
+        // copy — same split the DiG `keep` / `RefineRecord::keep` above use.
+        if let Some(tidi) = tidi {
+            tidi.keep(&valid_inds, &inner_valid_inds);
         }
         refiner = refiner.keep(inner_valid_inds);
     }
