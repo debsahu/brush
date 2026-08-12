@@ -23,7 +23,7 @@
 //! Design decisions where the paper and the Brush internals had to be
 //! reconciled are called out inline with `NOTE:`.
 
-use brush_render::burn_glue::detach_autodiff;
+use brush_render::burn_glue::{detach_autodiff, match_backend};
 use brush_render::camera::Camera;
 use brush_render::kernels::camera_model::CameraModel;
 use burn::{
@@ -662,9 +662,10 @@ pub fn depth_opacity_reg_loss(
     margin: f32,
     softness: f32,
 ) -> Option<Tensor<1>> {
-    // Run the projection on the OPACITY leaf's (autodiff) device so `p_i` lands
-    // there and can multiply the graph-tracked activated opacity directly. The
-    // projection detaches internally, so `residual` / `valid` carry no gradient.
+    // Project on the opacity leaf's physical device. `project_depth_residual`
+    // detaches the means onto the INNER backend (the identical code the prune
+    // path runs), so `residual` / `valid` come back inner-kind and carry no
+    // gradient.
     let device = raw_opacity.device();
     let (residual, valid) = project_depth_residual(means, gt_depth, camera, img_size, &device)?;
 
@@ -676,10 +677,20 @@ pub fn depth_opacity_reg_loss(
     let denom = valid_f.clone().sum().clamp_min(1.0);
 
     // Detached smooth penalty weight: σ((-r - margin) / softness), 0 where the
-    // return is invalid. `p_i` inherits the detached projection, so it carries no
-    // gradient — it is a fixed per-Gaussian weight this step.
+    // return is invalid. `p_i` inherits the detached projection (no gradient) and
+    // is still on the INNER backend at this point.
     let soft = softness.max(1e-8);
     let p = sigmoid(residual.neg().sub_scalar(margin).div_scalar(soft)) * valid_f;
+
+    // Bridge the detached penalty + denominator UP onto the opacity leaf's
+    // (autodiff) backend so they can combine with the live activated opacity
+    // without a cross-backend panic (project_depth_residual left them inner-kind
+    // for the prune path). `match_backend` lifts them as NO-GRAD constants when
+    // the reference (raw_opacity) is autodiff, so the ONLY gradient path is
+    // through `sigmoid(raw_opacity)` — mirroring how Brush folds the frozen
+    // 3D-filter floor against an autodiff param (see `match_backend`).
+    let p = match_backend(p, &raw_opacity);
+    let denom = match_backend(denom, &raw_opacity);
 
     // The ONLY graph-connected factor: the activated opacity of the live leaf.
     let alpha = sigmoid(raw_opacity);
