@@ -1459,10 +1459,19 @@ impl CloudDistanceGrid {
     /// (NaN/±inf) centre is forced to `+inf` so it always reads as a floater
     /// (it is separately caught by the trainer's non-finite prune too).
     pub fn gather_distance(&self, means: Tensor<2>) -> Tensor<1> {
-        // Everything on the field's (inner) device. `detach_autodiff` is a
-        // passthrough on an already-inner tensor and drops the graph on an
-        // autodiff one; either way we want the raw positions, no gradient.
-        let device = self.field.device();
+        // PRUNE path = NO gradient, so force BOTH the field and the means onto the
+        // SAME INNER backend/device before any op. `detach_autodiff` drops an
+        // autodiff-kind tensor to the inner backend (passthrough if already
+        // inner). This matters because the field may have been built on an
+        // autodiff-MARKED device at init (the grid `build` uses whatever device
+        // train_stream passes), while the prune means arrive inner-kind (splats
+        // are `.valid()` in `refine_for_phase`). Gathering an inner index against
+        // an autodiff-kind field — or subtracting an inner `origin` from an
+        // autodiff `means` — trips the cross-backend panic that bit the opacity
+        // regularizer. Aligning here on the field's INNER device fixes it. Do NOT
+        // `lift_to_autodiff`: this is a boolean mask, not a loss term.
+        let field = detach_autodiff(self.field.clone());
+        let device = field.device();
         let means = detach_autodiff(means).to_device(&device);
         let [nx, ny, nz] = self.dims;
         let num_vox = nx * ny * nz;
@@ -1514,8 +1523,9 @@ impl CloudDistanceGrid {
             .clamp(0i64, (num_vox - 1) as i64)
             .squeeze_dim::<1>(1); // [N] Int
 
-        // Distance-to-nearest-cloud-point, gathered from the static field.
-        let d = self.field.clone().select(0, flat); // [N]
+        // Distance-to-nearest-cloud-point, gathered from the static field. Both
+        // `field` (detached above) and `flat` are inner-kind on `device`.
+        let d = field.select(0, flat); // [N]
         // Force divergent rows to `+inf` (always > any finite threshold → pruned).
         d.mask_fill(nonfinite.squeeze_dim::<1>(1), f32::INFINITY)
     }
@@ -3537,5 +3547,61 @@ mod device_tests {
             .into_vec()
             .expect("bool");
         assert!(mn[0], "a divergent (NaN) centre must be pruned");
+    }
+
+    /// cloud-prune out-of-AABB: a floater far OUTSIDE the cloud's bounding box
+    /// must read a LARGE distance and be pruned, not wrap onto a low-distance
+    /// boundary voxel and be spared. The grid pads the cloud bbox by `reach`
+    /// (= margin + 2·softness) on every side and CLAMPS the voxel coord into
+    /// range, so an out-of-box centre lands on a boundary voxel that is at least
+    /// `pad = reach` from any cloud point. For the cloud-prune sizing (margin =
+    /// dist, softness = dist/3) `pad = 1.67·dist > dist`, so the clamped read is
+    /// always > dist. Probe centres far out along each axis (and a diagonal).
+    #[tokio::test]
+    async fn cloud_prune_out_of_aabb_reads_far_and_prunes() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let dist = 0.19f32;
+        let softness = dist / 3.0;
+
+        // A small planar patch at the origin = the whole cloud bbox.
+        let mut cloud = Vec::new();
+        for i in -1..=1 {
+            for j in -1..=1 {
+                cloud.extend_from_slice(&[i as f32 * 0.05, j as f32 * 0.05, 0.0]);
+            }
+        }
+        let m = cloud.len() / 3;
+        let cloud = Tensor::<2>::from_data(TensorData::new(cloud, [m, 3]), &device);
+        let grid = CloudDistanceGrid::build(cloud, dist, softness, None, &device)
+            .await
+            .expect("a non-empty cloud builds a grid");
+
+        // Centres FAR outside the bbox along +x, -y, +z, and a big diagonal. Each
+        // shares two in-range axes with a real cloud column, so a per-axis clamp
+        // that dropped the out-of-range axis's distance would spuriously spare it.
+        let means = Tensor::<2>::from_data(
+            TensorData::new(
+                vec![
+                    50.0f32, 0.0, 0.0, // +x, y/z aligned with a cloud column
+                    0.0, -50.0, 0.0, // -y
+                    0.0, 0.0, 50.0, // +z
+                    100.0, 100.0, 100.0, // far diagonal
+                ],
+                [4, 3],
+            ),
+            &device,
+        );
+        let mask: Vec<bool> = grid
+            .far_mask(means, dist)
+            .into_data_async()
+            .await
+            .expect("far_mask readback")
+            .into_vec()
+            .expect("bool");
+        assert!(
+            mask.iter().all(|&p| p),
+            "every out-of-AABB centre must read far (> dist) and be pruned, got {mask:?}"
+        );
     }
 }
