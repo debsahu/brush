@@ -1496,20 +1496,44 @@ impl CloudDistanceGrid {
             .greater_elem(2.5)
             .bool_not(); // [N, 1] Bool, true = divergent row
 
-        let cx = coord
-            .clone()
-            .slice(burn::tensor::s![.., 0..1])
+        let cxf = coord.clone().slice(burn::tensor::s![.., 0..1]);
+        let cyf = coord.clone().slice(burn::tensor::s![.., 1..2]);
+        let czf = coord.slice(burn::tensor::s![.., 2..3]);
+
+        // Explicit UNCLAMPED in-grid mask (mirrors `project_depth_residual`'s
+        // `in_frame`): a centre whose voxel coord falls outside `[0, dim-1]` on ANY
+        // axis is OUTSIDE the padded grid → genuinely far from the cloud → forced
+        // to `+inf` (pruned), NOT read from the clamped boundary voxel. The clamp
+        // alone was a hard-delete hazard on a LARGE-extent cloud with a small
+        // `--cloud-prune-dist`: the `vox *= 1.5` coarsening loop (MAX_VOXELS cap)
+        // can push `vox` large enough that the boundary voxel's stored distance
+        // drops below `dist`, so a wildly out-of-grid floater aligned with real
+        // cloud on the other two axes would read as near-cloud and be spared. The
+        // unclamped test removes that vox-size dependency entirely — out-of-grid is
+        // always a floater. Strict comparators only (module style): `x >= lo` is
+        // `!(x < lo)`, `x <= hi` is `!(x > hi)`. (NaN rows read false here but are
+        // already covered by `nonfinite`.)
+        let in_axis = |c: Tensor<2>, hi: f32| -> Tensor<2, Bool> {
+            c.clone()
+                .lower_elem(0.0)
+                .bool_not()
+                .bool_and(c.greater_elem(hi).bool_not())
+        };
+        let in_grid = in_axis(cxf.clone(), (nx - 1) as f32)
+            .bool_and(in_axis(cyf.clone(), (ny - 1) as f32))
+            .bool_and(in_axis(czf.clone(), (nz - 1) as f32)); // [N,1]
+        // Force `+inf` on divergent OR out-of-grid rows.
+        let force_far = nonfinite.clone().bool_or(in_grid.bool_not()); // [N,1]
+
+        let cx = cxf
             .clamp(0.0, (nx - 1) as f32)
             .mask_fill(nonfinite.clone(), 0.0)
             .int();
-        let cy = coord
-            .clone()
-            .slice(burn::tensor::s![.., 1..2])
+        let cy = cyf
             .clamp(0.0, (ny - 1) as f32)
             .mask_fill(nonfinite.clone(), 0.0)
             .int();
-        let cz = coord
-            .slice(burn::tensor::s![.., 2..3])
+        let cz = czf
             .clamp(0.0, (nz - 1) as f32)
             .mask_fill(nonfinite.clone(), 0.0)
             .int();
@@ -1526,16 +1550,45 @@ impl CloudDistanceGrid {
         // Distance-to-nearest-cloud-point, gathered from the static field. Both
         // `field` (detached above) and `flat` are inner-kind on `device`.
         let d = field.select(0, flat); // [N]
-        // Force divergent rows to `+inf` (always > any finite threshold → pruned).
-        d.mask_fill(nonfinite.squeeze_dim::<1>(1), f32::INFINITY)
+        // Force divergent + out-of-grid rows to `+inf` (always > any threshold →
+        // pruned); the clamped index for those rows is valid but discarded here.
+        d.mask_fill(force_far.squeeze_dim::<1>(1), f32::INFINITY)
     }
 
     /// Boolean `[N]` mask, true where a Gaussian centre is FARTHER than `dist`
     /// (scene 3D-distance units) from the nearest cloud point — the hard
     /// cloud-prune candidate set unioned into the refine prune mask. Divergent
     /// centres read true. See [`Self::gather_distance`] (LIVE means, point-only).
-    pub fn far_mask(&self, means: Tensor<2>, dist: f32) -> Tensor<1, Bool> {
-        self.gather_distance(means).greater_elem(dist)
+    ///
+    /// BOOL REPRESENTATION: the mask is built the SAME way the TIDI prune builds
+    /// its output (`select_prune_mask`): a host float 0/1 vector uploaded with
+    /// `from_data(.., device)` then `greater_elem(0.5)`. This matters because the
+    /// gather runs on the field's `detach_autodiff`ed inner backend, whose direct
+    /// `greater_elem` yields a `Bool(Native)` tensor, while `prune_mask` (and
+    /// every other mask in `refine_for_phase`) is `Bool(U32)` on `splats.device()`
+    /// — OR-ing the two would trip a `TypeMismatch(Bool(U32) vs Bool(Native))`.
+    /// Building the Bool on the caller's `device` (pass `splats.device()`) yields
+    /// the identical representation, so `prune_mask.bool_or(far)` just works, and
+    /// the host round-trip of `[N]` distances matches the readbacks the prune
+    /// path already does each cleanup. `device` is the trainer device the union
+    /// happens on (inner in `refine_for_phase`, since splats are `.valid()`).
+    pub async fn far_mask(&self, means: Tensor<2>, dist: f32, device: &Device) -> Tensor<1, Bool> {
+        let host: Vec<f32> = self
+            .gather_distance(means)
+            .into_data_async()
+            .await
+            .expect("cloud-prune distance readback")
+            .into_vec()
+            .expect("f32");
+        let n = host.len();
+        // `d > dist` on the host (divergent rows are `+inf` from `gather_distance`,
+        // so `inf > dist` is true → pruned). Upload as a 0/1 float and threshold on
+        // `device`, exactly like `select_prune_mask`'s returning idiom.
+        let far: Vec<f32> = host
+            .iter()
+            .map(|&d| if d > dist { 1.0 } else { 0.0 })
+            .collect();
+        Tensor::<1>::from_data(TensorData::new(far, [n]), device).greater_elem(0.5)
     }
 }
 
@@ -3461,13 +3514,17 @@ mod device_tests {
             .await
             .expect("a non-empty cloud builds a grid");
 
+        // The mask is built on the INNER device, mirroring `refine_for_phase`
+        // (splats are `.valid()`/inner there, so `prune_mask` is inner Bool(U32)).
+        let inner = device.clone().inner();
+
         // G0 ON the surface (coincident with a cloud point); G1 FAR at (1,1,1).
         let means = Tensor::<2>::from_data(
             TensorData::new(vec![0.0f32, 0.0, 0.0, 1.0, 1.0, 1.0], [2, 3]),
             &device,
         );
         let mask: Vec<bool> = grid
-            .far_mask(means, dist)
+            .far_mask(means, dist, &inner)
             .into_data_async()
             .await
             .expect("far_mask readback")
@@ -3506,11 +3563,13 @@ mod device_tests {
         let grid = CloudDistanceGrid::build(cloud, dist, softness, None, &device)
             .await
             .expect("a non-empty cloud builds a grid");
+        // Mask built on the INNER device, as in `refine_for_phase`.
+        let inner = device.clone().inner();
 
         // Cycle 1: the Gaussian sits on the surface → not pruned.
         let near = Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 0.0, 0.0], [1, 3]), &device);
         let m1: Vec<bool> = grid
-            .far_mask(near, dist)
+            .far_mask(near, dist, &inner)
             .into_data_async()
             .await
             .expect("readback")
@@ -3523,7 +3582,7 @@ mod device_tests {
         let moved =
             Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 0.0, 1.5], [1, 3]), &device);
         let m2: Vec<bool> = grid
-            .far_mask(moved, dist)
+            .far_mask(moved, dist, &inner)
             .into_data_async()
             .await
             .expect("readback")
@@ -3540,7 +3599,7 @@ mod device_tests {
             &device,
         );
         let mn: Vec<bool> = grid
-            .far_mask(nan, dist)
+            .far_mask(nan, dist, &inner)
             .into_data_async()
             .await
             .expect("readback")
@@ -3576,6 +3635,7 @@ mod device_tests {
         let grid = CloudDistanceGrid::build(cloud, dist, softness, None, &device)
             .await
             .expect("a non-empty cloud builds a grid");
+        let inner = device.clone().inner();
 
         // Centres FAR outside the bbox along +x, -y, +z, and a big diagonal. Each
         // shares two in-range axes with a real cloud column, so a per-axis clamp
@@ -3593,7 +3653,7 @@ mod device_tests {
             &device,
         );
         let mask: Vec<bool> = grid
-            .far_mask(means, dist)
+            .far_mask(means, dist, &inner)
             .into_data_async()
             .await
             .expect("far_mask readback")
@@ -3603,5 +3663,62 @@ mod device_tests {
             mask.iter().all(|&p| p),
             "every out-of-AABB centre must read far (> dist) and be pruned, got {mask:?}"
         );
+    }
+
+    /// cloud-prune coarse-grid regression: on a LARGE-extent cloud with a small
+    /// `--cloud-prune-dist`, the `vox *= 1.5` coarsening loop (MAX_VOXELS cap)
+    /// pushes `vox` past ~1.82·dist, at which point the clamped boundary voxel's
+    /// stored distance drops BELOW `dist`. Without the unclamped in-grid mask, a
+    /// wildly out-of-grid floater aligned with real cloud on two axes would read
+    /// that small boundary distance and be spuriously SPARED (a hard-delete miss).
+    /// The in-grid mask forces every out-of-grid centre to `+inf`, removing the
+    /// vox-size dependency. Here `dist = 0.01` over a ~5-unit cloud forces the
+    /// coarsening, and the far floater must still prune while an on-cloud point is
+    /// spared.
+    #[tokio::test]
+    async fn cloud_prune_out_of_grid_prunes_on_coarsened_grid() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let dist = 0.01f32;
+        let softness = dist / 3.0;
+
+        // Two points 5 units apart: a large bbox that forces the fine grid over the
+        // 24M-voxel cap, so `build_distance_field` coarsens `vox` well past dist.
+        let cloud = Tensor::<2>::from_data(
+            TensorData::new(vec![0.0f32, 0.0, 0.0, 5.0, 5.0, 5.0], [2, 3]),
+            &device,
+        );
+        let grid = CloudDistanceGrid::build(cloud, dist, softness, None, &device)
+            .await
+            .expect("a non-empty cloud builds a grid");
+        let inner = device.clone().inner();
+
+        // Confirm we ARE in the coarsened regime the fix targets (vox > 1.82·dist),
+        // so the clamp-only path would have read a boundary distance < dist.
+        assert!(
+            grid.vox > 1.82 * dist,
+            "test must exercise the coarsened regime (vox {} vs 1.82·dist {})",
+            grid.vox,
+            1.82 * dist
+        );
+
+        // G0 far OUT of the grid (x = 1000, y/z aligned with the (0,0,0) cloud
+        // point); G1 ON a cloud point. Out-of-grid must prune; on-cloud must not.
+        let means = Tensor::<2>::from_data(
+            TensorData::new(vec![1000.0f32, 0.0, 0.0, 0.0, 0.0, 0.0], [2, 3]),
+            &device,
+        );
+        let mask: Vec<bool> = grid
+            .far_mask(means, dist, &inner)
+            .into_data_async()
+            .await
+            .expect("far_mask readback")
+            .into_vec()
+            .expect("bool");
+        assert!(
+            mask[0],
+            "an out-of-grid floater must prune even when vox is coarsened past dist"
+        );
+        assert!(!mask[1], "an on-cloud Gaussian must still be spared");
     }
 }

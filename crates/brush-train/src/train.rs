@@ -1866,7 +1866,12 @@ impl SplatTrainer {
             if self.config.cloud_prune && global_iter >= self.config.cloud_prune_start_iter {
                 match &self.cloud_prune_grid {
                     Some(grid) => {
-                        let far = grid.far_mask(splats.means(), self.config.cloud_prune_dist);
+                        // Build the far mask on `device` (= splats' inner backend)
+                        // so its Bool representation matches `prune_mask` and
+                        // `bool_or` does not trip a Bool(U32)/Bool(Native) mismatch.
+                        let far = grid
+                            .far_mask(splats.means(), self.config.cloud_prune_dist, &device)
+                            .await;
                         prune_mask.bool_or(far)
                     }
                     None => prune_mask,
