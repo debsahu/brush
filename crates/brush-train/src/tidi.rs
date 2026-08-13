@@ -1709,6 +1709,40 @@ pub fn depth_opacity_reg_loss(
 /// `(proj − d)²` and the projected variance keep `means` / `scales` / `rotations`
 /// on the graph, so the gradient reaches geometry without a backend cross-kind
 /// panic.
+/// Scale-explosion regularizer (Stipple, arXiv:2608.00931 `L_scale-regularizer`).
+///
+/// `mean over all activated scales s of [ s² · 𝟙{s > threshold} ]`. The indicator
+/// is a DETACHED hard gate (`greater_elem(..).float()`, no gradient through the
+/// comparison), so the s² gradient reaches ONLY the scales above the threshold.
+/// It shrinks the runaway "fog" gaussians that MRNF's error-map growth spawns in
+/// unconstrained regions (our sky-smear / fat scale-tail, p99≈26-32) and leaves
+/// the whole surface population untouched. The paper writes a SUM; we take the
+/// mean over the N·3 elements so the weight is invariant to splat count.
+///
+/// `scales` are ACTIVATED (exp of log-scale), so `threshold` is in the same
+/// world units — set it above the surface population's p99 so only the exploded
+/// tail is gated. BACKEND: pure autodiff tensor ops on `scales.device()`; the
+/// gate is autodiff-kind (float mask), no cross-kind panic.
+pub fn scale_reg_loss(scales: Tensor<2>, threshold: f32) -> Tensor<1> {
+    let over = scales.clone().greater_elem(threshold).float(); // detached indicator
+    (scales.powi_scalar(2) * over).mean()
+}
+
+/// Anti-needle isotropy regularizer (Stipple, arXiv:2608.00931 `L_anti-needle`).
+///
+/// `mean over gaussians of exp(max_k log s_k − min_k log s_k)` = the mean max/min
+/// activated-scale ratio. 1.0 for a perfect sphere, growing with needle-likeness;
+/// pulls anisotropic gaussians toward isotropic covariance. Input is LOG scales
+/// (`[N,3]`); the exp of the log-range IS the raw ratio, gradient-connected
+/// through both the max and the min axis. Complements our prune-side needle
+/// guards (differentiable PREVENTION vs geometric removal). BACKEND: pure
+/// autodiff tensor ops on `log_scales.device()`.
+pub fn anti_needle_loss(log_scales: Tensor<2>) -> Tensor<1> {
+    let mx = log_scales.clone().max_dim(1); // [N,1]
+    let mn = log_scales.min_dim(1); // [N,1]
+    (mx - mn).exp().mean()
+}
+
 pub fn plane_coplanarity_loss(
     means: Tensor<2>,
     rotations: Tensor<2>,
@@ -3701,5 +3735,52 @@ mod device_tests {
             "an on-cloud Gaussian must read d ≤ dist (spared), got {}",
             dists[1]
         );
+    }
+
+    // Stipple ports (arXiv:2608.00931).
+
+    #[tokio::test]
+    async fn scale_reg_gates_above_threshold_only() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        // G0 tiny (0.1 on every axis), G1 exploded (10.0 on every axis).
+        let scales = Tensor::<2>::from_data(
+            TensorData::new(vec![0.1f32, 0.1, 0.1, 10.0, 10.0, 10.0], [2, 3]),
+            &device,
+        );
+        async fn scalar(t: Tensor<1>) -> f32 {
+            t.into_data_async()
+                .await
+                .expect("readback")
+                .into_vec::<f32>()
+                .expect("f32")[0]
+        }
+        // Threshold above both scales: nothing gated, loss exactly 0.
+        let none = scalar(scale_reg_loss(scales.clone(), 100.0)).await;
+        assert!(none.abs() < 1e-6, "below-threshold scales must not be penalized, got {none}");
+        // Threshold 1.0: only the three 10.0 axes gate. mean over 6 elems =
+        // (0+0+0 + 100+100+100)/6 = 50.
+        let some = scalar(scale_reg_loss(scales, 1.0)).await;
+        assert!((some - 50.0).abs() < 1e-3, "expected mean 50.0, got {some}");
+    }
+
+    #[tokio::test]
+    async fn anti_needle_ratio_is_one_for_sphere_and_grows_for_needle() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        // G0 isotropic log-scales (all equal) -> exp(max-min)=exp(0)=1.
+        // G1 needle: log [0,0,3] -> exp(3-0)=e^3≈20.0855.
+        let log_scales = Tensor::<2>::from_data(
+            TensorData::new(vec![0.5f32, 0.5, 0.5, 0.0, 0.0, 3.0], [2, 3]),
+            &device,
+        );
+        let v = anti_needle_loss(log_scales)
+            .into_data_async()
+            .await
+            .expect("readback")
+            .into_vec::<f32>()
+            .expect("f32")[0];
+        // mean of (1.0, e^3) = (1 + 20.0855)/2 = 10.5428.
+        assert!((v - 10.5428).abs() < 1e-2, "expected mean ≈10.5428, got {v}");
     }
 }

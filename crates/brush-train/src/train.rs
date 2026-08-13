@@ -1286,6 +1286,22 @@ impl SplatTrainer {
                 loss = loss + scales.min_dim(1).mean() * self.config.flatten_loss_weight;
             }
 
+            // Scale-explosion + anti-needle regularizers (Stipple, arXiv:2608.00931).
+            // Differentiable PREVENTION of the MRNF scale blow-up that our
+            // prune-side guards only remove after the fact. Both act on the RAW
+            // pre-3D-filter scales, like the flatten term above. Default-off.
+            if self.config.scale_reg_weight > 0.0 {
+                let scales = splats.transforms.val().slice(s![.., 7..10]).exp();
+                loss = loss
+                    + crate::tidi::scale_reg_loss(scales, self.config.scale_reg_threshold)
+                        * self.config.scale_reg_weight;
+            }
+            if self.config.anti_needle_weight > 0.0 {
+                let log_scales = splats.transforms.val().slice(s![.., 7..10]);
+                loss = loss
+                    + crate::tidi::anti_needle_loss(log_scales) * self.config.anti_needle_weight;
+            }
+
             // Strip the autodiff graph off the loss so consumers can read the
             // scalar later without keeping the backward pass alive.
             let loss_inner = loss.clone().inner();

@@ -507,6 +507,30 @@ pub struct TrainConfig {
     #[serde(default)]
     pub flatten_loss_weight: f32,
 
+    /// Weight of the scale-explosion regularizer (Stipple `L_scale-regularizer`,
+    /// arXiv:2608.00931): mean `s²` over ACTIVATED scales above
+    /// `--scale-reg-threshold`, zero at or below it. A differentiable brake on
+    /// MRNF's runaway "fog" gaussians in unconstrained regions (sky-smear) —
+    /// prevents the blow-up our prune-side guards only remove after the fact.
+    /// 0 disables.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub scale_reg_weight: f32,
+
+    /// Activated-scale threshold above which `--scale-reg-weight` penalizes `s²`.
+    /// World/scale units; set above the surface population's p99 so only the
+    /// exploded tail is gated. Inert unless `--scale-reg-weight > 0`.
+    #[arg(long, help_heading = "Training options", default_value = "3.0")]
+    #[serde(default = "default_scale_reg_threshold")]
+    pub scale_reg_threshold: f32,
+
+    /// Weight of the anti-needle isotropy regularizer (Stipple `L_anti-needle`,
+    /// arXiv:2608.00931): mean `exp(log s_max − log s_min)` per gaussian. Pulls
+    /// anisotropic splats toward isotropic covariance. 0 disables.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub anti_needle_weight: f32,
+
     /// Base background color (R,G,B) used during training.
     #[arg(
         long,
@@ -1069,6 +1093,10 @@ fn default_tidi_guard_sh_quantile() -> f32 {
 }
 fn default_tidi_guard_thin_quantile() -> f32 {
     0.10
+}
+
+fn default_scale_reg_threshold() -> f32 {
+    3.0
 }
 fn default_tidi_guard_aniso_quantile() -> f32 {
     0.95
