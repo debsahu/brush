@@ -3525,6 +3525,7 @@ mod device_tests {
         );
         let mask: Vec<bool> = grid
             .far_mask(means, dist, &inner)
+            .await
             .into_data_async()
             .await
             .expect("far_mask readback")
@@ -3570,6 +3571,7 @@ mod device_tests {
         let near = Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 0.0, 0.0], [1, 3]), &device);
         let m1: Vec<bool> = grid
             .far_mask(near, dist, &inner)
+            .await
             .into_data_async()
             .await
             .expect("readback")
@@ -3583,6 +3585,7 @@ mod device_tests {
             Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 0.0, 1.5], [1, 3]), &device);
         let m2: Vec<bool> = grid
             .far_mask(moved, dist, &inner)
+            .await
             .into_data_async()
             .await
             .expect("readback")
@@ -3600,6 +3603,7 @@ mod device_tests {
         );
         let mn: Vec<bool> = grid
             .far_mask(nan, dist, &inner)
+            .await
             .into_data_async()
             .await
             .expect("readback")
@@ -3654,6 +3658,7 @@ mod device_tests {
         );
         let mask: Vec<bool> = grid
             .far_mask(means, dist, &inner)
+            .await
             .into_data_async()
             .await
             .expect("far_mask readback")
@@ -3710,6 +3715,7 @@ mod device_tests {
         );
         let mask: Vec<bool> = grid
             .far_mask(means, dist, &inner)
+            .await
             .into_data_async()
             .await
             .expect("far_mask readback")
