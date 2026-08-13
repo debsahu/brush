@@ -1866,12 +1866,33 @@ impl SplatTrainer {
             if self.config.cloud_prune && global_iter >= self.config.cloud_prune_start_iter {
                 match &self.cloud_prune_grid {
                     Some(grid) => {
-                        // Build the far mask on `device` (= splats' inner backend)
-                        // so its Bool representation matches `prune_mask` and
-                        // `bool_or` does not trip a Bool(U32)/Bool(Native) mismatch.
-                        let far = grid
-                            .far_mask(splats.means(), self.config.cloud_prune_dist, &device)
-                            .await;
+                        // Gather each LIVE mean's distance-to-cloud (out-of-grid /
+                        // non-finite already forced to +inf), read it to the host,
+                        // and build the far mask the IDENTICAL way `select_prune_mask`
+                        // builds its prune output: a host 0/1 float uploaded with
+                        // `from_data(.., device)` on `device` (= `splats.device()`,
+                        // the same device every other prune mask here is built on)
+                        // then `greater_elem(0.5)`. That makes `far` the same Bool
+                        // kind as `prune_mask`, so `bool_or` cannot trip a
+                        // Bool(U32)/Bool(Native) TypeMismatch — the far mask is
+                        // constructed by the exact proven idiom, not a new one. The
+                        // `[N]` distance readback is the same order as the readbacks
+                        // the TIDI prune already does each cleanup.
+                        let dists: Vec<f32> = grid
+                            .gather_prune_distances(splats.means())
+                            .into_data_async()
+                            .await
+                            .expect("cloud-prune distance readback")
+                            .into_vec()
+                            .expect("f32");
+                        let cp = self.config.cloud_prune_dist;
+                        let n = dists.len();
+                        let far_f: Vec<f32> = dists
+                            .iter()
+                            .map(|&d| if d > cp { 1.0 } else { 0.0 })
+                            .collect();
+                        let far = Tensor::<1>::from_data(TensorData::new(far_f, [n]), &device)
+                            .greater_elem(0.5);
                         prune_mask.bool_or(far)
                     }
                     None => prune_mask,

@@ -1437,6 +1437,13 @@ impl CloudDistanceGrid {
 
     /// Gather each Gaussian centre's 3D distance to the nearest CLOUD POINT from
     /// the static field, for the hard cloud-distance prune (`--cloud-prune`).
+    /// Returns the per-Gaussian DISTANCES (`Tensor<1>` f32) — NOT a Bool. The
+    /// caller thresholds `d > --cloud-prune-dist` to a mask AT THE UNION SITE
+    /// using the SAME `from_data(.., device).greater_elem(..)` idiom every other
+    /// `refine_for_phase` prune mask resolves to, so the mask is the identical
+    /// Bool kind as `prune_mask` and `bool_or` cannot trip a Bool(U32)/Bool(Native)
+    /// mismatch. Out-of-grid and non-finite rows are already forced to `+inf`
+    /// here, so a plain `> dist` comparison prunes them.
     ///
     /// POINT-ONLY: the caller MUST have built this grid with `planes = None`. The
     /// prune wants distance-to-nearest-cloud-POINT, NOT the plane-augmented
@@ -1458,7 +1465,7 @@ impl CloudDistanceGrid {
     /// prune is a boolean decision, so no gradient is needed). A divergent
     /// (NaN/±inf) centre is forced to `+inf` so it always reads as a floater
     /// (it is separately caught by the trainer's non-finite prune too).
-    pub fn gather_distance(&self, means: Tensor<2>) -> Tensor<1> {
+    pub fn gather_prune_distances(&self, means: Tensor<2>) -> Tensor<1> {
         // PRUNE path = NO gradient, so force BOTH the field and the means onto the
         // SAME INNER backend/device before any op. `detach_autodiff` drops an
         // autodiff-kind tensor to the inner backend (passthrough if already
@@ -1553,42 +1560,6 @@ impl CloudDistanceGrid {
         // Force divergent + out-of-grid rows to `+inf` (always > any threshold →
         // pruned); the clamped index for those rows is valid but discarded here.
         d.mask_fill(force_far.squeeze_dim::<1>(1), f32::INFINITY)
-    }
-
-    /// Boolean `[N]` mask, true where a Gaussian centre is FARTHER than `dist`
-    /// (scene 3D-distance units) from the nearest cloud point — the hard
-    /// cloud-prune candidate set unioned into the refine prune mask. Divergent
-    /// centres read true. See [`Self::gather_distance`] (LIVE means, point-only).
-    ///
-    /// BOOL REPRESENTATION: the mask is built the SAME way the TIDI prune builds
-    /// its output (`select_prune_mask`): a host float 0/1 vector uploaded with
-    /// `from_data(.., device)` then `greater_elem(0.5)`. This matters because the
-    /// gather runs on the field's `detach_autodiff`ed inner backend, whose direct
-    /// `greater_elem` yields a `Bool(Native)` tensor, while `prune_mask` (and
-    /// every other mask in `refine_for_phase`) is `Bool(U32)` on `splats.device()`
-    /// — OR-ing the two would trip a `TypeMismatch(Bool(U32) vs Bool(Native))`.
-    /// Building the Bool on the caller's `device` (pass `splats.device()`) yields
-    /// the identical representation, so `prune_mask.bool_or(far)` just works, and
-    /// the host round-trip of `[N]` distances matches the readbacks the prune
-    /// path already does each cleanup. `device` is the trainer device the union
-    /// happens on (inner in `refine_for_phase`, since splats are `.valid()`).
-    pub async fn far_mask(&self, means: Tensor<2>, dist: f32, device: &Device) -> Tensor<1, Bool> {
-        let host: Vec<f32> = self
-            .gather_distance(means)
-            .into_data_async()
-            .await
-            .expect("cloud-prune distance readback")
-            .into_vec()
-            .expect("f32");
-        let n = host.len();
-        // `d > dist` on the host (divergent rows are `+inf` from `gather_distance`,
-        // so `inf > dist` is true → pruned). Upload as a 0/1 float and threshold on
-        // `device`, exactly like `select_prune_mask`'s returning idiom.
-        let far: Vec<f32> = host
-            .iter()
-            .map(|&d| if d > dist { 1.0 } else { 0.0 })
-            .collect();
-        Tensor::<1>::from_data(TensorData::new(far, [n]), device).greater_elem(0.5)
     }
 }
 
@@ -3490,9 +3461,11 @@ mod device_tests {
 
     /// cloud-prune TEST (a): the hard distance-to-cloud prune marks a Gaussian
     /// FAR from the cloud and spares an on-surface one. Build a small planar cloud
-    /// patch at the origin, then probe two means against `far_mask(dist)`: an
-    /// on-surface centre (d ~ 0 < dist → kept) and a mid-air centre (d ≫ dist →
-    /// pruned). This is the whole point-only signal the prune unions in.
+    /// patch at the origin, then read `gather_prune_distances`: an on-surface
+    /// centre reads `d ≤ dist` (kept) and a mid-air centre `d > dist` (pruned).
+    /// The DISTANCES are read directly (f32) — the union-site threshold is what
+    /// turns them into a `prune_mask`-kind Bool, so the test verifies the actual
+    /// signal without depending on any Bool representation.
     #[tokio::test]
     async fn cloud_prune_far_mask_marks_far_spares_on_surface() {
         let device =
@@ -3514,30 +3487,27 @@ mod device_tests {
             .await
             .expect("a non-empty cloud builds a grid");
 
-        // The mask is built on the INNER device, mirroring `refine_for_phase`
-        // (splats are `.valid()`/inner there, so `prune_mask` is inner Bool(U32)).
-        let inner = device.clone().inner();
-
         // G0 ON the surface (coincident with a cloud point); G1 FAR at (1,1,1).
         let means = Tensor::<2>::from_data(
             TensorData::new(vec![0.0f32, 0.0, 0.0, 1.0, 1.0, 1.0], [2, 3]),
             &device,
         );
-        let mask: Vec<bool> = grid
-            .far_mask(means, dist, &inner)
-            .await
+        let dists: Vec<f32> = grid
+            .gather_prune_distances(means)
             .into_data_async()
             .await
-            .expect("far_mask readback")
+            .expect("distance readback")
             .into_vec()
-            .expect("bool");
+            .expect("f32");
         assert!(
-            !mask[0],
-            "an on-surface Gaussian must NOT be pruned (d < dist)"
+            dists[0] <= dist,
+            "an on-surface Gaussian must read d ≤ dist (not pruned), got {}",
+            dists[0]
         );
         assert!(
-            mask[1],
-            "a far-from-cloud Gaussian must be pruned (d > dist)"
+            dists[1] > dist,
+            "a far-from-cloud Gaussian must read d > dist (pruned), got {}",
+            dists[1]
         );
     }
 
@@ -3564,52 +3534,56 @@ mod device_tests {
         let grid = CloudDistanceGrid::build(cloud, dist, softness, None, &device)
             .await
             .expect("a non-empty cloud builds a grid");
-        // Mask built on the INNER device, as in `refine_for_phase`.
-        let inner = device.clone().inner();
 
-        // Cycle 1: the Gaussian sits on the surface → not pruned.
+        // Cycle 1: the Gaussian sits on the surface → d ≤ dist → not pruned.
         let near = Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 0.0, 0.0], [1, 3]), &device);
-        let m1: Vec<bool> = grid
-            .far_mask(near, dist, &inner)
-            .await
+        let d1: Vec<f32> = grid
+            .gather_prune_distances(near)
             .into_data_async()
             .await
-            .expect("readback")
+            .expect("distance readback")
             .into_vec()
-            .expect("bool");
-        assert!(!m1[0], "before moving, the on-surface Gaussian is kept");
+            .expect("f32");
+        assert!(
+            d1[0] <= dist,
+            "before moving, the on-surface Gaussian reads d ≤ dist, got {}",
+            d1[0]
+        );
 
-        // Cycle 2: the SAME Gaussian has drifted far off the surface → pruned now,
+        // Cycle 2: the SAME Gaussian has drifted far off the surface → d > dist now,
         // against the identical (static) grid. This is the live-means contract.
         let moved =
             Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 0.0, 1.5], [1, 3]), &device);
-        let m2: Vec<bool> = grid
-            .far_mask(moved, dist, &inner)
-            .await
+        let d2: Vec<f32> = grid
+            .gather_prune_distances(moved)
             .into_data_async()
             .await
-            .expect("readback")
+            .expect("distance readback")
             .into_vec()
-            .expect("bool");
+            .expect("f32");
         assert!(
-            m2[0],
-            "after drifting off the surface the SAME Gaussian must be pruned (live means)"
+            d2[0] > dist,
+            "after drifting off the surface the SAME Gaussian reads d > dist (live means), got {}",
+            d2[0]
         );
 
-        // A divergent (NaN) centre reads as far (forced +inf) → always pruned.
+        // A divergent (NaN) centre is forced to +inf → always > dist → pruned.
         let nan = Tensor::<2>::from_data(
             TensorData::new(vec![f32::NAN, f32::NAN, f32::NAN], [1, 3]),
             &device,
         );
-        let mn: Vec<bool> = grid
-            .far_mask(nan, dist, &inner)
-            .await
+        let dn: Vec<f32> = grid
+            .gather_prune_distances(nan)
             .into_data_async()
             .await
-            .expect("readback")
+            .expect("distance readback")
             .into_vec()
-            .expect("bool");
-        assert!(mn[0], "a divergent (NaN) centre must be pruned");
+            .expect("f32");
+        assert!(
+            dn[0] > dist,
+            "a divergent (NaN) centre must read d > dist (forced +inf), got {}",
+            dn[0]
+        );
     }
 
     /// cloud-prune out-of-AABB: a floater far OUTSIDE the cloud's bounding box
@@ -3639,7 +3613,6 @@ mod device_tests {
         let grid = CloudDistanceGrid::build(cloud, dist, softness, None, &device)
             .await
             .expect("a non-empty cloud builds a grid");
-        let inner = device.clone().inner();
 
         // Centres FAR outside the bbox along +x, -y, +z, and a big diagonal. Each
         // shares two in-range axes with a real cloud column, so a per-axis clamp
@@ -3656,17 +3629,16 @@ mod device_tests {
             ),
             &device,
         );
-        let mask: Vec<bool> = grid
-            .far_mask(means, dist, &inner)
-            .await
+        let dists: Vec<f32> = grid
+            .gather_prune_distances(means)
             .into_data_async()
             .await
-            .expect("far_mask readback")
+            .expect("distance readback")
             .into_vec()
-            .expect("bool");
+            .expect("f32");
         assert!(
-            mask.iter().all(|&p| p),
-            "every out-of-AABB centre must read far (> dist) and be pruned, got {mask:?}"
+            dists.iter().all(|&d| d > dist),
+            "every out-of-AABB centre must read far (> dist) and be pruned, got {dists:?}"
         );
     }
 
@@ -3696,7 +3668,6 @@ mod device_tests {
         let grid = CloudDistanceGrid::build(cloud, dist, softness, None, &device)
             .await
             .expect("a non-empty cloud builds a grid");
-        let inner = device.clone().inner();
 
         // Confirm we ARE in the coarsened regime the fix targets (vox > 1.82·dist),
         // so the clamp-only path would have read a boundary distance < dist.
@@ -3713,18 +3684,22 @@ mod device_tests {
             TensorData::new(vec![1000.0f32, 0.0, 0.0, 0.0, 0.0, 0.0], [2, 3]),
             &device,
         );
-        let mask: Vec<bool> = grid
-            .far_mask(means, dist, &inner)
-            .await
+        let dists: Vec<f32> = grid
+            .gather_prune_distances(means)
             .into_data_async()
             .await
-            .expect("far_mask readback")
+            .expect("distance readback")
             .into_vec()
-            .expect("bool");
+            .expect("f32");
         assert!(
-            mask[0],
-            "an out-of-grid floater must prune even when vox is coarsened past dist"
+            dists[0] > dist,
+            "an out-of-grid floater must read d > dist even when vox is coarsened past dist, got {}",
+            dists[0]
         );
-        assert!(!mask[1], "an on-cloud Gaussian must still be spared");
+        assert!(
+            dists[1] <= dist,
+            "an on-cloud Gaussian must read d ≤ dist (spared), got {}",
+            dists[1]
+        );
     }
 }
