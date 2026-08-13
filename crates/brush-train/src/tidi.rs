@@ -1434,6 +1434,99 @@ impl CloudDistanceGrid {
             dims: data.dims,
         })
     }
+
+    /// Gather each Gaussian centre's 3D distance to the nearest CLOUD POINT from
+    /// the static field, for the hard cloud-distance prune (`--cloud-prune`).
+    ///
+    /// POINT-ONLY: the caller MUST have built this grid with `planes = None`. The
+    /// prune wants distance-to-nearest-cloud-POINT, NOT the plane-augmented
+    /// distance the opacity regularizer can use under `--plane-gate` — a plane
+    /// INTERPOLATES the sparse cloud and would read a wall-perpendicular floater
+    /// (far from every cloud point but near the wall plane) as on-surface,
+    /// shielding exactly the floaters this prune must delete. `cloud_prune_grid`
+    /// is therefore a SEPARATE, always-point-only grid from `opacity_reg_grid`.
+    ///
+    /// LIVE means: this gathers the CURRENT `means` passed in against the STATIC
+    /// distance field (distance-to-static-cloud). The cloud never moves, so the
+    /// field is fixed; gathering live means each refine cycle is both correct and
+    /// cheap — a Gaussian that DRIFTED off the surface since the last cycle reads
+    /// its new, larger distance and is caught now. No rebuild is needed.
+    ///
+    /// Pure inner-backend O(1) gather. Reuses the a8e88f47 INTEGER flat-index
+    /// (never f32: a grid can exceed 2^24 voxels, and an f32 `i·(ny·nz)+…` would
+    /// round a large index onto an ADJACENT voxel). `means` are detached (the
+    /// prune is a boolean decision, so no gradient is needed). A divergent
+    /// (NaN/±inf) centre is forced to `+inf` so it always reads as a floater
+    /// (it is separately caught by the trainer's non-finite prune too).
+    pub fn gather_distance(&self, means: Tensor<2>) -> Tensor<1> {
+        // Everything on the field's (inner) device. `detach_autodiff` is a
+        // passthrough on an already-inner tensor and drops the graph on an
+        // autodiff one; either way we want the raw positions, no gradient.
+        let device = self.field.device();
+        let means = detach_autodiff(means).to_device(&device);
+        let [nx, ny, nz] = self.dims;
+        let num_vox = nx * ny * nz;
+
+        // Voxel coord = floor((mu - origin) / vox), clamped per axis into the grid.
+        let origin = Tensor::<2>::from_data(
+            TensorData::new(vec![self.origin[0], self.origin[1], self.origin[2]], [1, 3]),
+            &device,
+        );
+        let coord = means.sub(origin).div_scalar(self.vox.max(1e-6)).floor();
+
+        // A diverged (NaN/±inf) mean gives a non-finite coord on at least one
+        // axis. Flag such rows BEFORE the clamp turns ±inf into a finite in-range
+        // index, so they are forced to `+inf` (far → prune) below rather than
+        // silently reading whatever voxel a garbage index lands on. Mirrors
+        // `depth_opacity_reg_loss`'s BUG-2 guard.
+        let nonfinite = coord
+            .clone()
+            .is_finite()
+            .float()
+            .sum_dim(1) // [N, 1]: 3.0 iff all three axes are finite
+            .greater_elem(2.5)
+            .bool_not(); // [N, 1] Bool, true = divergent row
+
+        let cx = coord
+            .clone()
+            .slice(burn::tensor::s![.., 0..1])
+            .clamp(0.0, (nx - 1) as f32)
+            .mask_fill(nonfinite.clone(), 0.0)
+            .int();
+        let cy = coord
+            .clone()
+            .slice(burn::tensor::s![.., 1..2])
+            .clamp(0.0, (ny - 1) as f32)
+            .mask_fill(nonfinite.clone(), 0.0)
+            .int();
+        let cz = coord
+            .slice(burn::tensor::s![.., 2..3])
+            .clamp(0.0, (nz - 1) as f32)
+            .mask_fill(nonfinite.clone(), 0.0)
+            .int();
+
+        // Flat index `(i·ny + j)·nz + k` in INTEGER arithmetic (a8e88f47), exactly
+        // matching the host `usize` index in `build_distance_field`.
+        let flat = cx
+            .mul_scalar((ny * nz) as i64)
+            .add(cy.mul_scalar(nz as i64))
+            .add(cz)
+            .clamp(0i64, (num_vox - 1) as i64)
+            .squeeze_dim::<1>(1); // [N] Int
+
+        // Distance-to-nearest-cloud-point, gathered from the static field.
+        let d = self.field.clone().select(0, flat); // [N]
+        // Force divergent rows to `+inf` (always > any finite threshold → pruned).
+        d.mask_fill(nonfinite.squeeze_dim::<1>(1), f32::INFINITY)
+    }
+
+    /// Boolean `[N]` mask, true where a Gaussian centre is FARTHER than `dist`
+    /// (scene 3D-distance units) from the nearest cloud point — the hard
+    /// cloud-prune candidate set unioned into the refine prune mask. Divergent
+    /// centres read true. See [`Self::gather_distance`] (LIVE means, point-only).
+    pub fn far_mask(&self, means: Tensor<2>, dist: f32) -> Tensor<1, Bool> {
+        self.gather_distance(means).greater_elem(dist)
+    }
 }
 
 /// Whether the depth-coupled opacity regularizer contributes a term this step:
@@ -3330,5 +3423,119 @@ mod device_tests {
             "the finite on-plane Gaussian must still be pulled, got {}",
             gm[2]
         );
+    }
+
+    /// cloud-prune TEST (a): the hard distance-to-cloud prune marks a Gaussian
+    /// FAR from the cloud and spares an on-surface one. Build a small planar cloud
+    /// patch at the origin, then probe two means against `far_mask(dist)`: an
+    /// on-surface centre (d ~ 0 < dist → kept) and a mid-air centre (d ≫ dist →
+    /// pruned). This is the whole point-only signal the prune unions in.
+    #[tokio::test]
+    async fn cloud_prune_far_mask_marks_far_spares_on_surface() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let dist = 0.19f32;
+        let softness = dist / 3.0; // the trainer's sizing (see init_plane_priors)
+
+        // Cloud: a 3×3 patch in the z = 0 plane (spacing 0.05) = the measured surface.
+        let mut cloud = Vec::new();
+        for i in -1..=1 {
+            for j in -1..=1 {
+                cloud.extend_from_slice(&[i as f32 * 0.05, j as f32 * 0.05, 0.0]);
+            }
+        }
+        let m = cloud.len() / 3;
+        let cloud = Tensor::<2>::from_data(TensorData::new(cloud, [m, 3]), &device);
+        // POINT-ONLY grid (planes = None), exactly as the cloud-prune builds it.
+        let grid = CloudDistanceGrid::build(cloud, dist, softness, None, &device)
+            .await
+            .expect("a non-empty cloud builds a grid");
+
+        // G0 ON the surface (coincident with a cloud point); G1 FAR at (1,1,1).
+        let means = Tensor::<2>::from_data(
+            TensorData::new(vec![0.0f32, 0.0, 0.0, 1.0, 1.0, 1.0], [2, 3]),
+            &device,
+        );
+        let mask: Vec<bool> = grid
+            .far_mask(means, dist)
+            .into_data_async()
+            .await
+            .expect("far_mask readback")
+            .into_vec()
+            .expect("bool");
+        assert!(
+            !mask[0],
+            "an on-surface Gaussian must NOT be pruned (d < dist)"
+        );
+        assert!(
+            mask[1],
+            "a far-from-cloud Gaussian must be pruned (d > dist)"
+        );
+    }
+
+    /// cloud-prune TEST (c): the gather uses LIVE means. Against ONE static grid,
+    /// the SAME Gaussian reads as on-surface at one position and as a floater
+    /// after it MOVES away — proving the prune gathers the current mean each cycle
+    /// (positions drift during training), not a stale snapshot. Also covers the
+    /// divergent-centre row (NaN → always far → pruned).
+    #[tokio::test]
+    async fn cloud_prune_gathers_live_means_after_move() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let dist = 0.19f32;
+        let softness = dist / 3.0;
+
+        let mut cloud = Vec::new();
+        for i in -1..=1 {
+            for j in -1..=1 {
+                cloud.extend_from_slice(&[i as f32 * 0.05, j as f32 * 0.05, 0.0]);
+            }
+        }
+        let m = cloud.len() / 3;
+        let cloud = Tensor::<2>::from_data(TensorData::new(cloud, [m, 3]), &device);
+        let grid = CloudDistanceGrid::build(cloud, dist, softness, None, &device)
+            .await
+            .expect("a non-empty cloud builds a grid");
+
+        // Cycle 1: the Gaussian sits on the surface → not pruned.
+        let near = Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 0.0, 0.0], [1, 3]), &device);
+        let m1: Vec<bool> = grid
+            .far_mask(near, dist)
+            .into_data_async()
+            .await
+            .expect("readback")
+            .into_vec()
+            .expect("bool");
+        assert!(!m1[0], "before moving, the on-surface Gaussian is kept");
+
+        // Cycle 2: the SAME Gaussian has drifted far off the surface → pruned now,
+        // against the identical (static) grid. This is the live-means contract.
+        let moved =
+            Tensor::<2>::from_data(TensorData::new(vec![0.0f32, 0.0, 1.5], [1, 3]), &device);
+        let m2: Vec<bool> = grid
+            .far_mask(moved, dist)
+            .into_data_async()
+            .await
+            .expect("readback")
+            .into_vec()
+            .expect("bool");
+        assert!(
+            m2[0],
+            "after drifting off the surface the SAME Gaussian must be pruned (live means)"
+        );
+
+        // A divergent (NaN) centre reads as far (forced +inf) → always pruned.
+        let nan = Tensor::<2>::from_data(
+            TensorData::new(vec![f32::NAN, f32::NAN, f32::NAN], [1, 3]),
+            &device,
+        );
+        let mn: Vec<bool> = grid
+            .far_mask(nan, dist)
+            .into_data_async()
+            .await
+            .expect("readback")
+            .into_vec()
+            .expect("bool");
+        assert!(mn[0], "a divergent (NaN) centre must be pruned");
     }
 }

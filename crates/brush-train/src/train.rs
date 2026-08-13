@@ -154,6 +154,14 @@ pub struct SplatTrainer {
     /// 2). `None` unless `--plane-gate` or `--plane-coplanarity-weight` is set.
     /// Cheap + device-independent, so it carries across LOD boundaries verbatim.
     plane_set: Option<PlaneSet>,
+    /// Static distance-to-cloud grid for the hard cloud-distance prune
+    /// (`--cloud-prune`). Built ONCE from the seed cloud at training start,
+    /// ALWAYS point-only (planes = `None`) — the prune must not use the
+    /// plane-augmented distance (a plane shields wall-perpendicular floaters), so
+    /// this is a SEPARATE grid from `opacity_reg_grid` even when `--plane-gate` is
+    /// on. Carried across LOD boundaries; `None` (inert) when `--cloud-prune` is
+    /// off or there is no seed cloud.
+    cloud_prune_grid: Option<CloudDistanceGrid>,
     #[cfg(not(target_family = "wasm"))]
     lpips: Option<lpips::LpipsModel>,
 }
@@ -311,6 +319,7 @@ impl SplatTrainer {
             tidi: None,
             opacity_reg_grid: None,
             plane_set: None,
+            cloud_prune_grid: None,
             #[cfg(not(target_family = "wasm"))]
             lpips,
         }
@@ -417,6 +426,24 @@ impl SplatTrainer {
             None
         };
 
+        // Hard cloud-distance prune (`--cloud-prune`): its OWN point-only grid,
+        // sized to the prune threshold. ALWAYS point-only (planes = None) even
+        // under --plane-gate — the prune must NOT read the plane-augmented
+        // distance (a plane shields wall-perpendicular floaters). Built here from
+        // a CLONE so the opacity-reg build below can still consume `cloud_means`.
+        if self.config.cloud_prune {
+            let dist = self.config.cloud_prune_dist.max(1e-6);
+            // Softness sizes only the field's accurate/truncation REACH past
+            // `dist` (not the stored on-surface distances); mirror the opacity-reg
+            // proportion (softness = margin/3) so the field is accurate out to
+            // ~1.7·dist and truncates at ~3·dist — both > dist, so a floater at
+            // ANY distance beyond `dist` reads a value > dist. vox = dist/3 keeps
+            // the on-surface quantisation a small fraction of the threshold.
+            let softness = dist / 3.0;
+            self.cloud_prune_grid =
+                CloudDistanceGrid::build(cloud_means.clone(), dist, softness, None, device).await;
+        }
+
         // Distance-to-cloud grid, plane-augmented only when --plane-gate is set.
         if self.config.depth_opacity_reg_weight > 0.0 {
             let plane_slice = if self.config.plane_gate {
@@ -473,6 +500,22 @@ impl SplatTrainer {
 
     pub fn set_opacity_reg_grid(&mut self, grid: Option<CloudDistanceGrid>) {
         self.opacity_reg_grid = grid;
+    }
+
+    /// Whether the cloud-prune point-only grid is built (for logging).
+    pub fn has_cloud_prune_grid(&self) -> bool {
+        self.cloud_prune_grid.is_some()
+    }
+
+    /// Move the (static, point-only) cloud-prune grid out, to carry across an LOD
+    /// boundary where the trainer is rebuilt. The seed cloud never changes, so the
+    /// grid is reused verbatim rather than recomputed.
+    pub fn take_cloud_prune_grid(&mut self) -> Option<CloudDistanceGrid> {
+        self.cloud_prune_grid.take()
+    }
+
+    pub fn set_cloud_prune_grid(&mut self, grid: Option<CloudDistanceGrid>) {
+        self.cloud_prune_grid = grid;
     }
 
     /// Magnitude summary of the learned appearance parameters (`None` when
@@ -1808,6 +1851,29 @@ impl SplatTrainer {
         } else {
             prune_mask
         };
+
+        // Hard cloud-distance prune (`--cloud-prune`): union any Gaussian whose
+        // LIVE centre is farther than `--cloud-prune-dist` from the nearest
+        // seed/LiDAR cloud point (a floater in empty space) into the prune mask.
+        // View-INDEPENDENT: it gathers the CURRENT means against the STATIC
+        // point-only distance grid built once at init (no camera, no z-buffer,
+        // no see-through), so a Gaussian that drifted off the surface since the
+        // last refine is caught this cycle. Independent of the TIDI paths above;
+        // built here on the same pre-prune snapshot so the single `prune_points`
+        // call reindexes everything at once. Inert (no lookup) when the flag is
+        // off, before the start iter, or when no seed cloud built a grid.
+        let prune_mask =
+            if self.config.cloud_prune && global_iter >= self.config.cloud_prune_start_iter {
+                match &self.cloud_prune_grid {
+                    Some(grid) => {
+                        let far = grid.far_mask(splats.means(), self.config.cloud_prune_dist);
+                        prune_mask.bool_or(far)
+                    }
+                    None => prune_mask,
+                }
+            } else {
+                prune_mask
+            };
 
         let (mut splats, refiner, pruned_count) = prune_points(
             splats,

@@ -908,6 +908,48 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "TIDI options", default_value = "-1.0")]
     #[serde(default = "default_plane_coplanarity_assign_dist")]
     pub plane_coplanarity_assign_dist: f32,
+
+    // ------------------------------------------------------------------
+    // Hard cloud-distance prune (`--cloud-prune`). The VALIDATED floater
+    // remover: an in-training HARD prune that DELETES any Gaussian whose centre
+    // is FAR (in 3D) from the seed/LiDAR point cloud -- i.e. floating in empty
+    // space. View-INDEPENDENT (no camera, no z-buffer, so no see-through leak),
+    // it looks the Gaussian's centre up in a static distance-to-cloud grid built
+    // ONCE from the seed cloud and prunes when d > `--cloud-prune-dist`. Unlike
+    // `--tidi-depth-prune` (per-view projected depth, which reads far points
+    // through gaps in a sparse cloud and prunes SURFACE splats), this is the
+    // honest floater signal: the cloud IS the measured surface. Because it
+    // deletes DURING training (inside the refine cycle), the surface heals and
+    // colour redistributes -- no black halo, unlike a post-hoc opacity filter.
+    // Its grid is ALWAYS point-only (never plane-augmented, even under
+    // `--plane-gate`): a plane would shield wall-perpendicular floaters. Default
+    // OFF and byte-inert (grid never built, no lookup) when unset. Pair with
+    // `--stop-replace-iter` + `--growth-stop-iter` (same iter as
+    // `--cloud-prune-start-iter`) so the prune NET-REDUCES rather than backfills.
+    // ------------------------------------------------------------------
+    /// Master switch for the hard distance-to-cloud floater prune.
+    #[arg(long, help_heading = "TIDI options", default_value = "false")]
+    #[serde(default)]
+    pub cloud_prune: bool,
+
+    /// Distance threshold: a Gaussian whose centre is farther than this (in scene
+    /// 3D-distance units) from the nearest seed/LiDAR cloud point is pruned as a
+    /// floater. Default 0.19 ~= 8x a ~0.024 cloud spacing. Larger = only very
+    /// isolated Gaussians go; smaller = more aggressive. NOTE: the grid's
+    /// conservative half-voxel bias (vox = dist/3) means the EFFECTIVE cut sits a
+    /// bit ABOVE the nominal value, erring toward keeping splats.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.19")]
+    #[serde(default = "default_cloud_prune_dist")]
+    pub cloud_prune_dist: f32,
+
+    /// Global iter before which the cloud-prune is inert (no grid lookup, no
+    /// prune). Default 0 = prune from the first refine. Pair with
+    /// `--stop-replace-iter` (stop dead-slot backfill) and `--growth-stop-iter`
+    /// (stop densification) at the SAME iter so the prune net-reduces the splat
+    /// count instead of being immediately backfilled.
+    #[arg(long, help_heading = "TIDI options", default_value = "0")]
+    #[serde(default = "default_cloud_prune_start_iter")]
+    pub cloud_prune_start_iter: u32,
 }
 
 impl Default for TrainConfig {
@@ -1070,6 +1112,12 @@ fn default_plane_coplanarity_weight() -> f32 {
 fn default_plane_coplanarity_assign_dist() -> f32 {
     -1.0
 }
+fn default_cloud_prune_dist() -> f32 {
+    0.19
+}
+fn default_cloud_prune_start_iter() -> u32 {
+    0
+}
 fn default_tidi_global_cap_frac() -> f32 {
     0.002
 }
@@ -1098,6 +1146,41 @@ mod tests {
             .err()
             .expect("stacked appearance flags must conflict");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// cloud-prune TEST (b): default-OFF / byte-inert. A command line that does
+    /// not mention it leaves `cloud_prune` false (the gate the trainer keys on to
+    /// skip building the grid and to skip the refine union), with the documented
+    /// threshold + start-iter defaults. `--cloud-prune` flips it on without
+    /// disturbing the defaults.
+    #[test]
+    fn cloud_prune_defaults_off_and_parses() {
+        let def = TrainConfig::default();
+        assert!(
+            !def.cloud_prune,
+            "cloud-prune must default OFF (byte-inert)"
+        );
+        assert_eq!(def.cloud_prune_dist, 0.19);
+        assert_eq!(def.cloud_prune_start_iter, 0);
+
+        // An unrelated flag must not switch it on.
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert!(!other.cloud_prune);
+
+        // The flag turns it on and the tuning knobs parse.
+        let on = TrainConfig::try_parse_from([
+            "brush",
+            "--cloud-prune",
+            "--cloud-prune-dist",
+            "0.25",
+            "--cloud-prune-start-iter",
+            "12000",
+        ])
+        .expect("cloud-prune flags must parse");
+        assert!(on.cloud_prune);
+        assert_eq!(on.cloud_prune_dist, 0.25);
+        assert_eq!(on.cloud_prune_start_iter, 12000);
     }
 
     /// Inertness contract for the geometry-prior flags: a command line that

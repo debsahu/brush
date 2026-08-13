@@ -213,10 +213,29 @@ pub(crate) async fn train_stream(
     // `--plane-coplanarity-weight` is set (the LiDAR-PlanarGS priors). When
     // `--plane-gate` is on, those planes are baked into the grid's field.
     let cfg = &train_stream_config.train_config;
-    if cfg.depth_opacity_reg_weight > 0.0 || cfg.plane_gate || cfg.plane_coplanarity_weight > 0.0 {
+    if cfg.depth_opacity_reg_weight > 0.0
+        || cfg.plane_gate
+        || cfg.plane_coplanarity_weight > 0.0
+        || cfg.cloud_prune
+    {
         trainer
             .init_plane_priors(init_splats.means(), &device)
             .await;
+        if cfg.cloud_prune {
+            if trainer.has_cloud_prune_grid() {
+                log::info!(
+                    "Cloud-prune: built point-only distance-to-cloud grid from {} seed \
+                     points (dist {})",
+                    init_splats.num_splats(),
+                    cfg.cloud_prune_dist
+                );
+            } else {
+                log::warn!(
+                    "--cloud-prune set but the seed cloud is empty; the cloud-prune is \
+                     inert for this run"
+                );
+            }
+        }
         if cfg.depth_opacity_reg_weight > 0.0 {
             if trainer.has_opacity_reg_grid() {
                 log::info!(
@@ -464,6 +483,8 @@ pub(crate) async fn train_stream(
             // The distance-to-cloud grid is static (built from the seed cloud), so
             // carry it across the LOD boundary verbatim rather than recomputing.
             let opacity_reg_grid = trainer.take_opacity_reg_grid();
+            // The cloud-prune point-only grid is static too, carry it verbatim.
+            let cloud_prune_grid = trainer.take_cloud_prune_grid();
             // Planes are static (seed-cloud RANSAC), so carry them verbatim too.
             let plane_set = trainer.take_plane_set();
             let bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
@@ -476,6 +497,7 @@ pub(crate) async fn train_stream(
             trainer.set_view_cams(lod_view_cams);
             trainer.set_appearance(appearance);
             trainer.set_opacity_reg_grid(opacity_reg_grid);
+            trainer.set_cloud_prune_grid(cloud_prune_grid);
             trainer.set_plane_set(plane_set);
 
             log::info!(
