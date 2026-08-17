@@ -32,7 +32,7 @@ use burn::{
     optim::GradientsParams,
     tensor::{Bool, Device, Gradients, Int, TensorData, activation::sigmoid},
 };
-use rand::{Rng, RngExt, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rayon::prelude::*;
 
 use crate::adam_scaled::{AdamScaled, AdamState};

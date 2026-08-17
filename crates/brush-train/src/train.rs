@@ -27,10 +27,6 @@ use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degre
 // bwd crate dissolved into brush-render/src/bwd/ (upstream #517).
 use brush_render::bwd::{DeferredShGrad, render_splat_features, render_splats_for_training};
 use burn::{
-    lr_scheduler::{
-        LrScheduler,
-        exponential::{ExponentialLrScheduler, ExponentialLrSchedulerConfig},
-    },
     module::{AutodiffModule, Param, ParamId},
     optim::GradientsParams,
     tensor::{
@@ -42,6 +38,32 @@ use burn::{
 use hashbrown::HashSet;
 use rand::SeedableRng;
 use tracing::{Instrument, trace_span};
+
+/// Exponential learning-rate schedule: `lr(n) = initial_lr · gamma^n`, advanced
+/// one step per `step()`. A behaviour-exact local replica of burn's
+/// `ExponentialLrScheduler` (whose `Config::init()` returns a `ModuleLrScheduler`
+/// under burn 0.22, no longer the raw scalar scheduler we need). Seeding
+/// `previous_lr = initial_lr / gamma` makes the first `step()` return
+/// `initial_lr`, exactly as burn's `build()` does.
+#[derive(Clone, Copy, Debug)]
+struct ExpLrScheduler {
+    previous_lr: f64,
+    gamma: f64,
+}
+
+impl ExpLrScheduler {
+    fn new(initial_lr: f64, gamma: f64) -> Self {
+        Self {
+            previous_lr: initial_lr / gamma,
+            gamma,
+        }
+    }
+
+    fn step(&mut self) -> f64 {
+        self.previous_lr *= self.gamma;
+        self.previous_lr
+    }
+}
 
 /// Default robust-AABB percentile, used for the one-time initial/LOD bounds by
 /// external callers. The per-refine bounds recompute inside the trainer uses the
@@ -149,8 +171,8 @@ fn can_defer_sh_grad(_optimizer: &SplatOptim, _splats: &Splats) -> bool {
 
 pub struct SplatTrainer {
     config: TrainConfig,
-    sched_mean: ExponentialLrScheduler,
-    sched_scale: ExponentialLrScheduler,
+    sched_mean: ExpLrScheduler,
+    sched_scale: ExpLrScheduler,
     refine_record: Option<RefineRecord>,
     optim: Option<SplatOptim>,
     /// Optional per-view appearance compensation (bilateral grid / PPISP).
@@ -312,7 +334,7 @@ impl SplatTrainer {
     ) -> Self {
         let decay =
             (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_train_iters as f64);
-        let lr_mean = ExponentialLrSchedulerConfig::new(config.lr_mean, decay);
+        let lr_mean = ExpLrScheduler::new(config.lr_mean, decay);
 
         // MRNF LR schedule (R1): independent exponential decay for the log-scale
         // parameters, mirroring LFS `_scale_lr_gamma` (mrnf.cpp:425) and the
@@ -326,7 +348,7 @@ impl SplatTrainer {
         } else {
             1.0
         };
-        let lr_scale = ExponentialLrSchedulerConfig::new(config.lr_scale, scale_decay);
+        let lr_scale = ExpLrScheduler::new(config.lr_scale, scale_decay);
 
         let ssim_enabled = config.ssim_weight > 0.0;
 
@@ -341,8 +363,8 @@ impl SplatTrainer {
 
         Self {
             config,
-            sched_mean: lr_mean.init().expect("Mean lr schedule must be valid."),
-            sched_scale: lr_scale.init().expect("Scale lr schedule must be valid."),
+            sched_mean: lr_mean,
+            sched_scale: lr_scale,
             optim: None,
             appearance: None,
             refine_record: None,
