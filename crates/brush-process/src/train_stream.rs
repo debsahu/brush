@@ -830,7 +830,7 @@ mod tests {
         // apple.png is 64x54. A 32px cap followed by 0.5 LOD scale yields
         // the exact 16x13 dimensions consumed by `LoadImage::load`.
         let image = LoadImage::new(vfs, "apple.png".into(), None, 32, None).with_scale(0.5);
-        assert_eq!(image.output_dimensions().await.unwrap(), (16, 13));
+        assert_eq!(image.dimensions().await.unwrap(), (16, 13));
         let loaded = image.load().await.expect("fixture decode");
         assert_eq!((loaded.width(), loaded.height()), (16, 13));
 

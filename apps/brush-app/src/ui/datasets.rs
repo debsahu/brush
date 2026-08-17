@@ -199,7 +199,7 @@ async fn load_preview(
     if reply.is_closed() {
         return None;
     }
-    let train_size = view.image.output_dimensions().await.ok()?;
+    let train_size = view.image.dimensions().await.ok()?;
     if reply.is_closed() {
         return None;
     }
