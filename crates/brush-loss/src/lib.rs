@@ -2565,4 +2565,55 @@ mod normal_loss_tests {
             "edge weighting must reduce the loss: {weighted} !< {unweighted}"
         );
     }
+
+    // ===== SCRATCH PROBES (temporary, will be removed) =====
+
+    // P1: bare fill + reduce. Does `zeros().sum()` alone trip fusion?
+    #[tokio::test]
+    async fn probe_zeros_sum() {
+        let d = device().await;
+        let z = Tensor::<3>::zeros([1, 2, 3], &d);
+        assert_eq!(read(z.sum()).await[0], 0.0);
+    }
+
+    // P2: two scalar reductions of fill-constants, divided (the normal_loss tail shape).
+    #[tokio::test]
+    async fn probe_two_reduce_div() {
+        let d = device().await;
+        let a = Tensor::<3>::zeros([1, 2, 3], &d).sum();
+        let b = Tensor::<3>::zeros([1, 2, 3], &d).sum().mul_scalar(3.0).clamp_min(1.0);
+        assert_eq!(read(a / b).await[0], 0.0);
+    }
+
+    // P3: EXACT normal_loss body but inputs built via from_data (real device
+    // tensors, all-zero gt / all-one pred) — mimics a production all-invalid batch.
+    #[tokio::test]
+    async fn probe_normal_loss_fromdata_zeros() {
+        let d = device().await;
+        let gt = Tensor::<3>::from_data(
+            TensorData::new(vec![0.0f32; 6], [1, 2, 3]),
+            &d,
+        );
+        let pred = Tensor::<3>::from_data(
+            TensorData::new(vec![1.0f32; 6], [1, 2, 3]),
+            &d,
+        );
+        assert_eq!(read(normal_loss(pred, gt)).await[0], 0.0);
+    }
+
+    // P4: candidate fix A — denominator kept materialized by adding a masked-count
+    // via a single fused reduce over a stacked tensor. (reformulation probe)
+    #[tokio::test]
+    async fn probe_fix_reshape_reduce() {
+        let d = device().await;
+        let gt = Tensor::<3>::zeros([1, 2, 3], &d);
+        let pred = Tensor::<3>::ones([1, 2, 3], &d);
+        let gt_len = gt.clone().powi_scalar(2).sum_dim(2).sqrt();
+        let valid = gt_len.greater_elem(0.5).float();
+        let abs_err = (pred - gt).abs().sum_dim(2) * valid.clone();
+        // reduce via sum_dim to keep rank, then divide elementwise-broadcast.
+        let num = abs_err.sum();
+        let den = valid.sum().mul_scalar(3.0).clamp_min(1.0);
+        assert_eq!(read(num / den).await[0], 0.0);
+    }
 }
