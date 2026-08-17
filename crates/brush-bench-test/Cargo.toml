@@ -9,14 +9,12 @@ license.workspace = true
 native-msl = [
     "brush-process/native-msl",
     "brush-render/native-msl",
-    "brush-render-bwd/native-msl",
     "brush-train/native-msl",
 ]
 raster-census = ["brush-render/raster-census"]
 
 [dependencies]
 brush-render.path = "../brush-render"
-brush-render-bwd.path = "../brush-render-bwd"
 brush-train.path = "../brush-train"
 brush-dataset.path = "../brush-dataset"
 brush-process.path = "../brush-process"

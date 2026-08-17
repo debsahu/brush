@@ -311,8 +311,11 @@ fn find_points3d_path<'a>(vfs: &'a BrushVfs, points_dir: &'a Path) -> Option<(&'
     Some((path, is_binary))
 }
 
-/// Locate a per-image depth map.
-fn find_depth_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Option<&'a Path> {
+/// Locate a per-image prior map stored under a `<prior_dir>/` directory whose
+/// tail matches the image's own directory tail, with a stem matching either the
+/// image's full file name or its stem (so both `depth/img.png.tiff` and
+/// `depth/img.tiff` resolve for `images/img.png`).
+fn find_prior_path<'a>(vfs: &'a BrushVfs, path: &'a Path, prior_dir: &str) -> Option<&'a Path> {
     let search_name = path.file_name().expect("File must have a name");
     let search_stem = path.file_stem().expect("File must have a name");
 
@@ -323,16 +326,27 @@ fn find_depth_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Option<&'a Path> {
         if !(stem.eq_ignore_ascii_case(search_name) || stem.eq_ignore_ascii_case(search_stem)) {
             return false;
         }
-        let depth_idx = candidate
+        let dir_idx = candidate
             .components()
-            .position(|c| c.as_os_str().eq_ignore_ascii_case("depth"));
-        depth_idx.is_some_and(|idx| {
+            .position(|c| c.as_os_str().eq_ignore_ascii_case(prior_dir));
+        dir_idx.is_some_and(|idx| {
             let candidate_components: Vec<_> = candidate.components().collect();
             let path_dir_components: Vec<_> = path.parent().unwrap().components().collect();
-            let depth_dir_subpath = &candidate_components[idx + 1..candidate_components.len() - 1];
-            path_dir_components.ends_with(depth_dir_subpath)
+            let prior_dir_subpath = &candidate_components[idx + 1..candidate_components.len() - 1];
+            path_dir_components.ends_with(prior_dir_subpath)
         })
     })
+}
+
+/// Locate a per-image depth map (`depth/<image stem>.tiff`).
+fn find_depth_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Option<&'a Path> {
+    find_prior_path(vfs, path, "depth")
+}
+
+/// Locate a per-image surface-normal map (`normal/<image stem>.tiff`). Same
+/// matching rules as [`find_depth_path`], different directory component.
+fn find_normal_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Option<&'a Path> {
+    find_prior_path(vfs, path, "normal")
 }
 
 #[cfg(test)]
@@ -440,5 +454,67 @@ mod tests {
             index.find_image_by_name("FRAME.PNG"),
             Some(Path::new("images/nested/frame.png"))
         );
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_find_normal_matches_stem_and_full_name() {
+        // `normal/<stem>.tiff` next to `images/<stem>.png`.
+        let vfs = BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/img.png"),
+            PathBuf::from("normal/img.tiff"),
+        ]);
+        assert_eq!(
+            find_normal_path(&vfs, Path::new("images/img.png")),
+            Some(Path::new("normal/img.tiff"))
+        );
+
+        // `normal/<full name>.tiff` is accepted too, same as depth.
+        let vfs = BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/img.jpg"),
+            PathBuf::from("normal/img.jpg.tiff"),
+        ]);
+        assert_eq!(
+            find_normal_path(&vfs, Path::new("images/img.jpg")),
+            Some(Path::new("normal/img.jpg.tiff"))
+        );
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_find_normal_requires_matching_subdirs() {
+        // Nested dir tails must line up.
+        let vfs = BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/foo/bar/img.png"),
+            PathBuf::from("normal/foo/bar/img.tiff"),
+        ]);
+        assert_eq!(
+            find_normal_path(&vfs, Path::new("images/foo/bar/img.png")),
+            Some(Path::new("normal/foo/bar/img.tiff"))
+        );
+
+        let vfs = BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/baz/img.png"),
+            PathBuf::from("normal/foo/img.tiff"),
+        ]);
+        assert_eq!(find_normal_path(&vfs, Path::new("images/baz/img.png")), None);
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_normal_and_depth_dirs_do_not_cross_match() {
+        let vfs = BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/img.png"),
+            PathBuf::from("depth/img.tiff"),
+        ]);
+        // A depth-only dataset must not resolve a normal prior, and vice versa.
+        assert_eq!(find_normal_path(&vfs, Path::new("images/img.png")), None);
+        assert_eq!(
+            find_depth_path(&vfs, Path::new("images/img.png")),
+            Some(Path::new("depth/img.tiff"))
+        );
+
+        let vfs = BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/img.png"),
+            PathBuf::from("normal/img.tiff"),
+        ]);
+        assert_eq!(find_depth_path(&vfs, Path::new("images/img.png")), None);
     }
 }

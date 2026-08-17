@@ -5,6 +5,7 @@
 #![allow(clippy::missing_assert_message)]
 
 use brush_dataset::scene::SceneBatch;
+use brush_render::bwd::render_splats;
 use brush_render::{
     AlphaMode,
     bounding_box::BoundingBox,
@@ -12,7 +13,6 @@ use brush_render::{
     gaussian_splats::{SplatRenderMode, Splats},
     kernels::camera_model::CameraModel::Pinhole,
 };
-use brush_render_bwd::render_splats;
 use brush_train::{config::TrainConfig, train::SplatTrainer};
 use burn::module::AutodiffModule;
 use burn::tensor::{Device, TensorData};
@@ -128,6 +128,7 @@ fn generate_test_batch(resolution: (u32, u32)) -> SceneBatch {
         alpha_mode: AlphaMode::Transparent,
         features: None,
         depth: None,
+        normal: None,
         camera,
         view_index: 0,
     }
@@ -257,6 +258,7 @@ async fn train_with_zero_visible_does_not_crash() {
         alpha_mode: AlphaMode::Transparent,
         features: None,
         depth: None,
+        normal: None,
         camera,
         view_index: 0,
     };
@@ -267,7 +269,9 @@ async fn train_with_zero_visible_does_not_crash() {
         &device,
         BoundingBox::from_min_max(Vec3::splat(-2.0), Vec3::splat(2.0)),
     );
-    let (new_splats, _stats) = trainer.step_with_refine_weight(batch, splats, false).await;
+    let (new_splats, _stats) = trainer
+        .step_with_refine_weight(batch, splats, false, 0)
+        .await;
     // Should succeed; nothing visible means num_visible ≈ 0.
     assert!(new_splats.num_splats() > 0);
 }

@@ -16,7 +16,7 @@ mod native {
         scene::{SceneBatch, sample_to_packed_data, view_to_sample_image},
     };
     use brush_render::{AlphaMode, gaussian_splats::SplatRenderMode};
-    use brush_render_bwd::burn_glue::lift_splats_to_autodiff;
+    use brush_render::bwd::burn_glue::lift_splats_to_autodiff;
     use brush_serde::load_splat_from_ply;
     use brush_train::{
         config::TrainConfig,
@@ -151,6 +151,7 @@ mod native {
                 alpha_mode: view.image.alpha_mode(),
                 features: None,
                 depth: None,
+                normal: None,
                 camera: view.camera,
                 view_index: index,
             };
@@ -202,7 +203,18 @@ mod native {
             let current = splats.take().expect("replay always restores splats");
             let differentiable = lift_splats_to_autodiff(current);
             let (updated, stats) = trainer
-                .step_with_refine_weight(batch, differentiable, compute_refine_weight)
+                // This replay trainer's OWN cumulative step, not the iteration
+                // the checkpoint was originally trained at. Correct for the
+                // gates as they stand (replay uses `TrainConfig::default()`, so
+                // `--depth-normal-start-iter` is inert here), but if a replay
+                // ever wants to exercise an iteration gate it needs the
+                // checkpoint's real clock, not this one.
+                .step_with_refine_weight(
+                    batch,
+                    differentiable,
+                    compute_refine_weight,
+                    (step_offset + step) as u32,
+                )
                 .await;
             *splats = Some(updated.valid());
             last_loss = Some(stats.loss);

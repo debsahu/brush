@@ -2,6 +2,15 @@ use brush_render::gaussian_splats::SplatRenderMode;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
+/// Decay shape for the depth-loss annealing schedule (`--depth-weight-decay`).
+#[derive(Default, Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DepthWeightDecay {
+    #[default]
+    Linear,
+    Cosine,
+}
+
 #[derive(Clone, Parser, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct TrainConfig {
@@ -124,6 +133,56 @@ pub struct TrainConfig {
     /// Period after which splat growth stops.
     #[arg(long, help_heading = "Refine options", default_value = "15000")]
     pub growth_stop_iter: u32,
+
+    /// Iteration after which the refine step is skipped ENTIRELY: no prune, no
+    /// dead-splat replacement, no oversized force-split. Topology is frozen and
+    /// the remaining iterations are pure photometric optimisation of a fixed
+    /// splat set. Mirrors LFS MRNF's `stop_refine` (mrnf.cpp `is_refining()`
+    /// requires `iter < stop_refine`, default 28500), which our port previously
+    /// had no equivalent for: `--growth-stop-iter` only stops NET growth, while
+    /// prune + 1:1 multinomial replacement keep churning the population every
+    /// `--refine-every` steps. At a saturated `--max-splats` cap that churn has
+    /// no sink for elongated splats, so spindle fraction rises monotonically.
+    /// 0 disables (previous behaviour). Set equal to `--growth-stop-iter` for
+    /// LFS-like semantics.
+    ///
+    /// MEASURED OUTCOME (0726hickorywood, 60k, 5M cap, SH2, three arms identical
+    /// but for this flag): this flag LOST to leaving refine alone. Control
+    /// PSNR 14.377 / SSIM 0.7884 / needle frac 0.1400; with this flag at 30k,
+    /// PSNR 13.978 / SSIM 0.7823 / needle frac 0.1618. It raised median opacity
+    /// 0.21 -> 0.23, but opacity moved OPPOSITE to PSNR/SSIM, so do not treat it
+    /// as a quality proxy. Kept for LFS parity and further study; NOT recommended.
+    #[arg(long, help_heading = "Refine options", default_value = "0")]
+    pub stop_refine_iter: u32,
+
+    /// Iteration after which pruned splats are NO LONGER backfilled by
+    /// multinomial replacement, while prune itself keeps running. Growth is
+    /// governed separately by `--growth-stop-iter`.
+    ///
+    /// Motivation (measured on 0726hickorywood, 2026-08-05): the two halves of
+    /// refine pull in opposite directions once the `--max-splats` cap is
+    /// saturated. Replacement re-splits to hold the count, and MRNF's LAS split
+    /// gives BOTH children 0.6x the parent opacity, so the population drifts
+    /// translucent (median opacity fell to 0.08 on a 10M-cap run). Prune, on the
+    /// other hand, is the only sink for over-stretched splats, via its
+    /// `scale_max > extent * --prune-extent-factor` term. Freezing all of refine
+    /// with `--stop-refine-iter` therefore fixes the opacity dilution but
+    /// REMOVES the spindle sink: measured elongation slope rose from
+    /// +0.0029/1k iters to +0.0047/1k after the freeze.
+    ///
+    /// This flag separates them: keep the prune sink, drop the dilution. Splat
+    /// count decays gently from the cap instead of churning at it.
+    /// 0 disables (previous behaviour).
+    ///
+    /// MEASURED OUTCOME (same three-arm test): also LOST to the control --
+    /// PSNR 13.649 / SSIM 0.7779 / needle frac 0.1606, the worst PSNR of the
+    /// three. The premise that prune is the needle sink did not hold: needle
+    /// fraction was ~equal to the full-freeze arm (0.1606 vs 0.1618) despite
+    /// prune running throughout. Its one real effect is a 21% smaller asset
+    /// (3.94M vs 5.00M splats) at ~equal opacity, so it is a size lever, not a
+    /// quality lever. NOT recommended for quality.
+    #[arg(long, help_heading = "Refine options", default_value = "0")]
+    pub stop_replace_iter: u32,
 
     /// Split any splat whose max screen-space extent exceeds this fraction of
     /// the image dimension, shrinking the children so they land at (at most)
@@ -389,6 +448,137 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options", default_value = "0.0")]
     pub depth_loss_weight: f32,
 
+    /// Global iter at which the depth-loss weight starts decaying. Full
+    /// `--depth-loss-weight` before it. Only meaningful with
+    /// `--depth-weight-end-iter` > 0.
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    #[serde(default = "default_depth_weight_start_iter")]
+    pub depth_weight_start_iter: u32,
+
+    /// Global iter at which the decay finishes; weight is
+    /// `--depth-weight-end` from here on. 0 = annealing OFF (constant
+    /// weight, previous behaviour, byte-identical).
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    #[serde(default = "default_depth_weight_end_iter")]
+    pub depth_weight_end_iter: u32,
+
+    /// Final depth-loss weight after --depth-weight-end-iter.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default = "default_depth_weight_end")]
+    pub depth_weight_end: f32,
+
+    /// Decay shape between start and end iters.
+    #[arg(long, help_heading = "Training options", default_value = "linear")]
+    #[serde(default)]
+    pub depth_weight_decay: DepthWeightDecay,
+
+    /// DN-Splatter-style gradient-aware depth weighting: per-pixel weight
+    /// `w = exp(-|grad I| / sigma)` from the GT RGB image multiplies the depth-loss
+    /// map — full weight on textureless regions, down-weighted on image edges.
+    /// Composes multiplicatively with the annealed scalar weight.
+    #[arg(long, help_heading = "Training options", default_value = "false")]
+    #[serde(default)]
+    pub depth_grad_aware: bool,
+
+    /// Sigma for the gradient-aware weight, in [0,1] RGB intensity units of the
+    /// channel-mean forward-difference gradient. Smaller = harsher edge
+    /// down-weighting. Ignored unless --depth-grad-aware.
+    #[arg(long, help_heading = "Training options", default_value = "0.1")]
+    #[serde(default = "default_depth_grad_sigma")]
+    pub depth_grad_sigma: f32,
+
+    /// Weight of the l1 loss between the rendered per-gaussian normal image and
+    /// an external normal prior (`normal/<stem>.tiff`, 3-channel float32,
+    /// camera-frame `OpenCV`-convention unit normals, `(0,0,0)` = invalid).
+    /// Needs prior data; inert without it. DN-Splatter's normal loss /
+    /// `PlanarGS` `L_rn`; `PlanarGS` ratio suggests ~0.2. 0 disables.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub normal_loss_weight: f32,
+
+    /// Weight of the depth/normal consistency term: `1 - dot` between normals
+    /// derived from the RENDERED depth and the rendered per-gaussian normals
+    /// (`PlanarGS` `L_dn`). Needs no prior data at all. Setting it forces the
+    /// depth render channel on. Pinhole cameras only — skipped with a warning
+    /// on fisheye models. `PlanarGS` ratio suggests ~0.05. 0 disables.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub depth_normal_weight: f32,
+
+    /// Iteration at which `--depth-normal-weight` switches on. Before it the
+    /// consistency term contributes nothing AND its render work is skipped.
+    ///
+    /// 2DGS gates exactly this term (`lambda_normal = opt.lambda_normal if
+    /// iteration > 7000 else 0.0`, i.e. 7k of 30k, ~23% of the run) while
+    /// letting densification continue to 15k — so the gate is NOT about waiting
+    /// for topology to settle, it is about not enforcing self-consistency on
+    /// geometry that has barely formed. Counts GLOBAL iterations, so a resumed
+    /// run does not restart the countdown. 0 = never gate (previous behaviour).
+    ///
+    /// Counting globally also means the gate does NOT re-close at an LOD
+    /// transition, even though the trainer is re-seeded there. That is
+    /// deliberate — by then the geometry it was waiting for exists.
+    ///
+    /// Note the asymmetry: `--flatten-loss-weight` deliberately has NO such
+    /// gate, because DN-Splatter runs the identical scale term ungated at 1.0
+    /// from step 0.
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    #[serde(default)]
+    pub depth_normal_start_iter: u32,
+
+    /// Weight of total-variation smoothness on the rendered normal image
+    /// (DN-Splatter's `L_smooth`). Needs no prior data.
+    ///
+    /// DN-Splatter weights this **0.5**, five times its normal data term (0.1),
+    /// making it the largest weight in their normal group. On a textureless wall
+    /// the per-pixel normal field can be noisy while still matching the prior on
+    /// average; the data term cannot see that and this can. Since textureless
+    /// walls are the reason these priors exist, this is the load-bearing one.
+    /// 0 disables.
+    ///
+    /// CAVEAT on 0.5: DN-Splatter's RELEASED CODE never applies its
+    /// `normal_lambda`, so the runs behind their tables used smoothness:data at
+    /// 1:1, not 5:1. Our TV is also a pooled per-element mean where theirs is
+    /// `mean(|h|) + mean(|w|)` (~2x) and the paper normalises per-pixel (~3x), so
+    /// the same number does not mean the same strength. Order of magnitude to
+    /// sweep, not a validated setting.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub normal_smooth_weight: f32,
+
+    /// Weight of the flattening term: the population mean of each gaussian's
+    /// smallest activated scale, on the RAW (pre-3D-filter) scales. A soft
+    /// 2DGS-style pressure toward surface-aligned gaussians — nothing is
+    /// collapsed or re-parametrized. `PlanarGS` `L_s`; `PlanarGS` ratio suggests
+    /// ~1.0. 0 disables.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub flatten_loss_weight: f32,
+
+    /// Weight of the scale-explosion regularizer (Stipple `L_scale-regularizer`,
+    /// arXiv:2608.00931): mean `s²` over ACTIVATED scales above
+    /// `--scale-reg-threshold`, zero at or below it. A differentiable brake on
+    /// MRNF's runaway "fog" gaussians in unconstrained regions (sky-smear) —
+    /// prevents the blow-up our prune-side guards only remove after the fact.
+    /// 0 disables.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub scale_reg_weight: f32,
+
+    /// Activated-scale threshold above which `--scale-reg-weight` penalizes `s²`.
+    /// World/scale units; set above the surface population's p99 so only the
+    /// exploded tail is gated. Inert unless `--scale-reg-weight > 0`.
+    #[arg(long, help_heading = "Training options", default_value = "3.0")]
+    #[serde(default = "default_scale_reg_threshold")]
+    pub scale_reg_threshold: f32,
+
+    /// Weight of the anti-needle isotropy regularizer (Stipple `L_anti-needle`,
+    /// arXiv:2608.00931): mean `exp(log s_max − log s_min)` per gaussian. Pulls
+    /// anisotropic splats toward isotropic covariance. 0 disables.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub anti_needle_weight: f32,
+
     /// Base background color (R,G,B) used during training.
     #[arg(
         long,
@@ -519,6 +709,319 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Appearance options", default_value = "1.0")]
     #[serde(default = "default_ppisp_reg_scale")]
     pub ppisp_reg_scale: f32,
+
+    // ------------------------------------------------------------------
+    // TIDI-GS floater / haze suppression (arXiv 2601.09291). See
+    // `research/indoor-360-haze-removal.md` and `crate::tidi`. Multi-signal +
+    // isolation pruning for the translucent equilibrium floaters that grow on
+    // textureless indoor walls (which opacity thresholds structurally cannot
+    // remove). The WHOLE family is default-OFF: with BOTH `--tidi-prune` and
+    // `--tidi-depth-prune` unset the trainer never allocates TIDI state, so MRNF
+    // / depth-loss / PPISP / normal-prior runs take the identical path they
+    // always did. `--tidi-depth-prune` (defined after the photometric knobs) is
+    // a SEPARATE, standalone path that runs even without `--tidi-prune`.
+    // ------------------------------------------------------------------
+    /// Master switch for TIDI-GS multi-signal + isolation floater pruning.
+    #[arg(long, help_heading = "TIDI options", default_value = "false")]
+    #[serde(default)]
+    pub tidi_prune: bool,
+
+    /// Global iter at which TIDI pruning may begin (paper: a warmup so the scene
+    /// has formed). Signals accumulate from the first refine regardless; only
+    /// the prune is gated.
+    #[arg(long, help_heading = "TIDI options", default_value = "500")]
+    #[serde(default = "default_tidi_prune_start_iter")]
+    pub tidi_prune_start_iter: u32,
+
+    /// Minimum global-iter gap between TIDI cleanup passes (paper: every 400
+    /// steps). Effective cadence is rounded up to the next refine cycle, since
+    /// TIDI runs inside the refine hook.
+    #[arg(long, help_heading = "TIDI options", default_value = "400")]
+    #[serde(default = "default_tidi_prune_every")]
+    pub tidi_prune_every: u32,
+
+    /// Per-Gaussian warmup: a splat younger than this many steps (since birth /
+    /// last split) is never a prune candidate, protecting fresh detail.
+    #[arg(long, help_heading = "TIDI options", default_value = "500")]
+    #[serde(default = "default_tidi_warmup_steps")]
+    pub tidi_warmup_steps: u32,
+
+    /// Visibility signal: candidate iff the number of refine WINDOWS in which
+    /// this gaussian was ever visible is <= this (paper τ_vis = 2.0). NOTE: the
+    /// unit is refine windows, not steps -- see `TidiState::accumulate_window`,
+    /// which collapses each window to a 0/1 "seen" indicator so this threshold is
+    /// reachable (raw per-step counts scale with training length).
+    #[arg(long, help_heading = "TIDI options", default_value = "2.0")]
+    #[serde(default = "default_tidi_vis_threshold")]
+    pub tidi_vis_threshold: f32,
+
+    /// Opacity signal: candidate iff opacity <= this (paper τ_α = 0.04).
+    #[arg(long, help_heading = "TIDI options", default_value = "0.04")]
+    #[serde(default = "default_tidi_opacity_threshold")]
+    pub tidi_opacity_threshold: f32,
+
+    /// Learned-importance signal: candidate iff sigmoid(omega_i) <= this
+    /// (paper τ_ω = 0.35).
+    #[arg(long, help_heading = "TIDI options", default_value = "0.35")]
+    #[serde(default = "default_tidi_importance_threshold")]
+    pub tidi_importance_threshold: f32,
+
+    /// Position-gradient EMA signal: candidate iff EMA <= this (paper
+    /// τ_grad = 5e-4).
+    #[arg(long, help_heading = "TIDI options", default_value = "5e-4")]
+    #[serde(default = "default_tidi_grad_threshold")]
+    pub tidi_grad_threshold: f32,
+
+    /// EMA decay for the per-refine position-gradient signal (paper β = 0.99).
+    /// NOTE: advances once per refine window, not per step (Brush only exposes a
+    /// window position-gradient signal).
+    #[arg(long, help_heading = "TIDI options", default_value = "0.99")]
+    #[serde(default = "default_tidi_grad_ema_beta")]
+    pub tidi_grad_ema_beta: f32,
+
+    /// L1 sparsity weight on sigmoid(omega). 0 keeps omega alive on the
+    /// photometric gradient only (importance never falls -> effectively a
+    /// 3-signal gate); >0 lets persistently idle Gaussians decay into the pool.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.01")]
+    #[serde(default = "default_tidi_importance_reg")]
+    pub tidi_importance_reg: f32,
+
+    /// Adam LR for the omega importance leaf parameter.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.05")]
+    #[serde(default = "default_tidi_importance_lr")]
+    pub tidi_importance_lr: f64,
+
+    /// SH high-frequency-energy detail-guard quantile: exempt a candidate whose
+    /// ||f_rest|| is at/above this quantile of the STABLE set (specular/detail).
+    /// 0 disables. ADAPTIVE: the flag sets the quantile, not a fixed threshold.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.95")]
+    #[serde(default = "default_tidi_guard_sh_quantile")]
+    pub tidi_guard_sh_quantile: f32,
+
+    /// Thinness detail-guard quantile: exempt a candidate whose smallest scale
+    /// axis is at/below this quantile of the STABLE set (thin structure). 0
+    /// disables. ADAPTIVE.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.10")]
+    #[serde(default = "default_tidi_guard_thin_quantile")]
+    pub tidi_guard_thin_quantile: f32,
+
+    /// Anisotropy detail-guard quantile: exempt a candidate whose scale ratio
+    /// s3/s1 is at/above this quantile of the STABLE set (an elongated sheet /
+    /// needle the thinness guard misses when s1 is not small). 0 disables.
+    /// ADAPTIVE.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.95")]
+    #[serde(default = "default_tidi_guard_aniso_quantile")]
+    pub tidi_guard_aniso_quantile: f32,
+
+    /// Local colour-variance detail-guard quantile (needs an extra candidate
+    /// k-NN pass; off by default for cost). Thresholded against the CANDIDATE
+    /// distribution rather than the stable set. 0 disables (default).
+    #[arg(long, help_heading = "TIDI options", default_value = "0.0")]
+    #[serde(default = "default_tidi_guard_color_var_quantile")]
+    pub tidi_guard_color_var_quantile: f32,
+
+    /// k for the isolation k-NN (paper k = 16).
+    #[arg(long, help_heading = "TIDI options", default_value = "16")]
+    #[serde(default = "default_tidi_knn_k")]
+    pub tidi_knn_k: u32,
+
+    /// Isolation local cap: prune at most this fraction of a spatial cell's
+    /// candidates per cycle (paper 1.0%).
+    #[arg(long, help_heading = "TIDI options", default_value = "0.01")]
+    #[serde(default = "default_tidi_local_cap_frac")]
+    pub tidi_local_cap_frac: f32,
+
+    /// Isolation global cap: prune at most this fraction of ALL Gaussians per
+    /// cycle (paper 0.2%).
+    #[arg(long, help_heading = "TIDI options", default_value = "0.002")]
+    #[serde(default = "default_tidi_global_cap_frac")]
+    pub tidi_global_cap_frac: f32,
+
+    // ------------------------------------------------------------------
+    // TIDI depth / LiDAR-residual prune (a SEPARATE, standalone path from the
+    // four photometric signals above -- deliberately NOT AND-gated with
+    // opacity/omega/grad). The four photometric signals structurally CANNOT
+    // remove indoor equilibrium wall-haze: the haze floaters are photometrically
+    // VALID (stuck at a cancelling-error equilibrium), so they pass
+    // opacity/omega/grad and are never candidates. The one signal that CAN
+    // distinguish haze from real surface is GEOMETRY: haze floats in empty space
+    // in FRONT of the measured LiDAR/depth surface; real geometry sits AT the
+    // surface. This path reuses the exact per-frame depth `--depth-loss-weight`
+    // consumes (`depth/<stem>.tiff`, 0 = no return) as a hard prune
+    // discriminator. Default OFF and byte-inert unless enabled.
+    // ------------------------------------------------------------------
+    /// Master switch for the depth/LiDAR-residual prune path. Independent of
+    /// `--tidi-prune`'s photometric path (both live under the same TIDI state);
+    /// if this is set but `--tidi-prune` is not, ONLY the depth path runs. Inert
+    /// (no state allocated, no per-step cost) when both are unset. Opt-in
+    /// (never auto-on) because it DELETES splats on a depth signal whose quality
+    /// varies: LiDAR-projected depth is trustworthy, a mono estimator (e.g. DA3)
+    /// on featureless walls is sparse/unreliable, and the code cannot tell them
+    /// apart -- so the operator opts into "use depth when present" deliberately.
+    #[arg(long, help_heading = "TIDI options", default_value = "false")]
+    #[serde(default)]
+    pub tidi_depth_prune: bool,
+
+    /// Depth-residual margin: a Gaussian counts as "floating" only when its
+    /// camera-space z is more than this in FRONT of the measured depth at its
+    /// projected pixel. Units are the DEPTH map's units -- metres for
+    /// LiDAR/metric depth (the default 0.05 = 5 cm); an SfM dataset's depth may
+    /// be non-metric, so scale this accordingly.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.05")]
+    #[serde(default = "default_tidi_depth_margin")]
+    pub tidi_depth_margin: f32,
+
+    /// Depth path: prune when a Gaussian floats in at least this fraction of the
+    /// views that carry a valid depth return behind it (default 0.5 = 50%).
+    #[arg(long, help_heading = "TIDI options", default_value = "0.5")]
+    #[serde(default = "default_tidi_depth_float_frac")]
+    pub tidi_depth_float_frac: f32,
+
+    /// Depth path SAFETY gate: never prune a Gaussian unless at least this many
+    /// views have a real depth return behind it. This is what keeps the depth
+    /// path from touching unscanned regions (no LiDAR return -> exempt).
+    #[arg(long, help_heading = "TIDI options", default_value = "4")]
+    #[serde(default = "default_tidi_depth_min_valid_views")]
+    pub tidi_depth_min_valid_views: u32,
+
+    /// Depth path per-cycle global cap: prune at most this fraction of ALL
+    /// Gaussians via the depth path per cleanup. Looser than the photometric
+    /// `--tidi-global-cap-frac` (0.002) because the LiDAR-gated depth signal is
+    /// trustworthy.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.02")]
+    #[serde(default = "default_tidi_depth_cap_frac")]
+    pub tidi_depth_cap_frac: f32,
+
+    // ------------------------------------------------------------------
+    // Depth-coupled opacity regularizer -- the SMOOTH, differentiable
+    // alternative to the hard `--tidi-depth-prune`. Instead of deleting a
+    // floater in one step (which orphans its load-bearing colour and leaves a
+    // black halo), this adds a per-step loss whose ONLY gradient path is the
+    // Gaussian's activated opacity, fading off-surface splats out SMOOTHLY so
+    // the optimizer redistributes their colour into on-surface splats BEFORE
+    // they vanish. Gated on a VIEW-INDEPENDENT 3D test: a Gaussian is penalized
+    // when its centre is FAR from the seed/LiDAR point cloud, looked up in a
+    // static distance-to-cloud grid built once from the seed cloud. No per-frame
+    // depth and no camera projection (unlike the old per-view z-buffer residual).
+    // Independent of `--depth-loss-weight` and of the TIDI prune state; needs no
+    // persistent accumulators. Default OFF and byte-inert (no lookup, no loss
+    // term) when the weight is 0.
+    // ------------------------------------------------------------------
+    /// Depth-coupled opacity-regularizer weight (lambda). 0 = OFF (inert).
+    /// >0 adds `lambda * mean_i(p_i * sigmoid(opacity_i))` to the loss,
+    /// where `p_i` is a DETACHED smooth ramp that is ~1 for a Gaussian whose
+    /// centre is FAR (> margin) from the nearest seed/LiDAR cloud point and ~0
+    /// for one on/near the cloud. The gradient reaches ONLY the opacity leaf,
+    /// so far-from-cloud splats fade smoothly rather than being hard-deleted.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.0")]
+    #[serde(default = "default_depth_opacity_reg_weight")]
+    pub depth_opacity_reg_weight: f32,
+
+    /// Depth-opacity-reg margin: a Gaussian is penalized once its centre is more
+    /// than this far from the nearest seed/LiDAR cloud point in 3D. Units are
+    /// SCENE 3D-distance units (metres for a LiDAR-metric scene; possibly
+    /// non-metric for SfM). Set it a few times the cloud's nearest-neighbour
+    /// spacing so on-surface splats stay safe -- e.g. spacing ~0.024 -> margin
+    /// ~0.1-0.2. (Was a per-view depth residual; it is now a 3D distance.)
+    #[arg(long, help_heading = "TIDI options", default_value = "0.15")]
+    #[serde(default = "default_depth_opacity_reg_margin")]
+    pub depth_opacity_reg_margin: f32,
+
+    /// Depth-opacity-reg softness: the width of the sigmoid ramp (in the same 3D
+    /// distance units as margin) over which the penalty climbs from ~0 to ~1 as a
+    /// Gaussian moves farther from the cloud. Smaller = sharper on/off boundary.
+    /// Keep it `< margin`: the ramp is centred at `d = margin` (p = 0.5), so a
+    /// smaller softness keeps the penalty near 0 for on-surface splats (`d ~ 0`)
+    /// and stops it fading correctly-reconstructed walls. At the default 0.05 vs
+    /// margin 0.15, `p(d=0) ≈ 0.047`.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.05")]
+    #[serde(default = "default_depth_opacity_reg_softness")]
+    pub depth_opacity_reg_softness: f32,
+
+    /// Global iteration before which the depth-coupled opacity regularizer is
+    /// inert (skipped, no cost). The densifier backfills opacity-faded regions,
+    /// so firing the reg before densification stops (`--growth-stop-iter`,
+    /// default 15000) fights that backfill loop; start after it (e.g. 15000).
+    /// Default 0 = active from the first step (behaviour unchanged).
+    #[arg(long, help_heading = "TIDI options", default_value = "0")]
+    #[serde(default = "default_depth_opacity_reg_start_iter")]
+    pub depth_opacity_reg_start_iter: u32,
+
+    /// PLANE-GATE (FIX 1): augment the distance-to-cloud opacity field with
+    /// distance-to-nearest-PLANE, so a wall splat sitting BETWEEN sparse cloud
+    /// points (inside the wall's extent) reads on-surface instead of being
+    /// penalised as a floater, while a mid-air splat far from every plane is still
+    /// caught. Planes are extracted by RANSAC from the seed/LiDAR cloud (NOT a
+    /// VLM) once at init. Only meaningful alongside `--depth-opacity-reg-weight`
+    /// (it changes what that regularizer's field stores). `false` = the exact
+    /// point-only field (byte-identical to the pre-plane behaviour); no RANSAC
+    /// runs unless this or `--plane-coplanarity-weight` is set.
+    #[arg(long, help_heading = "TIDI options", default_value = "false")]
+    #[serde(default)]
+    pub plane_gate: bool,
+
+    /// CO-PLANARITY (FIX 2): weight of the plane geometry constraint. 0 = OFF
+    /// (inert, no RANSAC on its own). >0 adds, for every Gaussian assigned to a
+    /// RANSAC plane, `weight * mean[(n·mu − d)² + variance-along-n]`, which pulls
+    /// the centre onto the plane AND flattens it against the plane. Unlike the
+    /// opacity gate this carries a real gradient on POSITION and SCALE, so it
+    /// removes the geometric ambiguity on featureless walls directly. Riskier than
+    /// the gate (it moves geometry); keep it small (e.g. 0.05). Independent of
+    /// `--plane-gate`.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.0")]
+    #[serde(default = "default_plane_coplanarity_weight")]
+    pub plane_coplanarity_weight: f32,
+
+    /// CO-PLANARITY assignment band: a Gaussian is assigned to a plane only when
+    /// its perpendicular distance is below this (in scene 3D-distance units) AND
+    /// it projects inside the plane's bounded extent. `<= 0` (the default) means
+    /// "use `--depth-opacity-reg-margin`", so the band matches the opacity gate's
+    /// on-surface margin unless overridden.
+    #[arg(long, help_heading = "TIDI options", default_value = "-1.0")]
+    #[serde(default = "default_plane_coplanarity_assign_dist")]
+    pub plane_coplanarity_assign_dist: f32,
+
+    // ------------------------------------------------------------------
+    // Hard cloud-distance prune (`--cloud-prune`). The VALIDATED floater
+    // remover: an in-training HARD prune that DELETES any Gaussian whose centre
+    // is FAR (in 3D) from the seed/LiDAR point cloud -- i.e. floating in empty
+    // space. View-INDEPENDENT (no camera, no z-buffer, so no see-through leak),
+    // it looks the Gaussian's centre up in a static distance-to-cloud grid built
+    // ONCE from the seed cloud and prunes when d > `--cloud-prune-dist`. Unlike
+    // `--tidi-depth-prune` (per-view projected depth, which reads far points
+    // through gaps in a sparse cloud and prunes SURFACE splats), this is the
+    // honest floater signal: the cloud IS the measured surface. Because it
+    // deletes DURING training (inside the refine cycle), the surface heals and
+    // colour redistributes -- no black halo, unlike a post-hoc opacity filter.
+    // Its grid is ALWAYS point-only (never plane-augmented, even under
+    // `--plane-gate`): a plane would shield wall-perpendicular floaters. Default
+    // OFF and byte-inert (grid never built, no lookup) when unset. Pair with
+    // `--stop-replace-iter` + `--growth-stop-iter` (same iter as
+    // `--cloud-prune-start-iter`) so the prune NET-REDUCES rather than backfills.
+    // ------------------------------------------------------------------
+    /// Master switch for the hard distance-to-cloud floater prune.
+    #[arg(long, help_heading = "TIDI options", default_value = "false")]
+    #[serde(default)]
+    pub cloud_prune: bool,
+
+    /// Distance threshold: a Gaussian whose centre is farther than this (in scene
+    /// 3D-distance units) from the nearest seed/LiDAR cloud point is pruned as a
+    /// floater. Default 0.19 ~= 8x a ~0.024 cloud spacing. Larger = only very
+    /// isolated Gaussians go; smaller = more aggressive. NOTE: the grid's
+    /// conservative half-voxel bias (vox = dist/3) means the EFFECTIVE cut sits a
+    /// bit ABOVE the nominal value, erring toward keeping splats.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.19")]
+    #[serde(default = "default_cloud_prune_dist")]
+    pub cloud_prune_dist: f32,
+
+    /// Global iter before which the cloud-prune is inert (no grid lookup, no
+    /// prune). Default 0 = prune from the first refine. Pair with
+    /// `--stop-replace-iter` (stop dead-slot backfill) and `--growth-stop-iter`
+    /// (stop densification) at the SAME iter so the prune net-reduces the splat
+    /// count instead of being immediately backfilled.
+    #[arg(long, help_heading = "TIDI options", default_value = "0")]
+    #[serde(default = "default_cloud_prune_start_iter")]
+    pub cloud_prune_start_iter: u32,
 }
 
 impl Default for TrainConfig {
@@ -548,7 +1051,45 @@ impl TrainConfig {
         {
             return Err("total training and LOD iterations exceed u32::MAX".to_owned());
         }
+        if self.depth_weight_end_iter != 0
+            && self.depth_weight_end_iter <= self.depth_weight_start_iter
+        {
+            return Err(
+                "depth-weight-end-iter must be greater than depth-weight-start-iter".to_owned(),
+            );
+        }
+        if self.depth_weight_end < 0.0 {
+            return Err("depth-weight-end must not be negative".to_owned());
+        }
+        if self.depth_grad_aware && self.depth_grad_sigma <= 0.0 {
+            return Err("depth-grad-sigma must be positive when depth-grad-aware is set".to_owned());
+        }
         Ok(())
+    }
+
+    /// Effective depth-loss weight at `global_iter`. `end_iter == 0` disables
+    /// annealing entirely (returns `depth_loss_weight` unchanged).
+    pub fn depth_weight_at(&self, global_iter: u32) -> f32 {
+        let w0 = self.depth_loss_weight;
+        if self.depth_weight_end_iter == 0 {
+            return w0;
+        }
+        let s = self.depth_weight_start_iter;
+        let e = self.depth_weight_end_iter;
+        if global_iter <= s {
+            return w0;
+        }
+        let w1 = self.depth_weight_end;
+        if global_iter >= e {
+            return w1;
+        }
+        let t = (global_iter - s) as f32 / (e - s) as f32;
+        match self.depth_weight_decay {
+            DepthWeightDecay::Linear => w0 + (w1 - w0) * t,
+            DepthWeightDecay::Cosine => {
+                w1 + (w0 - w1) * 0.5 * (1.0 + (std::f32::consts::PI * t).cos())
+            }
+        }
     }
 
     pub fn total_iters(&self) -> u32 {
@@ -601,6 +1142,112 @@ fn default_edge_score_weight() -> f32 {
     0.25
 }
 
+// TIDI-GS serde defaults, kept in sync with the clap `default_value`s above so a
+// config that omits these fields deserializes to the same values the CLI uses.
+fn default_tidi_prune_start_iter() -> u32 {
+    500
+}
+fn default_tidi_prune_every() -> u32 {
+    400
+}
+fn default_tidi_warmup_steps() -> u32 {
+    500
+}
+fn default_tidi_vis_threshold() -> f32 {
+    2.0
+}
+fn default_tidi_opacity_threshold() -> f32 {
+    0.04
+}
+fn default_tidi_importance_threshold() -> f32 {
+    0.35
+}
+fn default_tidi_grad_threshold() -> f32 {
+    5e-4
+}
+fn default_tidi_grad_ema_beta() -> f32 {
+    0.99
+}
+fn default_tidi_importance_reg() -> f32 {
+    0.01
+}
+fn default_tidi_importance_lr() -> f64 {
+    0.05
+}
+fn default_tidi_guard_sh_quantile() -> f32 {
+    0.95
+}
+fn default_tidi_guard_thin_quantile() -> f32 {
+    0.10
+}
+
+fn default_scale_reg_threshold() -> f32 {
+    3.0
+}
+fn default_tidi_guard_aniso_quantile() -> f32 {
+    0.95
+}
+fn default_tidi_guard_color_var_quantile() -> f32 {
+    0.0
+}
+fn default_tidi_knn_k() -> u32 {
+    16
+}
+fn default_tidi_local_cap_frac() -> f32 {
+    0.01
+}
+fn default_tidi_depth_margin() -> f32 {
+    0.05
+}
+fn default_tidi_depth_float_frac() -> f32 {
+    0.5
+}
+fn default_tidi_depth_min_valid_views() -> u32 {
+    4
+}
+fn default_tidi_depth_cap_frac() -> f32 {
+    0.02
+}
+fn default_depth_opacity_reg_weight() -> f32 {
+    0.0
+}
+fn default_depth_opacity_reg_margin() -> f32 {
+    0.15
+}
+fn default_depth_opacity_reg_softness() -> f32 {
+    0.05
+}
+fn default_depth_opacity_reg_start_iter() -> u32 {
+    0
+}
+fn default_plane_coplanarity_weight() -> f32 {
+    0.0
+}
+fn default_plane_coplanarity_assign_dist() -> f32 {
+    -1.0
+}
+fn default_cloud_prune_dist() -> f32 {
+    0.19
+}
+fn default_cloud_prune_start_iter() -> u32 {
+    0
+}
+fn default_depth_weight_start_iter() -> u32 {
+    0
+}
+fn default_depth_weight_end_iter() -> u32 {
+    0
+}
+fn default_depth_weight_end() -> f32 {
+    0.0
+}
+fn default_depth_grad_sigma() -> f32 {
+    0.1
+}
+fn default_tidi_global_cap_frac() -> f32 {
+    0.002
+}
+
 /// Serde default for MRNF flags that are ON by default (LFS `mrnf_defaults`
 /// parity). Keeps deserialization of configs that omit these fields in sync
 /// with the clap `default_value_t = true`.
@@ -625,6 +1272,97 @@ mod tests {
             .err()
             .expect("stacked appearance flags must conflict");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// cloud-prune TEST (b): default-OFF / byte-inert. A command line that does
+    /// not mention it leaves `cloud_prune` false (the gate the trainer keys on to
+    /// skip building the grid and to skip the refine union), with the documented
+    /// threshold + start-iter defaults. `--cloud-prune` flips it on without
+    /// disturbing the defaults.
+    #[test]
+    fn cloud_prune_defaults_off_and_parses() {
+        let def = TrainConfig::default();
+        assert!(
+            !def.cloud_prune,
+            "cloud-prune must default OFF (byte-inert)"
+        );
+        assert_eq!(def.cloud_prune_dist, 0.19);
+        assert_eq!(def.cloud_prune_start_iter, 0);
+
+        // An unrelated flag must not switch it on.
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert!(!other.cloud_prune);
+
+        // The flag turns it on and the tuning knobs parse.
+        let on = TrainConfig::try_parse_from([
+            "brush",
+            "--cloud-prune",
+            "--cloud-prune-dist",
+            "0.25",
+            "--cloud-prune-start-iter",
+            "12000",
+        ])
+        .expect("cloud-prune flags must parse");
+        assert!(on.cloud_prune);
+        assert_eq!(on.cloud_prune_dist, 0.25);
+        assert_eq!(on.cloud_prune_start_iter, 12000);
+    }
+
+    /// Inertness contract for the geometry-prior flags: a command line that
+    /// does not mention them must leave all three at exactly 0.0, which is what
+    /// the `use_*` gates in the train loop key on. Losing this default silently
+    /// changes every existing run.
+    #[test]
+    fn geometry_prior_weights_default_to_zero_and_parse() {
+        let def = TrainConfig::default();
+        assert_eq!(def.normal_loss_weight, 0.0);
+        assert_eq!(def.depth_normal_weight, 0.0);
+        assert_eq!(def.flatten_loss_weight, 0.0);
+        assert_eq!(def.normal_smooth_weight, 0.0);
+        // The depth half is untouched by this change.
+        assert_eq!(def.depth_loss_weight, 0.0);
+
+        // 0 means "never gate", so the consistency term behaves exactly as it
+        // did before the gate existed. A nonzero default here would silently
+        // DISABLE the term for the first N iterations of every run that sets
+        // --depth-normal-weight, which is the opposite failure to the weights
+        // above and just as invisible.
+        assert_eq!(def.depth_normal_start_iter, 0);
+
+        // Unrelated flags must not switch them on.
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert_eq!(other.normal_loss_weight, 0.0);
+        assert_eq!(other.depth_normal_weight, 0.0);
+        assert_eq!(other.flatten_loss_weight, 0.0);
+        assert_eq!(other.normal_smooth_weight, 0.0);
+        assert_eq!(other.depth_normal_start_iter, 0);
+
+        let on = TrainConfig::try_parse_from([
+            "brush",
+            "--normal-loss-weight",
+            "0.2",
+            "--depth-normal-weight",
+            "0.05",
+            "--flatten-loss-weight",
+            "1.0",
+            "--normal-smooth-weight",
+            "0.5",
+            "--depth-normal-start-iter",
+            "7000",
+        ])
+        .expect("geometry-prior flags must parse");
+        assert!((on.normal_loss_weight - 0.2).abs() < 1e-9);
+        assert!((on.depth_normal_weight - 0.05).abs() < 1e-9);
+        assert!((on.flatten_loss_weight - 1.0).abs() < 1e-9);
+        assert!((on.normal_smooth_weight - 0.5).abs() < 1e-9);
+        assert_eq!(on.depth_normal_start_iter, 7000);
+
+        // There is deliberately NO --flatten-start-iter: DN-Splatter runs the
+        // identical scale term ungated at 1.0 from step 0, so a gate would be
+        // inventing a schedule no reference implementation uses.
+        assert!(TrainConfig::try_parse_from(["brush", "--flatten-start-iter", "7000"]).is_err());
     }
 
     #[test]
@@ -710,6 +1448,149 @@ mod tests {
         assert!(on.near_zero_rotation_prune);
     }
 
+    /// Inertness contract for the TIDI-GS family: a command line that does not
+    /// mention `--tidi-prune` leaves the master switch OFF (so the trainer never
+    /// allocates TIDI state and the render/refine paths are byte-identical), and
+    /// the paper's Table II constants are the shipped defaults.
+    #[test]
+    fn tidi_flags_default_off_and_match_paper() {
+        let def = TrainConfig::default();
+        assert!(
+            !def.tidi_prune,
+            "TIDI must be off unless explicitly enabled"
+        );
+        // paper Table II constants
+        assert!((def.tidi_vis_threshold - 2.0).abs() < 1e-9);
+        assert!((def.tidi_opacity_threshold - 0.04).abs() < 1e-9);
+        assert!((def.tidi_importance_threshold - 0.35).abs() < 1e-9);
+        assert!((def.tidi_grad_threshold - 5e-4).abs() < 1e-12);
+        assert!((def.tidi_grad_ema_beta - 0.99).abs() < 1e-9);
+        assert_eq!(def.tidi_knn_k, 16);
+        assert!((def.tidi_local_cap_frac - 0.01).abs() < 1e-9);
+        assert!((def.tidi_global_cap_frac - 0.002).abs() < 1e-9);
+
+        // Depth-prune path: also OFF by default, with the documented depth
+        // constants. Byte-inertness of the whole TIDI family keys on BOTH master
+        // switches being false.
+        assert!(
+            !def.tidi_depth_prune,
+            "depth-prune must be off unless explicitly enabled"
+        );
+        assert!((def.tidi_depth_margin - 0.05).abs() < 1e-9);
+        assert!((def.tidi_depth_float_frac - 0.5).abs() < 1e-9);
+        assert_eq!(def.tidi_depth_min_valid_views, 4);
+        assert!((def.tidi_depth_cap_frac - 0.02).abs() < 1e-9);
+
+        // Depth-coupled opacity regularizer: OFF (weight 0 = inert, no loss
+        // term / no projection) by default, with the documented ramp constants.
+        assert!(
+            (def.depth_opacity_reg_weight - 0.0).abs() < 1e-9,
+            "depth-opacity-reg must be off (weight 0) by default"
+        );
+        // margin / softness are now in SCENE 3D-distance units (distance-to-cloud
+        // gate), defaulting to 0.15 / 0.05.
+        assert!((def.depth_opacity_reg_margin - 0.15).abs() < 1e-9);
+        // softness MUST default to < margin so the ramp reaches ~0 by the surface
+        // (d=0); 0.05 vs margin 0.15 gives p(0) ~ 0.047.
+        assert!((def.depth_opacity_reg_softness - 0.05).abs() < 1e-9);
+        assert!(
+            def.depth_opacity_reg_softness < def.depth_opacity_reg_margin,
+            "softness must stay below margin or the ramp fades on-surface splats"
+        );
+        // The start-iter gate defaults to 0 (active from step 0 = unchanged).
+        assert_eq!(def.depth_opacity_reg_start_iter, 0);
+
+        // Plane priors (FIX 1 + FIX 2): both OFF by default and byte-inert. With
+        // --plane-gate false AND --plane-coplanarity-weight 0, no RANSAC runs and
+        // the run is identical to the pre-plane branch.
+        assert!(!def.plane_gate, "plane-gate must default off");
+        assert!(
+            (def.plane_coplanarity_weight - 0.0).abs() < 1e-9,
+            "co-planarity must default off (weight 0)"
+        );
+        // assign-dist sentinel <= 0 means "fall back to the opacity-reg margin".
+        assert!(def.plane_coplanarity_assign_dist <= 0.0);
+
+        // Unrelated flags must not switch it on.
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert!(!other.tidi_prune);
+        assert!(!other.tidi_depth_prune);
+        assert!((other.depth_opacity_reg_weight - 0.0).abs() < 1e-9);
+
+        // Bare `--tidi-prune` (a presence flag) enables it. There is deliberately
+        // no `--tidi-prune=false` form: the master switch is SetTrue so that the
+        // common `brush --tidi-prune` (no value) works; absence is the off state.
+        let on = TrainConfig::try_parse_from(["brush", "--tidi-prune"])
+            .expect("--tidi-prune must parse");
+        assert!(on.tidi_prune);
+        // Enabling the photometric path must NOT enable the depth path.
+        assert!(!on.tidi_depth_prune);
+
+        // The depth path is independent: `--tidi-depth-prune` on its own enables
+        // ONLY the depth path (photometric stays off).
+        let depth_on = TrainConfig::try_parse_from(["brush", "--tidi-depth-prune"])
+            .expect("--tidi-depth-prune must parse");
+        assert!(depth_on.tidi_depth_prune);
+        assert!(
+            !depth_on.tidi_prune,
+            "depth path must not imply photometric"
+        );
+
+        // The depth-coupled opacity regularizer is a value flag, independent of
+        // both prune switches: setting its weight enables it alone.
+        let opacreg = TrainConfig::try_parse_from([
+            "brush",
+            "--depth-opacity-reg-weight",
+            "0.5",
+            "--depth-opacity-reg-margin",
+            "0.15",
+        ])
+        .expect("--depth-opacity-reg-weight must parse");
+        assert!((opacreg.depth_opacity_reg_weight - 0.5).abs() < 1e-9);
+        assert!((opacreg.depth_opacity_reg_margin - 0.15).abs() < 1e-9);
+        assert!(
+            !opacreg.tidi_prune,
+            "opacity-reg must not imply photometric"
+        );
+        assert!(
+            !opacreg.tidi_depth_prune,
+            "opacity-reg must not imply depth-prune"
+        );
+
+        // The start-iter gate parses and is honoured (used to defer the term
+        // until densification stops).
+        let gated = TrainConfig::try_parse_from([
+            "brush",
+            "--depth-opacity-reg-weight",
+            "0.1",
+            "--depth-opacity-reg-start-iter",
+            "15000",
+        ])
+        .expect("--depth-opacity-reg-start-iter must parse");
+        assert_eq!(gated.depth_opacity_reg_start_iter, 15000);
+
+        // Plane flags parse independently and do not imply any other switch.
+        let plane = TrainConfig::try_parse_from([
+            "brush",
+            "--plane-gate",
+            "--plane-coplanarity-weight",
+            "0.05",
+        ])
+        .expect("--plane-gate / --plane-coplanarity-weight must parse");
+        assert!(plane.plane_gate);
+        assert!((plane.plane_coplanarity_weight - 0.05).abs() < 1e-9);
+        assert!(!plane.tidi_prune, "plane flags must not imply photometric");
+        assert!(
+            (plane.depth_opacity_reg_weight - 0.0).abs() < 1e-9,
+            "plane flags must not imply the opacity regularizer"
+        );
+        // --plane-gate is a presence flag; absence leaves it off.
+        let no_plane = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert!(!no_plane.plane_gate);
+    }
+
     #[test]
     fn cli_rejects_invalid_lod_ranges() {
         for args in [
@@ -765,5 +1646,105 @@ mod tests {
             config.validate(),
             Err("total training and LOD iterations exceed u32::MAX".to_owned())
         );
+    }
+
+    /// Depth-anneal + grad-aware flags: default-inert (byte-identical to the
+    /// pre-change behaviour), unrelated flags leave them, all six flags
+    /// round-trip on the CLI, and `validate()` rejects the two invalid combos.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn depth_anneal_and_grad_aware_default_noop_and_parse() {
+        let def = TrainConfig::default();
+        assert_eq!(def.depth_weight_start_iter, 0);
+        assert_eq!(def.depth_weight_end_iter, 0);
+        assert_eq!(def.depth_weight_end, 0.0);
+        assert_eq!(def.depth_weight_decay, DepthWeightDecay::Linear);
+        assert!(!def.depth_grad_aware);
+        assert!((def.depth_grad_sigma - 0.1).abs() < 1e-9);
+
+        // An unrelated flag must not disturb any of them.
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert_eq!(other.depth_weight_start_iter, 0);
+        assert_eq!(other.depth_weight_end_iter, 0);
+        assert_eq!(other.depth_weight_end, 0.0);
+        assert_eq!(other.depth_weight_decay, DepthWeightDecay::Linear);
+        assert!(!other.depth_grad_aware);
+        assert!((other.depth_grad_sigma - 0.1).abs() < 1e-9);
+
+        // All six flags parse and round-trip.
+        let on = TrainConfig::try_parse_from([
+            "brush",
+            "--depth-loss-weight",
+            "1.0",
+            "--depth-weight-start-iter",
+            "100",
+            "--depth-weight-end-iter",
+            "300",
+            "--depth-weight-end",
+            "0.25",
+            "--depth-weight-decay",
+            "cosine",
+            "--depth-grad-aware",
+            "--depth-grad-sigma",
+            "0.2",
+        ])
+        .expect("depth-anneal / grad-aware flags must parse");
+        assert_eq!(on.depth_weight_start_iter, 100);
+        assert_eq!(on.depth_weight_end_iter, 300);
+        assert!((on.depth_weight_end - 0.25).abs() < 1e-9);
+        assert_eq!(on.depth_weight_decay, DepthWeightDecay::Cosine);
+        assert!(on.depth_grad_aware);
+        assert!((on.depth_grad_sigma - 0.2).abs() < 1e-9);
+
+        // validate(): end-iter <= start-iter (nonzero) is rejected.
+        let mut bad = TrainConfig::default();
+        bad.depth_weight_start_iter = 300;
+        bad.depth_weight_end_iter = 300;
+        assert!(bad.validate().is_err());
+
+        // validate(): sigma <= 0 with grad-aware on is rejected.
+        let mut bad_sigma = TrainConfig::default();
+        bad_sigma.depth_grad_aware = true;
+        bad_sigma.depth_grad_sigma = 0.0;
+        assert!(bad_sigma.validate().is_err());
+    }
+
+    /// `depth_weight_at` schedule pins. With defaults it is the byte-identity
+    /// constant `depth_loss_weight`; with a schedule set it interpolates.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn depth_weight_schedule_pins() {
+        // Default cfg: annealing OFF, exact byte-identity to depth_loss_weight.
+        let def = TrainConfig::default();
+        for i in [0u32, 7000, u32::MAX] {
+            assert_eq!(def.depth_weight_at(i), def.depth_loss_weight);
+        }
+
+        // Linear schedule w0=1.0 over [100, 300] down to 0.0.
+        let mut lin = TrainConfig::default();
+        lin.depth_loss_weight = 1.0;
+        lin.depth_weight_start_iter = 100;
+        lin.depth_weight_end_iter = 300;
+        lin.depth_weight_end = 0.0;
+        lin.depth_weight_decay = DepthWeightDecay::Linear;
+        assert!((lin.depth_weight_at(0) - 1.0).abs() < 1e-6);
+        assert!((lin.depth_weight_at(100) - 1.0).abs() < 1e-6);
+        assert!((lin.depth_weight_at(200) - 0.5).abs() < 1e-6);
+        assert!((lin.depth_weight_at(300) - 0.0).abs() < 1e-6);
+        assert!((lin.depth_weight_at(10_000) - 0.0).abs() < 1e-6);
+
+        // Cosine schedule, same endpoints.
+        let mut cos = lin.clone();
+        cos.depth_weight_decay = DepthWeightDecay::Cosine;
+        assert!((cos.depth_weight_at(200) - 0.5).abs() < 1e-6);
+        // t = 0.25 -> 0.5 * (1 + cos(pi/4)) = 0.853553...
+        assert!((cos.depth_weight_at(150) - 0.853_553_4).abs() < 1e-6);
+
+        // Nonzero end weight pins the endpoints for both shapes.
+        let mut lin_nz = lin.clone();
+        lin_nz.depth_weight_end = 0.25;
+        assert!((lin_nz.depth_weight_at(100) - 1.0).abs() < 1e-6);
+        assert!((lin_nz.depth_weight_at(300) - 0.25).abs() < 1e-6);
     }
 }

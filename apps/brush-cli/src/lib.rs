@@ -20,10 +20,28 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::trace_span;
 
+/// Build stamp for this fork.
+///
+/// Upstream's bare `version` reports only `CARGO_PKG_VERSION`, so a stock Brush
+/// build and an EarthByte build are indistinguishable, as are two fork builds
+/// from different commits. This carries three things instead: the upstream crate
+/// version, a fork marker, and the exact `git describe` the binary was built
+/// from (suffixed `-dirty` when the tree had uncommitted changes).
+///
+/// Deliberately NOT a bump of `version` in `Cargo.toml`: that field is shared
+/// with upstream and would conflict on every merge, whereas this is additive.
+/// `BRUSH_BUILD_ID` comes from `build.rs`.
+const BRUSH_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "-earthbyte (",
+    env!("BRUSH_BUILD_ID"),
+    ")"
+);
+
 #[derive(Parser)]
 #[command(
     author,
-    version,
+    version = BRUSH_VERSION,
     arg_required_else_help = false,
     about = "Brush - universal splats"
 )]
@@ -393,6 +411,7 @@ pub async fn run_cli_ui(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn tracks_explicit_default_valued_training_option() {
@@ -477,5 +496,83 @@ mod tests {
         .expect("equals-form boolean must leave the positional source untouched");
         assert!(!explicit_false.train_stream.load_config.train_on_eval);
         assert!(explicit_false.source.is_some());
+    }
+
+    #[test]
+    fn parses_source_and_overrides() {
+        let cli = Cli::try_parse_from([
+            "brush-cli",
+            "some/dataset/path",
+            "--total-train-iters",
+            "50",
+            "--eval-split-every",
+            "2",
+            "--max-resolution",
+            "512",
+            "--sh-degree",
+            "2",
+            "--seed",
+            "7",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            &cli.source,
+            Some(DataSource::Path(p)) if p == "some/dataset/path"
+        ));
+        // Passing a source flips the viewer default off.
+        assert!(!cli.with_viewer);
+
+        let ts = &cli.train_stream;
+        assert_eq!(ts.train_config.total_train_iters, 50);
+        assert_eq!(ts.train_config.total_iters(), 50); // No LOD levels by default.
+        assert_eq!(ts.load_config.eval_split_every, Some(2));
+        assert_eq!(ts.load_config.max_resolution, 512);
+        assert_eq!(ts.model_config.sh_degree, 2);
+        assert_eq!(ts.process_config.seed, 7);
+
+        // A source without a viewer is a valid combination.
+        assert!(cli.validate().is_ok());
+    }
+
+    #[test]
+    fn parses_url_source() {
+        let cli = Cli::try_parse_from(["brush-cli", "https://example.com/data.zip"]).unwrap();
+        assert!(matches!(
+            &cli.source,
+            Some(DataSource::Url(u)) if u == "https://example.com/data.zip"
+        ));
+    }
+
+    #[test]
+    fn defaults_to_viewer_without_source() {
+        let cli = Cli::try_parse_from(["brush-cli"]).unwrap();
+        assert!(cli.source.is_none());
+        assert!(cli.with_viewer);
+        // Viewer without a source is valid (brush-app's default mode).
+        assert!(cli.validate().is_ok());
+    }
+
+    #[test]
+    fn viewer_flag_with_source() {
+        let cli = Cli::try_parse_from(["brush-cli", "some/path", "--with-viewer"]).unwrap();
+        assert!(cli.with_viewer);
+        assert!(cli.source.is_some());
+        assert!(cli.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_headless_without_source() {
+        let mut cli = Cli::try_parse_from(["brush-cli"]).unwrap();
+        cli.with_viewer = false;
+        let Err(err) = cli.validate() else {
+            panic!("expected validation error")
+        };
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn rejects_unknown_flag() {
+        assert!(Cli::try_parse_from(["brush-cli", "--not-a-real-flag"]).is_err());
     }
 }

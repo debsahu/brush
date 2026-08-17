@@ -6,7 +6,7 @@
 
 use brush_cube::{MainBackend as Wgpu, MainBackendBase, calc_cube_count_1d};
 use brush_render::shaders::helpers::ProjectUniforms;
-use brush_render_bwd::COMPACT_GRAD_LANES;
+use brush_render::bwd::COMPACT_GRAD_LANES;
 use burn::{
     Tensor,
     backend::{

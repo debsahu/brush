@@ -4,6 +4,7 @@ pub mod config;
 pub mod load_depth;
 pub mod load_features;
 pub mod load_image;
+pub mod load_normal;
 pub mod scene;
 pub mod scene_loader;
 

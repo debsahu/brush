@@ -504,6 +504,7 @@ pub async fn render_splats_with_rasterizer(
     };
 
     let use_float = matches!(texture_mode, TextureMode::Float);
+    let _render_device = transforms.device();
 
     // Float mode needs `Backward` (f32 image + per-splat bookkeeping); Packed
     // mode goes through the packed u8 path. Neither inference path uses the

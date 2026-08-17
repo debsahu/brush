@@ -205,6 +205,56 @@ pub(crate) async fn train_stream(
     );
     trainer.set_view_cams(view_cams.clone());
 
+    // Depth-coupled opacity regularizer: build the static distance-to-cloud grid
+    // ONCE from the seed point cloud (the measured surface the run is seeded
+    // from). View-independent, so it needs no per-frame depth. Skipped (and the
+    // reg no-ops with a warning) when the weight is 0 or the seed cloud is empty.
+    // Also runs the one-time RANSAC plane extraction when `--plane-gate` or
+    // `--plane-coplanarity-weight` is set (the LiDAR-PlanarGS priors). When
+    // `--plane-gate` is on, those planes are baked into the grid's field.
+    let cfg = &train_stream_config.train_config;
+    if cfg.depth_opacity_reg_weight > 0.0
+        || cfg.plane_gate
+        || cfg.plane_coplanarity_weight > 0.0
+        || cfg.cloud_prune
+    {
+        trainer
+            .init_plane_priors(init_splats.means(), &device)
+            .await;
+        if cfg.cloud_prune {
+            if trainer.has_cloud_prune_grid() {
+                log::info!(
+                    "Cloud-prune: built point-only distance-to-cloud grid from {} seed \
+                     points (dist {})",
+                    init_splats.num_splats(),
+                    cfg.cloud_prune_dist
+                );
+            } else {
+                log::warn!(
+                    "--cloud-prune set but the seed cloud is empty; the cloud-prune is \
+                     inert for this run"
+                );
+            }
+        }
+        if cfg.depth_opacity_reg_weight > 0.0 {
+            if trainer.has_opacity_reg_grid() {
+                log::info!(
+                    "Depth-opacity-reg: built distance-to-cloud grid from {} seed points{}",
+                    init_splats.num_splats(),
+                    if cfg.plane_gate { " (plane-gated)" } else { "" }
+                );
+            } else {
+                log::warn!(
+                    "--depth-opacity-reg-weight set but the seed cloud is empty; the \
+                     regularizer is inert for this run"
+                );
+            }
+        }
+        if let Some(summary) = trainer.plane_summary() {
+            log::info!("Plane priors: RANSAC found {summary}");
+        }
+    }
+
     // The trainer owns its working `splats` locally and publishes a
     // clone to the `Slot` after every modification (train
     // step, refine, LOD decimation).
@@ -430,6 +480,13 @@ pub(crate) async fn train_stream(
             );
 
             let appearance = trainer.take_appearance();
+            // The distance-to-cloud grid is static (built from the seed cloud), so
+            // carry it across the LOD boundary verbatim rather than recomputing.
+            let opacity_reg_grid = trainer.take_opacity_reg_grid();
+            // The cloud-prune point-only grid is static too, carry it verbatim.
+            let cloud_prune_grid = trainer.take_cloud_prune_grid();
+            // Planes are static (seed-cloud RANSAC), so carry them verbatim too.
+            let plane_set = trainer.take_plane_set();
             let bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
             trainer = SplatTrainer::new_seeded(
                 &train_stream_config.train_config,
@@ -439,6 +496,9 @@ pub(crate) async fn train_stream(
             );
             trainer.set_view_cams(lod_view_cams);
             trainer.set_appearance(appearance);
+            trainer.set_opacity_reg_grid(opacity_reg_grid);
+            trainer.set_cloud_prune_grid(cloud_prune_grid);
+            trainer.set_plane_set(plane_set);
 
             log::info!(
                 "LOD {current_lod}/{lod_levels}: Training for {lod_refine_steps} steps (image scale {:.0}%)",
@@ -457,10 +517,13 @@ pub(crate) async fn train_stream(
         // then strip back to inner so the viewer slot sees plain splats.
         // `step` immediately replaces `splats` with the returned value, so we
         // can move it here instead of cloning every iteration.
-        let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(splats);
+        let diff_splats = brush_render::bwd::burn_glue::lift_splats_to_autodiff(splats);
         let compute_refine_weight = trainer.refinement_weight_needed(iter);
         let (new_diff_splats, stats) = trainer
-            .step_with_refine_weight(batch, diff_splats, compute_refine_weight)
+            // `iter` is the GLOBAL iteration (the loop starts at
+            // `process_config.start_iter`), so `--depth-normal-start-iter` does
+            // not restart its countdown on a resumed run.
+            .step_with_refine_weight(batch, diff_splats, compute_refine_weight, iter)
             .await;
         splats = new_diff_splats.valid();
 
@@ -478,9 +541,11 @@ pub(crate) async fn train_stream(
         let phase_progress = (phase_iter as f32 / phase_total as f32).clamp(0.0, 1.0);
 
         let refine_start = Instant::now();
+        let stop_refine_iter = train_stream_config.train_config.stop_refine_iter;
         let refine = if phase_iter > 0
             && phase_iter.is_multiple_of(train_stream_config.train_config.refine_every)
             && phase_progress <= 0.95
+            && (stop_refine_iter == 0 || iter < stop_refine_iter)
         {
             let (new_splats, refine_stats) = trainer
                 .refine_for_phase(iter, phase_iter, phase_total, splats)
@@ -782,6 +847,7 @@ mod tests {
             camera,
             features: None,
             depth: None,
+            normal: None,
         }]);
         let cameras = mip_view_cameras(&scene).await;
         assert_eq!(cameras.len(), 1);
@@ -875,6 +941,12 @@ async fn run_eval(
 
     let mut psnr = 0.0;
     let mut ssim = 0.0;
+    // Masked counterparts, scored over the unmasked pixels only. `psnr`/`ssim`
+    // above count masked-out regions as error and are kept only so numbers
+    // recorded before 2026-08-10 stay comparable; these are the ones to gate on.
+    let mut psnr_masked = 0.0;
+    let mut ssim_masked = 0.0;
+    let mut valid_frac = 0.0;
     let mut count = 0;
     log::info!("Running evaluation for iteration {iter}");
 
@@ -904,6 +976,17 @@ async fn run_eval(
         count += 1;
         psnr += sample.psnr.clone().into_scalar_async::<f32>().await?;
         ssim += sample.ssim.clone().into_scalar_async::<f32>().await?;
+        psnr_masked += sample
+            .psnr_masked
+            .clone()
+            .into_scalar_async::<f32>()
+            .await?;
+        ssim_masked += sample
+            .ssim_masked
+            .clone()
+            .into_scalar_async::<f32>()
+            .await?;
+        valid_frac += sample.valid_frac;
 
         #[cfg(not(target_family = "wasm"))]
         if let Some(path) = &save_path {
@@ -923,6 +1006,16 @@ async fn run_eval(
     }
     psnr /= count as f32;
     ssim /= count as f32;
+    psnr_masked /= count as f32;
+    ssim_masked /= count as f32;
+    valid_frac /= count as f32;
+    // Both figures, every time, with the coverage that separates them -- so the
+    // gap is visible in the log rather than inferred. The masked pair is the one
+    // to compare against the Stage 4 >= 24 dB gate.
+    log::info!(
+        "eval iter {iter}: masked PSNR {psnr_masked:.3} SSIM {ssim_masked:.4}          | unmasked (legacy) PSNR {psnr:.3} SSIM {ssim:.4}          | mean coverage {:.1}%",
+        valid_frac * 100.0
+    );
     visualize.log_eval_stats(iter, psnr, ssim)?;
     emitter
         .emit(ProcessMessage::TrainMessage(TrainMessage::EvalResult {

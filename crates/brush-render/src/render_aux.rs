@@ -82,6 +82,9 @@ pub struct RenderAux {
 
 impl RenderAux {
     /// Calculate tile depth map for visualization.
+    ///
+    /// Kept from our depth-map viewer (commit c277d5cc); upstream #517 dropped
+    /// this helper, but our viewer still calls it, so it stays local.
     pub fn calc_tile_depth(&self) -> Tensor<2, Int> {
         use burn::tensor::s;
 

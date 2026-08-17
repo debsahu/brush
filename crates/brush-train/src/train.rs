@@ -1,5 +1,5 @@
 use crate::{
-    adam_scaled::{AdamScaled, AdamScaledConfig, AdamState},
+    adam_scaled::{AdamScaled, AdamState},
     config::TrainConfig,
     dig::{self, DigTrainState},
     edge, error_map,
@@ -9,30 +9,72 @@ use crate::{
     quat_vec::quaternion_vec_multiply,
     splat_init::bounds_from_pos,
     stats::RefineRecord,
+    tidi::{
+        CloudDistanceGrid, PlaneSet, TidiPruneParams, TidiState, extract_planes_from_cloud,
+        opacity_reg_active, plane_coplanarity_loss,
+    },
 };
 use brush_appearance::{AppearanceConfig, AppearanceTrainState};
 use brush_dataset::scene::SceneBatch;
-use brush_loss::{ImageLossConfig, depth_loss, image_loss};
+use brush_loss::{
+    ImageLossConfig, depth_loss, depth_normal_loss, image_loss, normal_loss, normal_smooth_loss,
+    normals_from_depth, rgb_grad_weight,
+};
 use brush_render::camera::Camera;
 use brush_render::gaussian_splats::{RasterizationMode, Splats, fold_min_scale};
+use brush_render::kernels::camera_model::CameraModel;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
-use brush_render_bwd::{DeferredShGrad, render_splat_features, render_splats_for_training};
+// bwd crate dissolved into brush-render/src/bwd/ (upstream #517).
+use brush_render::bwd::{DeferredShGrad, render_splat_features, render_splats_for_training};
 use burn::{
-    lr_scheduler::{
-        LrScheduler,
-        exponential::{ExponentialLrScheduler, ExponentialLrSchedulerConfig},
-    },
     module::{AutodiffModule, Param, ParamId},
-    optim::{GradientsParams, Optimizer, adaptor::OptimizerAdaptor, record::AdaptorRecord},
+    optim::GradientsParams,
     tensor::{
         Bool, Device, Distribution, Gradients, IndexingUpdateOp, Int, Tensor, TensorData,
         activation::sigmoid, s,
     },
 };
 
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashSet;
 use rand::SeedableRng;
 use tracing::{Instrument, trace_span};
+
+/// Exponential learning-rate schedule: `lr(n) = initial_lr · gamma^n`, advanced
+/// one step per `step()`. A behaviour-exact local replica of burn's
+/// `ExponentialLrScheduler` (whose `Config::init()` returns a `ModuleLrScheduler`
+/// under burn 0.22, no longer the raw scalar scheduler we need). Seeding
+/// `previous_lr = initial_lr / gamma` makes the first `step()` return
+/// `initial_lr`, exactly as burn's `build()` does.
+#[derive(Clone, Copy, Debug)]
+struct ExpLrScheduler {
+    previous_lr: f64,
+    gamma: f64,
+}
+
+impl ExpLrScheduler {
+    fn new(initial_lr: f64, gamma: f64) -> Self {
+        // burn's ExponentialLrSchedulerConfig::build() rejects these ranges; the
+        // local replica must keep the same fail-fast guarantee (a mis-set
+        // lr_*_end > lr_* yields gamma > 1, i.e. a GROWING lr, silently).
+        assert!(
+            initial_lr > 0.0,
+            "ExpLrScheduler initial_lr must be > 0, got {initial_lr}"
+        );
+        assert!(
+            gamma > 0.0 && gamma <= 1.0,
+            "ExpLrScheduler gamma must be in (0, 1], got {gamma}"
+        );
+        Self {
+            previous_lr: initial_lr / gamma,
+            gamma,
+        }
+    }
+
+    fn step(&mut self) -> f64 {
+        self.previous_lr *= self.gamma;
+        self.previous_lr
+    }
+}
 
 /// Default robust-AABB percentile, used for the one-time initial/LOD bounds by
 /// external callers. The per-refine bounds recompute inside the trainer uses the
@@ -49,7 +91,36 @@ const MIN_SCALE_FACTOR: f32 = 0.1;
 /// contributes roughly this many views to the per-gaussian edge accumulator.
 const EDGE_MIN_VIEW_SAMPLES: u32 = 10;
 
-type OptimizerType = OptimizerAdaptor<AdamScaled, Splats>;
+/// The three per-parameter Adam states of a [`Splats`] module, owned directly
+/// so the trainer can update LR scaling every step and surgically edit the
+/// momentum tensors during refine — all GPU-side, no record round-trips. burn
+/// 0.22 dropped the `SimpleOptimizer`/`OptimizerAdaptor` machinery our old
+/// `AdamScaled` rode; this hand-rolled owner replaces it (upstream #517 design).
+pub(crate) struct SplatOptim {
+    adam: AdamScaled,
+    transforms: AdamState<2>,
+    sh_coeffs: AdamState<3>,
+    opacities: AdamState<1>,
+}
+
+/// Step one parameter: pull its gradient, run Adam on the inner
+/// (autodiff-free) tensor, and re-wrap tracking. Parameters without a
+/// gradient this step are left untouched.
+fn step_param<const D: usize>(
+    adam: &AdamScaled,
+    lr: f64,
+    param: Param<Tensor<D>>,
+    state: &mut AdamState<D>,
+    grads: &mut Gradients,
+) -> Param<Tensor<D>> {
+    param.map(|t| {
+        let Some(grad) = t.grad_remove(grads) else {
+            return t;
+        };
+        let stepped = adam.step(lr, t.inner(), &grad, state);
+        Tensor::from_inner(stepped).require_grad()
+    })
+}
 
 #[cfg(all(
     feature = "native-msl",
@@ -78,10 +149,9 @@ fn sparse_sh_adam_requested() -> bool {
     target_arch = "aarch64",
     not(target_family = "wasm")
 ))]
-fn can_defer_sh_grad(optimizer: &OptimizerType, splats: &Splats) -> bool {
+fn can_defer_sh_grad(optimizer: &SplatOptim, splats: &Splats) -> bool {
     if !sparse_sh_adam_requested()
         || cfg!(feature = "debug-validation")
-        || optimizer.has_gradient_clipping()
         || !splats.sh_coeffs.val().is_require_grad()
         || splats.sh_coeffs.val().is_distributed()
     {
@@ -92,11 +162,12 @@ fn can_defer_sh_grad(optimizer: &OptimizerType, splats: &Splats) -> bool {
     if !crate::sh_adam::sparse_sh_adam_supported(&param) {
         return false;
     }
-    let Some(record) = optimizer.to_record().remove(&splats.sh_coeffs.id) else {
-        return false;
-    };
-    let state: AdamState<3> = record.into_state();
-    optimizer.optim().sparse_sh_compatible(&param, &state)
+    // AdamScaled has no gradient clipping, so the only gate is state
+    // compatibility (which is false until sh_coeffs has taken its first step and
+    // its momentum is populated).
+    optimizer
+        .adam
+        .sparse_sh_compatible(&param, &optimizer.sh_coeffs)
 }
 
 #[cfg(not(all(
@@ -105,16 +176,16 @@ fn can_defer_sh_grad(optimizer: &OptimizerType, splats: &Splats) -> bool {
     target_arch = "aarch64",
     not(target_family = "wasm")
 )))]
-fn can_defer_sh_grad(_optimizer: &OptimizerType, _splats: &Splats) -> bool {
+fn can_defer_sh_grad(_optimizer: &SplatOptim, _splats: &Splats) -> bool {
     false
 }
 
 pub struct SplatTrainer {
     config: TrainConfig,
-    sched_mean: ExponentialLrScheduler,
-    sched_scale: ExponentialLrScheduler,
+    sched_mean: ExpLrScheduler,
+    sched_scale: ExpLrScheduler,
     refine_record: Option<RefineRecord>,
-    optim: Option<OptimizerType>,
+    optim: Option<SplatOptim>,
     /// Optional per-view appearance compensation (bilateral grid / PPISP).
     /// Lives on the inner backend between steps, like the splats.
     appearance: Option<AppearanceTrainState>,
@@ -123,6 +194,8 @@ pub struct SplatTrainer {
     step_count: u32,
     max_sh_degree: u32,
     rng: rand::rngs::StdRng,
+    /// Run seed, kept so the one-time RANSAC plane extraction is deterministic.
+    seed: u64,
     /// Per-train-view (world center, focal in px at native res) for the
     /// Mip-Splatting 3D filter. Empty disables it. The floor itself lives on
     /// the splats (recomputed at each refine), not here.
@@ -130,16 +203,34 @@ pub struct SplatTrainer {
     /// `DiG` feature-training state; created lazily on the first batch that
     /// carries feature maps.
     dig: Option<DigTrainState>,
+    /// TIDI-GS floater-suppression state (learned importance `ω` + persistent
+    /// visibility / gradient-EMA / birth-iter accumulators). Created lazily on
+    /// the first step when `--tidi-prune` is set; `None` (and inert) otherwise.
+    tidi: Option<TidiState>,
+    /// Static distance-to-cloud grid for the depth-coupled opacity regularizer
+    /// (`--depth-opacity-reg-weight`). Built ONCE from the seed point cloud at
+    /// training start (see `train_stream`), carried across LOD boundaries, and
+    /// `None` (inert) when the regularizer is off or there is no seed cloud.
+    opacity_reg_grid: Option<CloudDistanceGrid>,
+    /// RANSAC planes extracted ONCE from the seed cloud (shared infra for the
+    /// plane-gated distance field, FIX 1, and the co-planarity constraint, FIX
+    /// 2). `None` unless `--plane-gate` or `--plane-coplanarity-weight` is set.
+    /// Cheap + device-independent, so it carries across LOD boundaries verbatim.
+    plane_set: Option<PlaneSet>,
+    /// Static distance-to-cloud grid for the hard cloud-distance prune
+    /// (`--cloud-prune`). Built ONCE from the seed cloud at training start,
+    /// ALWAYS point-only (planes = `None`) — the prune must not use the
+    /// plane-augmented distance (a plane shields wall-perpendicular floaters), so
+    /// this is a SEPARATE grid from `opacity_reg_grid` even when `--plane-gate` is
+    /// on. Carried across LOD boundaries; `None` (inert) when `--cloud-prune` is
+    /// off or there is no seed cloud.
+    cloud_prune_grid: Option<CloudDistanceGrid>,
     #[cfg(not(target_family = "wasm"))]
     lpips: Option<lpips::LpipsModel>,
 }
 
 fn inv_sigmoid(x: Tensor<1>) -> Tensor<1> {
     (x.clone() / (1.0f32 - x)).log()
-}
-
-fn create_optimizer_from_config() -> OptimizerType {
-    AdamScaledConfig::new().with_epsilon(1e-15).init()
 }
 
 #[cfg(all(
@@ -149,27 +240,30 @@ fn create_optimizer_from_config() -> OptimizerType {
     not(target_family = "wasm")
 ))]
 fn step_sh_coeffs(
-    optimizer: &mut OptimizerType,
+    optimizer: &mut SplatOptim,
     mut splats: Splats,
     grads: &mut Gradients,
     deferred: Option<DeferredShGrad>,
     learning_rate: f64,
 ) -> Splats {
     let Some(deferred) = deferred else {
-        let grad_coeff = GradientsParams::from_params(grads, &splats, &[splats.sh_coeffs.id]);
-        return optimizer.step(learning_rate, splats, grad_coeff);
+        splats.sh_coeffs = step_param(
+            &optimizer.adam,
+            learning_rate,
+            splats.sh_coeffs,
+            &mut optimizer.sh_coeffs,
+            grads,
+        );
+        return splats;
     };
 
-    use brush_render::burn_glue::{detach_autodiff, lift_to_autodiff};
-    let param_id = splats.sh_coeffs.id;
+    use brush_render::burn_glue::detach_autodiff;
     let param = detach_autodiff(splats.sh_coeffs.val());
-    let mut record = optimizer.to_record();
-    let state: AdamState<3> = record
-        .remove(&param_id)
-        .expect("deferred SH gradient requires initialized optimizer state")
-        .into_state();
+    // Take the SH state out by value for the consuming `step_sparse_sh`, then
+    // write the returned state back.
+    let state = std::mem::replace(&mut optimizer.sh_coeffs, AdamState::new(None, false));
     assert!(
-        optimizer.optim().sparse_sh_compatible(&param, &state),
+        optimizer.adam.sparse_sh_compatible(&param, &state),
         "deferred SH optimizer state changed after render preflight"
     );
     assert!(
@@ -177,7 +271,7 @@ fn step_sh_coeffs(
         "deferred SH device support changed after render preflight"
     );
 
-    let (param, state) = optimizer.optim().step_sparse_sh(
+    let (param, new_state) = optimizer.adam.step_sparse_sh(
         learning_rate,
         param,
         deferred.render_transforms,
@@ -186,11 +280,14 @@ fn step_sh_coeffs(
         deferred.project_uniforms,
         state,
     );
+    optimizer.sh_coeffs = new_state;
+    // `lift_to_autodiff` went `pub(crate)` in brush-render under #517, so it is
+    // no longer reachable from brush-train. `param` is the freshly-stepped inner
+    // tensor from `step_sparse_sh`; re-lift it with the public
+    // `from_inner(..).require_grad()` idiom — the same re-lift `step_param` uses.
     splats.sh_coeffs = splats
         .sh_coeffs
-        .map(|_| lift_to_autodiff(param).require_grad());
-    record.insert(param_id, AdaptorRecord::from_state(state));
-    *optimizer = create_optimizer_from_config().load_record(record);
+        .map(|_| Tensor::from_inner(param.inner()).require_grad());
     splats
 }
 
@@ -201,8 +298,8 @@ fn step_sh_coeffs(
     not(target_family = "wasm")
 )))]
 fn step_sh_coeffs(
-    optimizer: &mut OptimizerType,
-    splats: Splats,
+    optimizer: &mut SplatOptim,
+    mut splats: Splats,
     grads: &mut Gradients,
     deferred: Option<DeferredShGrad>,
     learning_rate: f64,
@@ -212,8 +309,14 @@ fn step_sh_coeffs(
         "non-native builds must never request deferred SH gradients"
     );
     drop(deferred);
-    let grad_coeff = GradientsParams::from_params(grads, &splats, &[splats.sh_coeffs.id]);
-    optimizer.step(learning_rate, splats, grad_coeff)
+    splats.sh_coeffs = step_param(
+        &optimizer.adam,
+        learning_rate,
+        splats.sh_coeffs,
+        &mut optimizer.sh_coeffs,
+        grads,
+    );
+    splats
 }
 
 pub async fn get_splat_bounds(splats: Splats, percentile: f32) -> BoundingBox {
@@ -242,7 +345,7 @@ impl SplatTrainer {
     ) -> Self {
         let decay =
             (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_train_iters as f64);
-        let lr_mean = ExponentialLrSchedulerConfig::new(config.lr_mean, decay);
+        let lr_mean = ExpLrScheduler::new(config.lr_mean, decay);
 
         // MRNF LR schedule (R1): independent exponential decay for the log-scale
         // parameters, mirroring LFS `_scale_lr_gamma` (mrnf.cpp:425) and the
@@ -256,7 +359,7 @@ impl SplatTrainer {
         } else {
             1.0
         };
-        let lr_scale = ExponentialLrSchedulerConfig::new(config.lr_scale, scale_decay);
+        let lr_scale = ExpLrScheduler::new(config.lr_scale, scale_decay);
 
         let ssim_enabled = config.ssim_weight > 0.0;
 
@@ -271,8 +374,8 @@ impl SplatTrainer {
 
         Self {
             config,
-            sched_mean: lr_mean.init().expect("Mean lr schedule must be valid."),
-            sched_scale: lr_scale.init().expect("Scale lr schedule must be valid."),
+            sched_mean: lr_mean,
+            sched_scale: lr_scale,
             optim: None,
             appearance: None,
             refine_record: None,
@@ -281,8 +384,13 @@ impl SplatTrainer {
             step_count: 0,
             max_sh_degree: 0,
             rng: rand::rngs::StdRng::seed_from_u64(seed),
+            seed,
             view_cams: Vec::new(),
             dig: None,
+            tidi: None,
+            opacity_reg_grid: None,
+            plane_set: None,
+            cloud_prune_grid: None,
             #[cfg(not(target_family = "wasm"))]
             lpips,
         }
@@ -360,6 +468,127 @@ impl SplatTrainer {
         self.appearance = appearance;
     }
 
+    /// Build the static distance-to-cloud grid for the depth-coupled opacity
+    /// regularizer from the seed point cloud (`cloud_means` = the seed splats'
+    /// centres — the measured surface the run is seeded from). Called ONCE at
+    /// training start when `--depth-opacity-reg-weight > 0`; the grid is
+    /// view-independent, so it never needs rebuilding as training proceeds.
+    /// A no-op (leaves the grid `None`, regularizer inert) when the cloud is
+    /// empty — e.g. a random-init run with no seed points.
+    pub async fn init_opacity_reg_grid(&mut self, cloud_means: Tensor<2>, device: &Device) {
+        self.init_plane_priors(cloud_means, device).await;
+    }
+
+    /// Build the seed-cloud priors ONCE at training start: the distance-to-cloud
+    /// grid (when `--depth-opacity-reg-weight > 0`) and the RANSAC planes (when
+    /// `--plane-gate` or `--plane-coplanarity-weight` is set). When `--plane-gate`
+    /// is on, the extracted planes are baked into the grid's field (FIX 1). The
+    /// planes are also stored on the trainer for the co-planarity constraint (FIX
+    /// 2). All view-independent, so nothing here is rebuilt as training proceeds.
+    pub async fn init_plane_priors(&mut self, cloud_means: Tensor<2>, device: &Device) {
+        let margin = self.config.depth_opacity_reg_margin;
+        let softness = self.config.depth_opacity_reg_softness;
+        let need_planes = self.config.plane_gate || self.config.plane_coplanarity_weight > 0.0;
+
+        // RANSAC planes (shared by both features), extracted once from the cloud.
+        let planes = if need_planes {
+            extract_planes_from_cloud(cloud_means.clone(), self.seed).await
+        } else {
+            None
+        };
+
+        // Hard cloud-distance prune (`--cloud-prune`): its OWN point-only grid,
+        // sized to the prune threshold. ALWAYS point-only (planes = None) even
+        // under --plane-gate — the prune must NOT read the plane-augmented
+        // distance (a plane shields wall-perpendicular floaters). Built here from
+        // a CLONE so the opacity-reg build below can still consume `cloud_means`.
+        if self.config.cloud_prune {
+            let dist = self.config.cloud_prune_dist.max(1e-6);
+            // Softness sizes only the field's accurate/truncation REACH past
+            // `dist` (not the stored on-surface distances); mirror the opacity-reg
+            // proportion (softness = margin/3) so the field is accurate out to
+            // ~1.7·dist and truncates at ~3·dist — both > dist, so a floater at
+            // ANY distance beyond `dist` reads a value > dist. vox = dist/3 keeps
+            // the on-surface quantisation a small fraction of the threshold.
+            let softness = dist / 3.0;
+            self.cloud_prune_grid =
+                CloudDistanceGrid::build(cloud_means.clone(), dist, softness, None, device).await;
+        }
+
+        // Distance-to-cloud grid, plane-augmented only when --plane-gate is set.
+        if self.config.depth_opacity_reg_weight > 0.0 {
+            let plane_slice = if self.config.plane_gate {
+                planes.as_ref().map(|p| p.planes.as_slice())
+            } else {
+                None
+            };
+            self.opacity_reg_grid =
+                CloudDistanceGrid::build(cloud_means, margin, softness, plane_slice, device).await;
+        }
+        self.plane_set = planes;
+    }
+
+    /// Whether the opacity-reg cloud grid is built (for logging).
+    pub fn has_opacity_reg_grid(&self) -> bool {
+        self.opacity_reg_grid.is_some()
+    }
+
+    /// Summary of the extracted planes (for logging): count + inlier fractions,
+    /// or `None` when plane priors are off / no planar structure was found.
+    pub fn plane_summary(&self) -> Option<String> {
+        self.plane_set.as_ref().map(|ps| {
+            let fracs: Vec<String> = ps
+                .planes
+                .iter()
+                .map(|p| format!("{:.1}%", p.inlier_frac * 100.0))
+                .collect();
+            format!(
+                "{} planes (spacing {:.4}, band {:.4}), inliers: [{}]",
+                ps.planes.len(),
+                ps.spacing,
+                ps.threshold,
+                fracs.join(", ")
+            )
+        })
+    }
+
+    /// Move the RANSAC plane set out, to carry across an LOD boundary (the cloud
+    /// never changes, so the planes are reused verbatim rather than recomputed).
+    pub fn take_plane_set(&mut self) -> Option<PlaneSet> {
+        self.plane_set.take()
+    }
+
+    pub fn set_plane_set(&mut self, planes: Option<PlaneSet>) {
+        self.plane_set = planes;
+    }
+
+    /// Move the (static) opacity-reg grid out, to carry across an LOD boundary
+    /// where the trainer is rebuilt. The cloud never changes, so the grid is
+    /// reused verbatim rather than recomputed.
+    pub fn take_opacity_reg_grid(&mut self) -> Option<CloudDistanceGrid> {
+        self.opacity_reg_grid.take()
+    }
+
+    pub fn set_opacity_reg_grid(&mut self, grid: Option<CloudDistanceGrid>) {
+        self.opacity_reg_grid = grid;
+    }
+
+    /// Whether the cloud-prune point-only grid is built (for logging).
+    pub fn has_cloud_prune_grid(&self) -> bool {
+        self.cloud_prune_grid.is_some()
+    }
+
+    /// Move the (static, point-only) cloud-prune grid out, to carry across an LOD
+    /// boundary where the trainer is rebuilt. The seed cloud never changes, so the
+    /// grid is reused verbatim rather than recomputed.
+    pub fn take_cloud_prune_grid(&mut self) -> Option<CloudDistanceGrid> {
+        self.cloud_prune_grid.take()
+    }
+
+    pub fn set_cloud_prune_grid(&mut self, grid: Option<CloudDistanceGrid>) {
+        self.cloud_prune_grid = grid;
+    }
+
     /// Magnitude summary of the learned appearance parameters (`None` when
     /// appearance compensation is disabled).
     pub async fn appearance_stats(&self) -> Option<String> {
@@ -420,7 +649,13 @@ impl SplatTrainer {
     }
 
     pub async fn step(&mut self, batch: SceneBatch, splats: Splats) -> (Splats, TrainStepStats) {
-        self.step_with_refine_weight(batch, splats, true).await
+        // `step_count` is this trainer's own count, which equals the global
+        // iteration for a run that starts at 0. The stream path passes the true
+        // global iteration instead, so `--depth-normal-start-iter` behaves
+        // correctly on a resume.
+        let iter = self.step_count;
+        self.step_with_refine_weight(batch, splats, true, iter)
+            .await
     }
 
     /// Whether the refinement-only gradient statistic is still consumed by
@@ -621,6 +856,7 @@ impl SplatTrainer {
         batch: SceneBatch,
         splats: Splats,
         compute_refine_weight: bool,
+        global_iter: u32,
     ) -> (Splats, TrainStepStats) {
         let mut splats = splats;
 
@@ -634,6 +870,17 @@ impl SplatTrainer {
         let camera = batch.camera;
 
         let device = splats.device();
+
+        // TIDI-GS: allocate the floater-suppression state on the first step when
+        // EITHER the photometric (`--tidi-prune`) OR the depth
+        // (`--tidi-depth-prune`) path is enabled. `ω` is created on the autodiff
+        // device (it is a leaf that gets a photometric gradient each step, unused
+        // by the depth path); the counts are kept in lockstep with the splats
+        // through `keep`/`split` at refine. With NEITHER flag set the state is
+        // never allocated, so the whole family stays byte-inert.
+        if (self.config.tidi_prune || self.config.tidi_depth_prune) && self.tidi.is_none() {
+            self.tidi = Some(TidiState::new(splats.num_splats(), global_iter, &device));
+        }
         let has_alpha = batch.has_alpha;
         // GT lives on the GPU as packed `[H, W]` u32 (RGBA u8). All mixing
         // (bg compositing, alpha matching, mask) is folded into the loss
@@ -672,9 +919,45 @@ impl SplatTrainer {
         let (mut grads, visible, num_visible, loss_inner, deferred_sh_grad) = {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
-            let render_input = splats.clone();
-            let use_depth = batch.depth.is_some() && self.config.depth_loss_weight > 0.0;
-            let raster_mode = if use_depth {
+            //
+            // TIDI-GS learned-importance gate: when enabled, the render sees each
+            // opacity multiplied by `σ(ω)` (paper signal (c)). This is what gives
+            // `ω` a photometric gradient — a Gaussian that matters to the image
+            // is pushed to `σ(ω)→1`, while the L1 sparsity term lets idle ones
+            // decay toward the candidate pool. The gate maps the raw opacity
+            // through `logit(σ(raw)·σ(ω))`, so grad still flows to the ORIGINAL
+            // opacity leaf (queried by id below); `ω` is exported nowhere. The
+            // gate starts near-identity (`σ(ω)≈0.998`), so enabling TIDI barely
+            // perturbs the scene, and it is skipped entirely when `--tidi-prune`
+            // is off.
+            let render_input = match self.tidi.as_ref() {
+                Some(tidi) if self.config.tidi_prune => {
+                    let mut ri = splats.clone();
+                    ri.raw_opacities = ri.raw_opacities.map(|ro| tidi.gate_opacity(ro));
+                    ri
+                }
+                _ => splats.clone(),
+            };
+            let eff_depth_weight = self.config.depth_weight_at(global_iter);
+            let use_depth = batch.depth.is_some() && eff_depth_weight > 0.0;
+            // Geometry-prior terms (all inert at their 0.0 defaults, gated
+            // exactly like `use_depth`, so a run that does not pass the flags
+            // takes the same path it always did).
+            let use_prior_normal = self.config.normal_loss_weight > 0.0 && batch.normal.is_some();
+            // 2DGS gates this term at 7k of 30k. Gating here rather than just
+            // zeroing the weight also skips the depth channel and the normal
+            // render pass entirely before the start iteration, so the gate costs
+            // nothing instead of rendering work that gets multiplied by zero.
+            let dn_started = self.config.depth_normal_start_iter == 0
+                || global_iter >= self.config.depth_normal_start_iter;
+            let use_dn = self.config.depth_normal_weight > 0.0 && dn_started;
+            let use_smooth = self.config.normal_smooth_weight > 0.0;
+            let use_normal_render = use_prior_normal || use_dn || use_smooth;
+            let use_flatten = self.config.flatten_loss_weight > 0.0;
+            // The depth/normal consistency term reads the rendered depth, so it
+            // needs the depth channel even without any gt depth map.
+            let has_depth_channel = use_depth || use_dn;
+            let raster_mode = if has_depth_channel {
                 RasterizationMode::RgbaAndDepth
             } else {
                 RasterizationMode::Rgba
@@ -698,13 +981,14 @@ impl SplatTrainer {
             //
             // Appearance correction (PPISP / bilateral grid) models only the
             // color/alpha response and its ISP kernel asserts a 3- or 4-channel
-            // input. When depth loss is active the render carries an extra
+            // input. When a depth-consuming term is active (depth loss, or the
+            // depth/normal consistency term) the render carries an extra
             // depth channel (index 4) that is geometry, not color: it must
             // bypass the correction. Split the RGBA channels off, correct
             // those, then re-attach the untouched depth so `pred_image` keeps
             // its [H, W, 5] layout for the depth-loss term below.
             let pred_image = match &active_appearance {
-                Some(active) if use_depth => {
+                Some(active) if has_depth_channel => {
                     let rgba = diff_out.img.clone().slice(s![.., .., 0..4]);
                     let depth = diff_out.img.slice(s![.., .., 4..5]);
                     Tensor::cat(vec![active.apply(rgba), depth], 2)
@@ -778,6 +1062,18 @@ impl SplatTrainer {
                 && let Some(reg) = active.reg_loss()
             {
                 loss = loss + reg;
+            }
+
+            // TIDI-GS: L1 sparsity on the learned importance `σ(ω)`. Balances
+            // against the photometric gradient the opacity gate feeds `ω`, so
+            // contributing Gaussians settle at `σ(ω)→1` and persistently idle
+            // ones decay toward `τ_ω`. Weight 0 leaves `ω` on the photometric
+            // gradient only (a 3-signal gate); inert when `--tidi-prune` is off.
+            if self.config.tidi_prune
+                && self.config.tidi_importance_reg > 0.0
+                && let Some(tidi) = self.tidi.as_ref()
+            {
+                loss = loss + tidi.sparsity_loss() * self.config.tidi_importance_reg;
             }
 
             // DiG: DINO feature MSE on a rendered feature image (geometry
@@ -880,7 +1176,216 @@ impl SplatTrainer {
                 let alpha = pred_image.clone().slice(s![.., .., 3..4]).detach();
                 let expected_depth =
                     (accumulated_depth / alpha.clamp_min(1e-10)).reshape([img_h, img_w]);
-                loss = loss + depth_loss(expected_depth, gt_depth) * self.config.depth_loss_weight;
+                // DN-Splatter gradient-aware weighting: build a per-pixel weight
+                // from the GT RGB image (same source `image_loss` consumes),
+                // lifted onto the AD graph as a constant like the LPIPS path, so
+                // it grows no tape. Composes multiplicatively with the annealed
+                // scalar weight outside. Only materialises the f32 GT when on.
+                let pixel_weight = if self.config.depth_grad_aware {
+                    let gt_rgb: Tensor<3> = Tensor::from_inner(brush_loss::unpack_gt_rgb(
+                        gt_packed.clone(),
+                        composite_bg,
+                    ));
+                    Some(rgb_grad_weight(gt_rgb, self.config.depth_grad_sigma))
+                } else {
+                    None
+                };
+                loss = loss + depth_loss(expected_depth, gt_depth, pixel_weight) * eff_depth_weight;
+            }
+
+            // Depth-coupled opacity regularizer (3D distance-to-cloud gate). For
+            // every Gaussian whose centre sits FAR (> margin) from the seed/LiDAR
+            // point cloud in 3D, add a per-step penalty whose ONLY gradient path
+            // is the activated opacity, so floaters in empty space fade out
+            // smoothly (their colour redistributes into on-surface splats) instead
+            // of being hard-deleted (which orphans that colour and leaves a black
+            // halo). Positions/field detached. VIEW-INDEPENDENT — no per-frame
+            // depth or camera projection, just the static cloud grid (built once
+            // from the seed cloud in `train_stream`); this replaces the old
+            // per-view z-buffer residual, which leaked background through
+            // foreground gaps and marked surface splats as floating. Gated on
+            // `--depth-opacity-reg-start-iter` so densification can finish
+            // backfilling opacity-faded regions first. Inert (no lookup, no term)
+            // when the weight is 0 or before the start iter.
+            if opacity_reg_active(
+                global_iter,
+                self.config.depth_opacity_reg_start_iter,
+                self.config.depth_opacity_reg_weight,
+            ) {
+                match &self.opacity_reg_grid {
+                    Some(grid) => {
+                        let term = crate::tidi::depth_opacity_reg_loss(
+                            splats.raw_opacities.val(),
+                            splats.means(),
+                            grid,
+                            self.config.depth_opacity_reg_margin,
+                            self.config.depth_opacity_reg_softness,
+                        );
+                        loss = loss + term * self.config.depth_opacity_reg_weight;
+                    }
+                    None => warn_depth_opacity_reg_no_cloud(),
+                }
+            }
+
+            // Co-planarity constraint (FIX 2, `--plane-coplanarity-weight`): for
+            // every Gaussian assigned to a RANSAC seed-cloud plane, pull its centre
+            // onto the plane and flatten it against the plane. Unlike the opacity
+            // gate above this is a real GEOMETRY gradient (position + scale +
+            // rotation), so it directly removes the photometric rank deficiency on
+            // featureless walls. Assignment is detached; only means/scales/rotations
+            // carry gradient. Inert (no term) when the weight is 0 or no planes were
+            // extracted.
+            if self.config.plane_coplanarity_weight > 0.0
+                && let Some(planes) = &self.plane_set
+            {
+                let assign = if self.config.plane_coplanarity_assign_dist > 0.0 {
+                    self.config.plane_coplanarity_assign_dist
+                } else {
+                    self.config.depth_opacity_reg_margin
+                };
+                if let Some(term) = plane_coplanarity_loss(
+                    splats.means(),
+                    splats.rotations(),
+                    splats.scales(),
+                    planes,
+                    assign,
+                    &device,
+                ) {
+                    loss = loss + term * self.config.plane_coplanarity_weight;
+                }
+            }
+
+            // Geometry priors: the normal half of DN-Splatter / PlanarGS.
+            //
+            // The rendered normal image reuses `render_splat_features`, the same
+            // vehicle the DiG path uses: it detaches geometry internally and
+            // back-props into the FEATURE values, so feeding it per-splat
+            // normals derived from the quaternions makes this loss rotate
+            // gaussians. No new kernel is involved.
+            if use_normal_render {
+                let (t_fold, o_fold) = match &splats.min_scale {
+                    Some(f) => fold_min_scale(
+                        splats.transforms.val(),
+                        splats.raw_opacities.val(),
+                        f.clone(),
+                    ),
+                    None => (splats.transforms.val(), splats.raw_opacities.val()),
+                };
+                let render_mode = if splats.render_mip {
+                    brush_render::gaussian_splats::SplatRenderMode::Mip
+                } else {
+                    brush_render::gaussian_splats::SplatRenderMode::Default
+                };
+                let normals = splat_normals(t_fold.clone(), camera.position);
+                let normal_img =
+                    render_splat_features(t_fold, o_fold, normals, &camera, img_size, render_mode)
+                        .instrument(trace_span!("Normal forward"))
+                        .await;
+
+                // Same detached alpha normalization as the DiG and depth paths:
+                // the normal terms must not be able to lower their error by
+                // changing transparency.
+                let normal_alpha = normal_img.clone().slice(s![.., .., 3..4]).detach();
+                let n_world =
+                    normal_img.slice(s![.., .., 0..3]) / normal_alpha.clone().clamp_min(1e-10);
+                let n_len = n_world
+                    .clone()
+                    .powi_scalar(2)
+                    .sum_dim(2)
+                    .sqrt()
+                    .clamp_min(1e-6);
+                let n_world = n_world / n_len;
+
+                // World -> camera. Right-multiplying row vectors by Rᵀ is the
+                // same as left-multiplying column vectors by R.
+                let rot = camera.world_to_local().matrix3;
+                let r_t: Tensor<2> = Tensor::<1>::from_floats(
+                    [
+                        rot.x_axis.x,
+                        rot.x_axis.y,
+                        rot.x_axis.z,
+                        rot.y_axis.x,
+                        rot.y_axis.y,
+                        rot.y_axis.z,
+                        rot.z_axis.x,
+                        rot.z_axis.y,
+                        rot.z_axis.z,
+                    ],
+                    &device,
+                )
+                .reshape([3, 3]);
+                let n_cam = n_world
+                    .reshape([(img_h * img_w) as i32, 3])
+                    .matmul(r_t)
+                    .reshape([img_h, img_w, 3]);
+
+                if use_prior_normal && let Some(normal_data) = &batch.normal {
+                    let gt_normal: Tensor<3> = Tensor::from_data(normal_data.clone(), &device);
+                    loss = loss
+                        + normal_loss(n_cam.clone(), gt_normal) * self.config.normal_loss_weight;
+                }
+
+                // TV smoothness on the rendered normal image. Needs no prior
+                // data and no depth channel, so it is deliberately NOT gated on
+                // an iteration: DN-Splatter runs its normal terms ungated.
+                if use_smooth {
+                    loss = loss
+                        + normal_smooth_loss(n_cam.clone(), normal_alpha.clone())
+                            * self.config.normal_smooth_weight;
+                }
+
+                if use_dn {
+                    // Unprojection is pinhole-only for now; our fisheye-split
+                    // path is KB4, interior cube faces are Pinhole. Skip with a
+                    // warning rather than silently supervising with wrong math.
+                    if matches!(camera.camera_model, CameraModel::Pinhole) {
+                        let accumulated_depth = pred_image.clone().slice(s![.., .., 4..5]);
+                        let alpha = pred_image.clone().slice(s![.., .., 3..4]).detach();
+                        let expected_depth =
+                            (accumulated_depth / alpha.clamp_min(1e-10)).reshape([img_h, img_w]);
+                        let focal = camera.focal(img_size);
+                        let center = camera.center(img_size);
+                        let n_from_depth = normals_from_depth(
+                            expected_depth,
+                            focal.x,
+                            focal.y,
+                            center.x,
+                            center.y,
+                        );
+                        loss = loss
+                            + depth_normal_loss(n_from_depth, n_cam, normal_alpha)
+                                * self.config.depth_normal_weight;
+                    } else {
+                        warn_depth_normal_needs_pinhole();
+                    }
+                }
+            }
+
+            // Flattening pressure (PlanarGS `L_s`): the mean smallest activated
+            // scale, on the RAW pre-3D-filter scales. The Mip filter floors the
+            // RENDERED thinness; the penalty deliberately acts on the learned
+            // scale so exports keep the thin axis and we do not fight the
+            // anti-aliasing floor. MRNF's prune keys on `scale_max`, so there is
+            // no interaction with it.
+            if use_flatten {
+                let scales = splats.transforms.val().slice(s![.., 7..10]).exp();
+                loss = loss + scales.min_dim(1).mean() * self.config.flatten_loss_weight;
+            }
+
+            // Scale-explosion + anti-needle regularizers (Stipple, arXiv:2608.00931).
+            // Differentiable PREVENTION of the MRNF scale blow-up that our
+            // prune-side guards only remove after the fact. Both act on the RAW
+            // pre-3D-filter scales, like the flatten term above. Default-off.
+            if self.config.scale_reg_weight > 0.0 {
+                let scales = splats.transforms.val().slice(s![.., 7..10]).exp();
+                loss = loss
+                    + crate::tidi::scale_reg_loss(scales, self.config.scale_reg_threshold)
+                        * self.config.scale_reg_weight;
+            }
+            if self.config.anti_needle_weight > 0.0 {
+                let log_scales = splats.transforms.val().slice(s![.., 7..10]);
+                loss = loss
+                    + crate::tidi::anti_needle_loss(log_scales) * self.config.anti_needle_weight;
             }
 
             // Strip the autodiff graph off the loss so consumers can read the
@@ -952,6 +1457,28 @@ impl SplatTrainer {
             )
             .await;
 
+            // TIDI depth / LiDAR-residual prune: fold THIS view's depth residual
+            // into the persistent float/valid counters (`TidiState::accumulate_depth`).
+            // Deliberately independent of `--depth-loss-weight` — it only reuses
+            // the same per-frame depth tensor the depth loss consumes, not the
+            // loss. No-op when the batch carries no depth (nerfstudio
+            // `depth: None`); a run that set `--tidi-depth-prune` with no depth at
+            // all warns once at prune time and stays inert.
+            if self.config.tidi_depth_prune
+                && let Some(depth_data) = &batch.depth
+            {
+                let margin = self.config.tidi_depth_margin;
+                if let Some(tidi) = self.tidi.as_mut() {
+                    tidi.accumulate_depth(
+                        splats.means(),
+                        depth_data.clone(),
+                        &camera,
+                        img_size,
+                        margin,
+                    );
+                }
+            }
+
             (
                 grads,
                 visible,
@@ -961,8 +1488,8 @@ impl SplatTrainer {
             )
         };
 
-        // OptimizerAdaptor strips autodiff before calling SimpleOptimizer::step,
-        // so optimizer state (scaling, momentum) lives on the inner device.
+        // The optimizer strips autodiff before stepping, so optimizer state
+        // (scaling, momentum) lives on the inner device.
         let opt_device = device.clone().inner();
         let optimizer =
             self.optim.get_or_insert_with(|| {
@@ -978,14 +1505,12 @@ impl SplatTrainer {
                 let sh_lr_scales = Tensor::<1>::from_floats(scales.as_slice(), &opt_device)
                     .reshape([1, num_coeffs as i32, 1]);
 
-                create_optimizer_from_config().load_record(HashMap::from([(
-                    splats.sh_coeffs.id,
-                    AdaptorRecord::from_state(AdamState {
-                        momentum: None,
-                        scaling: Some(sh_lr_scales),
-                        reduce_moment_2: true,
-                    }),
-                )]))
+                SplatOptim {
+                    adam: AdamScaled::new(1e-15),
+                    transforms: AdamState::new(None, false),
+                    sh_coeffs: AdamState::new(Some(sh_lr_scales), true),
+                    opacities: AdamState::new(None, false),
+                }
             });
 
         let lr_mean = self.sched_mean.step() * median_scale as f64;
@@ -995,9 +1520,9 @@ impl SplatTrainer {
 
         // Update per-component LR scaling for the transforms param.
         // transforms layout: means(3) + rotations(4) + log_scales(3)
-        // We use base_lr=1.0 and encode actual LRs in the scaling tensor.
-        //
-        // TODO: Ideally we don't have to do this every step... but idk as long as mean is on a schedule not much to do!
+        // We use base_lr=1.0 and encode actual LRs in the scaling tensor. Adam
+        // momentum persists across steps in `optimizer.transforms.momentum`; only
+        // the scaling tensor is swapped here to follow the LR schedules.
         {
             let lr_values: [f32; 10] = [
                 lr_mean as f32,
@@ -1011,27 +1536,19 @@ impl SplatTrainer {
                 lr_scale as f32,
                 lr_scale as f32,
             ];
-            let transform_scaling =
-                Tensor::<1>::from_floats(lr_values.as_slice(), &opt_device).reshape([1, 10]);
-            let mut record = optimizer.to_record();
-            let existing = record.remove(&splats.transforms.id);
-            let momentum = existing.and_then(|r| r.into_state::<2>().momentum);
-            record.insert(
-                splats.transforms.id,
-                AdaptorRecord::from_state(AdamState {
-                    momentum,
-                    scaling: Some(transform_scaling),
-                    reduce_moment_2: false,
-                }),
-            );
-            *optimizer = create_optimizer_from_config().load_record(record);
+            optimizer.transforms.scaling =
+                Some(Tensor::<1>::from_floats(lr_values.as_slice(), &opt_device).reshape([1, 10]));
         }
 
         splats = trace_span!("Optimizer step").in_scope(|| {
-            splats = trace_span!("Transforms step").in_scope(|| {
-                let grad_transforms =
-                    GradientsParams::from_params(&mut grads, &splats, &[splats.transforms.id]);
-                optimizer.step(1.0, splats, grad_transforms)
+            splats.transforms = trace_span!("Transforms step").in_scope(|| {
+                step_param(
+                    &optimizer.adam,
+                    1.0,
+                    splats.transforms,
+                    &mut optimizer.transforms,
+                    &mut grads,
+                )
             });
             splats = trace_span!("SH Coeffs step").in_scope(|| {
                 step_sh_coeffs(
@@ -1042,10 +1559,14 @@ impl SplatTrainer {
                     self.config.lr_coeffs_dc,
                 )
             });
-            splats = trace_span!("Opacity step").in_scope(|| {
-                let grad_opac =
-                    GradientsParams::from_params(&mut grads, &splats, &[splats.raw_opacities.id]);
-                optimizer.step(self.config.lr_opac, splats, grad_opac)
+            splats.raw_opacities = trace_span!("Opacity step").in_scope(|| {
+                step_param(
+                    &optimizer.adam,
+                    self.config.lr_opac,
+                    splats.raw_opacities,
+                    &mut optimizer.opacities,
+                    &mut grads,
+                )
             });
             splats
         });
@@ -1080,6 +1601,20 @@ impl SplatTrainer {
                 let grad_mlp =
                     GradientsParams::from_params(&mut grads, &module, &module.mlp_param_ids());
                 dig.module = dig.optim.step(lr, module, grad_mlp);
+            });
+        }
+
+        // TIDI-GS: one Adam step on the learned importance `ω` from the same
+        // backward pass (photometric gate + L1 sparsity). `ω` participates in
+        // every step's graph via the opacity gate ONLY on the photometric path
+        // (`--tidi-prune`), so its grad is present exactly then. Gate the step on
+        // `tidi_prune`: on a depth-only run (`--tidi-depth-prune` alone) the state
+        // exists but `ω` never entered the graph, so there is nothing to step.
+        if self.config.tidi_prune
+            && let Some(tidi) = &mut self.tidi
+        {
+            trace_span!("TIDI importance step").in_scope(|| {
+                tidi.optimize(self.config.tidi_importance_lr, &mut grads);
             });
         }
 
@@ -1258,11 +1793,10 @@ impl SplatTrainer {
 
         // If not refining, update splat to step with gradients applied.
         // Prune dead splats. This ALWAYS happen even if we're not "refining" anymore.
-        let mut record = self
+        let mut optim = self
             .optim
             .take()
-            .expect("Can only refine after optimizer is initialized")
-            .to_record();
+            .expect("Can only refine after optimizer is initialized");
         let alpha_mask = splats.opacities().lower_elem(self.config.min_opacity);
         let scales = splats.scales();
 
@@ -1357,8 +1891,120 @@ impl SplatTrainer {
             prune_mask
         };
 
-        let (mut splats, refiner, pruned_count) =
-            prune_points(splats, &mut record, refiner, prune_mask, self.dig.as_mut()).await;
+        // TIDI-GS floater pruning (opt-in). Every refine window folds this
+        // window's visibility + position-gradient into the persistent
+        // accumulators; on a cleanup cycle (≈ every `--tidi-prune-every` steps,
+        // past the start iter) the isolation-selected floater set is unioned
+        // into `prune_mask`. Built here as ONE combined mask before the single
+        // `prune_points` call, on the pre-prune tensor snapshot, so there is no
+        // double-prune / index invalidation. The four-signal candidate rule is
+        // an AND (see `tidi::select_prune_indices`) and is deliberately NOT
+        // folded into the OR-based geometric culls above — only its final
+        // isolation-selected output joins the union.
+        // Enter when EITHER path is enabled. `accumulate_window` folds the
+        // photometric (visibility + position-gradient) signals and only runs on
+        // the photometric path; the depth path's `float`/`valid` counters are
+        // folded per-step in `step_with_refine_weight`, not here. The prune
+        // cadence + start-iter gate are shared, and `select_prune_mask` internally
+        // runs whichever candidate path(s) `tidi_params` marked active.
+        let prune_mask = if self.config.tidi_prune || self.config.tidi_depth_prune {
+            let params = tidi_params(&self.config);
+            if let Some(tidi) = self.tidi.as_mut() {
+                if self.config.tidi_prune {
+                    tidi.accumulate_window(
+                        refiner.vis_weight.clone(),
+                        refiner.refine_weight_norm.clone(),
+                        self.config.tidi_grad_ema_beta,
+                    );
+                }
+                if tidi.should_prune(
+                    global_iter,
+                    self.config.tidi_prune_start_iter,
+                    self.config.tidi_prune_every,
+                ) {
+                    match tidi
+                        .select_prune_mask(
+                            &params,
+                            global_iter,
+                            splats.opacities(),
+                            splats.means(),
+                            splats.sh_coeffs.val(),
+                            splats.scales(),
+                            &device,
+                        )
+                        .await
+                    {
+                        Some(tidi_mask) => prune_mask.bool_or(tidi_mask),
+                        None => prune_mask,
+                    }
+                } else {
+                    prune_mask
+                }
+            } else {
+                prune_mask
+            }
+        } else {
+            prune_mask
+        };
+
+        // Hard cloud-distance prune (`--cloud-prune`): union any Gaussian whose
+        // LIVE centre is farther than `--cloud-prune-dist` from the nearest
+        // seed/LiDAR cloud point (a floater in empty space) into the prune mask.
+        // View-INDEPENDENT: it gathers the CURRENT means against the STATIC
+        // point-only distance grid built once at init (no camera, no z-buffer,
+        // no see-through), so a Gaussian that drifted off the surface since the
+        // last refine is caught this cycle. Independent of the TIDI paths above;
+        // built here on the same pre-prune snapshot so the single `prune_points`
+        // call reindexes everything at once. Inert (no lookup) when the flag is
+        // off, before the start iter, or when no seed cloud built a grid.
+        let prune_mask =
+            if self.config.cloud_prune && global_iter >= self.config.cloud_prune_start_iter {
+                match &self.cloud_prune_grid {
+                    Some(grid) => {
+                        // Gather each LIVE mean's distance-to-cloud (out-of-grid /
+                        // non-finite already forced to +inf), read it to the host,
+                        // and build the far mask the IDENTICAL way `select_prune_mask`
+                        // builds its prune output: a host 0/1 float uploaded with
+                        // `from_data(.., device)` on `device` (= `splats.device()`,
+                        // the same device every other prune mask here is built on)
+                        // then `greater_elem(0.5)`. That makes `far` the same Bool
+                        // kind as `prune_mask`, so `bool_or` cannot trip a
+                        // Bool(U32)/Bool(Native) TypeMismatch — the far mask is
+                        // constructed by the exact proven idiom, not a new one. The
+                        // `[N]` distance readback is the same order as the readbacks
+                        // the TIDI prune already does each cleanup.
+                        let dists: Vec<f32> = grid
+                            .gather_prune_distances(splats.means())
+                            .into_data_async()
+                            .await
+                            .expect("cloud-prune distance readback")
+                            .into_vec()
+                            .expect("f32");
+                        let cp = self.config.cloud_prune_dist;
+                        let n = dists.len();
+                        let far_f: Vec<f32> = dists
+                            .iter()
+                            .map(|&d| if d > cp { 1.0 } else { 0.0 })
+                            .collect();
+                        let far = Tensor::<1>::from_data(TensorData::new(far_f, [n]), &device)
+                            .greater_elem(0.5);
+                        prune_mask.bool_or(far)
+                    }
+                    None => prune_mask,
+                }
+            } else {
+                prune_mask
+            };
+
+        let (mut splats, refiner, pruned_count) = prune_points(
+            splats,
+            &mut optim,
+            refiner,
+            prune_mask,
+            self.dig.as_mut(),
+            self.tidi.as_mut(),
+        )
+        .await;
 
         // Edge-guidance factor (MRNF port, delta #4), aligned to the post-prune
         // splat order. Multiplies into both the dead-slot replacement and the
@@ -1375,8 +2021,14 @@ impl SplatTrainer {
 
         let mut split_inds = HashSet::new();
 
-        // Always replace dead gaussians, so that the pruned budget is reused.
-        if pruned_count > 0 {
+        // Replace dead gaussians so the pruned budget is reused -- unless
+        // `--stop-replace-iter` has disabled backfill, in which case prune keeps
+        // culling (notably the over-stretched splats caught by the max-scale
+        // term) but the count is allowed to decay rather than being held at cap
+        // by opacity-diluting splits.
+        let replace_stopped =
+            self.config.stop_replace_iter > 0 && global_iter >= self.config.stop_replace_iter;
+        if pruned_count > 0 && !replace_stopped {
             // Replacement weighting. By default opacity × visibility. With
             // `replace_by_gradient > 0`, interpolate toward the gradient-
             // weighted distribution (where error actually lives).
@@ -1506,10 +2158,11 @@ impl SplatTrainer {
         let screen_sizes = refiner.max_screen_size.clone();
         splats = self.refine_splats(
             &device,
-            record,
+            optim,
             splats,
             split_inds,
             screen_sizes,
+            global_iter,
             phase_iter,
             phase_total,
         );
@@ -1543,10 +2196,11 @@ impl SplatTrainer {
     fn refine_splats(
         &mut self,
         device: &Device,
-        mut record: HashMap<ParamId, AdaptorRecord<AdamScaled>>,
+        mut optim: SplatOptim,
         mut splats: Splats,
         split_inds: HashSet<i32>,
         screen_sizes: Tensor<1>,
+        global_iter: u32,
         phase_iter: u32,
         phase_total: u32,
     ) -> Splats {
@@ -1685,6 +2339,21 @@ impl SplatTrainer {
                 dig.split(&refine_inds, &refine_inds_opt, &opt_device);
             }
 
+            // TIDI state splits alongside. Children are APPENDED (matching the
+            // `cat` order below) and get a FRESH state (importance ≈ 1, zero
+            // visibility / grad-EMA, birth = this global iter) so new detail is
+            // never inherited into the candidate pool and is protected by the
+            // per-Gaussian warmup — see `TidiState::split`.
+            if let Some(tidi) = &mut self.tidi {
+                tidi.split(
+                    refine_count,
+                    &refine_inds_opt,
+                    &opt_device,
+                    &device.clone().inner(),
+                    global_iter,
+                );
+            }
+
             // Both halves of a split start with zero Adam moments.
             //
             // Burn's scatter bridge
@@ -1692,7 +2361,7 @@ impl SplatTrainer {
             // it out instead of using Assign.
             splats = map_splats_and_opt(
                 splats,
-                &mut record,
+                &mut optim,
                 |x| Tensor::cat(vec![x, new_transforms], 0),
                 |x| Tensor::cat(vec![x, cur_sh_coeffs], 0),
                 |x| Tensor::cat(vec![x, new_raw_opac], 0),
@@ -1764,14 +2433,14 @@ impl SplatTrainer {
             });
         }
 
-        self.optim = Some(create_optimizer_from_config().load_record(record));
+        self.optim = Some(optim);
         splats
     }
 }
 
 fn map_splats_and_opt(
     mut splats: Splats,
-    record: &mut HashMap<ParamId, AdaptorRecord<AdamScaled>>,
+    optim: &mut SplatOptim,
     map_transforms: impl FnOnce(Tensor<2>) -> Tensor<2>,
     map_sh_coeffs: impl FnOnce(Tensor<3>) -> Tensor<3>,
     map_opac: impl FnOnce(Tensor<1>) -> Tensor<1>,
@@ -1781,34 +2450,36 @@ fn map_splats_and_opt(
     map_opt_opac: impl Fn(Tensor<1>) -> Tensor<1>,
 ) -> Splats {
     splats.transforms = splats.transforms.map(map_transforms);
-    map_opt(splats.transforms.id, record, &map_opt_transforms);
+    optim.transforms.map_momentum(map_opt_transforms);
     splats.sh_coeffs = splats.sh_coeffs.map(map_sh_coeffs);
-    map_opt(splats.sh_coeffs.id, record, &map_opt_sh_coeffs);
+    optim.sh_coeffs.map_momentum(map_opt_sh_coeffs);
     splats.raw_opacities = splats.raw_opacities.map(map_opac);
-    map_opt(splats.raw_opacities.id, record, &map_opt_opac);
+    optim.opacities.map_momentum(map_opt_opac);
     splats
 }
 
-/// Apply `map_fn` to `moment_1` and `moment_2`. `map_fn` must be shape-agnostic
-/// along trailing dims since `moment_2` may have size-1 trailing dims under
-/// `reduce_moment_2`.
-pub(crate) fn map_opt<const D: usize>(
-    param_id: ParamId,
-    record: &mut HashMap<ParamId, AdaptorRecord<AdamScaled>>,
-    map_fn: &impl Fn(Tensor<D>) -> Tensor<D>,
-) {
-    let mut state: AdamState<D> = record
-        .remove(&param_id)
-        .expect("failed to get optimizer record")
-        .into_state();
-
-    state.momentum = state.momentum.map(|mut moment| {
-        moment.moment_1 = map_fn(moment.moment_1);
-        moment.moment_2 = map_fn(moment.moment_2);
-        moment
-    });
-
-    record.insert(param_id, AdaptorRecord::from_state(state));
+/// Snapshot the TIDI thresholds/caps from the training config into the
+/// config-free params the pure selection logic consumes.
+fn tidi_params(config: &TrainConfig) -> TidiPruneParams {
+    TidiPruneParams {
+        photometric: config.tidi_prune,
+        vis_threshold: config.tidi_vis_threshold,
+        opacity_threshold: config.tidi_opacity_threshold,
+        importance_threshold: config.tidi_importance_threshold,
+        grad_threshold: config.tidi_grad_threshold,
+        warmup_steps: config.tidi_warmup_steps as i32,
+        guard_sh_quantile: config.tidi_guard_sh_quantile,
+        guard_thin_quantile: config.tidi_guard_thin_quantile,
+        guard_aniso_quantile: config.tidi_guard_aniso_quantile,
+        guard_color_var_quantile: config.tidi_guard_color_var_quantile,
+        knn_k: config.tidi_knn_k as usize,
+        local_cap_frac: config.tidi_local_cap_frac,
+        global_cap_frac: config.tidi_global_cap_frac,
+        depth_prune: config.tidi_depth_prune,
+        depth_float_frac: config.tidi_depth_float_frac,
+        depth_min_valid_views: config.tidi_depth_min_valid_views as f32,
+        depth_cap_frac: config.tidi_depth_cap_frac,
+    }
 }
 
 // Prunes points based on the given mask.
@@ -1817,10 +2488,11 @@ pub(crate) fn map_opt<const D: usize>(
 //   mask: bool[n]. If True, prune this Gaussian.
 async fn prune_points(
     mut splats: Splats,
-    record: &mut HashMap<ParamId, AdaptorRecord<AdamScaled>>,
+    optim: &mut SplatOptim,
     mut refiner: RefineRecord,
     prune: Tensor<1, Bool>,
     dig: Option<&mut DigTrainState>,
+    tidi: Option<&mut TidiState>,
 ) -> (Splats, RefineRecord, u32) {
     assert_eq!(
         prune.dims()[0] as u32,
@@ -1853,7 +2525,7 @@ async fn prune_points(
         }
         splats = map_splats_and_opt(
             splats,
-            record,
+            optim,
             |x| x.select(0, valid_inds.clone()),
             |x| x.select(0, valid_inds.clone()),
             |x| x.select(0, valid_inds.clone()),
@@ -1863,6 +2535,12 @@ async fn prune_points(
         );
         if let Some(dig) = dig {
             dig.keep(&valid_inds);
+        }
+        // Reindex the TIDI accumulators + `ω` in lockstep. `ω`/its Adam state
+        // ride the autodiff `valid_inds`; the inner accumulators use the inner
+        // copy — same split the DiG `keep` / `RefineRecord::keep` above use.
+        if let Some(tidi) = tidi {
+            tidi.keep(&valid_inds, &inner_valid_inds);
         }
         refiner = refiner.keep(inner_valid_inds);
     }
@@ -1885,6 +2563,102 @@ fn sample_background_color<R: rand::Rng + ?Sized>(
         rng.random_range(-strength..strength),
     );
     (base + noise).clamp(glam::Vec3::ZERO, glam::Vec3::ONE)
+}
+
+/// Warn exactly once that `--depth-normal-weight` is being skipped because the
+/// camera is not a pinhole. Once, because it would otherwise fire every step of
+/// every view.
+fn warn_depth_normal_needs_pinhole() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "--depth-normal-weight is set but this camera is not Pinhole; the \
+             depth/normal consistency term is skipped for non-pinhole views \
+             (unprojection for fisheye models is not implemented yet)."
+        );
+    });
+}
+
+/// Warn exactly once that `--depth-opacity-reg-weight` is set but no distance-to-
+/// cloud grid was built (the run has no seed point cloud — e.g. a random-init run
+/// with no COLMAP/LiDAR points). The regularizer then no-ops for the run; it never
+/// panics. The grid is a dataset-level property, so this fires at most once.
+fn warn_depth_opacity_reg_no_cloud() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "--depth-opacity-reg-weight is set but no seed point cloud was available \
+             to build the distance-to-cloud grid; the depth-coupled opacity \
+             regularizer is inert for this run. Seed the run from a point cloud \
+             (COLMAP points3D / LiDAR ply) to enable it."
+        );
+    });
+}
+
+/// Per-splat world-space surface normal: the gaussian's thinnest local axis,
+/// rotated into world space and oriented toward the camera. `[N, 10]` ->
+/// `[N, 3]` unit vectors.
+///
+/// Two deliberately DETACHED discrete choices, both standard in the
+/// DN-Splatter / `PlanarGS` family:
+/// - which axis is thinnest (`argmin` over the log-scales), so the normal
+///   does not try to differentiate a permutation;
+/// - the camera-facing sign flip, so the loss cannot "fix" a wrong normal by
+///   toggling the sign instead of rotating the gaussian.
+///
+/// What remains live is the quaternion, so a normal loss rotates gaussians.
+/// The scales are read but not differentiated through.
+fn splat_normals(transforms: Tensor<2>, cam_pos: glam::Vec3) -> Tensor<2> {
+    let n = transforms.dims()[0];
+    let device = transforms.device();
+
+    let means = transforms.clone().slice(s![.., 0..3]);
+    let quats = transforms.clone().slice(s![.., 3..7]);
+    let log_scales = transforms.slice(s![.., 7..10]);
+
+    // One-hot over the thinnest axis. `exp` is monotone so argmin over the log
+    // scales is argmin over the scales; `argmin` picks a single index, which
+    // avoids the double-count an `equal`-mask tie would cause.
+    let min_idx: Tensor<2, Int> = log_scales.detach().argmin(1);
+    let axis: Tensor<2> = Tensor::zeros([n, 3], &device).scatter(
+        1,
+        min_idx,
+        Tensor::ones([n, 1], &device),
+        IndexingUpdateOp::Add,
+    );
+
+    // Rotating the local axis by the (normalized) quaternion is exactly the
+    // corresponding column of the rotation matrix, computed differentiably.
+    let q_len = quats
+        .clone()
+        .powi_scalar(2)
+        .sum_dim(1)
+        .sqrt()
+        .clamp_min(1e-12);
+    let unit_quats = quats / q_len;
+    let normal = quaternion_vec_multiply(unit_quats, axis);
+    let n_len = normal
+        .clone()
+        .powi_scalar(2)
+        .sum_dim(1)
+        .sqrt()
+        .clamp_min(1e-12);
+    let normal = normal / n_len;
+
+    // Face the camera: we want `n · (mean - cam) < 0`. `sign()` would emit 0 on
+    // an exactly perpendicular splat and annihilate its normal, so build the
+    // ±1 selector from a comparison instead.
+    let to_splat = (means
+        - Tensor::<1>::from_floats([cam_pos.x, cam_pos.y, cam_pos.z], &device).reshape([1, 3]))
+    .detach();
+    let facing = (to_splat * normal.clone().detach()).sum_dim(1);
+    let sign = facing
+        .lower_elem(0.0)
+        .float()
+        .mul_scalar(2.0)
+        .sub_scalar(1.0);
+
+    normal * sign
 }
 
 #[cfg(test)]
@@ -1982,7 +2756,7 @@ mod depth_loss_grad_tests {
         // A positive constant target, so the disparity error and its gradient are
         // nonzero wherever a gaussian was rendered.
         let gt_depth = Tensor::<2>::ones([img_h, img_w], &device) * 3.0;
-        let loss = depth_loss(expected_depth, gt_depth);
+        let loss = depth_loss(expected_depth, gt_depth, None);
 
         let grads = splats.bwd_validate(loss).await;
 
@@ -2022,5 +2796,336 @@ mod depth_loss_grad_tests {
                 "depth loss must not push opacity, got {opac_grad_absmax}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod normal_prior_grad_tests {
+    use super::*;
+    use brush_render::gaussian_splats::SplatRenderMode;
+    use brush_render::kernels::camera_model::CameraModel;
+
+    const IMG: glam::UVec2 = glam::uvec2(48, 48);
+
+    /// A slab of overlapping gaussians filling the middle of the frame, all
+    /// tilted by the same rotation about +Y so their surface normal disagrees
+    /// with the (flat) rendered depth. Thinnest axis is local +Z.
+    fn tilted_plane_splats(device: &Device, tilt: f32) -> Splats {
+        let mut means = vec![];
+        let n_side = 7;
+        for iy in 0..n_side {
+            for ix in 0..n_side {
+                let f = |i: i32| (i as f32 / (n_side - 1) as f32) * 2.0 - 1.0;
+                means.extend_from_slice(&[f(ix), f(iy), 0.0]);
+            }
+        }
+        let n = means.len() / 3;
+        let q = glam::Quat::from_rotation_y(tilt);
+        let rotations: Vec<f32> = (0..n).flat_map(|_| [q.w, q.x, q.y, q.z]).collect();
+        // Thinnest axis is z, so `splat_normals` picks the local +Z column.
+        let log_scales: Vec<f32> = (0..n).flat_map(|_| [-1.6, -1.6, -2.5]).collect();
+        let sh: Vec<f32> = (0..n).flat_map(|_| [0.5, 0.5, 0.5]).collect();
+        let opac: Vec<f32> = vec![4.0; n];
+
+        Splats::from_raw(
+            means,
+            rotations,
+            log_scales,
+            sh,
+            opac,
+            SplatRenderMode::Default,
+            device,
+        )
+    }
+
+    fn test_camera() -> Camera {
+        Camera::new(
+            glam::vec3(0.0, 0.0, -5.0),
+            glam::Quat::IDENTITY,
+            0.7,
+            0.7,
+            glam::vec2(0.5, 0.5),
+            CameraModel::Pinhole,
+        )
+    }
+
+    async fn absmax(t: Tensor<2>) -> f32 {
+        t.abs()
+            .max()
+            .into_data_async()
+            .await
+            .expect("grad readback")
+            .to_vec::<f32>()
+            .expect("f32 grad")[0]
+    }
+
+    async fn opacity_absmax(splats: &Splats, grads: &Gradients) -> f32 {
+        match splats.raw_opacities.grad(grads) {
+            None => 0.0,
+            Some(g) => g
+                .abs()
+                .max()
+                .into_data_async()
+                .await
+                .expect("opacity grad readback")
+                .to_vec::<f32>()
+                .expect("f32 opacity grad")[0],
+        }
+    }
+
+    /// Render the per-gaussian normal image the training loop builds, in the
+    /// camera frame. Mirrors the `use_normal_render` block of `step()`.
+    async fn render_camera_normals(splats: &Splats, camera: &Camera) -> Tensor<3> {
+        let device = splats.device();
+        let transforms = splats.transforms.val();
+        let normals = splat_normals(transforms.clone(), camera.position);
+        let img = render_splat_features(
+            transforms,
+            splats.raw_opacities.val(),
+            normals,
+            camera,
+            IMG,
+            SplatRenderMode::Default,
+        )
+        .await;
+
+        let alpha = img.clone().slice(s![.., .., 3..4]).detach();
+        let n_world = img.slice(s![.., .., 0..3]) / alpha.clamp_min(1e-10);
+        let n_len = n_world
+            .clone()
+            .powi_scalar(2)
+            .sum_dim(2)
+            .sqrt()
+            .clamp_min(1e-6);
+        let n_world = n_world / n_len;
+
+        let rot = camera.world_to_local().matrix3;
+        let r_t: Tensor<2> = Tensor::<1>::from_floats(
+            [
+                rot.x_axis.x,
+                rot.x_axis.y,
+                rot.x_axis.z,
+                rot.y_axis.x,
+                rot.y_axis.y,
+                rot.y_axis.z,
+                rot.z_axis.x,
+                rot.z_axis.y,
+                rot.z_axis.z,
+            ],
+            &device,
+        )
+        .reshape([3, 3]);
+
+        let [h, w, _] = n_world.dims();
+        n_world
+            .reshape([(h * w) as i32, 3])
+            .matmul(r_t)
+            .reshape([h, w, 3])
+    }
+
+    /// The prior-normal loss must rotate gaussians and nothing else.
+    ///
+    /// `render_splat_features` detaches geometry internally and back-props into
+    /// the feature VALUES, and `splat_normals` detaches both discrete choices
+    /// (thinnest axis, camera-facing sign). So the only live path from this loss
+    /// back into the model is the quaternion, transforms columns 3..7 — not
+    /// means, not scales, not opacity. That is the contract this test guards.
+    #[tokio::test]
+    async fn normal_loss_moves_rotations_only() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = tilted_plane_splats(&device, 0.5);
+        let camera = test_camera();
+
+        let n_cam = render_camera_normals(&splats, &camera).await;
+
+        // Fronto-parallel prior everywhere: disagrees with the tilted splats, so
+        // the error and its gradient are nonzero.
+        let mut gt = vec![0.0f32; (IMG.y * IMG.x) as usize * 3];
+        for px in gt.chunks_exact_mut(3) {
+            px[2] = -1.0;
+        }
+        let gt = Tensor::<3>::from_data(
+            TensorData::new(gt, [IMG.y as usize, IMG.x as usize, 3]),
+            &device,
+        );
+
+        let loss = normal_loss(n_cam, gt);
+        let loss_val = loss
+            .clone()
+            .into_data_async()
+            .await
+            .expect("loss readback")
+            .to_vec::<f32>()
+            .expect("f32 loss")[0];
+        assert!(
+            loss_val > 1e-6 && loss_val.is_finite(),
+            "expected a real normal loss, got {loss_val}"
+        );
+
+        let grads = splats.bwd_validate(loss).await;
+        let transforms_grad = splats
+            .transforms
+            .grad(&grads)
+            .expect("normal loss must reach the transforms");
+
+        let rot_grad = absmax(transforms_grad.clone().slice(s![.., 3..7])).await;
+        assert!(
+            rot_grad > 1e-8,
+            "expected a nonzero rotation gradient, got {rot_grad}"
+        );
+
+        let mean_grad = absmax(transforms_grad.clone().slice(s![.., 0..3])).await;
+        assert!(
+            mean_grad < 1e-8,
+            "prior-normal loss must not move means, got {mean_grad}"
+        );
+
+        let scale_grad = absmax(transforms_grad.slice(s![.., 7..10])).await;
+        assert!(
+            scale_grad < 1e-8,
+            "prior-normal loss must not move scales, got {scale_grad}"
+        );
+
+        let opac_grad = opacity_absmax(&splats, &grads).await;
+        assert!(
+            opac_grad < 1e-8,
+            "prior-normal loss must not push opacity, got {opac_grad}"
+        );
+    }
+
+    /// The flatten term is a pressure on scales alone.
+    #[tokio::test]
+    async fn flatten_loss_touches_scales_only() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = tilted_plane_splats(&device, 0.0);
+
+        let scales = splats.transforms.val().slice(s![.., 7..10]).exp();
+        let loss = scales.min_dim(1).mean();
+
+        let grads = splats.bwd_validate(loss).await;
+        let transforms_grad = splats
+            .transforms
+            .grad(&grads)
+            .expect("flatten loss must reach the transforms");
+
+        let scale_grad = absmax(transforms_grad.clone().slice(s![.., 7..10])).await;
+        assert!(
+            scale_grad > 1e-8,
+            "expected a nonzero scale gradient, got {scale_grad}"
+        );
+
+        let other_grad = absmax(transforms_grad.slice(s![.., 0..7])).await;
+        assert!(
+            other_grad < 1e-8,
+            "flatten loss must not move means or rotations, got {other_grad}"
+        );
+
+        let opac_grad = opacity_absmax(&splats, &grads).await;
+        assert!(
+            opac_grad < 1e-8,
+            "flatten loss must not push opacity, got {opac_grad}"
+        );
+    }
+
+    /// Depth/normal consistency: finite loss on a real render, and a live
+    /// gradient path back into the rotations.
+    #[tokio::test]
+    async fn depth_normal_consistency_has_grad() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = tilted_plane_splats(&device, 0.5);
+        let camera = test_camera();
+
+        let out = render_splats_for_training(
+            splats.clone(),
+            &camera,
+            IMG,
+            glam::Vec3::ZERO,
+            false,
+            RasterizationMode::RgbaAndDepth,
+            false,
+        )
+        .await;
+
+        let [h, w, _] = out.img.dims();
+        let alpha = out.img.clone().slice(s![.., .., 3..4]).detach();
+        let expected_depth = (out.img.clone().slice(s![.., .., 4..5])
+            / alpha.clone().clamp_min(1e-10))
+        .reshape([h, w]);
+
+        let focal = camera.focal(IMG);
+        let center = camera.center(IMG);
+        let n_from_depth = normals_from_depth(expected_depth, focal.x, focal.y, center.x, center.y);
+
+        let n_cam = render_camera_normals(&splats, &camera).await;
+        let loss = depth_normal_loss(n_from_depth, n_cam, alpha);
+
+        let loss_val = loss
+            .clone()
+            .into_data_async()
+            .await
+            .expect("loss readback")
+            .to_vec::<f32>()
+            .expect("f32 loss")[0];
+        assert!(
+            loss_val.is_finite() && loss_val > 1e-6,
+            "expected a real consistency loss on a tilted plane, got {loss_val}"
+        );
+
+        let grads = splats.bwd_validate(loss).await;
+        let transforms_grad = splats
+            .transforms
+            .grad(&grads)
+            .expect("consistency loss must reach the transforms");
+        let rot_grad = absmax(transforms_grad.slice(s![.., 3..7])).await;
+        assert!(
+            rot_grad > 1e-8,
+            "expected a nonzero rotation gradient, got {rot_grad}"
+        );
+    }
+
+    /// A fronto-parallel slab must report near-zero disagreement: this is the
+    /// sign/orientation check for the whole chain (splat normal -> rendered
+    /// feature -> camera frame -> depth-derived normal).
+    #[tokio::test]
+    async fn flat_slab_agrees_with_its_own_depth() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = tilted_plane_splats(&device, 0.0);
+        let camera = test_camera();
+
+        let out = render_splats_for_training(
+            splats.clone(),
+            &camera,
+            IMG,
+            glam::Vec3::ZERO,
+            false,
+            RasterizationMode::RgbaAndDepth,
+            false,
+        )
+        .await;
+        let [h, w, _] = out.img.dims();
+        let alpha = out.img.clone().slice(s![.., .., 3..4]).detach();
+        let expected_depth = (out.img.clone().slice(s![.., .., 4..5])
+            / alpha.clone().clamp_min(1e-10))
+        .reshape([h, w]);
+
+        let focal = camera.focal(IMG);
+        let center = camera.center(IMG);
+        let n_from_depth = normals_from_depth(expected_depth, focal.x, focal.y, center.x, center.y);
+        let n_cam = render_camera_normals(&splats, &camera).await;
+
+        let loss = depth_normal_loss(n_from_depth, n_cam, alpha)
+            .into_data_async()
+            .await
+            .expect("loss readback")
+            .to_vec::<f32>()
+            .expect("f32 loss")[0];
+        assert!(
+            loss < 0.05,
+            "a flat slab must agree with its own depth, got {loss}"
+        );
     }
 }

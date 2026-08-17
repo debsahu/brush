@@ -13,13 +13,14 @@ use burn::{
     Tensor,
     module::{Module, Param, ParamId},
     nn::{Linear, LinearConfig},
-    optim::{Optimizer, adaptor::OptimizerAdaptor},
+    optim::GradientsParams,
     tensor::{Device, Int, TensorData, activation::relu},
 };
 
+use hashbrown::HashMap;
 use rayon::prelude::*;
 
-use crate::adam_scaled::{AdamScaled, AdamScaledConfig};
+use crate::adam_scaled::{AdamScaled, AdamState};
 
 /// MLP hidden width (fixed by the reference architecture).
 const MLP_HIDDEN: usize = 64;
@@ -131,10 +132,68 @@ pub struct DigExport {
     pub mlp: Vec<(String, [usize; 2], Vec<f32>)>,
 }
 
-pub(crate) type DigOptimizer = OptimizerAdaptor<AdamScaled, DigModule>;
+/// Hand-rolled Adam optimizer for the `DiG` module — burn 0.22 dropped the
+/// `SimpleOptimizer`/`OptimizerAdaptor` machinery our old `AdamScaled` rode, so
+/// we own the per-parameter [`AdamState`] directly (same pattern as the splats'
+/// `SplatOptim`). Every `DiG` parameter (feature table + the four bias-free MLP
+/// weights) is a `Tensor<2>`, so one `HashMap<ParamId, AdamState<2>>` keyed by
+/// parameter id holds all optimizer state. State for a param is created lazily
+/// on its first step and survives refine because `Param::map` keeps the id.
+pub(crate) struct DigOptimizer {
+    adam: AdamScaled,
+    states: HashMap<ParamId, AdamState<2>>,
+}
 
 pub(crate) fn create_dig_optimizer() -> DigOptimizer {
-    AdamScaledConfig::new().with_epsilon(1e-15).init()
+    DigOptimizer {
+        adam: AdamScaled::new(1e-15),
+        states: HashMap::new(),
+    }
+}
+
+impl DigOptimizer {
+    /// Step every parameter that has a gradient in `grads`, at `lr`. Params
+    /// without a gradient this call are returned untouched. Mirrors the splats'
+    /// `step_param`: run Adam on the inner (autodiff-free) tensor, re-wrap
+    /// tracking.
+    pub(crate) fn step(
+        &mut self,
+        lr: f64,
+        mut module: DigModule,
+        mut grads: GradientsParams,
+    ) -> DigModule {
+        module.features = self.step_param(lr, module.features, &mut grads);
+        module.l1.weight = self.step_param(lr, module.l1.weight, &mut grads);
+        module.l2.weight = self.step_param(lr, module.l2.weight, &mut grads);
+        module.l3.weight = self.step_param(lr, module.l3.weight, &mut grads);
+        module.l4.weight = self.step_param(lr, module.l4.weight, &mut grads);
+        module
+    }
+
+    fn step_param(
+        &mut self,
+        lr: f64,
+        param: Param<Tensor<2>>,
+        grads: &mut GradientsParams,
+    ) -> Param<Tensor<2>> {
+        let id = param.id;
+        let Some(grad) = grads.remove::<2>(id) else {
+            return param;
+        };
+        let adam = self.adam.clone();
+        let state = self.states.entry(id).or_insert_with(|| AdamState::new(None, false));
+        param.map(|t| {
+            let stepped = adam.step(lr, t.inner(), &grad, state);
+            Tensor::from_inner(stepped).require_grad()
+        })
+    }
+
+    /// Mutable access to a parameter's Adam momentum, for refine reindexing.
+    fn map_state(&mut self, id: ParamId, map_fn: impl Fn(Tensor<2>) -> Tensor<2>) {
+        if let Some(state) = self.states.get_mut(&id) {
+            state.map_momentum(map_fn);
+        }
+    }
 }
 
 /// Trainer-owned `DiG` state: the module, its optimizer, and a cached
@@ -165,18 +224,14 @@ impl DigTrainState {
     /// [`Self::keep`] / [`Self::split`] so the table can't silently desync
     /// from the splats.
     pub fn keep(&mut self, valid_inds: &Tensor<1, Int>) {
+        let fid = self.module.features.id;
         self.module.features = self
             .module
             .features
             .clone()
             .map(|x| x.select(0, valid_inds.clone()));
-        let mut record = self.optim.to_record();
-        if record.contains_key(&self.module.features.id) {
-            crate::train::map_opt(self.module.features.id, &mut record, &|x: Tensor<2>| {
-                x.select(0, valid_inds.clone())
-            });
-            self.optim = create_dig_optimizer().load_record(record);
-        }
+        self.optim
+            .map_state(fid, |x| x.select(0, valid_inds.clone()));
         self.invalidate_neighbors();
     }
 
@@ -189,6 +244,7 @@ impl DigTrainState {
         refine_inds_opt: &Tensor<1, Int>,
         opt_device: &Device,
     ) {
+        let fid = self.module.features.id;
         let refine_count = refine_inds.dims()[0];
         let cur_feats = self.module.features.val().select(0, refine_inds.clone());
         self.module.features = self
@@ -196,21 +252,15 @@ impl DigTrainState {
             .features
             .clone()
             .map(|x| Tensor::cat(vec![x, cur_feats], 0));
-        let mut record = self.optim.to_record();
-        if record.contains_key(&self.module.features.id) {
-            let inds_opt = refine_inds_opt.clone();
-            let opt_device = opt_device.clone();
-            crate::train::map_opt(self.module.features.id, &mut record, &move |x: Tensor<
-                2,
-            >| {
-                let d1 = x.dims()[1];
-                let neg_parent = -x.clone().select(0, inds_opt.clone());
-                let inds: Tensor<2, Int> = inds_opt.clone().unsqueeze_dim(1).repeat_dim(1, d1);
-                let x = x.scatter(0, inds, neg_parent, burn::tensor::IndexingUpdateOp::Add);
-                Tensor::cat(vec![x, Tensor::zeros([refine_count, d1], &opt_device)], 0)
-            });
-            self.optim = create_dig_optimizer().load_record(record);
-        }
+        let inds_opt = refine_inds_opt.clone();
+        let opt_device = opt_device.clone();
+        self.optim.map_state(fid, move |x| {
+            let d1 = x.dims()[1];
+            let neg_parent = -x.clone().select(0, inds_opt.clone());
+            let inds: Tensor<2, Int> = inds_opt.clone().unsqueeze_dim(1).repeat_dim(1, d1);
+            let x = x.scatter(0, inds, neg_parent, burn::tensor::IndexingUpdateOp::Add);
+            Tensor::cat(vec![x, Tensor::zeros([refine_count, d1], &opt_device)], 0)
+        });
         self.invalidate_neighbors();
     }
 

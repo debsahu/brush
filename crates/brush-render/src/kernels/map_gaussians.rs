@@ -51,7 +51,11 @@ pub fn map_gaussians_to_intersect_kernel(
         0u32,
         splat_cum_hit_counts[prev_idx as usize],
     );
-    // Slot budget reserved for this splat in PF.
+    // Slot budget reserved for this splat in PF. PF ran the same
+    // `will_primitive_contribute` walk, so the emission loop below should
+    // count the same tiles — but the two dispatches go through separate
+    // shader optimisation passes, so cap emission at `pf_count` and pad any
+    // leftover budget (belt and suspenders).
     let pf_count = splat_cum_hit_counts[compact_gid as usize] - base_isect_id;
 
     // Tile id past the valid range — radix-sorts after every real tile
@@ -62,6 +66,12 @@ pub fn map_gaussians_to_intersect_kernel(
     // Match PF's row-major traversal without per-tile integer div/rem. Stop as
     // soon as the reserved output budget is full (including a zero budget).
     let mut num_tiles_hit = 0u32;
+    // Explicit row/column nested walk (not a flattened single loop) so the
+    // shader never pays a per-tile integer div/rem, and so the non-square
+    // (16x8) tile layout via comptime `tile_width`/`tile_height` is honoured.
+    // Emission is capped at `pf_count`: PF ran the same
+    // `will_primitive_contribute` predicate, so the counts should agree, but
+    // the two dispatches go through separate shader optimisation passes.
     let mut ty = bb.min_y;
     while ty < bb.max_y && num_tiles_hit < pf_count {
         let mut tx = bb.min_x;

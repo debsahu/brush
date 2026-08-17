@@ -7,6 +7,7 @@ use std::sync::Arc;
 pub use crate::load_depth::LoadDepth;
 pub use crate::load_features::LoadFeatures;
 pub use crate::load_image::LoadImage;
+pub use crate::load_normal::LoadNormal;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ViewType {
@@ -21,6 +22,8 @@ pub struct SceneView {
     pub camera: Camera,
     pub features: Option<LoadFeatures>,
     pub depth: Option<LoadDepth>,
+    /// Optional per-view surface-normal prior (`normal/<stem>.tiff`).
+    pub normal: Option<LoadNormal>,
 }
 
 // Encapsulates a multi-view scene including cameras and the splats.
@@ -70,6 +73,7 @@ impl Scene {
                 camera: v.camera,
                 features: v.features,
                 depth: v.depth,
+                normal: v.normal,
             })
             .collect();
         Self::new(views)
@@ -146,6 +150,9 @@ pub struct SceneBatch {
     pub features: Option<(TensorData, usize)>,
     /// Optional `[H, W]` f32 metric depth map, `0` marking invalid depth.
     pub depth: Option<TensorData>,
+    /// Optional `[H, W, 3]` f32 camera-frame unit normal map, `(0, 0, 0)`
+    /// marking an invalid pixel.
+    pub normal: Option<TensorData>,
     pub camera: Camera,
     /// Index of this view in the training scene's view list. Used by
     /// per-view appearance models (bilateral grid / PPISP).

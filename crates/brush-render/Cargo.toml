@@ -11,13 +11,16 @@ brush-cube.path = "../brush-cube"
 brush-prefix-sum.path = "../brush-prefix-sum"
 brush-sort.path = "../brush-sort"
 
-burn = { workspace = true, features = ["wgpu"] }
+# WebGPU everywhere. On macOS you can opt into native MSL with
+# `brush-cube/metal` (see that crate's manifest for why it is not on by
+# default). We still avoid Vulkan on Linux/Windows after the crashes in
+# #423 / #395.
+burn = { workspace = true, features = ["wgpu", "autodiff"] }
 burn-wgpu.workspace = true
 burn-cubecl.workspace = true
 burn-fusion.workspace = true
 burn-ir.workspace = true
 
-assert_approx_eq.workspace = true
 glam.workspace = true
 clap.workspace = true
 serde.workspace = true
@@ -33,10 +36,8 @@ debug-validation = []
 native-msl = ["burn-wgpu/metal"]
 raster-census = ["dep:serde_json"]
 
-# CubeCL emits WGSL by default on every platform. The native-msl feature opts
-# the macOS Metal backend into CubeCL's MSL compiler; other backends still use
-# WGSL.
 [dev-dependencies]
+assert_approx_eq.workspace = true
 wasm-bindgen-test = "0.3"
 
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
