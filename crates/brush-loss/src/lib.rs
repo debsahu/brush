@@ -1816,7 +1816,15 @@ pub fn normals_from_depth(depth: Tensor<2>, fx: f32, fy: f32, cx: f32, cy: f32) 
     let cz = dvx * duy - dvy * dux;
     let cross: Tensor<3> = Tensor::cat(vec![cx_, cy_, cz], 2);
 
-    let len = cross.clone().powi_scalar(2).sum_dim(2).sqrt();
+    // Safe norm: clamp the squared length off zero BEFORE the sqrt. A
+    // degenerate (all-zero) cross product — every background pixel, where the
+    // render's depth is exactly 0 — has sum_sq == 0, and sqrt has an infinite
+    // local derivative there. Autodiff then evaluates 0 * inf = NaN for the
+    // (masked, zero-weight) gradient and poisons the whole map, which flows
+    // through the render depth backward into gradient_transforms. Clamping
+    // sum_sq keeps the sqrt derivative finite; valid pixels (sum_sq >> floor)
+    // pass through clamp_min unchanged, so their normal and gradient stay exact.
+    let len = cross.clone().powi_scalar(2).sum_dim(2).clamp_min(1e-24).sqrt();
     let normal = cross / len.clone().clamp_min(1e-12);
 
     // A degenerate (zero-length) cross product carries no orientation.
