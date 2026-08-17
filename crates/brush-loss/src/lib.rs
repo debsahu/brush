@@ -2326,11 +2326,26 @@ mod normal_loss_tests {
     }
 
     /// An all-invalid prior yields 0, not NaN.
+    ///
+    /// The inputs are built with `from_data`, not `Tensor::zeros`/`ones`, on
+    /// purpose. Production always calls `normal_loss(n_cam, gt_normal)` with a
+    /// rendered `n_cam` and `gt_normal = Tensor::from_data(normal_data)` — both
+    /// real, uploaded device tensors, and an all-invalid prior is simply a
+    /// loaded `(0,0,0)` tensor. A lazy `Tensor::zeros`/`ones` graph is a
+    /// different beast: when every input to this masked-reduction chain is a
+    /// compile-time fill constant, burn-fusion 0.22-pre.2 constant-folds the
+    /// whole fused block until its fallback op list drains to zero, then indexes
+    /// that empty list from a stale ordering and panics on the shared-device
+    /// runner thread (nondeterministically, whichever folded block loses the
+    /// race that run). That fold path is unreachable from any real caller, so
+    /// this test feeds the same all-zero values the way production does, which
+    /// exercises the true code path and is robust. The asserted value is
+    /// unchanged: an all-invalid prior must score exactly 0.
     #[tokio::test]
     async fn normal_loss_is_zero_with_no_valid_prior() {
         let device = device().await;
-        let gt = Tensor::<3>::zeros([1, 2, 3], &device);
-        let pred = Tensor::<3>::ones([1, 2, 3], &device);
+        let gt = Tensor::<3>::from_data(TensorData::new(vec![0.0f32; 6], [1, 2, 3]), &device);
+        let pred = Tensor::<3>::from_data(TensorData::new(vec![1.0f32; 6], [1, 2, 3]), &device);
         let loss = read(normal_loss(pred, gt)).await[0];
         assert_eq!(loss, 0.0);
     }
@@ -2408,6 +2423,13 @@ mod normal_loss_tests {
 
     /// Zero-length (invalid) normals are skipped even when covered, and an
     /// all-invalid frame yields 0, not NaN. A 1-pixel-tall frame returns 0.
+    ///
+    /// Every input is built with `from_data`, matching the real caller
+    /// (`normal_smooth_loss(n_cam, normal_alpha)`, both rendered device
+    /// tensors) and side-stepping the burn-fusion 0.22-pre.2 fold panic that a
+    /// lazy `Tensor::zeros`/`ones` graph provokes — see the note on
+    /// `normal_loss_is_zero_with_no_valid_prior`. The asserted values (2/6 and
+    /// 0) are unchanged.
     #[tokio::test]
     async fn normal_smooth_loss_edge_cases() {
         let device = device().await;
@@ -2420,19 +2442,19 @@ mod normal_loss_tests {
             ], [2, 2, 3]),
             &device,
         );
-        let alpha = Tensor::<3>::ones([2, 2, 1], &device);
+        let alpha = Tensor::<3>::from_data(TensorData::new(vec![1.0f32; 4], [2, 2, 1]), &device);
         // Valid diffs: row col0 (0), col row1 |(0,0,1)-(1,0,0)|=2. counts: row 1, col 1.
         let loss = read(normal_smooth_loss(n, alpha)).await[0];
         assert!((loss - 2.0 / 6.0).abs() < 1e-6, "loss = {loss}");
 
         // Nothing covered: 0, not NaN.
-        let n2 = Tensor::<3>::ones([2, 2, 3], &device);
-        let a2 = Tensor::<3>::zeros([2, 2, 1], &device);
+        let n2 = Tensor::<3>::from_data(TensorData::new(vec![1.0f32; 12], [2, 2, 3]), &device);
+        let a2 = Tensor::<3>::from_data(TensorData::new(vec![0.0f32; 4], [2, 2, 1]), &device);
         assert_eq!(read(normal_smooth_loss(n2, a2)).await[0], 0.0);
 
         // Degenerate frame: too small for any difference.
-        let n3 = Tensor::<3>::ones([1, 5, 3], &device);
-        let a3 = Tensor::<3>::ones([1, 5, 1], &device);
+        let n3 = Tensor::<3>::from_data(TensorData::new(vec![1.0f32; 15], [1, 5, 3]), &device);
+        let a3 = Tensor::<3>::from_data(TensorData::new(vec![1.0f32; 5], [1, 5, 1]), &device);
         assert_eq!(read(normal_smooth_loss(n3, a3)).await[0], 0.0);
     }
 
@@ -2564,116 +2586,5 @@ mod normal_loss_tests {
             weighted < unweighted,
             "edge weighting must reduce the loss: {weighted} !< {unweighted}"
         );
-    }
-
-    // ===== SCRATCH PROBES (temporary, will be removed) =====
-
-    // P1: bare fill + reduce. Does `zeros().sum()` alone trip fusion?
-    #[tokio::test]
-    async fn probe_zeros_sum() {
-        let d = device().await;
-        let z = Tensor::<3>::zeros([1, 2, 3], &d);
-        assert_eq!(read(z.sum()).await[0], 0.0);
-    }
-
-    // P2: two scalar reductions of fill-constants, divided (the normal_loss tail shape).
-    #[tokio::test]
-    async fn probe_two_reduce_div() {
-        let d = device().await;
-        let a = Tensor::<3>::zeros([1, 2, 3], &d).sum();
-        let b = Tensor::<3>::zeros([1, 2, 3], &d).sum().mul_scalar(3.0).clamp_min(1.0);
-        assert_eq!(read(a / b).await[0], 0.0);
-    }
-
-    // P3: EXACT normal_loss body but inputs built via from_data (real device
-    // tensors, all-zero gt / all-one pred) — mimics a production all-invalid batch.
-    #[tokio::test]
-    async fn probe_normal_loss_fromdata_zeros() {
-        let d = device().await;
-        let gt = Tensor::<3>::from_data(
-            TensorData::new(vec![0.0f32; 6], [1, 2, 3]),
-            &d,
-        );
-        let pred = Tensor::<3>::from_data(
-            TensorData::new(vec![1.0f32; 6], [1, 2, 3]),
-            &d,
-        );
-        assert_eq!(read(normal_loss(pred, gt)).await[0], 0.0);
-    }
-
-    // P4: baseline repro — exact normal_loss body with fill-constant inputs.
-    #[tokio::test]
-    async fn probe_fix_reshape_reduce() {
-        let d = device().await;
-        let gt = Tensor::<3>::zeros([1, 2, 3], &d);
-        let pred = Tensor::<3>::ones([1, 2, 3], &d);
-        let gt_len = gt.clone().powi_scalar(2).sum_dim(2).sqrt();
-        let valid = gt_len.greater_elem(0.5).float();
-        let abs_err = (pred - gt).abs().sum_dim(2) * valid.clone();
-        let num = abs_err.sum();
-        let den = valid.sum().mul_scalar(3.0).clamp_min(1.0);
-        assert_eq!(read(num / den).await[0], 0.0);
-    }
-
-    // FIX candidate A: add a fresh separately-sourced zero to the final result.
-    // Output identical (+0). Does a trailing add of an independent fill break
-    // the single foldable block?
-    #[tokio::test]
-    async fn probe_fixA_trailing_add_zero() {
-        let d = device().await;
-        let gt = Tensor::<3>::zeros([1, 2, 3], &d);
-        let pred = Tensor::<3>::ones([1, 2, 3], &d);
-        let gt_len = gt.clone().powi_scalar(2).sum_dim(2).sqrt();
-        let valid = gt_len.greater_elem(0.5).float();
-        let abs_err = (pred - gt).abs().sum_dim(2) * valid.clone();
-        let out = abs_err.sum() / valid.sum().mul_scalar(3.0).clamp_min(1.0);
-        let out = out + Tensor::<1>::zeros([1], &d);
-        assert_eq!(read(out).await[0], 0.0);
-    }
-
-    // FIX candidate B: reshape boundaries on num & den before div.
-    #[tokio::test]
-    async fn probe_fixB_reshape_boundary() {
-        let d = device().await;
-        let gt = Tensor::<3>::zeros([1, 2, 3], &d);
-        let pred = Tensor::<3>::ones([1, 2, 3], &d);
-        let gt_len = gt.clone().powi_scalar(2).sum_dim(2).sqrt();
-        let valid = gt_len.greater_elem(0.5).float();
-        let abs_err = (pred - gt).abs().sum_dim(2) * valid.clone();
-        let num = abs_err.sum().reshape([1]);
-        let den = valid.sum().mul_scalar(3.0).clamp_min(1.0).reshape([1]);
-        assert_eq!(read(num / den).await[0], 0.0);
-    }
-
-    // FIX candidate C: force a readback ONLY on the degenerate all-invalid branch.
-    // count materialized once; if zero, return an early fresh zero (short chain).
-    #[tokio::test]
-    async fn probe_fixC_count_guard() {
-        let d = device().await;
-        let gt = Tensor::<3>::zeros([1, 2, 3], &d);
-        let pred = Tensor::<3>::ones([1, 2, 3], &d);
-        let gt_len = gt.clone().powi_scalar(2).sum_dim(2).sqrt();
-        let valid = gt_len.greater_elem(0.5).float();
-        let abs_err = (pred - gt).abs().sum_dim(2) * valid.clone();
-        let out = abs_err.sum() / valid.sum().mul_scalar(3.0).clamp_min(1.0);
-        assert_eq!(read(out).await[0], 0.0);
-    }
-
-    // CONFIRM: from_data (real device tensor) construction of BOTH degenerate
-    // cases the failing tests assert. These mirror production input shape.
-    #[tokio::test]
-    async fn probe_confirm_fromdata_normal_loss() {
-        let d = device().await;
-        let gt = Tensor::<3>::from_data(TensorData::new(vec![0.0f32; 6], [1, 2, 3]), &d);
-        let pred = Tensor::<3>::from_data(TensorData::new(vec![1.0f32; 6], [1, 2, 3]), &d);
-        assert_eq!(read(normal_loss(pred, gt)).await[0], 0.0);
-    }
-
-    #[tokio::test]
-    async fn probe_confirm_fromdata_smooth_nothing_covered() {
-        let d = device().await;
-        let n2 = Tensor::<3>::from_data(TensorData::new(vec![1.0f32; 12], [2, 2, 3]), &d);
-        let a2 = Tensor::<3>::from_data(TensorData::new(vec![0.0f32; 4], [2, 2, 1]), &d);
-        assert_eq!(read(normal_smooth_loss(n2, a2)).await[0], 0.0);
     }
 }
