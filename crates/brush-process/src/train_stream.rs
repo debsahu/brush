@@ -805,7 +805,7 @@ pub(crate) async fn train_stream(
 async fn mip_view_cameras(scene: &Scene) -> Vec<(glam::Vec3, f32)> {
     let mut cameras = Vec::with_capacity(scene.views.len());
     for view in scene.views.iter() {
-        let (width, height) = view.image.output_dimensions().await.unwrap_or((1, 1));
+        let (width, height) = view.image.dimensions().await.unwrap_or((1, 1));
         let focal = view.camera.focal(glam::uvec2(width, height)).x;
         cameras.push((view.camera.position, focal));
     }
