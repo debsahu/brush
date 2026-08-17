@@ -594,6 +594,9 @@ mod tests {
             subsample_points: None,
             alpha_mode: None,
             max_scene_batch_cache_size: 0,
+            train_on_eval: false,
+            estimate_metric_scale: false,
+            features_dir_name: "dino_features".to_string(),
         }
     }
 
