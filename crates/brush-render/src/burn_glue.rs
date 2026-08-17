@@ -76,6 +76,15 @@ pub fn wrap_wgpu_float<const D: usize>(t: FloatTensor<MainBackend>) -> Tensor<D>
     })
 }
 
+/// Inverse of [`unwrap_wgpu_int`]: wraps a fusion-Wgpu int tensor as a
+/// user-facing `Tensor<D, Int>`.
+pub fn wrap_wgpu_int<const D: usize>(t: IntTensor<MainBackend>) -> Tensor<D, Int> {
+    Tensor::from_dispatch(DispatchTensor {
+        kind: wgpu_kind!(BackendTensor::Int(t)),
+        checkpointing: None,
+    })
+}
+
 /// Extract the inner `AutodiffTensor<MainBackend>` from a `Tensor<D>` on an
 /// autodiff-enabled Wgpu device. Panics on any other shape.
 pub fn unwrap_ad_wgpu_float<const D: usize>(t: Tensor<D>) -> FloatTensor<AutodiffMain> {
@@ -222,7 +231,9 @@ impl SplatOps for Fusion<MainBackendBase> {
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
-        refine_weight: FloatTensor<Self>,
+        // Ignored in the forward: the refine statistic is produced by the
+        // rasterize backward. Present only as a differentiable trait input.
+        _refine_weight: FloatTensor<Self>,
         render_mode: SplatRenderMode,
         raster_mode: RasterizationMode,
         background: Vec3,
@@ -270,18 +281,16 @@ impl SplatRasterizerOps for Fusion<MainBackendBase> {
         let base_raw_opac = client
             .clone()
             .resolve_tensor_float::<MainBackendBase>(raw_opacities);
-        let base_refine_weight = client
-            .clone()
-            .resolve_tensor_float::<MainBackendBase>(refine_weight);
 
-        // Run the full pipeline on MainBackendBase.
+        // Run the full pipeline on MainBackendBase. `render_with_rasterizer`
+        // takes no `refine_weight`: the refine statistic is produced by the
+        // rasterize backward, not the forward.
         let out = <MainBackendBase as SplatRasterizerOps>::render_with_rasterizer(
             camera,
             img_size,
             base_transforms,
             base_sh_coeffs,
             base_raw_opac,
-            base_refine_weight,
             render_mode,
             raster_mode,
             background,

@@ -148,7 +148,7 @@ fn rasterize_bwd_impl(
 
     let hard_floats = client
         .properties()
-        .atomic_type_usage(Type::atomic(Type::new(ElemType::Float(FloatKind::F32))))
+        .atomic_type_usage(Type::atomic(Type::scalar(ElemType::Float(FloatKind::F32))))
         .contains(AtomicUsage::Add);
 
     let cube_count = CubeCount::Static(tile_bounds.x, tile_bounds.y, 1);

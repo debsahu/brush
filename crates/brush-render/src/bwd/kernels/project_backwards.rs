@@ -12,7 +12,7 @@ use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
 
-use crate::kernels::rasterize_backwards::COMPACT_GRAD_LANES;
+use super::rasterize_backwards::COMPACT_GRAD_LANES;
 
 pub const WG_SIZE: u32 = 256;
 

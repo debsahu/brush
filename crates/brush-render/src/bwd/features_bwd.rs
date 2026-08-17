@@ -70,7 +70,7 @@ fn rasterize_features_bwd_base(
 
     let hard_floats = client
         .properties()
-        .atomic_type_usage(Type::atomic(Type::new(ElemType::Float(FloatKind::F32))))
+        .atomic_type_usage(Type::atomic(Type::scalar(ElemType::Float(FloatKind::F32))))
         .contains(AtomicUsage::Add);
 
     let uniforms = crate::kernels::types::RasterizeUniformsLaunch::new(

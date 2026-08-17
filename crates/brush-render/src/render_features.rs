@@ -270,6 +270,9 @@ pub async fn render_features_base(
             global_from_compact_gid.clone().into_tensor_arg(),
             out_img.clone().into_tensor_arg(),
             uniforms,
+            // Precomputed divisor for the tiles-per-row split (matches the
+            // color rasterizer launch).
+            project_uniforms.tile_bounds[0],
             feat_dim,
         );
     });

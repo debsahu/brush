@@ -771,12 +771,8 @@ impl SplatOps for AutodiffMain {
         // Non-grad deferred-SH anchor: the generic dispatch never defers SH, so
         // this parent stays untracked and `RenderBackwards` takes the dense
         // branch. Kept only to fill the fixed 5-input parent set.
-        let device = <Self as FloatTensorOps<Self>>::float_device(&transforms);
-        let deferred_sh = <Self as FloatTensorOps<Self>>::float_zeros(
-            Shape::new([1, 1]),
-            &device,
-            FloatDType::F32,
-        );
+        let device = transforms.device();
+        let deferred_sh = Self::float_zeros(Shape::new([1, 1]), &device, FloatDType::F32);
 
         let prep_nodes = RenderBackwards
             .prepare::<NoCheckpointing>([

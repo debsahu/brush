@@ -206,6 +206,9 @@ impl SplatRasterizerOps for MainBackendBase {
                     global_from_compact_gid.clone().into_tensor_arg(),
                     visible.clone().into_tensor_arg(),
                     uniforms,
+                    // Precomputed divisor for the tiles-per-row split in the
+                    // per-pixel index math (matches the populated launch below).
+                    project_uniforms.tile_bounds[0],
                     bwd_info,
                     smooth_cutoff,
                     tile_width,
