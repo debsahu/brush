@@ -2,6 +2,15 @@ use brush_render::gaussian_splats::SplatRenderMode;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
+/// Decay shape for the depth-loss annealing schedule (`--depth-weight-decay`).
+#[derive(Default, Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DepthWeightDecay {
+    #[default]
+    Linear,
+    Cosine,
+}
+
 #[derive(Clone, Parser, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct TrainConfig {
@@ -438,6 +447,45 @@ pub struct TrainConfig {
     /// Weight of l1 loss on depth (disparity-space)
     #[arg(long, help_heading = "Training options", default_value = "0.0")]
     pub depth_loss_weight: f32,
+
+    /// Global iter at which the depth-loss weight starts decaying. Full
+    /// `--depth-loss-weight` before it. Only meaningful with
+    /// `--depth-weight-end-iter` > 0.
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    #[serde(default = "default_depth_weight_start_iter")]
+    pub depth_weight_start_iter: u32,
+
+    /// Global iter at which the decay finishes; weight is
+    /// `--depth-weight-end` from here on. 0 = annealing OFF (constant
+    /// weight, previous behaviour, byte-identical).
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    #[serde(default = "default_depth_weight_end_iter")]
+    pub depth_weight_end_iter: u32,
+
+    /// Final depth-loss weight after --depth-weight-end-iter.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default = "default_depth_weight_end")]
+    pub depth_weight_end: f32,
+
+    /// Decay shape between start and end iters.
+    #[arg(long, help_heading = "Training options", default_value = "linear")]
+    #[serde(default)]
+    pub depth_weight_decay: DepthWeightDecay,
+
+    /// DN-Splatter-style gradient-aware depth weighting: per-pixel weight
+    /// `w = exp(-|grad I| / sigma)` from the GT RGB image multiplies the depth-loss
+    /// map — full weight on textureless regions, down-weighted on image edges.
+    /// Composes multiplicatively with the annealed scalar weight.
+    #[arg(long, help_heading = "Training options", default_value = "false")]
+    #[serde(default)]
+    pub depth_grad_aware: bool,
+
+    /// Sigma for the gradient-aware weight, in [0,1] RGB intensity units of the
+    /// channel-mean forward-difference gradient. Smaller = harsher edge
+    /// down-weighting. Ignored unless --depth-grad-aware.
+    #[arg(long, help_heading = "Training options", default_value = "0.1")]
+    #[serde(default = "default_depth_grad_sigma")]
+    pub depth_grad_sigma: f32,
 
     /// Weight of the l1 loss between the rendered per-gaussian normal image and
     /// an external normal prior (`normal/<stem>.tiff`, 3-channel float32,
@@ -1003,7 +1051,45 @@ impl TrainConfig {
         {
             return Err("total training and LOD iterations exceed u32::MAX".to_owned());
         }
+        if self.depth_weight_end_iter != 0
+            && self.depth_weight_end_iter <= self.depth_weight_start_iter
+        {
+            return Err(
+                "depth-weight-end-iter must be greater than depth-weight-start-iter".to_owned(),
+            );
+        }
+        if self.depth_weight_end < 0.0 {
+            return Err("depth-weight-end must not be negative".to_owned());
+        }
+        if self.depth_grad_aware && self.depth_grad_sigma <= 0.0 {
+            return Err("depth-grad-sigma must be positive when depth-grad-aware is set".to_owned());
+        }
         Ok(())
+    }
+
+    /// Effective depth-loss weight at `global_iter`. `end_iter == 0` disables
+    /// annealing entirely (returns `depth_loss_weight` unchanged).
+    pub fn depth_weight_at(&self, global_iter: u32) -> f32 {
+        let w0 = self.depth_loss_weight;
+        if self.depth_weight_end_iter == 0 {
+            return w0;
+        }
+        let s = self.depth_weight_start_iter;
+        let e = self.depth_weight_end_iter;
+        if global_iter <= s {
+            return w0;
+        }
+        let w1 = self.depth_weight_end;
+        if global_iter >= e {
+            return w1;
+        }
+        let t = (global_iter - s) as f32 / (e - s) as f32;
+        match self.depth_weight_decay {
+            DepthWeightDecay::Linear => w0 + (w1 - w0) * t,
+            DepthWeightDecay::Cosine => {
+                w1 + (w0 - w1) * 0.5 * (1.0 + (std::f32::consts::PI * t).cos())
+            }
+        }
     }
 
     pub fn total_iters(&self) -> u32 {
@@ -1145,6 +1231,18 @@ fn default_cloud_prune_dist() -> f32 {
 }
 fn default_cloud_prune_start_iter() -> u32 {
     0
+}
+fn default_depth_weight_start_iter() -> u32 {
+    0
+}
+fn default_depth_weight_end_iter() -> u32 {
+    0
+}
+fn default_depth_weight_end() -> f32 {
+    0.0
+}
+fn default_depth_grad_sigma() -> f32 {
+    0.1
 }
 fn default_tidi_global_cap_frac() -> f32 {
     0.002
@@ -1548,5 +1646,105 @@ mod tests {
             config.validate(),
             Err("total training and LOD iterations exceed u32::MAX".to_owned())
         );
+    }
+
+    /// Depth-anneal + grad-aware flags: default-inert (byte-identical to the
+    /// pre-change behaviour), unrelated flags leave them, all six flags
+    /// round-trip on the CLI, and `validate()` rejects the two invalid combos.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn depth_anneal_and_grad_aware_default_noop_and_parse() {
+        let def = TrainConfig::default();
+        assert_eq!(def.depth_weight_start_iter, 0);
+        assert_eq!(def.depth_weight_end_iter, 0);
+        assert_eq!(def.depth_weight_end, 0.0);
+        assert_eq!(def.depth_weight_decay, DepthWeightDecay::Linear);
+        assert!(!def.depth_grad_aware);
+        assert!((def.depth_grad_sigma - 0.1).abs() < 1e-9);
+
+        // An unrelated flag must not disturb any of them.
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert_eq!(other.depth_weight_start_iter, 0);
+        assert_eq!(other.depth_weight_end_iter, 0);
+        assert_eq!(other.depth_weight_end, 0.0);
+        assert_eq!(other.depth_weight_decay, DepthWeightDecay::Linear);
+        assert!(!other.depth_grad_aware);
+        assert!((other.depth_grad_sigma - 0.1).abs() < 1e-9);
+
+        // All six flags parse and round-trip.
+        let on = TrainConfig::try_parse_from([
+            "brush",
+            "--depth-loss-weight",
+            "1.0",
+            "--depth-weight-start-iter",
+            "100",
+            "--depth-weight-end-iter",
+            "300",
+            "--depth-weight-end",
+            "0.25",
+            "--depth-weight-decay",
+            "cosine",
+            "--depth-grad-aware",
+            "--depth-grad-sigma",
+            "0.2",
+        ])
+        .expect("depth-anneal / grad-aware flags must parse");
+        assert_eq!(on.depth_weight_start_iter, 100);
+        assert_eq!(on.depth_weight_end_iter, 300);
+        assert!((on.depth_weight_end - 0.25).abs() < 1e-9);
+        assert_eq!(on.depth_weight_decay, DepthWeightDecay::Cosine);
+        assert!(on.depth_grad_aware);
+        assert!((on.depth_grad_sigma - 0.2).abs() < 1e-9);
+
+        // validate(): end-iter <= start-iter (nonzero) is rejected.
+        let mut bad = TrainConfig::default();
+        bad.depth_weight_start_iter = 300;
+        bad.depth_weight_end_iter = 300;
+        assert!(bad.validate().is_err());
+
+        // validate(): sigma <= 0 with grad-aware on is rejected.
+        let mut bad_sigma = TrainConfig::default();
+        bad_sigma.depth_grad_aware = true;
+        bad_sigma.depth_grad_sigma = 0.0;
+        assert!(bad_sigma.validate().is_err());
+    }
+
+    /// `depth_weight_at` schedule pins. With defaults it is the byte-identity
+    /// constant `depth_loss_weight`; with a schedule set it interpolates.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn depth_weight_schedule_pins() {
+        // Default cfg: annealing OFF, exact byte-identity to depth_loss_weight.
+        let def = TrainConfig::default();
+        for i in [0u32, 7000, u32::MAX] {
+            assert_eq!(def.depth_weight_at(i), def.depth_loss_weight);
+        }
+
+        // Linear schedule w0=1.0 over [100, 300] down to 0.0.
+        let mut lin = TrainConfig::default();
+        lin.depth_loss_weight = 1.0;
+        lin.depth_weight_start_iter = 100;
+        lin.depth_weight_end_iter = 300;
+        lin.depth_weight_end = 0.0;
+        lin.depth_weight_decay = DepthWeightDecay::Linear;
+        assert!((lin.depth_weight_at(0) - 1.0).abs() < 1e-6);
+        assert!((lin.depth_weight_at(100) - 1.0).abs() < 1e-6);
+        assert!((lin.depth_weight_at(200) - 0.5).abs() < 1e-6);
+        assert!((lin.depth_weight_at(300) - 0.0).abs() < 1e-6);
+        assert!((lin.depth_weight_at(10_000) - 0.0).abs() < 1e-6);
+
+        // Cosine schedule, same endpoints.
+        let mut cos = lin.clone();
+        cos.depth_weight_decay = DepthWeightDecay::Cosine;
+        assert!((cos.depth_weight_at(200) - 0.5).abs() < 1e-6);
+        // t = 0.25 -> 0.5 * (1 + cos(pi/4)) = 0.853553...
+        assert!((cos.depth_weight_at(150) - 0.853_553_4).abs() < 1e-6);
+
+        // Nonzero end weight pins the endpoints for both shapes.
+        let mut lin_nz = lin.clone();
+        lin_nz.depth_weight_end = 0.25;
+        assert!((lin_nz.depth_weight_at(100) - 1.0).abs() < 1e-6);
+        assert!((lin_nz.depth_weight_at(300) - 0.25).abs() < 1e-6);
     }
 }

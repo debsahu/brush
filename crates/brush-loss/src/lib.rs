@@ -1694,7 +1694,11 @@ pub fn image_loss_eval(
 }
 
 /// L1 depth loss in disparity (inverse-depth) space
-pub fn depth_loss(pred_depth: Tensor<2>, gt_depth: Tensor<2>) -> Tensor<1> {
+pub fn depth_loss(
+    pred_depth: Tensor<2>,
+    gt_depth: Tensor<2>,
+    pixel_weight: Option<Tensor<2>>,
+) -> Tensor<1> {
     let pred_invalid = pred_depth.clone().lower_equal_elem(0.0);
     let disp_pred = pred_depth.recip().mask_fill(pred_invalid, 0.0);
 
@@ -1705,7 +1709,43 @@ pub fn depth_loss(pred_depth: Tensor<2>, gt_depth: Tensor<2>) -> Tensor<1> {
     let valid = gt_valid.float();
     let abs_err = (disp_pred - disp_gt).abs() * valid.clone();
 
+    // DN-Splatter semantics: per-pixel modulation of the error map; the
+    // denominator stays the UNweighted valid count, so w == 1 (and None) is
+    // byte-identical to the old fn.
+    let abs_err = match pixel_weight {
+        Some(w) => abs_err * w,
+        None => abs_err,
+    };
+
     abs_err.sum() / valid.sum().clamp_min(1.0)
+}
+
+/// Per-pixel depth-loss weight `exp(-|grad I| / sigma)` from a GT RGB image
+/// `[H, W, 3]` in [0, 1]. |grad I| is the channel-mean L1 forward difference,
+/// `(sum_c |I[y,x+1]-I[y,x]| + sum_c |I[y+1,x]-I[y,x]|) / 3`. The forward-
+/// difference border (last row/col) reads gradient 0, i.e. full weight.
+pub fn rgb_grad_weight(gt_rgb: Tensor<3>, sigma: f32) -> Tensor<2> {
+    let [h, w, _] = gt_rgb.dims();
+    let device = gt_rgb.device();
+    if h < 2 || w < 2 {
+        return Tensor::ones([h, w], &device);
+    }
+
+    let dx = (gt_rgb.clone().slice(s![.., 1..w, ..]) - gt_rgb.clone().slice(s![.., 0..w - 1, ..]))
+        .abs()
+        .sum_dim(2)
+        .div_scalar(3.0); // [H, W-1, 1]
+    let dy = (gt_rgb.clone().slice(s![1..h, .., ..]) - gt_rgb.slice(s![0..h - 1, .., ..]))
+        .abs()
+        .sum_dim(2)
+        .div_scalar(3.0); // [H-1, W, 1]
+
+    let gx = Tensor::<2>::zeros([h, w], &device)
+        .slice_assign(s![.., 0..w - 1], dx.reshape([h as i32, (w - 1) as i32]));
+    let gy = Tensor::<2>::zeros([h, w], &device)
+        .slice_assign(s![0..h - 1, ..], dy.reshape([(h - 1) as i32, w as i32]));
+
+    (gx + gy).mul_scalar(-1.0 / sigma).exp()
 }
 
 /// L1 loss between a rendered camera-frame normal image and an external normal
@@ -2394,5 +2434,102 @@ mod normal_loss_tests {
         let n3 = Tensor::<3>::ones([1, 5, 3], &device);
         let a3 = Tensor::<3>::ones([1, 5, 1], &device);
         assert_eq!(read(normal_smooth_loss(n3, a3)).await[0], 0.0);
+    }
+
+    /// `depth_loss(.., None)` must equal `depth_loss(.., Some(ones))` exactly:
+    /// a unit per-pixel weight is the byte-identity of the pre-change fn, even
+    /// with some `gt <= 0` (invalid) pixels in the map.
+    #[tokio::test]
+    async fn depth_loss_none_matches_unit_weight() {
+        let device = device().await;
+        let pred = Tensor::<2>::from_data(
+            TensorData::new(vec![1.0, 2.0, 4.0, 0.5, 3.0, 1.5], [2, 3]),
+            &device,
+        );
+        // Two of the six pixels have gt <= 0 (invalid, skipped).
+        let gt = Tensor::<2>::from_data(
+            TensorData::new(vec![2.0, 0.0, 3.0, 1.0, -1.0, 2.0], [2, 3]),
+            &device,
+        );
+        let ones = Tensor::<2>::ones([2, 3], &device);
+
+        let none = read(depth_loss(pred.clone(), gt.clone(), None)).await[0];
+        let unit = read(depth_loss(pred, gt, Some(ones))).await[0];
+        assert_eq!(none, unit);
+    }
+
+    /// A vertical step edge (cols 0-2 = 0.0, cols 3-5 = 1.0) gives weight
+    /// `exp(-1/sigma)` only where a forward difference crosses the step
+    /// (column 2), and 1.0 everywhere else including the last row/col.
+    #[tokio::test]
+    async fn rgb_grad_weight_synthetic_edge() {
+        let device = device().await;
+        let (h, w) = (4usize, 6usize);
+        let mut data = vec![0.0f32; h * w * 3];
+        for y in 0..h {
+            for x in 3..w {
+                for c in 0..3 {
+                    data[(y * w + x) * 3 + c] = 1.0;
+                }
+            }
+        }
+        let img = Tensor::<3>::from_data(TensorData::new(data, [h, w, 3]), &device);
+        let weight = read(rgb_grad_weight(img, 0.5)).await;
+
+        let edge = (-2.0f32).exp(); // exp(-|1|/0.5)
+        for y in 0..h {
+            for x in 0..w {
+                let got = weight[y * w + x];
+                let expected = if x == 2 { edge } else { 1.0 };
+                assert!(
+                    (got - expected).abs() < 1e-6,
+                    "weight at ({x},{y}) = {got}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    /// Gradient-aware weighting down-weights edges: a constant disparity-error
+    /// field modulated by the step-image weight equals the hand-computed
+    /// `sum(w)/N * err` and is strictly below the unweighted loss.
+    #[tokio::test]
+    async fn grad_aware_depth_loss_downweights_edges() {
+        let device = device().await;
+        let (h, w) = (4usize, 6usize);
+
+        // Constant per-pixel disparity error: pred disparity 1/1 = 1, gt
+        // disparity 1/2 = 0.5, so |err| = 0.5 at every valid pixel.
+        let pred = Tensor::<2>::ones([h, w], &device);
+        let gt = Tensor::<2>::ones([h, w], &device) * 2.0;
+        let err = 0.5f32;
+        let n = (h * w) as f32;
+
+        // The step image + its weight (edge column 2 = exp(-2), else 1.0).
+        let mut data = vec![0.0f32; h * w * 3];
+        for y in 0..h {
+            for x in 3..w {
+                for c in 0..3 {
+                    data[(y * w + x) * 3 + c] = 1.0;
+                }
+            }
+        }
+        let img = Tensor::<3>::from_data(TensorData::new(data, [h, w, 3]), &device);
+        let weight = rgb_grad_weight(img, 0.5);
+        let w_vals = read(weight.clone()).await;
+        let sum_w: f32 = w_vals.iter().sum();
+
+        let weighted = read(depth_loss(pred.clone(), gt.clone(), Some(weight))).await[0];
+        let unweighted = read(depth_loss(pred, gt, None)).await[0];
+
+        // Denominator is the unweighted valid count N; err is constant.
+        assert!(
+            (weighted - sum_w / n * err).abs() < 1e-6,
+            "weighted = {weighted}, expected {}",
+            sum_w / n * err
+        );
+        assert!(
+            weighted < unweighted,
+            "edge weighting must reduce the loss: {weighted} !< {unweighted}"
+        );
     }
 }

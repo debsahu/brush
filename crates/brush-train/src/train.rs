@@ -18,7 +18,7 @@ use brush_appearance::{AppearanceConfig, AppearanceTrainState};
 use brush_dataset::scene::SceneBatch;
 use brush_loss::{
     ImageLossConfig, depth_loss, depth_normal_loss, image_loss, normal_loss, normal_smooth_loss,
-    normals_from_depth,
+    normals_from_depth, rgb_grad_weight,
 };
 use brush_render::camera::Camera;
 use brush_render::gaussian_splats::{RasterizationMode, Splats, fold_min_scale};
@@ -867,7 +867,8 @@ impl SplatTrainer {
                 }
                 _ => splats.clone(),
             };
-            let use_depth = batch.depth.is_some() && self.config.depth_loss_weight > 0.0;
+            let eff_depth_weight = self.config.depth_weight_at(global_iter);
+            let use_depth = batch.depth.is_some() && eff_depth_weight > 0.0;
             // Geometry-prior terms (all inert at their 0.0 defaults, gated
             // exactly like `use_depth`, so a run that does not pass the flags
             // takes the same path it always did).
@@ -1104,7 +1105,21 @@ impl SplatTrainer {
                 let alpha = pred_image.clone().slice(s![.., .., 3..4]).detach();
                 let expected_depth =
                     (accumulated_depth / alpha.clamp_min(1e-10)).reshape([img_h, img_w]);
-                loss = loss + depth_loss(expected_depth, gt_depth) * self.config.depth_loss_weight;
+                // DN-Splatter gradient-aware weighting: build a per-pixel weight
+                // from the GT RGB image (same source `image_loss` consumes),
+                // lifted onto the AD graph as a constant like the LPIPS path, so
+                // it grows no tape. Composes multiplicatively with the annealed
+                // scalar weight outside. Only materialises the f32 GT when on.
+                let pixel_weight = if self.config.depth_grad_aware {
+                    let gt_rgb: Tensor<3> = Tensor::from_inner(brush_loss::unpack_gt_rgb(
+                        gt_packed.clone(),
+                        composite_bg,
+                    ));
+                    Some(rgb_grad_weight(gt_rgb, self.config.depth_grad_sigma))
+                } else {
+                    None
+                };
+                loss = loss + depth_loss(expected_depth, gt_depth, pixel_weight) * eff_depth_weight;
             }
 
             // Depth-coupled opacity regularizer (3D distance-to-cloud gate). For
@@ -2699,7 +2714,7 @@ mod depth_loss_grad_tests {
         // A positive constant target, so the disparity error and its gradient are
         // nonzero wherever a gaussian was rendered.
         let gt_depth = Tensor::<2>::ones([img_h, img_w], &device) * 3.0;
-        let loss = depth_loss(expected_depth, gt_depth);
+        let loss = depth_loss(expected_depth, gt_depth, None);
 
         let grads = splats.bwd_validate(loss).await;
 
