@@ -2489,6 +2489,39 @@ mod normal_loss_tests {
         }
     }
 
+    /// Mirror of `rgb_grad_weight_synthetic_edge` on the VERTICAL axis: a
+    /// horizontal step edge (rows 0-2 = 0.0, rows 3-5 = 1.0) gives weight
+    /// `exp(-1/sigma)` only where a row forward difference crosses the step
+    /// (row 2), and 1.0 everywhere else including the last row/col. Exercises
+    /// the `gy` `slice_assign` zero-pad direction the x-only fixtures never hit.
+    #[tokio::test]
+    async fn rgb_grad_weight_synthetic_edge_horizontal() {
+        let device = device().await;
+        let (h, w) = (6usize, 4usize);
+        let mut data = vec![0.0f32; h * w * 3];
+        for y in 3..h {
+            for x in 0..w {
+                for c in 0..3 {
+                    data[(y * w + x) * 3 + c] = 1.0;
+                }
+            }
+        }
+        let img = Tensor::<3>::from_data(TensorData::new(data, [h, w, 3]), &device);
+        let weight = read(rgb_grad_weight(img, 0.5)).await;
+
+        let edge = (-2.0f32).exp(); // exp(-|1|/0.5)
+        for y in 0..h {
+            for x in 0..w {
+                let got = weight[y * w + x];
+                let expected = if y == 2 { edge } else { 1.0 };
+                assert!(
+                    (got - expected).abs() < 1e-6,
+                    "weight at ({x},{y}) = {got}, expected {expected}"
+                );
+            }
+        }
+    }
+
     /// Gradient-aware weighting down-weights edges: a constant disparity-error
     /// field modulated by the step-image weight equals the hand-computed
     /// `sum(w)/N * err` and is strictly below the unweighted loss.
