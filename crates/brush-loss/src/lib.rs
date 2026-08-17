@@ -2601,8 +2601,7 @@ mod normal_loss_tests {
         assert_eq!(read(normal_loss(pred, gt)).await[0], 0.0);
     }
 
-    // P4: candidate fix A — denominator kept materialized by adding a masked-count
-    // via a single fused reduce over a stacked tensor. (reformulation probe)
+    // P4: baseline repro — exact normal_loss body with fill-constant inputs.
     #[tokio::test]
     async fn probe_fix_reshape_reduce() {
         let d = device().await;
@@ -2611,9 +2610,70 @@ mod normal_loss_tests {
         let gt_len = gt.clone().powi_scalar(2).sum_dim(2).sqrt();
         let valid = gt_len.greater_elem(0.5).float();
         let abs_err = (pred - gt).abs().sum_dim(2) * valid.clone();
-        // reduce via sum_dim to keep rank, then divide elementwise-broadcast.
         let num = abs_err.sum();
         let den = valid.sum().mul_scalar(3.0).clamp_min(1.0);
         assert_eq!(read(num / den).await[0], 0.0);
+    }
+
+    // FIX candidate A: add a fresh separately-sourced zero to the final result.
+    // Output identical (+0). Does a trailing add of an independent fill break
+    // the single foldable block?
+    #[tokio::test]
+    async fn probe_fixA_trailing_add_zero() {
+        let d = device().await;
+        let gt = Tensor::<3>::zeros([1, 2, 3], &d);
+        let pred = Tensor::<3>::ones([1, 2, 3], &d);
+        let gt_len = gt.clone().powi_scalar(2).sum_dim(2).sqrt();
+        let valid = gt_len.greater_elem(0.5).float();
+        let abs_err = (pred - gt).abs().sum_dim(2) * valid.clone();
+        let out = abs_err.sum() / valid.sum().mul_scalar(3.0).clamp_min(1.0);
+        let out = out + Tensor::<1>::zeros([1], &d);
+        assert_eq!(read(out).await[0], 0.0);
+    }
+
+    // FIX candidate B: reshape boundaries on num & den before div.
+    #[tokio::test]
+    async fn probe_fixB_reshape_boundary() {
+        let d = device().await;
+        let gt = Tensor::<3>::zeros([1, 2, 3], &d);
+        let pred = Tensor::<3>::ones([1, 2, 3], &d);
+        let gt_len = gt.clone().powi_scalar(2).sum_dim(2).sqrt();
+        let valid = gt_len.greater_elem(0.5).float();
+        let abs_err = (pred - gt).abs().sum_dim(2) * valid.clone();
+        let num = abs_err.sum().reshape([1]);
+        let den = valid.sum().mul_scalar(3.0).clamp_min(1.0).reshape([1]);
+        assert_eq!(read(num / den).await[0], 0.0);
+    }
+
+    // FIX candidate C: force a readback ONLY on the degenerate all-invalid branch.
+    // count materialized once; if zero, return an early fresh zero (short chain).
+    #[tokio::test]
+    async fn probe_fixC_count_guard() {
+        let d = device().await;
+        let gt = Tensor::<3>::zeros([1, 2, 3], &d);
+        let pred = Tensor::<3>::ones([1, 2, 3], &d);
+        let gt_len = gt.clone().powi_scalar(2).sum_dim(2).sqrt();
+        let valid = gt_len.greater_elem(0.5).float();
+        let abs_err = (pred - gt).abs().sum_dim(2) * valid.clone();
+        let out = abs_err.sum() / valid.sum().mul_scalar(3.0).clamp_min(1.0);
+        assert_eq!(read(out).await[0], 0.0);
+    }
+
+    // CONFIRM: from_data (real device tensor) construction of BOTH degenerate
+    // cases the failing tests assert. These mirror production input shape.
+    #[tokio::test]
+    async fn probe_confirm_fromdata_normal_loss() {
+        let d = device().await;
+        let gt = Tensor::<3>::from_data(TensorData::new(vec![0.0f32; 6], [1, 2, 3]), &d);
+        let pred = Tensor::<3>::from_data(TensorData::new(vec![1.0f32; 6], [1, 2, 3]), &d);
+        assert_eq!(read(normal_loss(pred, gt)).await[0], 0.0);
+    }
+
+    #[tokio::test]
+    async fn probe_confirm_fromdata_smooth_nothing_covered() {
+        let d = device().await;
+        let n2 = Tensor::<3>::from_data(TensorData::new(vec![1.0f32; 12], [2, 2, 3]), &d);
+        let a2 = Tensor::<3>::from_data(TensorData::new(vec![0.0f32; 4], [2, 2, 1]), &d);
+        assert_eq!(read(normal_smooth_loss(n2, a2)).await[0], 0.0);
     }
 }
