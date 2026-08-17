@@ -29,13 +29,13 @@ use brush_render::kernels::camera_model::CameraModel;
 use burn::{
     Tensor,
     module::{Module, Param, ParamId},
-    optim::{GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
+    optim::GradientsParams,
     tensor::{Bool, Device, Gradients, Int, TensorData, activation::sigmoid},
 };
 use rand::{Rng, RngExt, SeedableRng};
 use rayon::prelude::*;
 
-use crate::adam_scaled::{AdamScaled, AdamScaledConfig};
+use crate::adam_scaled::{AdamScaled, AdamState};
 
 /// Raw `ω` init. `σ(ω)` starts at ≈0.998 so the learned-importance opacity gate
 /// begins as near-identity (a ~0.2% opacity nudge when TIDI is first enabled)
@@ -64,10 +64,45 @@ impl ImportanceModule {
     }
 }
 
-type ImportanceOptimizer = OptimizerAdaptor<AdamScaled, ImportanceModule>;
+/// Hand-rolled single-parameter Adam for `ω` — burn 0.22 dropped the
+/// `SimpleOptimizer`/`OptimizerAdaptor` machinery our old `AdamScaled` rode.
+/// `ω` is the only parameter, so one `AdamState<1>` holds all optimizer state;
+/// it survives refine because `Param::map` keeps the parameter id.
+struct ImportanceOptimizer {
+    adam: AdamScaled,
+    state: AdamState<1>,
+}
 
 fn create_importance_optimizer() -> ImportanceOptimizer {
-    AdamScaledConfig::new().with_epsilon(1e-15).init()
+    ImportanceOptimizer {
+        adam: AdamScaled::new(1e-15),
+        state: AdamState::new(None, false),
+    }
+}
+
+impl ImportanceOptimizer {
+    fn step(
+        &mut self,
+        lr: f64,
+        mut module: ImportanceModule,
+        mut grads: GradientsParams,
+    ) -> ImportanceModule {
+        let id = module.omega.id;
+        if let Some(grad) = grads.remove::<1>(id) {
+            let adam = self.adam.clone();
+            let state = &mut self.state;
+            module.omega = module.omega.map(|t| {
+                let stepped = adam.step(lr, t.inner(), &grad, state);
+                Tensor::from_inner(stepped).require_grad()
+            });
+        }
+        module
+    }
+
+    /// Mutable access to `ω`'s Adam momentum, for refine reindexing.
+    fn map_state(&mut self, map_fn: impl Fn(Tensor<1>) -> Tensor<1>) {
+        self.state.map_momentum(map_fn);
+    }
 }
 
 /// Trainer-owned TIDI state. Everything here PERSISTS across refine cycles — it
@@ -315,13 +350,7 @@ impl TidiState {
             .omega
             .clone()
             .map(|x| x.select(0, valid_inds.clone()));
-        let mut record = self.optim.to_record();
-        if record.contains_key(&self.importance.omega.id) {
-            crate::train::map_opt(self.importance.omega.id, &mut record, &|x: Tensor<1>| {
-                x.select(0, valid_inds.clone())
-            });
-            self.optim = create_importance_optimizer().load_record(record);
-        }
+        self.optim.map_state(|x| x.select(0, valid_inds.clone()));
         self.vis_accum = self.vis_accum.clone().select(0, inner_valid_inds.clone());
         self.grad_ema = self.grad_ema.clone().select(0, inner_valid_inds.clone());
         self.birth_iter = self.birth_iter.clone().select(0, inner_valid_inds.clone());
@@ -351,17 +380,13 @@ impl TidiState {
             .omega
             .clone()
             .map(|x| Tensor::cat(vec![x, fresh.clone()], 0));
-        let mut record = self.optim.to_record();
-        if record.contains_key(&self.importance.omega.id) {
+        {
             let opt_device = opt_device.clone();
             // Parent moments untouched; children start at zero.
             let _ = refine_inds_opt; // symmetry with DiG's signature; not needed here.
-            crate::train::map_opt(self.importance.omega.id, &mut record, &move |x: Tensor<
-                1,
-            >| {
+            self.optim.map_state(move |x| {
                 Tensor::cat(vec![x, Tensor::<1>::zeros([refine_count], &opt_device)], 0)
             });
-            self.optim = create_importance_optimizer().load_record(record);
         }
         let zeros = Tensor::<1>::zeros([refine_count], inner_device);
         self.vis_accum = Tensor::cat(vec![self.vis_accum.clone(), zeros.clone()], 0);
