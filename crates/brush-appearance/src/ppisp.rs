@@ -337,7 +337,7 @@ fn ppisp_backward<B: Backend + PpispOps<B>>(
     use burn::tensor::Slice;
     let sl = |r: std::ops::Range<usize>| -> Slice { r.into() };
 
-    let device = B::float_device(&rgb);
+    let device = rgb.device();
     let num_frames = exposure.shape().dims::<1>()[0];
     let num_cameras = vignetting.shape().dims::<3>()[0];
 

@@ -169,7 +169,7 @@ pub fn detach_autodiff<const D: usize>(t: Tensor<D>) -> Tensor<D> {
 /// inner/autodiff folds (e.g. `fold_min_scale`) need — a lifted constant then
 /// degrades to the inner backend on the next op and trips a cross-backend
 /// assert. Keep the hand-rolled lift.
-pub(crate) fn lift_to_autodiff<const D: usize>(t: Tensor<D>) -> Tensor<D> {
+pub fn lift_to_autodiff<const D: usize>(t: Tensor<D>) -> Tensor<D> {
     let dispatch: DispatchTensor = t.into_dispatch();
     match dispatch.kind {
         wgpu_kind!(BackendTensor::Float(inner)) => {
