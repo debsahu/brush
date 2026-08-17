@@ -27,6 +27,7 @@ Brush takes in COLMAP data or datasets in the Nerfstudio format. Training is ful
 It also supports masking images:
 - Images with transparency. This will force the final splat to match the transparency of the input.
 - A folder of images called 'masks'. This ignores parts of the image that are masked out.
+  Black pixels in the mask are ignored, white pixels are kept. Pass `--invert-masks` if your masks are the other way around.
 
 ### Appearance compensation
 

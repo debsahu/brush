@@ -248,6 +248,7 @@ async fn load_dataset_inner(
                 mask_path.map(|p| p.to_path_buf()),
                 load_args.max_resolution,
                 load_args.alpha_mode,
+                load_args.invert_masks,
             );
 
             views.push(SceneView {
@@ -593,6 +594,7 @@ mod tests {
             subsample_frames: None,
             subsample_points: None,
             alpha_mode: None,
+            invert_masks: false,
             max_scene_batch_cache_size: 0,
             train_on_eval: false,
             estimate_metric_scale: false,

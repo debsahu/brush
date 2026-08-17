@@ -77,6 +77,9 @@ pub struct LoadDatasetConfig {
     /// Whether to rescale the dataset to suite the depth map scale
     #[arg(long, help_heading = "Dataset Options", default_value = "false")]
     pub estimate_metric_scale: bool,
+    /// Invert mask images, so white means "ignore this pixel" instead of "keep it".
+    #[arg(long, help_heading = "Dataset Options", default_value = "false")]
+    pub invert_masks: bool,
     /// Max size of the cache for frames of the dataset, larger values usually improve performance for large datasets at the cost of more memory usage, can be e.g. 6G, 6000M, 6000MiB, 6000MB
     #[arg(long, help_heading = "Dataset Options", default_value = DEFAULT_MAX_SCENE_BATCH_CACHE_SIZE, value_parser = parse_size)]
     pub max_scene_batch_cache_size: u64,
