@@ -53,6 +53,17 @@ struct ExpLrScheduler {
 
 impl ExpLrScheduler {
     fn new(initial_lr: f64, gamma: f64) -> Self {
+        // burn's ExponentialLrSchedulerConfig::build() rejects these ranges; the
+        // local replica must keep the same fail-fast guarantee (a mis-set
+        // lr_*_end > lr_* yields gamma > 1, i.e. a GROWING lr, silently).
+        assert!(
+            initial_lr > 0.0,
+            "ExpLrScheduler initial_lr must be > 0, got {initial_lr}"
+        );
+        assert!(
+            gamma > 0.0 && gamma <= 1.0,
+            "ExpLrScheduler gamma must be in (0, 1], got {gamma}"
+        );
         Self {
             previous_lr: initial_lr / gamma,
             gamma,
