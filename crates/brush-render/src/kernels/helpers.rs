@@ -6,6 +6,7 @@
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
+use burn_cubecl::cubecl::std::FastDivmod;
 
 use super::types::{PixelRect, ProjectUniforms, Quat, Splat, Sym2, TileBbox, Vec3A};
 use crate::kernels::camera_model::{CameraModel, calculate_project_jacobian};
@@ -63,18 +64,23 @@ pub fn compact_bits_16(v: u32) -> u32 {
 
 /// Decode a tile-internal Morton id to (px, py) coordinates within the image.
 /// The supported 16x16 and 16x8 layouts are exact prefixes of this Morton map.
+///
+/// `tiles_per_row` arrives as a [`FastDivmod`] because the tile row/column
+/// split is a runtime divide on the per-pixel path; the magic numbers are
+/// precomputed host-side. `tile_width`/`tile_height` stay comptime so the
+/// non-square (16x8) tile layouts our forward/backward kernels use compile
+/// to constant folds.
 #[cube]
 pub fn map_1d_to_2d(
     id: u32,
-    tiles_per_row: u32,
+    tiles_per_row: FastDivmod<u32>,
     #[comptime] tile_width: u32,
     #[comptime] tile_height: u32,
 ) -> (u32, u32) {
     let tile_size = comptime![tile_width * tile_height];
     let tile_id = id / tile_size;
     let within = id % tile_size;
-    let tile_x = tile_id % tiles_per_row;
-    let tile_y = tile_id / tiles_per_row;
+    let (tile_y, tile_x) = tiles_per_row.div_mod(tile_id);
     let mx = compact_bits_16(within);
     let my = compact_bits_16(within >> 1u32);
     (tile_x * tile_width + mx, tile_y * tile_height + my)

@@ -6,11 +6,10 @@ readme.workspace = true
 license.workspace = true
 
 [features]
-debug-validation = ["brush-render-bwd/debug-validation"]
+debug-validation = ["brush-render/debug-validation"]
 native-msl = [
     "brush-loss/native-msl",
     "brush-render/native-msl",
-    "brush-render-bwd/native-msl",
     "burn-wgpu/metal",
 ]
 
@@ -19,7 +18,6 @@ brush-render.path = "../brush-render"
 brush-appearance.path = "../brush-appearance"
 brush-cube.path = "../brush-cube"
 brush-dataset.path = "../brush-dataset"
-brush-render-bwd.path = "../brush-render-bwd"
 brush-loss.path = "../brush-loss"
 brush-serde.path = "../brush-serde"
 lpips.path = "../lpips"

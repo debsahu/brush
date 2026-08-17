@@ -16,7 +16,7 @@ mod native {
         scene::{SceneBatch, sample_to_packed_data, view_to_sample_image},
     };
     use brush_render::{AlphaMode, gaussian_splats::SplatRenderMode};
-    use brush_render_bwd::burn_glue::lift_splats_to_autodiff;
+    use brush_render::bwd::burn_glue::lift_splats_to_autodiff;
     use brush_serde::load_splat_from_ply;
     use brush_train::{
         config::TrainConfig,

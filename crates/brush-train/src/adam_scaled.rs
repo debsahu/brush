@@ -220,9 +220,14 @@ impl SimpleOptimizer for AdamScaled {
         &self,
         lr: LearningRate,
         tensor: Tensor<D>,
-        mut grad: Tensor<D>,
+        grad: &Tensor<D>,
         state: Option<Self::State<D>>,
     ) -> (Tensor<D>, Option<Self::State<D>>) {
+        // burn's `SimpleOptimizer::step` now hands the gradient in by reference
+        // (upstream #517 burn bump). Take one owned copy up front so the rest of
+        // the routine — weight decay, the fused-SH reshape path, the momentum
+        // transform — keeps its original by-value logic unchanged.
+        let mut grad = grad.clone();
         let mut state_momentum = None;
         let mut scaling = None;
         let reduce = state.as_ref().is_some_and(|s| s.reduce_moment_2);

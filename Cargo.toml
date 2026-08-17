@@ -14,7 +14,6 @@ members = [
     "crates/brush-prefix-sum",
     "crates/brush-process",
     "crates/brush-render",
-    "crates/brush-render-bwd",
     "crates/brush-rerun",
     "crates/brush-serde",
     "crates/brush-serde-macros",
@@ -30,7 +29,7 @@ default-members = ["apps/brush-app"]
 
 [workspace.package]
 edition = "2024"
-version = "0.3.0"
+version = "1.0.0"
 readme = "README.md"
 license = "Apache-2.0"
 repository = "https://github.com/ArthurBrussee/brush"
@@ -82,7 +81,7 @@ web-time = "1.1.0"
 humantime = "2.1.0"
 async-fn-stream = "0.3"
 assert_approx_eq = "1.1.0"
-safetensors = "0.7"
+safetensors = "0.8"
 log = "0.4.22"
 wasm-bindgen = "0.2.100"
 wasm-bindgen-futures = "0.4"
@@ -91,7 +90,7 @@ wasm-streams = "0.6"
 rayon = "1.11"
 
 # Backends are chosen per platform.
-wgpu = { version = "29", default-features = false, features = ["naga-ir"] }
+wgpu = { version = "30", default-features = false, features = ["naga-ir"] }
 
 serde-ply = "0.2.1"
 
@@ -99,24 +98,24 @@ serde-ply = "0.2.1"
 # enables `burn-core/dataset`, which pulls gix-tempfile -> signal-hook-registry
 # -> errno, none of which compile for wasm32. Brush has its own dataset stack
 # and no RL, so dropping `rl` keeps the wasm build green.
-burn = { git = "https://github.com/ArthurBrussee/burn", rev = "da67c9397048e8fcdadda4ebc7de1e16182a999c", default-features = false, features = [
+burn = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = [
     'std',
     'optim',
     'extension',
 ] }
-burn-cubecl = { git = "https://github.com/ArthurBrussee/burn", rev = "da67c9397048e8fcdadda4ebc7de1e16182a999c" }
-burn-ir = { git = "https://github.com/ArthurBrussee/burn", rev = "da67c9397048e8fcdadda4ebc7de1e16182a999c" }
-burn-wgpu = { git = "https://github.com/ArthurBrussee/burn", rev = "da67c9397048e8fcdadda4ebc7de1e16182a999c", features = [
+burn-cubecl = { git = "https://github.com/tracel-ai/burn", branch = "main" }
+burn-ir = { git = "https://github.com/tracel-ai/burn", branch = "main" }
+burn-wgpu = { git = "https://github.com/tracel-ai/burn", branch = "main", features = [
     "exclusive-memory-only",
 ] }
-burn-fusion = { git = "https://github.com/ArthurBrussee/burn", rev = "da67c9397048e8fcdadda4ebc7de1e16182a999c" }
+burn-fusion = { git = "https://github.com/tracel-ai/burn", branch = "main" }
 # `pytorch` is only needed by lpips-convert (one-off weight conversion tool).
 # Enabled there directly so the main graph doesn't grow `zip 8` and its newer
 # crypto family (digest 0.11, hmac 0.13, ...).
-burn-store = { git = "https://github.com/ArthurBrussee/burn", rev = "da67c9397048e8fcdadda4ebc7de1e16182a999c" }
+burn-store = { git = "https://github.com/tracel-ai/burn", branch = "main" }
 
-egui = { version = "0.34.3"  }
-eframe = { version = "0.34.3", default-features = false, features = [
+egui = { version = "0.36" }
+eframe = { version = "0.36", default-features = false, features = [
     "wgpu",
     "android-game-activity",
     "wayland",
@@ -124,9 +123,9 @@ eframe = { version = "0.34.3", default-features = false, features = [
     "persistence",
 ] }
 
-egui_tiles = { version = "0.15", features = ["serde"] }
+egui_tiles = { version = "0.17", features = ["serde"] }
 
-rerun = { version = "0.33", default-features = false, features = [
+rerun = { version = "0.36", default-features = false, features = [
     'sdk',
     'glam',
 ] }
@@ -145,6 +144,11 @@ alphanumeric-sort = "1.5.3"
 opt-level = 1
 # Reduce debuginfo for faster linking
 debug = 1
+
+# No debuginfo for dependencies: they're rarely stepped into, and dropping it
+# cuts link time and target-dir size noticeably (workspace crates keep theirs).
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 lto = "thin"
@@ -321,41 +325,47 @@ needless_range_loop = "allow"
 # This doesn't quite work with Burn:
 single_range_in_vec_init = "allow"
 
-# wgpu fork with WebGPU subgroups feature mapping + JS interop accessors
-# (needed for our backward kernel's subgroupAdd/subgroupAny on web, and for
-# brush-js to expose the underlying GPUDevice/GPUBuffer to JS). Our js-interop
-# wgpu rides trunk (for cubecl-wgpu's transition_resources and
-# Result<BufferView> from get_mapped_range), and carries a small patch raising
-# Metal's per-stage buffer limits back to the v29.0.1 relaxed values — trunk
-# still ships the conservative 8/12/8 split from #9118 (tracked by #9287).
+# wgpu fork (v30.0.0 + 2 commits): WebGPU subgroups feature mapping + the JS
+# interop constructors (WebAdapter/WebDevice/WebQueue::from_handle and
+# `webgpu_backend` re-exports) — needed for our backward kernel's
+# subgroupAdd/subgroupAny on web, and for brush-js to share a GPUDevice with
+# the host page. v30 upstreamed the rest of the old js-interop branch (the
+# `as_webgpu` accessors, and #9287's relaxed Metal buffer limits), so the fork
+# is much smaller than it used to be.
 #
-# Trunk also added AdapterInfo::limit_bucket which trips egui-wgpu 0.34.3;
-# fixed on the egui fork — bump together since egui is a workspace.
+# egui 0.36 ships the wgpu-30 upgrade (emilk/egui#8289) upstream, so the
+# egui fork is no longer needed.
 [patch.crates-io]
-wgpu                 = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop" }
-wgpu-core            = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop" }
-wgpu-hal             = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop" }
-wgpu-types           = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop" }
-naga                 = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop" }
-egui                 = { git = "https://github.com/ArthurBrussee/egui", branch = "wgpu-trunk-compat-0.34.3" }
-eframe               = { git = "https://github.com/ArthurBrussee/egui", branch = "wgpu-trunk-compat-0.34.3" }
-egui-wgpu            = { git = "https://github.com/ArthurBrussee/egui", branch = "wgpu-trunk-compat-0.34.3" }
-egui-winit           = { git = "https://github.com/ArthurBrussee/egui", branch = "wgpu-trunk-compat-0.34.3" }
-egui_glow            = { git = "https://github.com/ArthurBrussee/egui", branch = "wgpu-trunk-compat-0.34.3" }
-ecolor               = { git = "https://github.com/ArthurBrussee/egui", branch = "wgpu-trunk-compat-0.34.3" }
-emath                = { git = "https://github.com/ArthurBrussee/egui", branch = "wgpu-trunk-compat-0.34.3" }
-epaint               = { git = "https://github.com/ArthurBrussee/egui", branch = "wgpu-trunk-compat-0.34.3" }
-epaint_default_fonts = { git = "https://github.com/ArthurBrussee/egui", branch = "wgpu-trunk-compat-0.34.3" }
+wgpu                 = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop-30" }
+wgpu-core            = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop-30" }
+wgpu-hal             = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop-30" }
+wgpu-types           = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop-30" }
+naga                 = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop-30" }
 
-# cubecl-wgpu pins wgpu to a specific git rev of gfx-rs/wgpu (not crates.io),
-# so the patch above doesn't catch it — redirect that source too, otherwise we
-# end up with two parallel wgpu trees.
-[patch."https://github.com/gfx-rs/wgpu.git"]
-wgpu       = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop" }
-wgpu-core  = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop" }
-wgpu-hal   = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop" }
-wgpu-types = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop" }
-naga       = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop" }
+# cubecl-runtime at the rev burn pins doesn't build for wasm (missing
+# wasm-bindgen-futures dep; cubecl-common serde/hash features only enabled in
+# the desktop target section). Fixed on the fork branch (= burn's pinned rev +
+# two manifest commits), plus the barrier fix for `workgroup_uniform_load`
+# that native MSL needs (tracel-ai/cubecl#1525). The whole family must be
+# patched together — patching one crate would split the tree via its
+# path-deps. Drop once upstream takes both and burn re-pins.
+[patch."https://github.com/tracel-ai/cubecl"]
+cubecl                 = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
+cubecl-common          = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
+cubecl-core            = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
+cubecl-cpp             = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
+cubecl-cpu             = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
+cubecl-cuda            = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
+cubecl-environment     = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
+cubecl-hip             = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
+cubecl-ir              = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
+cubecl-macros          = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
+cubecl-macros-internal = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
+cubecl-opt             = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
+cubecl-runtime         = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
+cubecl-std             = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
+cubecl-wgpu            = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
+cubecl-zspace          = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
 
 # To iterate locally on a checkout, swap each `git = "..."` for
 # `path = "../cubecl/crates/<name>"`.

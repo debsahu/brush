@@ -24,7 +24,8 @@ use brush_render::camera::Camera;
 use brush_render::gaussian_splats::{RasterizationMode, Splats, fold_min_scale};
 use brush_render::kernels::camera_model::CameraModel;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
-use brush_render_bwd::{DeferredShGrad, render_splat_features, render_splats_for_training};
+// bwd crate dissolved into brush-render/src/bwd/ (upstream #517).
+use brush_render::bwd::{DeferredShGrad, render_splat_features, render_splats_for_training};
 use burn::{
     lr_scheduler::{
         LrScheduler,
@@ -192,7 +193,7 @@ fn step_sh_coeffs(
         return optimizer.step(learning_rate, splats, grad_coeff);
     };
 
-    use brush_render::burn_glue::{detach_autodiff, lift_to_autodiff};
+    use brush_render::burn_glue::detach_autodiff;
     let param_id = splats.sh_coeffs.id;
     let param = detach_autodiff(splats.sh_coeffs.val());
     let mut record = optimizer.to_record();
@@ -218,9 +219,14 @@ fn step_sh_coeffs(
         deferred.project_uniforms,
         state,
     );
+    // `lift_to_autodiff` went `pub(crate)` in brush-render under #517, so it is
+    // no longer reachable from brush-train. `param` is the freshly-stepped inner
+    // tensor from `step_sparse_sh`; re-lift it with the public
+    // `from_inner(..).require_grad()` idiom — the same re-lift upstream's own
+    // `step_param` uses for a stepped inner parameter.
     splats.sh_coeffs = splats
         .sh_coeffs
-        .map(|_| lift_to_autodiff(param).require_grad());
+        .map(|_| Tensor::from_inner(param.inner()).require_grad());
     record.insert(param_id, AdaptorRecord::from_state(state));
     *optimizer = create_optimizer_from_config().load_record(record);
     splats

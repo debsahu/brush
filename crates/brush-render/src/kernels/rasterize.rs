@@ -14,6 +14,7 @@
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
+use burn_cubecl::cubecl::std::FastDivmod;
 
 use super::helpers::{
     ALPHA_CUTOFF_MID, PROJECTED_LANES, PROJECTED_LANES_USIZE, alpha_cutoff_weight, calc_sigma,
@@ -32,6 +33,7 @@ pub fn rasterize_kernel(
     global_from_compact_gid: &Tensor<u32>,
     visible: &mut Tensor<f32>,
     u: RasterizeUniforms,
+    tile_bw_div: FastDivmod<u32>,
     #[comptime] bwd_info: bool,
     #[comptime] smooth_cutoff: bool,
     #[comptime] tile_width: u32,
@@ -40,7 +42,7 @@ pub fn rasterize_kernel(
 ) {
     let tile_size = comptime![tile_width * tile_height];
     let global_id = ABSOLUTE_POS as u32;
-    let (pix_x, pix_y) = map_1d_to_2d(global_id, u.tile_bw, tile_width, tile_height);
+    let (pix_x, pix_y) = map_1d_to_2d(global_id, tile_bw_div, tile_width, tile_height);
     let pix_id = pix_x + pix_y * u.img_w;
     let pixel_coord_x = pix_x as f32 + 0.5f32;
     let pixel_coord_y = pix_y as f32 + 0.5f32;

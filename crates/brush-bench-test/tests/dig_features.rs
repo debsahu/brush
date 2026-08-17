@@ -12,7 +12,7 @@ use brush_render::{
     gaussian_splats::{SplatRenderMode, Splats},
     kernels::camera_model::CameraModel::Pinhole,
 };
-use brush_render_bwd::{render_splat_features, render_splats};
+use brush_render::bwd::{render_splat_features, render_splats};
 use brush_train::{config::TrainConfig, train::SplatTrainer};
 use burn::module::AutodiffModule;
 use burn::tensor::{Device, Tensor, TensorData};
@@ -253,7 +253,7 @@ async fn training_with_features_and_refine() {
 
     // Refine exercises prune + split remapping of the feature table.
     let (splats_refined, _stats) = trainer.refine(3, splats.valid()).await;
-    let mut splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(splats_refined);
+    let mut splats = brush_render::bwd::burn_glue::lift_splats_to_autodiff(splats_refined);
 
     // One more step after refine — shape mismatches would panic here.
     let (new_splats, stats) = trainer.step(batch, splats).await;

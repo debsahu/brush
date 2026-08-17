@@ -48,7 +48,7 @@
 use brush_render::burn_glue::{detach_autodiff, lift_to_autodiff};
 use brush_render::camera::Camera;
 use brush_render::gaussian_splats::{SplatRenderMode, Splats, fold_min_scale};
-use brush_render_bwd::render_splat_features;
+use brush_render::bwd::render_splat_features;
 use burn::tensor::{Tensor, module::conv2d, ops::ConvOptions, s};
 
 // spirulae-splat 5x5 Gaussian blur (matches LFS `SPIRULAE_BLUR_5x5`,

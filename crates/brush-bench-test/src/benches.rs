@@ -1,4 +1,5 @@
 use brush_dataset::scene::SceneBatch;
+use brush_render::bwd::render_splats as render_splats_diff;
 use brush_render::{
     AlphaMode, TextureMode,
     camera::Camera,
@@ -6,7 +7,6 @@ use brush_render::{
     kernels::camera_model::CameraModel::Pinhole,
     render_splats,
 };
-use brush_render_bwd::render_splats as render_splats_diff;
 use brush_train::train::SplatTrainer;
 use burn::tensor::{Device, TensorData};
 use glam::{Quat, Vec3};

@@ -21,8 +21,8 @@ use brush_render::{
     },
 };
 #[cfg(not(target_family = "wasm"))]
-use brush_render_bwd::render_splats_for_training;
-use brush_render_bwd::{
+use brush_render::bwd::render_splats_for_training;
+use brush_render::bwd::{
     render_splats_with_pass, render_splats_with_pass_and_rasterizer,
     render_splats_with_refine_weight,
 };

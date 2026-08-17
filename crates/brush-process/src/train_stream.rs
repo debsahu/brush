@@ -517,7 +517,7 @@ pub(crate) async fn train_stream(
         // then strip back to inner so the viewer slot sees plain splats.
         // `step` immediately replaces `splats` with the returned value, so we
         // can move it here instead of cloning every iteration.
-        let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(splats);
+        let diff_splats = brush_render::bwd::burn_glue::lift_splats_to_autodiff(splats);
         let compute_refine_weight = trainer.refinement_weight_needed(iter);
         let (new_diff_splats, stats) = trainer
             // `iter` is the GLOBAL iteration (the loop starts at
