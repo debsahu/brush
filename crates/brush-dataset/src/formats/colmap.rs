@@ -221,8 +221,8 @@ async fn load_dataset_inner(
             // Surface-normal prior, discovered exactly like depth. Carries no
             // scale, so it is deliberately NOT part of the metric-scale
             // estimation above.
-            let normal = find_normal_path(&vfs, path)
-                .map(|p| LoadNormal::new(vfs.clone(), p.to_path_buf()));
+            let normal =
+                find_normal_path(&vfs, path).map(|p| LoadNormal::new(vfs.clone(), p.to_path_buf()));
 
             // Convert w2c to c2w.
             let world_to_cam = glam::Affine3A::from_rotation_translation(
@@ -596,7 +596,7 @@ mod tests {
             max_scene_batch_cache_size: 0,
             train_on_eval: false,
             estimate_metric_scale: false,
-            features_dir_name: "dino_features".to_string(),
+            features_dir_name: "dino_features".to_owned(),
         }
     }
 

@@ -181,7 +181,10 @@ impl DigOptimizer {
             return param;
         };
         let adam = self.adam.clone();
-        let state = self.states.entry(id).or_insert_with(|| AdamState::new(None, false));
+        let state = self
+            .states
+            .entry(id)
+            .or_insert_with(|| AdamState::new(None, false));
         param.map(|t| {
             let stepped = adam.step(lr, t.inner(), &grad, state);
             Tensor::from_inner(stepped).require_grad()

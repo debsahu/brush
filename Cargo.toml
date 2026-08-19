@@ -342,30 +342,89 @@ wgpu-hal             = { git = "https://github.com/ArthurBrussee/wgpu", branch =
 wgpu-types           = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop-30" }
 naga                 = { git = "https://github.com/ArthurBrussee/wgpu", branch = "js-interop-30" }
 
-# cubecl-runtime at the rev burn pins doesn't build for wasm (missing
-# wasm-bindgen-futures dep; cubecl-common serde/hash features only enabled in
-# the desktop target section). Fixed on the fork branch (= burn's pinned rev +
-# two manifest commits), plus the barrier fix for `workgroup_uniform_load`
-# that native MSL needs (tracel-ai/cubecl#1525). The whole family must be
-# patched together — patching one crate would split the tree via its
-# path-deps. Drop once upstream takes both and burn re-pins.
-[patch."https://github.com/tracel-ai/cubecl"]
-cubecl                 = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
-cubecl-common          = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
-cubecl-core            = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
-cubecl-cpp             = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
-cubecl-cpu             = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
-cubecl-cuda            = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
-cubecl-environment     = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
-cubecl-hip             = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
-cubecl-ir              = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
-cubecl-macros          = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
-cubecl-macros-internal = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
-cubecl-opt             = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
-cubecl-runtime         = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
-cubecl-std             = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
-cubecl-wgpu            = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
-cubecl-zspace          = { git = "https://github.com/ArthurBrussee/cubecl", branch = "msl-trial" }
+# ---------------------------------------------------------------------------
+# cubecl: the wasm32 build needs a patched cubecl-runtime.
+#
+# `cubecl-runtime 0.11.0-pre.2` (the version burn's `v0.22.0-pre.2` tag depends
+# on, from crates.io) calls `wasm_bindgen_futures::spawn_local` in
+# `src/tune/tuner.rs:485` under `cfg(target_family = "wasm")` but never declares
+# the dependency, and its `tune` module is NOT feature-gated. So it simply does
+# not compile for wasm32:
+#     error[E0433]: cannot find module or crate `wasm_bindgen_futures`
+# It also enables `cubecl-common`'s `serde`/`hash` features only in the desktop
+# target section, though they are needed unconditionally.
+#
+# Both are fixed upstream on `tracel-ai/cubecl` main, but main has since been
+# force-pushed BEHIND the `v0.11.0-pre.2` release (it is at PR #1505 while the
+# release tag `04ef8ece` carries a newer `cubecl-ir`, e.g. `Type::scalar` and the
+# `Pointer`/`Array`/`Matrix` variants that `brush-cube` and `brush-render/bwd`
+# use). There is therefore no published cubecl that both matches this burn tag
+# and builds for wasm.
+#
+# The previous block here was:
+#     [patch."https://github.com/tracel-ai/cubecl"]
+#     cubecl-* = { git = ".../ArthurBrussee/cubecl", branch = "msl-trial" }
+# It has been INERT since the burn pin moved to `tag = "v0.22.0-pre.2"`: a
+# `[patch."<url>"]` table only redirects deps whose *source* is that git URL, and
+# the tag's release-prep commit rewrites burn's cubecl deps to registry versions.
+# Cargo only warns (`patch ... was not used in the crate graph`), so the fork was
+# silently out of the build.
+#
+# That did NOT cost us the `workgroup_uniform_load` barrier, contrary to what
+# this comment used to claim. tracel-ai/cubecl#1525 fixes a regression that only
+# ever existed on cubecl `main`, whose pliron dialect-op rewrite of the lowering
+# dropped the barrier. The `v0.11.0-pre.2` release lineage is the OLDER IR, where
+# `Operation::WorkgroupUniformLoad` is lowered in one place per backend and both
+# the paths we build already emit the barrier:
+#   cubecl-cpp   shared/base.rs   -> `instructions.push(Instruction::SyncThreads)`
+#   cubecl-spirv instruction.rs   -> `self.compile_sync(Synchronization::SyncCube)`
+# The Metal dialect renders that as `threadgroup_barrier(mem_flags::mem_threadgroup)`.
+# So native MSL has had the barrier the whole time, both before and after the
+# patch went inert. Only cubecl-cpu (which Brush never builds) lacked it; the
+# fork below carries a hand-port of that one arm for upstream parity.
+# Moving it verbatim to `[patch.crates-io]` does not work either: `msl-trial`
+# descends from cubecl #1521, a lineage the release is not on, so it fails to
+# compile against this burn.
+#
+# The fix, verified locally (`cargo check --locked -p brush-app -p brush-js --lib
+# --target wasm32-unknown-unknown` passes), is a fork of the RELEASE TAG carrying
+# the two upstream manifest changes (plus the cubecl-cpu barrier port noted above):
+#
+#     git clone https://github.com/tracel-ai/cubecl && cd cubecl
+#     git checkout -b v0.11.0-pre.2-wasm-and-barrier v0.11.0-pre.2
+#     # in crates/cubecl-runtime/Cargo.toml:
+#     #   1. add, above [dev-dependencies]:
+#     #        [target.'cfg(target_family = "wasm")'.dependencies]
+#     #        wasm-bindgen-futures = { workspace = true }
+#     #   2. give the `cubecl-common` dep `features = ["serde", "hash"]`
+#     git commit -am 'cubecl-runtime: wasm-bindgen-futures dep + unconditional cubecl-common serde/hash'
+#     git push git@github.com:debsahu/cubecl.git v0.11.0-pre.2-wasm-and-barrier
+#
+# Then uncomment the block below and run `cargo update -w` once. Note it must be
+# `[patch.crates-io]` (burn depends on cubecl from the registry at this tag), and
+# it must be a `git` source rather than a local `path` — cargo applies
+# `--cap-lints allow` only to non-path deps, and cubecl-runtime has warnings that
+# CI's `RUSTFLAGS: -D warnings` would otherwise promote to errors.
+#
+# Drop the whole thing once tracel-ai publishes a cubecl release with the fix and
+# burn re-pins to it.
+#
+cubecl                 = { git = "https://github.com/debsahu/cubecl", branch = "v0.11.0-pre.2-wasm-and-barrier" }
+cubecl-common          = { git = "https://github.com/debsahu/cubecl", branch = "v0.11.0-pre.2-wasm-and-barrier" }
+cubecl-core            = { git = "https://github.com/debsahu/cubecl", branch = "v0.11.0-pre.2-wasm-and-barrier" }
+cubecl-cpp             = { git = "https://github.com/debsahu/cubecl", branch = "v0.11.0-pre.2-wasm-and-barrier" }
+cubecl-cpu             = { git = "https://github.com/debsahu/cubecl", branch = "v0.11.0-pre.2-wasm-and-barrier" }
+cubecl-cuda            = { git = "https://github.com/debsahu/cubecl", branch = "v0.11.0-pre.2-wasm-and-barrier" }
+cubecl-environment     = { git = "https://github.com/debsahu/cubecl", branch = "v0.11.0-pre.2-wasm-and-barrier" }
+cubecl-hip             = { git = "https://github.com/debsahu/cubecl", branch = "v0.11.0-pre.2-wasm-and-barrier" }
+cubecl-ir              = { git = "https://github.com/debsahu/cubecl", branch = "v0.11.0-pre.2-wasm-and-barrier" }
+cubecl-macros          = { git = "https://github.com/debsahu/cubecl", branch = "v0.11.0-pre.2-wasm-and-barrier" }
+cubecl-macros-internal = { git = "https://github.com/debsahu/cubecl", branch = "v0.11.0-pre.2-wasm-and-barrier" }
+cubecl-opt             = { git = "https://github.com/debsahu/cubecl", branch = "v0.11.0-pre.2-wasm-and-barrier" }
+cubecl-runtime         = { git = "https://github.com/debsahu/cubecl", branch = "v0.11.0-pre.2-wasm-and-barrier" }
+cubecl-std             = { git = "https://github.com/debsahu/cubecl", branch = "v0.11.0-pre.2-wasm-and-barrier" }
+cubecl-wgpu            = { git = "https://github.com/debsahu/cubecl", branch = "v0.11.0-pre.2-wasm-and-barrier" }
+cubecl-zspace          = { git = "https://github.com/debsahu/cubecl", branch = "v0.11.0-pre.2-wasm-and-barrier" }
 
 # To iterate locally on a checkout, swap each `git = "..."` for
 # `path = "../cubecl/crates/<name>"`.

@@ -11,6 +11,12 @@
 //! away from f16 quantization limits) so central differences are
 //! second-order accurate.
 
+#[cfg(not(target_family = "wasm"))]
+use brush_render::bwd::render_splats_for_training;
+use brush_render::bwd::{
+    render_splats_with_pass, render_splats_with_pass_and_rasterizer,
+    render_splats_with_refine_weight,
+};
 use brush_render::gaussian_splats::{RasterPass, RasterizationMode, Rasterizer};
 use brush_render::{
     camera::Camera,
@@ -19,12 +25,6 @@ use brush_render::{
         CameraModel, kannala_brandt_4::KannalaBrandt4Params,
         radial_tangential_8::RadialTangential8Params, thin_prism_fisheye::ThinPrismFisheyeParams,
     },
-};
-#[cfg(not(target_family = "wasm"))]
-use brush_render::bwd::render_splats_for_training;
-use brush_render::bwd::{
-    render_splats_with_pass, render_splats_with_pass_and_rasterizer,
-    render_splats_with_refine_weight,
 };
 
 /// Finite-diff tests need the C^1 cutoff so analytical and numerical

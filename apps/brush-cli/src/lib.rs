@@ -23,7 +23,7 @@ use tracing::trace_span;
 /// Build stamp for this fork.
 ///
 /// Upstream's bare `version` reports only `CARGO_PKG_VERSION`, so a stock Brush
-/// build and an EarthByte build are indistinguishable, as are two fork builds
+/// build and an `EarthByte` build are indistinguishable, as are two fork builds
 /// from different commits. This carries three things instead: the upstream crate
 /// version, a fork marker, and the exact `git describe` the binary was built
 /// from (suffixed `-dirty` when the tree had uncommitted changes).

@@ -46,7 +46,7 @@ pub const OMEGA_INIT: f32 = 6.0;
 
 /// The learnable per-Gaussian importance `ω_i`, kept as its own tiny module so
 /// it gets a real Adam optimizer (moments, `to_record`/`load_record`
-/// round-trip) exactly like the DiG feature table, and is kept in lockstep with
+/// round-trip) exactly like the `DiG` feature table, and is kept in lockstep with
 /// the splats through refine. It is training-time only — never exported, so the
 /// ply / viewer / FFI surface is untouched.
 #[derive(Module, Debug)]
@@ -106,7 +106,7 @@ impl ImportanceOptimizer {
 }
 
 /// Trainer-owned TIDI state. Everything here PERSISTS across refine cycles — it
-/// is deliberately NOT stored in [`crate::stats::RefineRecord`], which is
+/// is deliberately NOT stored in `crate::stats::RefineRecord`, which is
 /// window-scoped and rebuilt after every refine (that would reset the
 /// accumulators the paper needs to grow over training).
 ///
@@ -226,7 +226,7 @@ impl TidiState {
     }
 
     /// Pull `ω`'s gradient out of this step's backward pass and take one Adam
-    /// step, mirroring the DiG feature step (clone the module out, extract the
+    /// step, mirroring the `DiG` feature step (clone the module out, extract the
     /// grad by id, step, write back). `ω` gets its signal from the photometric
     /// (and depth) loss via the opacity gate plus the L1 sparsity term.
     pub fn optimize(&mut self, lr: f64, grads: &mut Gradients) {
@@ -293,7 +293,7 @@ impl TidiState {
     ///   * `floating` when additionally `z - Z̃ < -margin`, i.e. the Gaussian sits
     ///     more than `margin` in FRONT of the measured surface → `float_accum +=
     ///     1`. `margin` is in the depth map's own units (metres for LiDAR/metric
-    ///     depth; possibly non-metric for SfM depth).
+    ///     depth; possibly non-metric for `SfM` depth).
     ///
     /// Everything is one GPU tensor pass on the inner backend (no host readback,
     /// no autodiff graph) so an enabled run pays a handful of elementwise ops per
@@ -301,7 +301,7 @@ impl TidiState {
     ///
     /// PROJECTION: the world→camera transform is Brush's own
     /// [`Camera::world_to_local`]; the pixel projection is the pinhole model
-    /// (matching [`brush_render::kernels::camera_model::pinhole::project_pinhole`]:
+    /// (matching [`fn@brush_render::kernels::camera_model::pinhole::project_pinhole`]:
     /// `u = fx·x/z + cx`, `v = fy·y/z + cy`). Non-pinhole camera models
     /// (fisheye / radial-tangential) are not implemented on this host-tensor path
     /// — for them the call warns once and no-ops, exactly like the depth/normal
@@ -342,7 +342,7 @@ impl TidiState {
 
     /// Reindex through a prune. `valid_inds` (autodiff) reindexes `ω` and its
     /// Adam state; `inner_valid_inds` reindexes the inner accumulators. Called
-    /// from `prune_points` beside the DiG `keep`, so the tables can never
+    /// from `prune_points` beside the `DiG` `keep`, so the tables can never
     /// silently desync from the splats.
     pub fn keep(&mut self, valid_inds: &Tensor<1, Int>, inner_valid_inds: &Tensor<1, Int>) {
         self.importance.omega = self
@@ -363,7 +363,7 @@ impl TidiState {
     /// `cat` order) and, per the paper, get a FRESH state rather than inheriting
     /// the parent's: `ω = OMEGA_INIT` (protected, importance ≈ 1), zero
     /// visibility, zero grad-EMA, and `birth_iter = cur_iter` so the warmup
-    /// starts over. The parent rows are left untouched (unlike DiG, which zeroes
+    /// starts over. The parent rows are left untouched (unlike `DiG`, which zeroes
     /// both halves — a parent's importance history stays valid through a split).
     pub fn split(
         &mut self,
@@ -568,12 +568,13 @@ impl TidiState {
 ///     (< -margin means the Gaussian floats in FRONT of the measured surface);
 ///   * `valid`    `[N]` — true where the projection is in-frame, in front of the
 ///     camera (`z > 0`), and lands on a finite positive depth return.
+///
 /// Callers guard pinhole themselves (each owns its warning); this returns `None`
 /// only for an empty depth map.
 ///
 /// PROJECTION: the world→camera transform is Brush's own [`Camera::world_to_local`];
 /// the pixel projection is the pinhole model (matching
-/// [`brush_render::kernels::camera_model::pinhole::project_pinhole`]:
+/// [`fn@brush_render::kernels::camera_model::pinhole::project_pinhole`]:
 /// `u = fx·x/z + cx`, `v = fy·y/z + cy`). The end-to-end projection + residual is
 /// verified on-device in `accumulate_depth_counts_front_surface_and_unscanned`.
 fn project_depth_residual(
@@ -1231,7 +1232,7 @@ struct DistanceFieldData {
 /// occupied set by the search radius `r = ceil(reach/vox)` into a candidate set,
 /// then computes each candidate's nearest-point distance in parallel (each
 /// candidate is written exactly once, so there is no write race). Empty space is
-/// never visited. On a house-scale LiDAR cloud this is seconds on the build box.
+/// never visited. On a house-scale `LiDAR` cloud this is seconds on the build box.
 ///
 /// PLANE AUGMENTATION (FIX 1, `--plane-gate`): when `planes` is `Some`, the stored
 /// value is `min(distance-to-nearest-cloud-point, distance-to-nearest-bounded-plane)`.
@@ -1567,7 +1568,7 @@ impl CloudDistanceGrid {
             .int();
         let cz = czf
             .clamp(0.0, (nz - 1) as f32)
-            .mask_fill(nonfinite.clone(), 0.0)
+            .mask_fill(nonfinite, 0.0)
             .int();
 
         // Flat index `(i·ny + j)·nz + k` in INTEGER arithmetic (a8e88f47), exactly
@@ -1843,7 +1844,7 @@ pub fn plane_coplanarity_loss(
     let best_plane = cand.argmin(1); // [N,1] Int
     // Assigned iff some plane was within band+extent (min < LARGE).
     let assigned = best_dist.lower_elem(LARGE * 0.5); // [N,1] Bool
-    let assigned_f = assigned.clone().float(); // [N,1]
+    let assigned_f = assigned.float(); // [N,1]
     let best_idx = best_plane.squeeze_dim::<1>(1); // [N] Int
 
     // Per-Gaussian assigned plane params (detached constants).
@@ -1861,15 +1862,11 @@ pub fn plane_coplanarity_loss(
     // ops: `mask_fill` replaces a non-finite entry with a constant 0 (grad 0 there,
     // identity elsewhere), so finite rows are unaffected and a divergent row
     // contributes a finite 0 that assignment then zeroes out anyway.
-    let means = means
-        .clone()
-        .mask_fill(means.clone().is_finite().bool_not(), 0.0); // [N,3]
-    let scales = scales
-        .clone()
-        .mask_fill(scales.clone().is_finite().bool_not(), 0.0); // [N,3]
+    let means = means.clone().mask_fill(means.is_finite().bool_not(), 0.0); // [N,3]
+    let scales = scales.clone().mask_fill(scales.is_finite().bool_not(), 0.0); // [N,3]
     let rotations = rotations
         .clone()
-        .mask_fill(rotations.clone().is_finite().bool_not(), 0.0); // [N,4]
+        .mask_fill(rotations.is_finite().bool_not(), 0.0); // [N,4]
 
     // -- Position pull: (n_i·mu_i − d_i)² with LIVE (sanitized) means.
     let proj = (means * n_i.clone()).sum_dim(1).squeeze_dim::<1>(1); // [N]
@@ -1958,6 +1955,7 @@ fn quantile(mut v: Vec<f32>, q: f32) -> Option<f32> {
 ///     measured LiDAR/depth surface in ≥ `depth_float_frac` of the views that
 ///     had a valid return behind it (≥ `depth_min_valid_views` of them) → the
 ///     SAME detail guards → its own looser global cap.
+///
 /// The depth path is deliberately NOT AND-gated with the photometric signals:
 /// equilibrium wall-haze is photometrically valid, so it would never survive the
 /// four-signal AND, yet it is exactly what the depth residual catches. Split out
@@ -2186,12 +2184,12 @@ fn warn_depth_prune_no_depth() {
     });
 }
 
+/// Point indices bucketed by integer voxel coordinate.
+type VoxelGrid = hashbrown::HashMap<(i64, i64, i64), Vec<u32>>;
+
 /// Uniform-grid bucketing shared by the isolation scorer and the colour-variance
 /// guard. Returns the grid, the per-axis minimum, and the cell size.
-fn build_grid(
-    pos: &[f32],
-    n: usize,
-) -> (hashbrown::HashMap<(i64, i64, i64), Vec<u32>>, [f32; 3], f32) {
+fn build_grid(pos: &[f32], n: usize) -> (VoxelGrid, [f32; 3], f32) {
     let p = |i: usize| [pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]];
     let mut mn = [f32::INFINITY; 3];
     let mut mx = [f32::NEG_INFINITY; 3];
@@ -2232,7 +2230,7 @@ fn cell_key(q: [f32; 3], mn: [f32; 3], cell: f32) -> (i64, i64, i64) {
 
 /// Mean distance from each query point to its `k` nearest neighbours over the
 /// FULL point set (the query's own index is skipped). Grid-accelerated, mirrors
-/// the DiG `grid_knn` neighbourhood scan but returns distances rather than
+/// the `DiG` `grid_knn` neighbourhood scan but returns distances rather than
 /// indices.
 fn knn_mean_dist(pos: &[f32], query: &[u32], k: usize) -> Vec<f32> {
     let n = pos.len() / 3;
@@ -2810,7 +2808,7 @@ mod tests {
         let none = build_distance_field(&pos, margin, softness, None).expect("field");
         let [nx, ny, nz] = none.dims;
         let flat = |i: usize, j: usize, k: usize| (i * ny + j) * nz + k;
-        let vidx = |p: f32, o: f32| (((p - o) / none.vox).floor() as usize);
+        let vidx = |p: f32, o: f32| ((p - o) / none.vox).floor() as usize;
         let (gi, gj, gk) = (
             vidx(1.0, none.origin[0]),
             vidx(1.0, none.origin[1]),
@@ -2824,8 +2822,8 @@ mod tests {
         );
 
         // Plane-gated: same geometry (planes don't change the bbox), gap filled.
-        let aug =
-            build_distance_field(&pos, margin, softness, Some(&[plane.clone()])).expect("field");
+        let aug = build_distance_field(&pos, margin, softness, Some(std::slice::from_ref(&plane)))
+            .expect("field");
         assert_eq!(
             aug.dims, none.dims,
             "planes must not change the grid geometry"
@@ -2870,12 +2868,12 @@ mod tests {
                 a[1][0] * v[0] + a[1][1] * v[1] + a[1][2] * v[2],
                 a[2][0] * v[0] + a[2][1] * v[1] + a[2][2] * v[2],
             ];
-            let resid: f64 = (0..3)
+            let resid = (0..3)
                 .map(|k| (av[k] - vals[j] * v[k]).powi(2))
                 .sum::<f64>()
                 .sqrt();
             assert!(resid < 1e-6, "eigenpair {j}: A·v = λ·v residual {resid}");
-            let vnorm: f64 = (0..3).map(|k| v[k] * v[k]).sum::<f64>().sqrt();
+            let vnorm = (0..3).map(|k| v[k] * v[k]).sum::<f64>().sqrt();
             assert!(
                 (vnorm - 1.0).abs() < 1e-6,
                 "eigenvector {j} not unit: {vnorm}"
@@ -2926,8 +2924,8 @@ mod device_tests {
     /// BUG-2 regression: `accumulate_window` must count the NUMBER OF WINDOWS a
     /// gaussian was seen (a 0/1-per-window indicator summed), NOT the raw
     /// per-step visibility count. Two windows with per-step counts [10, 0, 3]
-    /// then [5, 0, 0] must give vis_accum [2, 0, 1] (windows seen), not [15, 0,
-    /// 3] (steps seen) — otherwise `fail_vis` (<= τ_vis = 2) is unreachable for
+    /// then [5, 0, 0] must give `vis_accum` [2, 0, 1] (windows seen), not [15, 0,
+    /// 3] (steps seen) — otherwise `fail_vis` (<= `τ_vis` = 2) is unreachable for
     /// any persistently rendered gaussian. Runs the real tensor path on a test
     /// device (GPU harness on the build box).
     #[tokio::test]
@@ -3193,7 +3191,7 @@ mod device_tests {
             .expect("a finite point builds a field");
         let [nx, ny, nz] = data.dims;
         let flat = |i: usize, j: usize, k: usize| (i * ny + j) * nz + k;
-        let vidx = |p: f32, o: f32| (((p - o) / data.vox).floor() as usize);
+        let vidx = |p: f32, o: f32| ((p - o) / data.vox).floor() as usize;
 
         // The voxel holding a cloud point reads ~0.
         let (i, j, k) = (
@@ -3226,7 +3224,7 @@ mod device_tests {
     }
 
     /// BUG-1 regression: the flat voxel index MUST be computed in integer
-    /// arithmetic. A grid can ship up to MAX_VOXELS (> 2^24) voxels, and f32 is
+    /// arithmetic. A grid can ship up to `MAX_VOXELS` (> 2^24) voxels, and f32 is
     /// exact only to 2^24, so an f32 `i·(ny·nz)+…` rounds a large index onto an
     /// adjacent voxel — the device gather would then read the wrong distance for
     /// ~half the Gaussians. This encodes the contract the loss now relies on: the
@@ -3702,7 +3700,7 @@ mod device_tests {
     }
 
     /// cloud-prune coarse-grid regression: on a LARGE-extent cloud with a small
-    /// `--cloud-prune-dist`, the `vox *= 1.5` coarsening loop (MAX_VOXELS cap)
+    /// `--cloud-prune-dist`, the `vox *= 1.5` coarsening loop (`MAX_VOXELS` cap)
     /// pushes `vox` past ~1.82·dist, at which point the clamped boundary voxel's
     /// stored distance drops BELOW `dist`. Without the unclamped in-grid mask, a
     /// wildly out-of-grid floater aligned with real cloud on two axes would read
@@ -3782,7 +3780,10 @@ mod device_tests {
         }
         // Threshold above both scales: nothing gated, loss exactly 0.
         let none = scalar(scale_reg_loss(scales.clone(), 100.0)).await;
-        assert!(none.abs() < 1e-6, "below-threshold scales must not be penalized, got {none}");
+        assert!(
+            none.abs() < 1e-6,
+            "below-threshold scales must not be penalized, got {none}"
+        );
         // Threshold 1.0: only the three 10.0 axes gate. mean over 6 elems =
         // (0+0+0 + 100+100+100)/6 = 50.
         let some = scalar(scale_reg_loss(scales, 1.0)).await;
@@ -3806,6 +3807,9 @@ mod device_tests {
             .into_vec::<f32>()
             .expect("f32")[0];
         // mean of (1.0, e^3) = (1 + 20.0855)/2 = 10.5428.
-        assert!((v - 10.5428).abs() < 1e-2, "expected mean ≈10.5428, got {v}");
+        assert!(
+            (v - 10.5428).abs() < 1e-2,
+            "expected mean ≈10.5428, got {v}"
+        );
     }
 }

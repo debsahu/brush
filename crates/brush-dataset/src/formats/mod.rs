@@ -495,7 +495,10 @@ mod tests {
             PathBuf::from("images/baz/img.png"),
             PathBuf::from("normal/foo/img.tiff"),
         ]);
-        assert_eq!(find_normal_path(&vfs, Path::new("images/baz/img.png")), None);
+        assert_eq!(
+            find_normal_path(&vfs, Path::new("images/baz/img.png")),
+            None
+        );
     }
 
     #[wasm_bindgen_test(unsupported = test)]
