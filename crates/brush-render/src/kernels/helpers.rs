@@ -52,6 +52,49 @@ pub fn alpha_cutoff_weight_deriv(alpha: f32) -> f32 {
 pub const PROJECTED_LANES: u32 = 10;
 pub const PROJECTED_LANES_USIZE: usize = PROJECTED_LANES as usize;
 
+/// `f32` lanes per splat in the PGSR plane-auxiliary channel tensor
+/// (`[N, PLANE_AUX_LANES]`, **global**-gid indexed):
+///   0..=2 camera-frame unit normal `n_cam`, 3 signed plane offset `d`.
+///
+/// PGSR (Chen et al. 2024, arXiv:2406.06521) plane parameterization; the values
+/// are produced on-tape by `brush_train::train::plane_features` and consumed
+/// verbatim here — the kernel deliberately does NOT reconstruct them, so the
+/// only thing this rendering path adds over the feature-pass approach is
+/// blending-weight gradients plus single-pass fusion.
+///
+/// Note this is **not** folded into [`PROJECTED_LANES`]. Staging four more lanes
+/// per splat in the tile-shared `local_batch` would cost every render (plane or
+/// not) 4 KiB of extra threadgroup memory at a 256-pixel tile, and this crate
+/// trades global reads for occupancy deliberately elsewhere (see
+/// `rasterize_features`, which reads its feature vector straight from global
+/// memory for exactly this reason). The plane lanes follow that precedent.
+pub const PLANE_AUX_LANES: u32 = 4;
+pub const PLANE_AUX_LANES_USIZE: usize = PLANE_AUX_LANES as usize;
+
+/// Channel stride of the backward-enabled rendered image AND of the backward
+/// kernel's per-pixel replay state, for a given mode.
+///
+/// Layout: `0..=3` rgba, `4` centre depth (when `render_depth`), `5..=8` the
+/// PGSR plane lanes (when `render_plane`). Single source of truth: the forward
+/// rasterizer, the backward's `pix_state` / `output` / `v_output` reads, and the
+/// host `out_dim` allocation all derive from this. Re-literalizing it is the
+/// exact drift that broke three call sites when the depth lane was added.
+pub const fn raster_out_channels(render_depth: bool, render_plane: bool) -> u32 {
+    let mut chans = 4;
+    if render_depth {
+        chans += 1;
+    }
+    if render_plane {
+        chans += PLANE_AUX_LANES;
+    }
+    chans
+}
+
+/// First image channel of the plane lanes. Derived, never literal.
+pub const fn plane_channel_offset(render_depth: bool) -> u32 {
+    raster_out_channels(render_depth, false)
+}
+
 #[cube]
 pub fn compact_bits_16(v: u32) -> u32 {
     let mut x = v & 0x55555555u32;

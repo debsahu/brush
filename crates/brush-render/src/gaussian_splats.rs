@@ -27,15 +27,35 @@ pub enum RasterizationMode {
     #[default]
     Rgba,
     RgbaAndDepth,
+    /// RGBA + centre depth + the four PGSR plane-auxiliary channels
+    /// (camera-frame normal `n_cam` and signed offset `d`), composited by the
+    /// MAIN rasterizer with the blending-weight gradient path LIVE.
+    ///
+    /// PGSR (Chen et al. 2024, arXiv:2406.06521). This is "approach B" of
+    /// `docs/superpowers/plans/2026-08-19-brush-pgsr-plane-render.md`: the same
+    /// on-tape `plane_features()` values the feature-pass approach uses, but
+    /// composited here so plane error also reaches opacity/conic/means2d — the
+    /// one thing the feature pass structurally cannot express.
+    ///
+    /// The centre-depth channel is deliberately kept alongside: it costs one
+    /// channel and buys a free centre-vs-plane depth residual diagnostic
+    /// (plan section 4.2).
+    RgbaDepthPlane,
 }
 
 impl RasterizationMode {
     pub const fn render_depth(self) -> bool {
-        matches!(self, Self::RgbaAndDepth)
+        matches!(self, Self::RgbaAndDepth | Self::RgbaDepthPlane)
+    }
+
+    /// Whether the PGSR plane-auxiliary channels are composited.
+    pub const fn render_plane(self) -> bool {
+        matches!(self, Self::RgbaDepthPlane)
     }
 
     pub const fn bwd_out_channels(self) -> usize {
-        if self.render_depth() { 5 } else { 4 }
+        crate::kernels::helpers::raster_out_channels(self.render_depth(), self.render_plane())
+            as usize
     }
 }
 

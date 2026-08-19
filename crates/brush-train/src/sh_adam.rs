@@ -5,7 +5,7 @@
 //! moment and parameter row without materialising intermediate tensors.
 
 use brush_cube::{MainBackend as Wgpu, MainBackendBase, calc_cube_count_1d};
-use brush_render::bwd::COMPACT_GRAD_LANES;
+use brush_render::bwd::{COMPACT_GRAD_LANES, RGB_LANE};
 use brush_render::shaders::helpers::ProjectUniforms;
 use burn::{
     Tensor,
@@ -218,7 +218,7 @@ mod kernel {
     use burn_cubecl::cubecl::cube;
     use burn_cubecl::cubecl::prelude::*;
 
-    use super::{COMPACT_GRAD_LANES, PLANE_SIZE, SPLATS_PER_WORKGROUP};
+    use super::{COMPACT_GRAD_LANES, PLANE_SIZE, RGB_LANE, SPLATS_PER_WORKGROUP};
 
     #[allow(clippy::too_many_arguments)]
     #[cube]
@@ -256,12 +256,12 @@ mod kernel {
             terminate!();
         }
         // compact_grads is the render backward's v_combined buffer, stride
-        // COMPACT_GRAD_LANES (rgb grads at lanes 5..=7). A stale literal 10 here
+        // COMPACT_GRAD_LANES (rgb grads at RGB_LANE..=+2). A stale literal 10 here
         // read the wrong splat's grad once the depth lane made the stride 11.
         let grad_base = (compact_gid * COMPACT_GRAD_LANES) as usize;
-        let r = compact_grads[grad_base + 5];
-        let g = compact_grads[grad_base + 6];
-        let b = compact_grads[grad_base + 7];
+        let r = compact_grads[grad_base + RGB_LANE];
+        let g = compact_grads[grad_base + RGB_LANE + 1];
+        let b = compact_grads[grad_base + RGB_LANE + 2];
         if r != 0.0f32 || g != 0.0f32 || b != 0.0f32 {
             let global_gid = global_from_compact_gid[compact_gid as usize];
             compact_plus_one_from_global[global_gid as usize] = compact_gid + 1u32;
@@ -326,11 +326,11 @@ mod kernel {
             } else if lane == 2u32 {
                 field = render_transforms[transform_base + 2];
             } else if lane == 3u32 {
-                field = compact_grads[grad_base + 5];
+                field = compact_grads[grad_base + RGB_LANE];
             } else if lane == 4u32 {
-                field = compact_grads[grad_base + 6];
+                field = compact_grads[grad_base + RGB_LANE + 1];
             } else if lane == 5u32 {
-                field = compact_grads[grad_base + 7];
+                field = compact_grads[grad_base + RGB_LANE + 2];
             }
             let mean_x = plane_broadcast(field, 0u32);
             let mean_y = plane_broadcast(field, 1u32);
@@ -1335,28 +1335,30 @@ mod tests {
             visible_globals.len()
         };
         // Build the compact grad buffer at the real render-backward stride
-        // (COMPACT_GRAD_LANES), rgb at lanes 5..=7; the trailing lanes are
+        // (COMPACT_GRAD_LANES), rgb at RGB_LANE..=+2; the trailing lanes are
         // unused by sparse SH Adam. Using the true stride keeps this fixture in
         // lockstep with the kernel and the stride assertion it exercises.
         let grad_stride = COMPACT_GRAD_LANES as usize;
         let mut compact_values = vec![0.0f32; visible_globals.len() * grad_stride];
         if !zero_visible {
             for compact in 0..visible_globals.len() {
-                compact_values[compact * grad_stride + 5] = 0.003 * (compact as f32 + 1.0);
-                compact_values[compact * grad_stride + 6] = -0.002 * (compact as f32 + 0.5);
-                compact_values[compact * grad_stride + 7] = 0.0015 * (compact as f32 + 0.25);
+                compact_values[compact * grad_stride + RGB_LANE] = 0.003 * (compact as f32 + 1.0);
+                compact_values[compact * grad_stride + RGB_LANE + 1] =
+                    -0.002 * (compact as f32 + 0.5);
+                compact_values[compact * grad_stride + RGB_LANE + 2] =
+                    0.0015 * (compact as f32 + 0.25);
             }
             // A visible row with exactly zero color gradient must follow the
             // same momentum-decay path as a non-visible row.
-            compact_values[2 * grad_stride + 5..2 * grad_stride + 8].fill(0.0);
+            compact_values[2 * grad_stride + RGB_LANE..2 * grad_stride + RGB_LANE + 3].fill(0.0);
         }
 
         let mut dense_grad = vec![0.0f32; num_values];
         for (compact, &global) in visible_globals.iter().take(num_visible).enumerate() {
             let color = [
-                compact_values[compact * grad_stride + 5],
-                compact_values[compact * grad_stride + 6],
-                compact_values[compact * grad_stride + 7],
+                compact_values[compact * grad_stride + RGB_LANE],
+                compact_values[compact * grad_stride + RGB_LANE + 1],
+                compact_values[compact * grad_stride + RGB_LANE + 2],
             ];
             if color == [0.0; 3] {
                 continue;

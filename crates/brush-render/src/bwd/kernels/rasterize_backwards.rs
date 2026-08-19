@@ -17,7 +17,8 @@ use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
 
 use crate::kernels::helpers::{
-    ALPHA_CUTOFF_MID, alpha_cutoff_weight, alpha_cutoff_weight_deriv, read_projected_splat,
+    ALPHA_CUTOFF_MID, PLANE_AUX_LANES, PLANE_AUX_LANES_USIZE, alpha_cutoff_weight,
+    alpha_cutoff_weight_deriv, plane_channel_offset, raster_out_channels, read_projected_splat,
 };
 use crate::kernels::types::{RasterizeUniforms, Splat, Sym2};
 
@@ -25,10 +26,36 @@ use crate::kernels::types::{RasterizeUniforms, Splat, Sym2};
 // sync_cube collapses to a SIMD-lockstep no-op on hardware.
 pub const SPLAT_BATCH: u32 = 32;
 
+// Lane indices within one `v_combined` row. This block is the single source of
+// truth for the layout: `PLANE_GRAD_LANE_START` and `COMPACT_GRAD_LANES` are
+// DERIVED from the last non-plane lane rather than written out, so adding a new
+// non-plane lane moves the plane block instead of silently overlapping it. A
+// hand-written `PLANE_GRAD_LANE_START = 11` encoded the pre-PGSR lane count and
+// would have compiled fine while aliasing the plane values.
+//
+/// Screen-space xy occupies `XY_LANE ..= XY_LANE + 1`.
+pub const XY_LANE: usize = 0;
+/// The symmetric 2D conic occupies `CONIC_LANE ..= CONIC_LANE + 2`.
+pub const CONIC_LANE: usize = XY_LANE + 2;
+/// Per-splat rgb occupies `RGB_LANE ..= RGB_LANE + 2`.
+pub const RGB_LANE: usize = CONIC_LANE + 3;
+/// Gradient w.r.t. the PROJECTED opacity (`Splat::color_a`), not the raw logit.
+pub const ALPHA_LANE: usize = RGB_LANE + 3;
+/// Refinement-only screen-space statistic; written only when
+/// `compute_refine_weight`.
+pub const REFINE_LANE: usize = ALPHA_LANE + 1;
+/// Alpha-composited camera-z of the splat CENTRE; written only when
+/// `render_depth`.
+pub const DEPTH_LANE: usize = REFINE_LANE + 1;
+
+/// First lane of the four PGSR plane-auxiliary VALUE gradients in
+/// `v_combined`. Everything below it is the pre-PGSR layout, unchanged.
+pub const PLANE_GRAD_LANE_START: usize = DEPTH_LANE + 1;
+
 /// Stride of the compact per-splat backward-gradient buffer (`v_combined`),
-/// indexed by `compact_gid`. The 11 lanes are:
+/// indexed by `compact_gid`. The 15 lanes are:
 ///   0..=1 screen-space xy, 2..=4 conic, 5..=7 rgb, 8 alpha,
-///   9 refine-weight, 10 expected-depth.
+///   9 refine-weight, 10 expected-depth, 11..=14 PGSR plane-aux values.
 ///
 /// This is the single source of truth for that stride. Every kernel that
 /// indexes `v_combined` (this kernel, `project_backwards`, and the coalesced
@@ -36,8 +63,11 @@ pub const SPLAT_BATCH: u32 = 32;
 /// derive their stride from this constant. The depth lane (10) was appended
 /// after the coalesced materializer was written against a stride of 10, and a
 /// hard-coded `* 10` there silently wrongly indexed every `compact_gid >= 1` — a
-/// shared constant makes that class of drift impossible.
-pub const COMPACT_GRAD_LANES: u32 = 11;
+/// shared constant makes that class of drift impossible. The four plane lanes
+/// (11..=14) were appended the same way; the same rule applies, and the sparse
+/// SH-Adam consumer in brush-train plus the finite-diff lane assertions in
+/// brush-bench-test both derive from this constant rather than restating it.
+pub const COMPACT_GRAD_LANES: u32 = (PLANE_GRAD_LANE_START + PLANE_AUX_LANES_USIZE) as u32;
 
 /// Per-splat gradient accumulator for the rasterize backward.
 #[derive(CubeType, Copy, Clone)]
@@ -53,6 +83,71 @@ pub struct SplatGrad {
     pub alpha: f32,
     pub refine: f32,
     pub depth: f32,
+    /// PGSR plane-auxiliary VALUE gradients (`d loss / d plane_aux[k]`).
+    pub plane_0: f32,
+    pub plane_1: f32,
+    pub plane_2: f32,
+    pub plane_3: f32,
+}
+
+/// One splat's four PGSR plane-auxiliary values, staged per backward batch.
+#[derive(CubeType, CubeTypeMut, Copy, Clone)]
+#[expand(derive(Clone, Copy))]
+pub struct PlaneAux {
+    pub v0: f32,
+    pub v1: f32,
+    pub v2: f32,
+    pub v3: f32,
+}
+
+#[cube]
+fn zero_plane_aux() -> PlaneAux {
+    PlaneAux {
+        v0: 0.0f32,
+        v1: 0.0f32,
+        v2: 0.0f32,
+        v3: 0.0f32,
+    }
+}
+
+/// Backward of one alpha-composited PGSR plane channel at one splat/pixel.
+///
+/// Returns `(alpha-VJP contribution, value-gradient contribution, updated
+/// suffix state)`.
+///
+/// The first component is the load-bearing difference between this ("fused",
+/// approach B) path and the feature-pass path (approach A). For a
+/// front-to-back composite `P = Σ_i w_i a_i` with `w_i = α_i T_i` and
+/// `T_{i+1} = T_i (1 − α_i)`, the suffix `S_i = Σ_{j≥i} w_j a_j` gives
+///
+/// ```text
+/// ∂P/∂α_i = T_i a_i − (S_i − α_i T_i a_i)/(1 − α_i) = (T_i a_i − S_i)/(1 − α_i)
+/// ```
+///
+/// which is exactly the `(state_w * a − state_p) * ra` form the RGB channels
+/// already use. Folding it into the alpha VJP is what lets plane (geometry)
+/// error reach opacity, conic and means2d.
+///
+/// This DELIBERATELY differs from the centre-depth channel two lines away,
+/// which drops its analogous term so depth error cannot move blending weights.
+/// That asymmetry is the design (plan section 4.5, contract rows 1 and 3), not
+/// an oversight: PGSR's whole claim is that a plane-intersection depth is an
+/// unbiased surface, so its error SHOULD be attributable to opacity/shape.
+/// Do not "fix" this to match the centre-depth precedent.
+#[cube]
+fn plane_channel_bwd(
+    state_p: f32,
+    v_o_p: f32,
+    aux_v: f32,
+    state_w: f32,
+    vis: f32,
+    ra: f32,
+) -> (f32, f32, f32) {
+    (
+        (state_w * aux_v - state_p) * v_o_p * ra,
+        vis * v_o_p,
+        state_p - vis * aux_v,
+    )
 }
 
 #[cube]
@@ -69,6 +164,10 @@ fn zero_grad() -> SplatGrad {
         alpha: 0.0f32,
         refine: 0.0f32,
         depth: 0.0f32,
+        plane_0: 0.0f32,
+        plane_1: 0.0f32,
+        plane_2: 0.0f32,
+        plane_3: 0.0f32,
     }
 }
 
@@ -76,11 +175,18 @@ fn zero_grad() -> SplatGrad {
 // appearance-grid backward); re-exported here for the host launch code.
 pub use brush_cube::{AtomicAddF32, CasAtomicAdd, HfAtomicAdd};
 
+#[allow(clippy::fn_params_excessive_bools)]
 #[cube(launch, launch_unchecked)]
 pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
     compact_gid_from_isect: &Tensor<u32>,
     tile_offsets: &Tensor<u32>,
     projected: &Tensor<f32>,
+    // `[N, PLANE_AUX_LANES]` PGSR plane parameters, GLOBAL-gid indexed (the
+    // forward reads the same buffer the same way). 1-element dummy when
+    // `render_plane` is false.
+    plane_aux: &Tensor<f32>,
+    // Compact -> global gid map, needed only to address `plane_aux`.
+    global_from_compact_gid: &Tensor<u32>,
     output: &Tensor<f32>,
     v_output: &Tensor<f32>,
     v_splats: &mut Tensor<Atomic<A::Storage>>,
@@ -90,6 +196,7 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
     #[comptime] tile_width: u32,
     #[comptime] tile_height: u32,
     #[comptime] render_depth: bool,
+    #[comptime] render_plane: bool,
 ) {
     let tile_size = comptime![tile_width * tile_height];
     let (tile_id, tile_origin_x, tile_origin_y) = tile_origin(u.tile_bw, tile_width, tile_height);
@@ -99,7 +206,7 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
     // pre-roll) are read-only post-init and L1-cached, so we re-derive
     // them inline in the inner loop. Smaller shared footprint → more
     // workgroup occupancy on Apple.
-    let pix_stride = comptime![if render_depth { 5u32 } else { 4u32 }];
+    let pix_stride = comptime![raster_out_channels(render_depth, render_plane)];
     let mut pix_state = Shared::new_slice((tile_size * pix_stride) as usize);
     load_pixel_state(
         output,
@@ -110,6 +217,7 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
         tile_width,
         tile_height,
         render_depth,
+        render_plane,
     );
     let (range_lo, range_hi) = load_range(tile_offsets, tile_id);
     let num_splats_in_tile = range_hi - range_lo;
@@ -117,15 +225,19 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
 
     let mut batch_idx = 0u32;
     while batch_idx < rounds {
-        let (compact_gid, splat, splat_active) = load_splat_for_batch(
+        let (compact_gid, splat, splat_active, aux) = load_splat_for_batch(
             compact_gid_from_isect,
             projected,
+            plane_aux,
+            global_from_compact_gid,
             range_lo,
             num_splats_in_tile,
             batch_idx,
+            render_plane,
         );
         let grad = accumulate_grads_for_batch(
             splat,
+            aux,
             splat_active,
             tile_origin_x,
             tile_origin_y,
@@ -140,23 +252,31 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
             tile_width,
             tile_height,
             render_depth,
+            render_plane,
         );
         if splat_active {
             let base = (compact_gid * COMPACT_GRAD_LANES) as usize;
-            A::add(&v_splats[base], grad.xy_x);
-            A::add(&v_splats[base + 1], grad.xy_y);
-            A::add(&v_splats[base + 2], grad.conic_x);
-            A::add(&v_splats[base + 3], grad.conic_y);
-            A::add(&v_splats[base + 4], grad.conic_z);
-            A::add(&v_splats[base + 5], grad.rgb_r);
-            A::add(&v_splats[base + 6], grad.rgb_g);
-            A::add(&v_splats[base + 7], grad.rgb_b);
-            A::add(&v_splats[base + 8], grad.alpha);
+            A::add(&v_splats[base + XY_LANE], grad.xy_x);
+            A::add(&v_splats[base + XY_LANE + 1], grad.xy_y);
+            A::add(&v_splats[base + CONIC_LANE], grad.conic_x);
+            A::add(&v_splats[base + CONIC_LANE + 1], grad.conic_y);
+            A::add(&v_splats[base + CONIC_LANE + 2], grad.conic_z);
+            A::add(&v_splats[base + RGB_LANE], grad.rgb_r);
+            A::add(&v_splats[base + RGB_LANE + 1], grad.rgb_g);
+            A::add(&v_splats[base + RGB_LANE + 2], grad.rgb_b);
+            A::add(&v_splats[base + ALPHA_LANE], grad.alpha);
             if comptime![compute_refine_weight] {
-                A::add(&v_splats[base + 9], grad.refine);
+                A::add(&v_splats[base + REFINE_LANE], grad.refine);
             }
             if comptime![render_depth] {
-                A::add(&v_splats[base + 10], grad.depth);
+                A::add(&v_splats[base + DEPTH_LANE], grad.depth);
+            }
+            if comptime![render_plane] {
+                let p = base + PLANE_GRAD_LANE_START;
+                A::add(&v_splats[p], grad.plane_0);
+                A::add(&v_splats[p + 1], grad.plane_1);
+                A::add(&v_splats[p + 2], grad.plane_2);
+                A::add(&v_splats[p + 3], grad.plane_3);
             }
         }
         batch_idx += 1u32;
@@ -195,6 +315,7 @@ fn load_range(tile_offsets: &Tensor<u32>, tile_id: u32) -> (u32, u32) {
 /// outside the image area get all-zero state — the inner loop's
 /// `state_w > 1.0e-4` guard then skips them.
 #[cube]
+#[allow(clippy::too_many_arguments)]
 fn load_pixel_state(
     output: &Tensor<f32>,
     u: RasterizeUniforms,
@@ -204,11 +325,14 @@ fn load_pixel_state(
     #[comptime] tile_width: u32,
     #[comptime] tile_height: u32,
     #[comptime] render_depth: bool,
+    #[comptime] render_plane: bool,
 ) {
     let tile_size = comptime![tile_width * tile_height];
     // Channels in the rendered image / per-pixel state stride. The depth
-    // numerator (if present) sits at offset 4, after rgba.
-    let out_chans = comptime![if render_depth { 5u32 } else { 4u32 }];
+    // numerator (if present) sits at offset 4, after rgba; the four PGSR plane
+    // sums follow it.
+    let out_chans = comptime![raster_out_channels(render_depth, render_plane)];
+    let plane_off = comptime![plane_channel_offset(render_depth) as usize];
     let pixels_per_load = (tile_size + SPLAT_BATCH - 1u32) / SPLAT_BATCH;
     let mut p = 0u32;
     while p < pixels_per_load {
@@ -235,6 +359,13 @@ fn load_pixel_state(
                     // just the accumulated sum_i w_i z_i.
                     pix_state[s + 4] = output[base + 4];
                 }
+                if comptime![render_plane] {
+                    // Same as depth: raw composited sums, no background term.
+                    pix_state[s + plane_off] = output[base + plane_off];
+                    pix_state[s + plane_off + 1] = output[base + plane_off + 1];
+                    pix_state[s + plane_off + 2] = output[base + plane_off + 2];
+                    pix_state[s + plane_off + 3] = output[base + plane_off + 3];
+                }
             } else {
                 pix_state[s] = 0.0f32;
                 pix_state[s + 1] = 0.0f32;
@@ -243,6 +374,12 @@ fn load_pixel_state(
                 if comptime![render_depth] {
                     pix_state[s + 4] = 0.0f32;
                 }
+                if comptime![render_plane] {
+                    pix_state[s + plane_off] = 0.0f32;
+                    pix_state[s + plane_off + 1] = 0.0f32;
+                    pix_state[s + plane_off + 2] = 0.0f32;
+                    pix_state[s + plane_off + 3] = 0.0f32;
+                }
             }
         }
         p += 1u32;
@@ -250,23 +387,39 @@ fn load_pixel_state(
 }
 
 #[cube]
+#[allow(clippy::too_many_arguments)]
 fn load_splat_for_batch(
     compact_gid_from_isect: &Tensor<u32>,
     projected: &Tensor<f32>,
+    plane_aux: &Tensor<f32>,
+    global_from_compact_gid: &Tensor<u32>,
     range_lo: u32,
     num_splats_in_tile: u32,
     batch_idx: u32,
-) -> (u32, Splat, bool) {
+    #[comptime] render_plane: bool,
+) -> (u32, Splat, bool, PlaneAux) {
     let splat_offset = batch_idx * SPLAT_BATCH + UNIT_POS;
     let mut compact_gid = 0u32;
     let mut splat = Splat::zero();
     let mut splat_active = false;
+    let mut aux = zero_plane_aux();
     if splat_offset < num_splats_in_tile {
         compact_gid = compact_gid_from_isect[(range_lo + splat_offset) as usize];
         splat = read_projected_splat(projected, compact_gid);
         splat_active = true;
+        if comptime![render_plane] {
+            // Same addressing as the forward: GLOBAL gid, straight from global
+            // memory. Read once per batch, reused across the whole pixel walk.
+            let ab = (global_from_compact_gid[compact_gid as usize] * PLANE_AUX_LANES) as usize;
+            aux = PlaneAux {
+                v0: plane_aux[ab],
+                v1: plane_aux[ab + 1],
+                v2: plane_aux[ab + 2],
+                v3: plane_aux[ab + 3],
+            };
+        }
     }
-    (compact_gid, splat, splat_active)
+    (compact_gid, splat, splat_active, aux)
 }
 
 #[allow(clippy::fn_params_excessive_bools)]
@@ -274,6 +427,7 @@ fn load_splat_for_batch(
 #[cube]
 fn accumulate_grads_for_batch(
     splat: Splat,
+    aux: PlaneAux,
     splat_active: bool,
     tile_origin_x: u32,
     tile_origin_y: u32,
@@ -288,9 +442,11 @@ fn accumulate_grads_for_batch(
     #[comptime] tile_width: u32,
     #[comptime] tile_height: u32,
     #[comptime] render_depth: bool,
+    #[comptime] render_plane: bool,
 ) -> SplatGrad {
     let tile_size = comptime![tile_width * tile_height];
-    let out_chans = comptime![if render_depth { 5u32 } else { 4u32 }];
+    let out_chans = comptime![raster_out_channels(render_depth, render_plane)];
+    let plane_off = comptime![plane_channel_offset(render_depth) as usize];
     let conic = Sym2 {
         c00: splat.conic_x,
         c01: splat.conic_y,
@@ -367,9 +523,10 @@ fn accumulate_grads_for_batch(
 
                         let ra = 1.0f32 / (1.0f32 - alpha_eff);
                         // Depth no longer contributes to this dot accumulator
-                        // (see the render_depth block below), so it is written
-                        // once and never mutated.
-                        let dot_rgb = ((state_w * clamped_r - state_x) * v_o_x
+                        // (see the render_depth block below). The PGSR plane
+                        // channels DO — that is approach B's defining property,
+                        // so this accumulator is mutable again.
+                        let mut dot_rgb = ((state_w * clamped_r - state_x) * v_o_x
                             + (state_w * clamped_g - state_y) * v_o_y
                             + (state_w * clamped_b - state_z) * v_o_z)
                             * ra;
@@ -393,6 +550,53 @@ fn accumulate_grads_for_batch(
                             // below stays for the front-to-back depth bookkeeping.
                             grad.depth += vis * v_o_d;
                             pix_state[s + 4] = state_d - vis * splat.depth;
+                        }
+                        if comptime![render_plane] {
+                            // PGSR plane channels: the alpha term IS folded in.
+                            // See `plane_channel_bwd` for the derivation and for
+                            // why this deliberately diverges from the depth
+                            // block directly above.
+                            let (d0, g0, n0) = plane_channel_bwd(
+                                pix_state[s + plane_off],
+                                v_output[pix_base + plane_off],
+                                aux.v0,
+                                state_w,
+                                vis,
+                                ra,
+                            );
+                            let (d1, g1, n1) = plane_channel_bwd(
+                                pix_state[s + plane_off + 1],
+                                v_output[pix_base + plane_off + 1],
+                                aux.v1,
+                                state_w,
+                                vis,
+                                ra,
+                            );
+                            let (d2, g2, n2) = plane_channel_bwd(
+                                pix_state[s + plane_off + 2],
+                                v_output[pix_base + plane_off + 2],
+                                aux.v2,
+                                state_w,
+                                vis,
+                                ra,
+                            );
+                            let (d3, g3, n3) = plane_channel_bwd(
+                                pix_state[s + plane_off + 3],
+                                v_output[pix_base + plane_off + 3],
+                                aux.v3,
+                                state_w,
+                                vis,
+                                ra,
+                            );
+                            dot_rgb += d0 + d1 + d2 + d3;
+                            grad.plane_0 += g0;
+                            grad.plane_1 += g1;
+                            grad.plane_2 += g2;
+                            grad.plane_3 += g3;
+                            pix_state[s + plane_off] = n0;
+                            pix_state[s + plane_off + 1] = n1;
+                            pix_state[s + plane_off + 2] = n2;
+                            pix_state[s + plane_off + 3] = n3;
                         }
                         // Chain through the cutoff. Hard step (production):
                         // w' = 0 and w == 1 in-branch, so the factor is 1.
@@ -440,4 +644,52 @@ fn accumulate_grads_for_batch(
         i += 1u32;
     }
     grad
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ALPHA_LANE, COMPACT_GRAD_LANES, CONIC_LANE, DEPTH_LANE, PLANE_GRAD_LANE_START, REFINE_LANE,
+        RGB_LANE, XY_LANE,
+    };
+    use crate::kernels::helpers::PLANE_AUX_LANES_USIZE;
+
+    /// PINS the current lane layout. The constants above DERIVE from one
+    /// another, which is what stops a new lane from silently overlapping the
+    /// plane block — but a derivation alone would let the layout shift under
+    /// consumers that legitimately encode it out-of-band: the independent VJP
+    /// golden vectors, the derivation doc, and any recorded gradient dump.
+    /// Changing these numbers is therefore a deliberate act, and this test is
+    /// where you acknowledge it.
+    #[test]
+    fn lane_layout_is_pinned_and_the_plane_block_comes_last() {
+        assert_eq!(XY_LANE, 0);
+        assert_eq!(CONIC_LANE, 2);
+        assert_eq!(RGB_LANE, 5);
+        assert_eq!(ALPHA_LANE, 8);
+        assert_eq!(REFINE_LANE, 9);
+        assert_eq!(DEPTH_LANE, 10);
+        assert_eq!(PLANE_GRAD_LANE_START, 11);
+        assert_eq!(COMPACT_GRAD_LANES, 15);
+
+        // The structural invariant the derivation exists to preserve: the plane
+        // block starts after EVERY non-plane lane and the stride covers it.
+        for lane in [
+            XY_LANE + 1,
+            CONIC_LANE + 2,
+            RGB_LANE + 2,
+            ALPHA_LANE,
+            REFINE_LANE,
+            DEPTH_LANE,
+        ] {
+            assert!(
+                lane < PLANE_GRAD_LANE_START,
+                "lane {lane} overlaps the plane block at {PLANE_GRAD_LANE_START}"
+            );
+        }
+        assert_eq!(
+            COMPACT_GRAD_LANES as usize,
+            PLANE_GRAD_LANE_START + PLANE_AUX_LANES_USIZE
+        );
+    }
 }
