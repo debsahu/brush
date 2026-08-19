@@ -3069,6 +3069,98 @@ fn splat_normals(transforms: Tensor<2>, cam_pos: glam::Vec3) -> Tensor<2> {
     normal * sign
 }
 
+/// The world→camera rotation as a `[3, 3]` tensor laid out so that a `[.., 3]`
+/// stack of ROW vectors can be rotated with a single `matmul`.
+///
+/// `glam`'s `Mat3::x_axis` is the first COLUMN, so reading the axes out in this
+/// order builds `Rᵀ` in row-major; right-multiplying row vectors by `Rᵀ` is the
+/// same as left-multiplying column vectors by `R`. Same idiom (and same layout)
+/// as the normal-render block in `step()`.
+pub fn world_to_cam_rot_t(cam: &Camera, device: &Device) -> Tensor<2> {
+    let rot = cam.world_to_local().matrix3;
+    Tensor::<1>::from_floats(
+        [
+            rot.x_axis.x,
+            rot.x_axis.y,
+            rot.x_axis.z,
+            rot.y_axis.x,
+            rot.y_axis.y,
+            rot.y_axis.z,
+            rot.z_axis.x,
+            rot.z_axis.y,
+            rot.z_axis.z,
+        ],
+        device,
+    )
+    .reshape([3, 3])
+}
+
+/// Per-splat camera-frame tangent-PLANE parameters, `[N, 10]` -> `[N, 4]`:
+/// channels `0..3` are the camera-frame unit normal `n_cam`, channel `3` is the
+/// signed plane offset `d`, defined so every point `p` on the splat's tangent
+/// plane satisfies `n_cam · p = d` in the `OpenCV` camera frame.
+///
+/// PGSR (Chen et al. 2024, arXiv:2406.06521), plane parameterization. Rendering
+/// these four channels through the feature rasterizer and intersecting each
+/// camera ray with the composited plane
+/// ([`brush_loss::plane_depth_from_features`]) gives PGSR's unbiased surface
+/// depth, in place of the alpha-composited camera-`z` of the splat CENTRES that
+/// `project_visible.rs:86` emits.
+///
+/// # Gradient contract (this is the whole point of the function)
+///
+/// The normal is `splat_normals` verbatim — including its two deliberately
+/// DETACHED discrete choices (thinnest-axis `argmin`, camera-facing sign) — then
+/// rotated into the camera frame, which is a constant orthonormal map. So
+/// channels `0..3` carry exactly today's normal-render gradient: live into the
+/// quaternions, nothing into the means or the scales.
+///
+/// Channel 3 is where this DIFFERS from `splat_normals`, and the difference is
+/// load-bearing. `splat_normals` uses the splat position only to pick a facing
+/// sign and therefore detaches it outright. Here
+///
+/// ```text
+/// d = n_world · (mean − cam_pos)
+/// ```
+///
+/// and the MEAN ENTERS DIFFERENTIABLY. That is the gradient path from plane
+/// depth back to gaussian positions, and it is the only one the feature pass can
+/// express (the feature rasterizer treats geometry as constant and back-props
+/// into feature VALUES only). Detaching the mean here would leave a function
+/// that still renders a perfectly correct plane-depth map and still trains —
+/// just with no position supervision at all from it, i.e. silently inert rather
+/// than visibly broken. `plane_features_offset_moves_means` pins it.
+///
+/// The camera-facing sign stays detached (it flips both `n` and `d` together, so
+/// the plane is unchanged and only the parameterization's sign convention moves).
+///
+/// # Why world frame for the offset
+///
+/// `d = n_cam · mean_cam` by definition, but a rotation preserves dot products
+/// and `mean_cam = R(mean − cam_pos)`, `n_cam = R·n_world`, so
+/// `n_cam · mean_cam = n_world · (mean − cam_pos)`. Computing it in world frame
+/// uses tensors already in hand and needs no `matmul` on the means.
+///
+/// `transforms` is expected to be the min-scale-FOLDED transforms
+/// (`fold_min_scale`), matching what the current normal render feeds
+/// `splat_normals`.
+pub fn plane_features(transforms: Tensor<2>, cam: &Camera) -> Tensor<2> {
+    let device = transforms.device();
+
+    let means = transforms.clone().slice(s![.., 0..3]);
+    let n_world = splat_normals(transforms, cam.position);
+
+    // Offset: LIVE in both `n_world` and `means`. See the gradient contract.
+    let cam_pos =
+        Tensor::<1>::from_floats([cam.position.x, cam.position.y, cam.position.z], &device)
+            .reshape([1, 3]);
+    let offset = (n_world.clone() * (means - cam_pos)).sum_dim(1);
+
+    let n_cam = n_world.matmul(world_to_cam_rot_t(cam, &device));
+
+    Tensor::cat(vec![n_cam, offset], 1)
+}
+
 #[cfg(test)]
 mod seeded_rng_tests {
     use super::*;
@@ -4148,5 +4240,315 @@ mod scene_scale_tests {
         let mut none = SplatTrainer::new(&cfg, &device, bounds);
         none.set_init_scene_scale(&[]);
         assert_eq!(none.metric_weight_scale(), 1.0);
+    }
+}
+
+/// WS-1 pins for the shared PGSR plane math: the gradient contract of
+/// [`plane_features`], and an end-to-end check that a real rasterized slab's
+/// composited plane features intersect back to the slab.
+///
+/// The analytic ray-plane unit tests live in brush-loss
+/// (`plane_depth_tests`); this module is where `plane_features` and the feature
+/// rasterizer are both reachable, so it is the only place the full chain
+/// splat quaternion -> plane parameters -> compositing -> ray intersection can
+/// be closed. It is the plane-path sibling of
+/// `normal_prior_grad_tests::flat_slab_agrees_with_its_own_depth`.
+#[cfg(test)]
+mod plane_feature_tests {
+    use super::*;
+    use brush_loss::plane_depth_from_features;
+    use brush_render::gaussian_splats::SplatRenderMode;
+    use brush_render::kernels::camera_model::CameraModel;
+
+    const IMG: glam::UVec2 = glam::uvec2(48, 48);
+
+    /// Camera at `-5` on the optical axis, identity rotation, so the
+    /// world→camera rotation is the identity and every sign in the chain is
+    /// readable by hand.
+    fn test_camera() -> Camera {
+        Camera::new(
+            glam::vec3(0.0, 0.0, -5.0),
+            glam::Quat::IDENTITY,
+            0.7,
+            0.7,
+            glam::vec2(0.5, 0.5),
+            CameraModel::Pinhole,
+        )
+    }
+
+    /// A slab of overlapping gaussians whose CENTRES ALL LIE ON one plane
+    /// through the world origin, tilted by `tilt` about `+Y`, each gaussian
+    /// rotated to match so its thinnest axis is the plane normal.
+    ///
+    /// The "centres lie on the plane" part is what makes the end-to-end test
+    /// exact rather than approximate: every splat then has the SAME plane offset
+    /// `d`, so the composited `Σwᵢdᵢ / Σwᵢnᵢ·ray` reduces to `d/(n·ray)` no
+    /// matter what per-pixel coverage weights the rasterizer produces. A slab
+    /// whose centres merely scatter near the plane would make the expected depth
+    /// depend on the weights, which are not knowable outside the kernel.
+    ///
+    /// This is the difference from `normal_prior_grad_tests::tilted_plane_splats`,
+    /// which rotates the gaussians but leaves the centres in the `z = 0` plane —
+    /// fine for a normal test, useless for a depth one.
+    fn planar_slab(device: &Device, tilt: f32) -> Splats {
+        let q = glam::Quat::from_rotation_y(tilt);
+        // Thinnest axis is local +Z, so the plane's in-plane spans are the
+        // rotated local X and Y axes.
+        let e1 = q * glam::vec3(1.0, 0.0, 0.0);
+        let e2 = q * glam::vec3(0.0, 1.0, 0.0);
+
+        let mut means = vec![];
+        let n_side = 9;
+        for iy in 0..n_side {
+            for ix in 0..n_side {
+                let f = |i: i32| (i as f32 / (n_side - 1) as f32) * 2.0 - 1.0;
+                let p = e1 * f(ix) + e2 * f(iy);
+                means.extend_from_slice(&[p.x, p.y, p.z]);
+            }
+        }
+        let n = means.len() / 3;
+        let rotations: Vec<f32> = (0..n).flat_map(|_| [q.w, q.x, q.y, q.z]).collect();
+        let log_scales: Vec<f32> = (0..n).flat_map(|_| [-1.6, -1.6, -2.5]).collect();
+        let sh: Vec<f32> = (0..n).flat_map(|_| [0.5, 0.5, 0.5]).collect();
+        let opac: Vec<f32> = vec![4.0; n];
+
+        Splats::from_raw(
+            means,
+            rotations,
+            log_scales,
+            sh,
+            opac,
+            SplatRenderMode::Default,
+            device,
+        )
+    }
+
+    async fn absmax(t: Tensor<2>) -> f32 {
+        t.abs()
+            .max()
+            .into_data_async()
+            .await
+            .expect("grad readback")
+            .to_vec::<f32>()
+            .expect("f32 grad")[0]
+    }
+
+    async fn read<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+        t.into_data_async()
+            .await
+            .expect("tensor readback")
+            .to_vec::<f32>()
+            .expect("f32 tensor")
+    }
+
+    /// The offset channel is the ONLY path from plane supervision back to
+    /// gaussian positions, and its gradient is not merely nonzero — it is
+    /// exactly the world normal.
+    ///
+    /// `d = n_world · (mean − cam_pos)`, so `∂(Σd)/∂mean = n_world` (the
+    /// camera-facing sign is detached, so it contributes nothing extra). Pinning
+    /// the VALUE, not just "greater than zero", is what makes this test catch the
+    /// failure the plan warns about: detaching the mean here leaves a function
+    /// that still renders a correct plane-depth map and still trains — it just
+    /// silently supervises no positions at all.
+    #[tokio::test]
+    async fn plane_features_offset_moves_means() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = planar_slab(&device, 0.5);
+        let camera = test_camera();
+
+        let feats = plane_features(splats.transforms.val(), &camera);
+        assert_eq!(feats.dims(), [splats.num_splats() as usize, 4]);
+
+        let loss = feats.slice(s![.., 3..4]).sum();
+        let grads = splats.bwd_validate(loss).await;
+        let transforms_grad = splats
+            .transforms
+            .grad(&grads)
+            .expect("the plane offset must reach the transforms");
+
+        let mean_grad = read(transforms_grad.clone().slice(s![.., 0..3])).await;
+        let want = read(splat_normals(splats.transforms.val(), camera.position)).await;
+        assert_eq!(mean_grad.len(), want.len());
+        let worst = mean_grad
+            .iter()
+            .zip(want.iter())
+            .map(|(g, n)| (g - n).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-5,
+            "d(offset)/d(mean) must equal the world normal, worst component error {worst}"
+        );
+        // Guard against the assertion above being satisfied by an all-zero
+        // gradient matching an all-zero normal.
+        let magnitude = want.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(
+            magnitude > 0.5,
+            "the fixture's normals must be nonzero, got {magnitude}"
+        );
+
+        // The offset also depends on the quaternion through `n_world`, so that
+        // path must be live too.
+        let rot_grad = absmax(transforms_grad.clone().slice(s![.., 3..7])).await;
+        assert!(
+            rot_grad > 1e-8,
+            "the plane offset must also reach the rotations, got {rot_grad}"
+        );
+
+        // The thinnest-axis choice is a detached `argmin`, so scales get nothing
+        // — the flatten term stays the scale-side pressure. Same contract as the
+        // existing normal loss.
+        let scale_grad = absmax(transforms_grad.slice(s![.., 7..10])).await;
+        assert!(
+            scale_grad < 1e-8,
+            "the detached argmin must leave scales alone, got {scale_grad}"
+        );
+
+        let opac_grad = match splats.raw_opacities.grad(&grads) {
+            None => 0.0,
+            Some(g) => absmax(g.unsqueeze_dim(1)).await,
+        };
+        assert!(
+            opac_grad < 1e-8,
+            "plane features must not push opacity, got {opac_grad}"
+        );
+    }
+
+    /// The normal channels carry the same contract `splat_normals` always had:
+    /// rotations only. Rotating into the camera frame is a constant orthonormal
+    /// map and must not open a new path.
+    #[tokio::test]
+    async fn plane_features_normal_moves_rotations_only() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = planar_slab(&device, 0.5);
+        let camera = test_camera();
+
+        let feats = plane_features(splats.transforms.val(), &camera);
+        // A weighted sum, so the three channels cannot cancel each other out.
+        let w: Tensor<2> = Tensor::<1>::from_floats([0.3f32, -0.7, 1.1], &device).reshape([1, 3]);
+        let loss = (feats.slice(s![.., 0..3]) * w).sum();
+
+        let grads = splats.bwd_validate(loss).await;
+        let transforms_grad = splats
+            .transforms
+            .grad(&grads)
+            .expect("the plane normal must reach the transforms");
+
+        let rot_grad = absmax(transforms_grad.clone().slice(s![.., 3..7])).await;
+        assert!(
+            rot_grad > 1e-8,
+            "expected a nonzero rotation gradient, got {rot_grad}"
+        );
+        let mean_grad = absmax(transforms_grad.clone().slice(s![.., 0..3])).await;
+        assert!(
+            mean_grad < 1e-8,
+            "the plane NORMAL must not move means, got {mean_grad}"
+        );
+        let scale_grad = absmax(transforms_grad.slice(s![.., 7..10])).await;
+        assert!(
+            scale_grad < 1e-8,
+            "the plane normal must not move scales, got {scale_grad}"
+        );
+    }
+
+    /// End-to-end: rasterize `plane_features` through the feature pass, feed the
+    /// `[H, W, 5]` result to `plane_depth_from_features`, and check the recovered
+    /// depth against the slab's closed-form ray-plane depth.
+    ///
+    /// Run on a fronto-parallel slab AND a slab tilted 0.5 rad about `+Y`. The
+    /// tilted arm is the one with teeth: a fronto-parallel plane has
+    /// `n_cam = (0, 0, −1)`, so the intersection collapses to `depth = −d` and
+    /// the ray grid, the intrinsics and the world→camera rotation all drop out.
+    /// Under the tilt the depth varies ~1.5x across the frame and every one of
+    /// those is live.
+    ///
+    /// Closed form for a plane through the world origin with camera-frame unit
+    /// normal `n` and offset `d = n · (0 − cam_pos)`:
+    /// `z(u, v) = d / (n · ray(u, v))`.
+    #[tokio::test]
+    async fn plane_depth_matches_a_rendered_slab() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let camera = test_camera();
+        let focal = camera.focal(IMG);
+        let center = camera.center(IMG);
+        let (w, h) = (IMG.x as usize, IMG.y as usize);
+
+        for tilt in [0.0f32, 0.5] {
+            let splats = planar_slab(&device, tilt);
+            let transforms = splats.transforms.val();
+
+            let feats = plane_features(transforms.clone(), &camera);
+            let feat_img = render_splat_features(
+                transforms,
+                splats.raw_opacities.val(),
+                feats,
+                &camera,
+                IMG,
+                SplatRenderMode::Default,
+            )
+            .await;
+            assert_eq!(feat_img.dims(), [h, w, 5]);
+
+            let (depth, normal, valid) = plane_depth_from_features(
+                feat_img, focal.x, focal.y, center.x, center.y, 0.5, 0.05, 0.05, 100.0,
+            );
+            let depth = read(depth).await;
+            let normal = read(normal).await;
+            let valid = read(valid).await;
+
+            // Expected plane, derived independently of `plane_features`: the
+            // thinnest axis is local +Z, rotated by the tilt; `splat_normals`
+            // flips it to face the camera; the camera rotation is the identity.
+            let n = {
+                let v = glam::Quat::from_rotation_y(tilt) * glam::vec3(0.0, 0.0, 1.0);
+                // Camera at -5z, plane through the origin: `n · (0 − cam)` is
+                // `+5·v.z`, which is positive, so the facing rule flips `v`.
+                -v
+            };
+            let d = n.dot(glam::Vec3::ZERO - camera.position);
+
+            let mut covered = 0usize;
+            let mut worst = 0.0f32;
+            for py in 0..h {
+                for px in 0..w {
+                    let i = py * w + px;
+                    if valid[i] == 0.0 {
+                        continue;
+                    }
+                    covered += 1;
+
+                    let ray = glam::vec3(
+                        (px as f32 + 0.5 - center.x) / focal.x,
+                        (py as f32 + 0.5 - center.y) / focal.y,
+                        1.0,
+                    );
+                    let want = d / n.dot(ray);
+                    worst = worst.max((depth[i] - want).abs() / want);
+
+                    for c in 0..3 {
+                        assert!(
+                            (normal[i * 3 + c] - n[c]).abs() < 1e-5,
+                            "tilt {tilt}: normal[{c}] at ({px},{py}) = {}, want {}",
+                            normal[i * 3 + c],
+                            n[c]
+                        );
+                    }
+                }
+            }
+
+            // The slab spans ±1 in the plane at depth ~5 with a 0.7 rad FOV, so
+            // it covers the middle of the frame, not all of it.
+            assert!(
+                covered > 400,
+                "tilt {tilt}: expected the slab to cover a real region, got {covered} valid pixels"
+            );
+            assert!(
+                worst < 1e-5,
+                "tilt {tilt}: worst relative depth error {worst} against the closed-form plane"
+            );
+        }
     }
 }

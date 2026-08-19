@@ -1937,6 +1937,192 @@ pub fn normals_from_depth(depth: Tensor<2>, fx: f32, fy: f32, cx: f32, cy: f32) 
     Tensor::zeros([h, w, 3], &device).slice_assign(s![0..h - 1, 0..w - 1, ..], interior)
 }
 
+/// Per-pixel **unbiased surface depth** by intersecting each camera ray with the
+/// alpha-composited tangent plane of the gaussians covering that pixel.
+///
+/// PGSR (Chen et al. 2024, arXiv:2406.06521), "unbiased depth rendering". The
+/// bias this removes: brush's existing depth channel composites the camera-`z`
+/// of each gaussian's **centre** (`project_visible.rs:86`), so the supervised
+/// surface sits at the centres of a shell of ellipsoids rather than on the
+/// surface those ellipsoids tile. Compositing each splat's tangent-plane
+/// parameters instead and intersecting the ray with the composited plane puts
+/// the depth on the plane, where the surface actually is.
+///
+/// `feat_img` is `[H, W, 5]` as emitted by the feature rasterizer:
+/// channels `0..3` = `Σ wᵢ · n_camᵢ`, channel `3` = `Σ wᵢ · dᵢ`, channel `4` =
+/// `α = Σ wᵢ`; the per-splat `(n_cam, d)` pairs come from
+/// `brush_train::train::plane_features`, where `d` is defined so that every
+/// point `p` on splat `i`'s tangent plane satisfies `n_camᵢ · p = dᵢ` in the
+/// `OpenCV` camera frame.
+///
+/// # No alpha division
+///
+/// The plane is intersected as
+/// `z = offset_sum / (n_sum · ray)`, using the **raw composited sums**. Alpha
+/// cancels exactly between numerator and denominator — dividing both by `α`
+/// would give the identical quotient — so, unlike the centre-depth path
+/// (train.rs:1201-1203), there is no alpha normalization here and therefore no
+/// detach decision to make about it. Alpha is still read, but only as a
+/// coverage **mask** (`α ≥ min_alpha`), and it is detached for that use: a
+/// validity test is not a gradient path.
+///
+/// # Ray convention — deliberately NOT the one `normals_from_depth` uses
+///
+/// The ray through integer pixel `(u, v)` is
+/// `((u + 0.5 − cx) / fx, (v + 0.5 − cy) / fy, 1)`. The `+ 0.5` is the pixel
+/// **centre**, which is the convention the rasterizer itself uses
+/// (`rasterize.rs`: `pixel_coord_x = pix_x + 0.5`, compared against
+/// `fx·x/z + cx` from `project_pinhole`). [`normals_from_depth`] above omits
+/// it; that is harmless there because it is a *finite-difference* estimator and
+/// a constant shift of the sample grid cancels to first order, but a ray-plane
+/// intersection is a *direct evaluation* and does not get that cancellation —
+/// a half-pixel error here is a real depth error of order
+/// `0.5·|n_x|/(fx·(n·ray))` relative, which blows up at grazing incidence. Do
+/// not "unify" the two by dropping the `0.5`.
+///
+/// # Validity and `NaN` discipline
+///
+/// A pixel is valid when all of: `α ≥ min_alpha`; `|n_sum · ray| ≥ min_denom`
+/// (a plane seen edge-on has no well-defined ray intersection); and
+/// `min_depth ≤ z ≤ max_depth`. Invalid pixels emit exactly `0` in both the
+/// depth and the normal, and carry no gradient.
+///
+/// Every input channel is `mask_fill`-sanitised to `0` before any division or
+/// `sqrt`, and the denominator is `mask_fill`-replaced by `1.0` wherever it
+/// fails `min_denom`, so no non-finite value is ever produced in the forward
+/// pass. This matters more than it looks: this fork has already paid once for a
+/// `0 · ∞ = NaN` in the *backward* of a masked-out pixel (see the safe-norm
+/// comment in [`normals_from_depth`]), and multiplying a non-finite value by a
+/// zero mask reproduces it exactly. Masking with `mask_fill` (which replaces the
+/// value and blocks the gradient) rather than with a multiply is what keeps that
+/// closed.
+///
+/// # Returns
+///
+/// `(depth [H, W], normal [H, W, 3], valid [H, W])`, where `normal` is the
+/// normalized `n_sum` (the composited camera-frame plane normal, for the
+/// depth/normal consistency term when plane depth is the active depth source)
+/// and `valid` is a `1.0`/`0.0` float mask.
+///
+/// Thresholds are parameters, not config: v1 pins PGSR-paper-typical constants
+/// at the call site.
+pub fn plane_depth_from_features(
+    feat_img: Tensor<3>,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+    min_alpha: f32,
+    min_denom: f32,
+    min_depth: f32,
+    max_depth: f32,
+) -> (Tensor<2>, Tensor<3>, Tensor<2>) {
+    let [h, w, c] = feat_img.dims();
+    assert_eq!(
+        c, 5,
+        "plane feature image must be [H, W, 5] (n_sum(3) + offset_sum(1) + alpha(1)), got {c} channels"
+    );
+    let device = feat_img.device();
+
+    let chan =
+        |t: Tensor<3>, i: usize| -> Tensor<2> { t.slice(s![.., .., i..i + 1]).reshape([h, w]) };
+    let c0 = chan(feat_img.clone(), 0);
+    let c1 = chan(feat_img.clone(), 1);
+    let c2 = chan(feat_img.clone(), 2);
+    let c3 = chan(feat_img.clone(), 3);
+    let c4 = chan(feat_img, 4);
+
+    // Sanitise EVERY channel up front, on the JOINT finite mask: one non-finite
+    // channel makes the whole pixel meaningless, so zero the pixel rather than
+    // repairing it channel-by-channel (a `NaN` in `n_x` alone would otherwise
+    // decay into a perfectly plausible axis-aligned plane and be reported valid).
+    // The pixel is then also excluded from `valid` below.
+    //
+    // Doing this BEFORE any division or sqrt is what keeps the backward clean: a
+    // non-finite value that survives into an op and is masked out afterwards
+    // reappears as `0 · ∞ = NaN` in that op's VJP and poisons the whole map.
+    // `mask_fill` substitutes the value (so the forward never sees it) and
+    // zeroes the gradient there (so the backward never multiplies by it).
+    let all_finite = c0
+        .clone()
+        .is_finite()
+        .bool_and(c1.clone().is_finite())
+        .bool_and(c2.clone().is_finite())
+        .bool_and(c3.clone().is_finite())
+        .bool_and(c4.clone().is_finite());
+    let non_finite = all_finite.clone().bool_not();
+
+    let nx = c0.mask_fill(non_finite.clone(), 0.0);
+    let ny = c1.mask_fill(non_finite.clone(), 0.0);
+    let nz = c2.mask_fill(non_finite.clone(), 0.0);
+    let offset = c3.mask_fill(non_finite.clone(), 0.0);
+    // Alpha is a coverage MASK, never a gradient path.
+    let alpha = c4.mask_fill(non_finite, 0.0).detach();
+
+    // Pixel-CENTRE ray grid, built host-side (no `arange` in this burn rev) and
+    // broadcast against the feature planes. See the ray-convention note above
+    // for why the `+ 0.5` is here and not in `normals_from_depth`.
+    let us: Vec<f32> = (0..w).map(|u| (u as f32 + 0.5 - cx) / fx).collect();
+    let vs: Vec<f32> = (0..h).map(|v| (v as f32 + 0.5 - cy) / fy).collect();
+    let a_u: Tensor<2> = Tensor::<1>::from_floats(us.as_slice(), &device).reshape([1, w]);
+    let b_v: Tensor<2> = Tensor::<1>::from_floats(vs.as_slice(), &device).reshape([h, 1]);
+
+    // n_sum · ray, with ray_z == 1 by construction.
+    let denom = nx.clone() * a_u + ny.clone() * b_v + nz.clone();
+
+    // A near-zero denominator is an edge-on plane: the intersection is
+    // unbounded, so reject rather than clamp. The replacement value 1.0 is
+    // arbitrary — it only has to be far from zero, since the quotient is
+    // discarded at exactly these pixels.
+    let denom_ok = denom.clone().abs().lower_elem(min_denom).bool_not();
+    let safe_denom = denom.mask_fill(denom_ok.clone().bool_not(), 1.0);
+
+    let depth_raw = offset / safe_denom;
+
+    // Physical plausibility. After the sanitisation above nothing here is
+    // non-finite, but both comparisons are false for a `NaN` anyway, so this
+    // also fails safe. Note `min_depth > 0` is what rejects a plane BEHIND the
+    // camera; an `|z| < max_depth` test would happily accept it.
+    let in_range = depth_raw
+        .clone()
+        .lower_elem(min_depth)
+        .bool_not()
+        .bool_and(depth_raw.clone().greater_elem(max_depth).bool_not());
+
+    let valid_mask = alpha
+        .lower_elem(min_alpha)
+        .bool_not()
+        .bool_and(all_finite)
+        .bool_and(denom_ok)
+        .bool_and(in_range);
+    let invalid = valid_mask.clone().bool_not();
+
+    let depth = depth_raw.mask_fill(invalid.clone(), 0.0);
+
+    // Safe norm, same discipline as `normals_from_depth`: clamp the SQUARED
+    // length off zero before the sqrt, so the sqrt's derivative stays finite on
+    // the (masked, zero-weight) background pixels.
+    let n_sum: Tensor<3> = Tensor::cat(
+        vec![
+            nx.reshape([h, w, 1]),
+            ny.reshape([h, w, 1]),
+            nz.reshape([h, w, 1]),
+        ],
+        2,
+    );
+    let len = n_sum
+        .clone()
+        .powi_scalar(2)
+        .sum_dim(2)
+        .clamp_min(1e-24)
+        .sqrt();
+    let normal = n_sum / len.clamp_min(1e-12);
+    let invalid3 = invalid.reshape([h, w, 1]).repeat_dim(2, 3);
+    let normal = normal.mask_fill(invalid3, 0.0);
+
+    (depth, normal, valid_mask.float())
+}
+
 /// Depth/normal consistency: `1 - dot` between normals derived from the
 /// rendered depth and the rendered per-gaussian normals (`PlanarGS` `L_dn`).
 ///
@@ -2848,6 +3034,340 @@ mod normal_loss_tests {
         assert!(
             weighted < unweighted,
             "edge weighting must reduce the loss: {weighted} !< {unweighted}"
+        );
+    }
+}
+
+/// Tests 4 and 5 of the PGSR plane-render plan: the ray-plane depth math.
+///
+/// These build the composited feature image ANALYTICALLY rather than by
+/// rendering. That is deliberate and is the stronger check for this function:
+/// a real render can only ever produce one particular coverage weight per pixel,
+/// whereas the whole "no alpha division" claim is a statement about what happens
+/// when the weight VARIES. Building `(w·n, w·d, w)` by hand with a per-pixel `w`
+/// lets `alpha_cancels_out_of_the_quotient` pin exactly that. The end-to-end
+/// check against a real rasterized slab lives in brush-train
+/// (`plane_depth_matches_a_rendered_slab`), where `plane_features` is available.
+#[cfg(all(test, not(target_family = "wasm")))]
+mod plane_depth_tests {
+    use super::*;
+    use brush_render::burn_glue::lift_to_autodiff;
+    use burn::tensor::TensorData;
+
+    // A deliberately SHORT focal on a wide-ish image: the rays then span
+    // roughly ±0.75 in x and ±0.61 in y, so a tilted plane's depth varies by
+    // more than 4x across the frame. With the long focals the `normal_loss_tests`
+    // module uses, every ray is within 3% of the optical axis and a tilted
+    // plane is numerically indistinguishable from a fronto-parallel one — which
+    // is exactly the bug class this test exists to catch.
+    const W: usize = 16;
+    const H: usize = 12;
+    const FX: f32 = 10.0;
+    const FY: f32 = 9.0;
+    const CX: f32 = W as f32 / 2.0;
+    const CY: f32 = H as f32 / 2.0;
+
+    const MIN_ALPHA: f32 = 0.1;
+    const MIN_DENOM: f32 = 0.05;
+    const MIN_DEPTH: f32 = 0.05;
+    const MAX_DEPTH: f32 = 100.0;
+
+    async fn device() -> burn::tensor::Device {
+        brush_cube::test_helpers::test_device().await.into()
+    }
+
+    async fn autodiff_device() -> burn::tensor::Device {
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff()
+    }
+
+    async fn read<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+        t.into_data_async()
+            .await
+            .expect("tensor readback")
+            .to_vec::<f32>()
+            .expect("f32 tensor")
+    }
+
+    /// Pixel-CENTRE ray, matching the rasterizer (`pix + 0.5` against
+    /// `fx·x/z + cx`). Written out here independently of the implementation so
+    /// a convention change in one has to be made in the other too.
+    fn ray(u: usize, v: usize) -> (f32, f32) {
+        ((u as f32 + 0.5 - CX) / FX, (v as f32 + 0.5 - CY) / FY)
+    }
+
+    /// Camera-facing unit normal and offset of the plane `z = z0 + a·x + b·y`,
+    /// in the `OpenCV` camera frame.
+    ///
+    /// `n·p = (a·x + b·y − z)/L`, which on the plane is `−z0/L`, so
+    /// `n = (a, b, −1)/L` and `d = −z0/L` with `L = sqrt(1 + a² + b²)`. The
+    /// normal points back toward the camera (`n_z < 0`) and the offset of a
+    /// visible plane is negative, which is the sign convention `splat_normals`
+    /// produces and `normals_from_depth` agrees with.
+    fn plane_params(z0: f32, a: f32, b: f32) -> ([f32; 3], f32) {
+        let l = (1.0 + a * a + b * b).sqrt();
+        ([a / l, b / l, -1.0 / l], -z0 / l)
+    }
+
+    /// Closed-form depth of that plane along the pixel ray, derived from the
+    /// plane's GEOMETRY (substitute `x = z·rᵤ`, `y = z·r_v` into
+    /// `z = z0 + a·x + b·y` and solve) rather than from the `d/(n·ray)`
+    /// formula under test — same construction the existing
+    /// `doubly_tilted_plane_pins_both_axes_and_intrinsics` uses.
+    fn plane_depth(z0: f32, a: f32, b: f32, u: usize, v: usize) -> f32 {
+        let (ru, rv) = ray(u, v);
+        z0 / (1.0 - a * ru - b * rv)
+    }
+
+    /// Build `[H, W, 5]` = `(w·n, w·d, w)` for a single plane covering the whole
+    /// frame with per-pixel coverage weight `w`.
+    fn feature_image(n: [f32; 3], d: f32, weight: &dyn Fn(usize, usize) -> f32) -> Vec<f32> {
+        let mut data = vec![0.0f32; H * W * 5];
+        for v in 0..H {
+            for u in 0..W {
+                let w = weight(u, v);
+                let i = (v * W + u) * 5;
+                data[i] = w * n[0];
+                data[i + 1] = w * n[1];
+                data[i + 2] = w * n[2];
+                data[i + 3] = w * d;
+                data[i + 4] = w;
+            }
+        }
+        data
+    }
+
+    /// A varying, always-covered weight. Deliberately not constant: see the
+    /// module comment.
+    fn varying_weight(u: usize, v: usize) -> f32 {
+        0.3 + 0.65 * (((u * 3 + v * 5) % 7) as f32 / 6.0)
+    }
+
+    async fn run(data: Vec<f32>, device: &burn::tensor::Device) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let feat = Tensor::<3>::from_data(TensorData::new(data, [H, W, 5]), device);
+        let (depth, normal, valid) = plane_depth_from_features(
+            feat, FX, FY, CX, CY, MIN_ALPHA, MIN_DENOM, MIN_DEPTH, MAX_DEPTH,
+        );
+        (read(depth).await, read(normal).await, read(valid).await)
+    }
+
+    /// **Test 4.** The composited plane features of a single flat splat must
+    /// yield exactly the closed-form ray-plane depth, on a fronto-parallel slab
+    /// AND on a doubly-tilted one.
+    ///
+    /// The tilted case is the load-bearing one. A fronto-parallel plane has
+    /// `n = (0, 0, −1)`, so `n·ray` collapses to `−1` regardless of the ray grid
+    /// — the intrinsics, the pixel-centre offset, and both transverse normal
+    /// components are all multiplied by zero and the test passes under almost
+    /// any convention. Tilting in BOTH axes, with `a` and `b` differing in
+    /// magnitude and sign and `FX != FY` with `W != H`, makes an axis swap, an
+    /// intrinsic swap, a sign flip, or a half-pixel grid offset each move the
+    /// answer well outside 1e-4.
+    #[tokio::test]
+    async fn plane_depth_flat_slab_exact() {
+        let device = device().await;
+
+        for (z0, a, b) in [(3.0f32, 0.0f32, 0.0f32), (3.0, 0.35, -0.6)] {
+            let (n, d) = plane_params(z0, a, b);
+            let (depth, normal, valid) = run(feature_image(n, d, &varying_weight), &device).await;
+
+            for v in 0..H {
+                for u in 0..W {
+                    let i = v * W + u;
+                    assert_eq!(
+                        valid[i], 1.0,
+                        "({u},{v}) must be valid for z0={z0} a={a} b={b}"
+                    );
+
+                    let want = plane_depth(z0, a, b, u, v);
+                    assert!(
+                        (depth[i] - want).abs() < 1e-4,
+                        "depth at ({u},{v}) for z0={z0} a={a} b={b} = {}, want {want}",
+                        depth[i]
+                    );
+
+                    for c in 0..3 {
+                        assert!(
+                            (normal[i * 3 + c] - n[c]).abs() < 1e-5,
+                            "normal[{c}] at ({u},{v}) = {}, want {}",
+                            normal[i * 3 + c],
+                            n[c]
+                        );
+                    }
+                }
+            }
+
+            // The tilted arm must actually be tilted: if the depth were flat
+            // across the frame the assertions above would be vacuous for the
+            // ray grid.
+            if a != 0.0 || b != 0.0 {
+                let (lo, hi) = depth
+                    .iter()
+                    .fold((f32::MAX, f32::MIN), |(lo, hi), &z| (lo.min(z), hi.max(z)));
+                assert!(
+                    hi / lo > 3.0,
+                    "the tilted fixture must span a wide depth range, got {lo}..{hi}"
+                );
+            }
+        }
+    }
+
+    /// The "no alpha division" contract, stated as a test: alpha cancels
+    /// between numerator and denominator, so scaling every channel of a pixel by
+    /// its coverage weight must leave the depth bit-for-bit alone.
+    #[tokio::test]
+    async fn alpha_cancels_out_of_the_quotient() {
+        let device = device().await;
+        let (n, d) = plane_params(3.0, 0.35, -0.6);
+
+        let (varying, _, _) = run(feature_image(n, d, &varying_weight), &device).await;
+        let (unit, _, _) = run(feature_image(n, d, &|_, _| 1.0), &device).await;
+
+        for (i, (a, b)) in varying.iter().zip(unit.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "pixel {i}: depth changed with coverage weight, {a} vs {b} — \
+                 alpha must cancel out of offset_sum / (n_sum · ray)"
+            );
+        }
+    }
+
+    /// **Test 5.** Every rejection route emits exactly 0 in both outputs, and —
+    /// the part that actually matters — the BACKWARD stays finite.
+    ///
+    /// This is the `0 · ∞ = NaN` regression class the fork already paid for once
+    /// (the safe-norm comment in `normals_from_depth`). A masked pixel whose raw
+    /// value is `inf` or `NaN` poisons the gradient of the WHOLE map if the mask
+    /// is applied as a multiply, because autodiff then evaluates `0 · ∞`. The
+    /// forward assertions below would pass under that bug; only the gradient
+    /// check catches it, so assert on the backward, not just the forward.
+    #[tokio::test]
+    async fn plane_depth_invalid_pixels_are_zero_and_nan_free() {
+        let device = autodiff_device().await;
+        let (n, d) = plane_params(3.0, 0.35, -0.6);
+        let mut data = feature_image(n, d, &varying_weight);
+
+        let set = |data: &mut Vec<f32>, u: usize, v: usize, px: [f32; 5]| {
+            let i = (v * W + u) * 5;
+            data[i..i + 5].copy_from_slice(&px);
+        };
+
+        // (0, 0): zero alpha — an uncovered background pixel. Everything is 0,
+        // so the denominator is 0 too; both routes must reject it.
+        set(&mut data, 0, 0, [0.0; 5]);
+        // (1, 0): covered, but the plane is seen exactly edge-on. The ray at
+        // (1, 0) is (-0.65, -0.611, 1); a normal orthogonal to it gives
+        // denom == 0 while alpha is healthy, isolating the min_denom route.
+        let (r1u, r1v) = ray(1, 0);
+        let graze = {
+            // Any vector orthogonal to the ray: (ray x e_x), normalized.
+            let (gx, gy, gz) = (0.0, 1.0, -r1v);
+            let l = (gx * gx + gy * gy + gz * gz).sqrt();
+            let _ = r1u;
+            [gx / l, gy / l, gz / l]
+        };
+        set(&mut data, 1, 0, [graze[0], graze[1], graze[2], -3.0, 1.0]);
+        // (2, 0): depth far beyond max_depth (tiny but supra-threshold denom).
+        set(&mut data, 2, 0, [0.0, 0.0, -0.06, -1000.0, 1.0]);
+        // (3, 0): depth below min_depth — the plane is behind / on the lens.
+        set(&mut data, 3, 0, [0.0, 0.0, -1.0, -0.001, 1.0]);
+        // (4, 0): NEGATIVE depth — a plane behind the camera. `min_depth > 0`
+        // must reject it; a bare `|z| < max` test would not.
+        set(&mut data, 4, 0, [0.0, 0.0, -1.0, 3.0, 1.0]);
+        // (5, 0) and (6, 0): non-finite channels arriving from upstream.
+        set(&mut data, 5, 0, [f32::NAN, 0.0, -1.0, -3.0, 1.0]);
+        set(&mut data, 6, 0, [0.0, 0.0, -1.0, f32::INFINITY, 1.0]);
+
+        let invalid: Vec<(usize, usize)> = (0..7).map(|u| (u, 0)).collect();
+
+        let feat = lift_to_autodiff(Tensor::<3>::from_data(
+            TensorData::new(data, [H, W, 5]),
+            &device,
+        ))
+        .require_grad();
+
+        let (depth, normal, valid) = plane_depth_from_features(
+            feat.clone(),
+            FX,
+            FY,
+            CX,
+            CY,
+            MIN_ALPHA,
+            MIN_DENOM,
+            MIN_DEPTH,
+            MAX_DEPTH,
+        );
+
+        let depth_v = read(depth.clone()).await;
+        let normal_v = read(normal.clone()).await;
+        let valid_v = read(valid).await;
+
+        for &(u, v) in &invalid {
+            let i = v * W + u;
+            assert_eq!(valid_v[i], 0.0, "({u},{v}) must be marked invalid");
+            assert_eq!(depth_v[i], 0.0, "({u},{v}) depth must be exactly 0");
+            for c in 0..3 {
+                assert_eq!(
+                    normal_v[i * 3 + c],
+                    0.0,
+                    "({u},{v}) normal[{c}] must be exactly 0"
+                );
+            }
+        }
+
+        // Untouched pixels must be unaffected by their poisoned neighbours: this
+        // function is per-pixel, so a NaN that "spreads" means it leaked through
+        // a reduction it should not have.
+        for v in 0..H {
+            for u in 0..W {
+                if invalid.contains(&(u, v)) {
+                    continue;
+                }
+                let i = v * W + u;
+                assert_eq!(valid_v[i], 1.0, "({u},{v}) must still be valid");
+                let want = plane_depth(3.0, 0.35, -0.6, u, v);
+                assert!(
+                    (depth_v[i] - want).abs() < 1e-4,
+                    "depth at ({u},{v}) = {}, want {want}",
+                    depth_v[i]
+                );
+            }
+        }
+
+        // Backward. A loss over BOTH outputs, so neither the division nor the
+        // safe-norm can hide.
+        let loss = depth.sum() + normal.sum();
+        let grads = loss.backward();
+        let g = read(
+            feat.grad(&grads)
+                .expect("the feature image must receive a gradient"),
+        )
+        .await;
+
+        assert!(
+            g.iter().all(|x| x.is_finite()),
+            "plane-depth backward produced {} non-finite gradient entries out of {}",
+            g.iter().filter(|x| !x.is_finite()).count(),
+            g.len()
+        );
+        // The gradient must be zero exactly on the rejected pixels (a mask that
+        // blocks the value but leaks the gradient is the other half of the bug).
+        for &(u, v) in &invalid {
+            let i = (v * W + u) * 5;
+            for c in 0..5 {
+                assert_eq!(
+                    g[i + c],
+                    0.0,
+                    "({u},{v}) channel {c} must carry no gradient, got {}",
+                    g[i + c]
+                );
+            }
+        }
+        // ...and nonzero somewhere on the valid pixels, so the test cannot pass
+        // by the whole map being dead.
+        let live: f32 = g[W * 5..].iter().map(|x| x.abs()).sum();
+        assert!(
+            live > 1e-6,
+            "valid pixels must carry a real gradient, got {live}"
         );
     }
 }
