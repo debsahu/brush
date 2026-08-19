@@ -1,10 +1,11 @@
 use super::{
-    DatasetFileIndex, DatasetLoadResult, FormatError, opengl_c2w_to_pose, split_eval_every,
+    DatasetFileIndex, DatasetLoadResult, FormatError, find_depth_path, find_normal_path,
+    opengl_c2w_to_pose, split_eval_every,
 };
 use crate::{
     Dataset,
     config::LoadDatasetConfig,
-    scene::{LoadImage, SceneView},
+    scene::{LoadDepth, LoadImage, LoadNormal, SceneView},
 };
 use brush_render::camera::{Camera, focal_to_fov};
 use brush_render::kernels::camera_model::CameraModel;
@@ -130,6 +131,19 @@ async fn read_dataset_inner(
         let mask_path = file_index
             .find_mask_path(&image_path)
             .map(Path::to_path_buf);
+
+        // Geometry priors, discovered exactly as in the COLMAP and nerfstudio
+        // loaders: `depth/<stem>` and `normal/<stem>` alongside the image
+        // (`super::find_prior_path`). The RealityCapture csv is a fixed
+        // pose/intrinsics column template with no place to name a per-image
+        // sidecar, so the directory convention is the only route here.
+        let depth = find_depth_path(&vfs, &image_path)
+            .map(|p| LoadDepth::new(vfs.clone(), p.to_path_buf()));
+        // Carries no scale, so -- as in colmap.rs -- it plays no part in any
+        // metric-scale estimation.
+        let normal = find_normal_path(&vfs, &image_path)
+            .map(|p| LoadNormal::new(vfs.clone(), p.to_path_buf()));
+
         let image = LoadImage::new(
             vfs.clone(),
             image_path,
@@ -156,8 +170,8 @@ async fn read_dataset_inner(
             camera,
             image,
             features: None,
-            depth: None,
-            normal: None,
+            depth,
+            normal,
         });
     }
 
@@ -303,5 +317,101 @@ mod tests {
             (p.k1, p.k2, p.k3, p.k4, p.k5, p.k6, p.p1, p.p2),
             (1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 4.0, 5.0)
         );
+    }
+}
+
+/// Prior discovery walks the VFS, so it needs a real on-disk dataset. Mirrors
+/// the nerfstudio loader's `prior_tests` module.
+#[cfg(all(test, not(target_family = "wasm")))]
+mod prior_tests {
+    use crate::formats::prior_test_support::{test_config, write_depth_tiff, write_normal_tiff};
+    use crate::formats::{DatasetLoadResult, load_dataset};
+    use brush_vfs::BrushVfs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    const IMG_W: u32 = 4;
+    const IMG_H: u32 = 3;
+
+    /// A minimal `RealityCapture` camera csv (pose + focal only -- the optional
+    /// principal-point and distortion columns are a customizable template) plus
+    /// the one image it names.
+    async fn write_dataset(dir: &Path) {
+        tokio::fs::write(
+            dir.join("cameras.csv"),
+            "#name,x,y,alt,heading,pitch,roll,f\nframe_001.png,1,2,3,10,20,30,20.0\n",
+        )
+        .await
+        .expect("write csv");
+
+        let images_dir = dir.join("images");
+        tokio::fs::create_dir_all(&images_dir)
+            .await
+            .expect("create images dir");
+        image::RgbImage::from_pixel(IMG_W, IMG_H, image::Rgb([10, 20, 30]))
+            .save(images_dir.join("frame_001.png"))
+            .expect("write png");
+    }
+
+    async fn load(dir: &Path) -> DatasetLoadResult {
+        let vfs = Arc::new(BrushVfs::from_path(dir).await.expect("build vfs"));
+        load_dataset(vfs, &test_config()).await.expect("load")
+    }
+
+    /// Same `depth/<stem>` + `normal/<stem>` convention as the COLMAP and
+    /// nerfstudio loaders. The csv has no per-image sidecar column, so the
+    /// directory layout is the only route in.
+    #[tokio::test]
+    async fn discovers_priors_by_directory_convention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_dataset(dir.path()).await;
+        write_depth_tiff(&dir.path().join("depth/frame_001.tiff"), IMG_W, IMG_H).await;
+        write_normal_tiff(&dir.path().join("normal/frame_001.tiff"), IMG_W, IMG_H).await;
+
+        let result = load(dir.path()).await;
+        let view = &result.dataset.train.views[0];
+
+        assert_eq!(
+            view.depth.as_ref().map(|d| d.path().to_path_buf()),
+            Some(PathBuf::from("depth/frame_001.tiff")),
+        );
+        assert_eq!(
+            view.normal.as_ref().map(|n| n.path().to_path_buf()),
+            Some(PathBuf::from("normal/frame_001.tiff")),
+        );
+
+        // No-resize contract: the prior decodes at the image's own resolution.
+        let depth = view
+            .depth
+            .as_ref()
+            .expect("depth prior")
+            .load(IMG_H as usize, IMG_W as usize)
+            .await
+            .expect("depth must decode at the image resolution");
+        assert_eq!(depth.shape, vec![IMG_H as usize, IMG_W as usize].into());
+
+        let normal = view
+            .normal
+            .as_ref()
+            .expect("normal prior")
+            .load(IMG_H as usize, IMG_W as usize)
+            .await
+            .expect("normal must decode at the image resolution");
+        assert_eq!(normal.shape, vec![IMG_H as usize, IMG_W as usize, 3].into());
+    }
+
+    /// Default-inertness pin: a prior-free csv dataset loads exactly as before.
+    #[tokio::test]
+    async fn dataset_without_priors_is_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_dataset(dir.path()).await;
+
+        let result = load(dir.path()).await;
+        let views = &result.dataset.train.views;
+        assert_eq!(views.len(), 1);
+        assert!(views[0].depth.is_none());
+        assert!(views[0].normal.is_none());
+        assert!(views[0].features.is_none());
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     }
 }
