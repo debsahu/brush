@@ -1678,7 +1678,15 @@ impl SplatTrainer {
             // back-props into the FEATURE values, so feeding it per-splat
             // normals derived from the quaternions makes this loss rotate
             // gaussians. No new kernel is involved.
-            if use_normal_render && let Some((n_cam, normal_alpha)) = &normal_render {
+            if use_normal_render {
+                // The render block above runs whenever `use_normal_render ||
+                // use_plane_depth`, so this is unreachable — `expect` rather
+                // than an `if let` because a silently-skipped normal term is a
+                // regression that no test failure would announce: the run just
+                // trains without the supervision it was configured for.
+                let (n_cam, normal_alpha) = normal_render
+                    .as_ref()
+                    .expect("use_normal_render implies the feature render ran");
                 let n_cam = n_cam.clone();
                 let normal_alpha = normal_alpha.clone();
 
