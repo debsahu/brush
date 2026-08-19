@@ -4802,4 +4802,94 @@ mod plane_aux_consumer_tests {
              orders are the same linear map and must agree to f32 rounding"
         );
     }
+    /// The duplication justification on [`normal_alpha_normalize`], made
+    /// enforceable.
+    ///
+    /// The `center` branch of `step()` writes the alpha-normalize-then-unit-norm
+    /// sequence INLINE, and the plane branch calls the helper. That is deliberate
+    /// duplication — the `center` sequence is what the byte-identity gate pins, so
+    /// folding both onto one shared helper is a refactor that would have to be
+    /// re-proven rather than assumed. The cost of the duplication is that the two
+    /// copies can drift.
+    ///
+    /// This pins that they have not. Asserted with `assert_eq!` on the raw f32s,
+    /// not a tolerance: these are the same ops applied in the same order, so
+    /// anything other than bit-equality is a real divergence, and a tolerance
+    /// would let one copy drift under the other. The comparison covers EVERY
+    /// pixel, background included, rather than filtering to the covered region.
+    ///
+    /// # What this does and does NOT pin — verified by mutation, not assumed
+    ///
+    /// Checked by deliberately breaking the helper and re-running:
+    ///
+    /// - Reordering the sequence (normalize before the alpha divide instead of
+    ///   after) **fails** the test. That is the drift worth guarding, and it is
+    ///   guarded.
+    /// - Changing a clamp CONSTANT (`1e-10` -> `1e-9`) **passes**. That is not a
+    ///   weakness to fix by tightening the test; it is a property of the
+    ///   expression. Wherever alpha is ~0 the composited feature numerator is ~0
+    ///   too, so the quotient is 0 for any clamp value — the clamps exist to keep
+    ///   `0/0` from being `NaN`, not to shape the output. No test on rendered data
+    ///   can distinguish their values, so do not read this test as pinning them.
+    ///
+    /// Stating that explicitly because the comment this test exists to justify
+    /// once cited a pin that had never been written; a pin whose reach is
+    /// overstated is the same failure one step further along.
+    #[tokio::test]
+    async fn center_normalize_matches_plane_helper() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = slab(&device);
+        let camera = tilted_camera();
+        let transforms = splats.transforms.val();
+        let (h, w) = (IMG.y as usize, IMG.x as usize);
+
+        // A real composited `[H, W, 4]`: 3 normal channels + alpha, with genuine
+        // covered and uncovered regions rather than synthetic values.
+        let img = render_splat_features(
+            transforms.clone(),
+            splats.raw_opacities.val(),
+            splat_normals(transforms, camera.position),
+            &camera,
+            IMG,
+            SplatRenderMode::Default,
+        )
+        .await;
+        assert_eq!(img.dims(), [h, w, 4]);
+
+        let alpha = img.clone().slice(s![.., .., 3..4]).detach();
+
+        // --- Verbatim copy of the `center` branch's inline sequence. ---
+        let inline = {
+            let n = img.clone().slice(s![.., .., 0..3]) / alpha.clone().clamp_min(1e-10);
+            let len = n.clone().powi_scalar(2).sum_dim(2).sqrt().clamp_min(1e-6);
+            n / len
+        };
+
+        // --- The helper the plane branch calls. ---
+        let helper = normal_alpha_normalize(img.slice(s![.., .., 0..3]), alpha.clone());
+
+        let got = read(helper).await;
+        let want = read(inline).await;
+        assert_eq!(got.len(), want.len());
+        assert_eq!(
+            got, want,
+            "normal_alpha_normalize has drifted from the center branch's inline              sequence; the two are supposed to be the same ops in the same order,              and the doc comment on the helper claims exactly that"
+        );
+
+        // Guard against a vacuous pass: if the render produced nothing, two
+        // all-zero images would compare equal and prove nothing. Require both a
+        // real covered region (unit-length normals) and real background.
+        let cover = read(alpha.reshape([h, w])).await;
+        let covered = cover.iter().filter(|a| **a >= PLANE_MIN_ALPHA).count();
+        let background = cover.iter().filter(|a| **a < 1e-6).count();
+        assert!(
+            covered > 400,
+            "expected a real covered region, got {covered} covered pixels"
+        );
+        assert!(
+            background > 100,
+            "expected real uncovered background (where the clamps bite), got              {background} pixels"
+        );
+    }
 }
