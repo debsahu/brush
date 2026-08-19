@@ -6,7 +6,6 @@
 //! pass. Same fusion custom-op plumbing as the RGB path in
 //! [`crate::burn_glue`], but with a single differentiable input.
 
-use brush_cube::{MainBackend, MainBackendBase, calc_cube_count_1d};
 use crate::burn_glue::{AutodiffMain, unwrap_ad_wgpu_float, wrap_ad_wgpu_float};
 use crate::{
     camera::Camera,
@@ -14,6 +13,7 @@ use crate::{
     render_features::{FeatureRenderOutput, render_features_base},
     shaders::helpers::TILE_WIDTH,
 };
+use brush_cube::{MainBackend, MainBackendBase, calc_cube_count_1d};
 use burn::backend::ops::FloatTensorOps;
 use burn::{
     backend::{

@@ -165,9 +165,7 @@ fn can_defer_sh_grad(optimizer: &SplatOptim, splats: &Splats) -> bool {
     // AdamScaled has no gradient clipping, so the only gate is state
     // compatibility (which is false until sh_coeffs has taken its first step and
     // its momentum is populated).
-    optimizer
-        .adam
-        .sparse_sh_compatible(&param, &optimizer.sh_coeffs)
+    AdamScaled::sparse_sh_compatible(&param, &optimizer.sh_coeffs)
 }
 
 #[cfg(not(all(
@@ -257,13 +255,27 @@ fn step_sh_coeffs(
         return splats;
     };
 
-    use brush_render::burn_glue::detach_autodiff;
+    // Positive evidence that the sparse fused path really runs when
+    // `BRUSH_NATIVE_MSL_SPARSE_SH_ADAM=1` (rather than silently falling back to
+    // the dense `step_param` branch above). `tracing::warn!` is NOT visible
+    // under brush-cli — it wires `env_logger` only, with no tracing-log bridge —
+    // so this uses `log::info!`, which is.
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SPARSE_STEPS: AtomicU64 = AtomicU64::new(0);
+        let n = SPARSE_STEPS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_multiple_of(100) {
+            log::info!("sparse native-MSL SH Adam: step_sparse_sh executed {n} time(s)");
+        }
+    }
+
+    use brush_render::burn_glue::{detach_autodiff, lift_to_autodiff};
     let param = detach_autodiff(splats.sh_coeffs.val());
     // Take the SH state out by value for the consuming `step_sparse_sh`, then
     // write the returned state back.
     let state = std::mem::replace(&mut optimizer.sh_coeffs, AdamState::new(None, false));
     assert!(
-        optimizer.adam.sparse_sh_compatible(&param, &state),
+        AdamScaled::sparse_sh_compatible(&param, &state),
         "deferred SH optimizer state changed after render preflight"
     );
     assert!(
@@ -281,13 +293,26 @@ fn step_sh_coeffs(
         state,
     );
     optimizer.sh_coeffs = new_state;
-    // `lift_to_autodiff` went `pub(crate)` in brush-render under #517, so it is
-    // no longer reachable from brush-train. `param` is the freshly-stepped inner
-    // tensor from `step_sparse_sh`; re-lift it with the public
-    // `from_inner(..).require_grad()` idiom — the same re-lift `step_param` uses.
+    // `param` is the freshly-stepped tensor from `step_sparse_sh`, and it is
+    // ALREADY on the inner (non-autodiff) backend: it entered as
+    // `detach_autodiff(..)` and `step_sparse_sh` never lifts it. Re-lift it into
+    // the graph with `lift_to_autodiff(..).require_grad()`, which is what this
+    // call site did before the burn-0.22 port (commit 3178759e) and what every
+    // other inner->autodiff parameter boundary in brush-train / brush-appearance
+    // uses (see `edge.rs`, `tidi.rs`, `brush-appearance/train_state.rs`).
+    //
+    // The port replaced this with `Tensor::from_inner(param.inner())` on the
+    // false premise that `lift_to_autodiff` had become `pub(crate)` — it is
+    // `pub` (brush-render/src/burn_glue.rs). That rewrite added one `.inner()`
+    // too many: `.inner()` on an already-inner Dispatch tensor panics with
+    // "Requires autodiff tensor." (burn-dispatch backend.rs:584), which is why
+    // BRUSH_NATIVE_MSL_SPARSE_SH_ADAM=1 died immediately. `lift_to_autodiff` is
+    // also the correct helper rather than `Tensor::from_inner` here because it
+    // lifts at the concrete-Wgpu autodiff level and sets `checkpointing`
+    // explicitly (see its doc comment).
     splats.sh_coeffs = splats
         .sh_coeffs
-        .map(|_| Tensor::from_inner(param.inner()).require_grad());
+        .map(|_| lift_to_autodiff(param).require_grad());
     splats
 }
 
@@ -3126,6 +3151,216 @@ mod normal_prior_grad_tests {
         assert!(
             loss < 0.05,
             "a flat slab must agree with its own depth, got {loss}"
+        );
+    }
+}
+
+/// Regression guard for the inner/autodiff bridge at the end of the native-MSL
+/// sparse SH Adam step (`step_sh_coeffs`'s deferred branch).
+///
+/// `step_sparse_sh` is fed `detach_autodiff(splats.sh_coeffs.val())` and never
+/// lifts it, so the parameter it returns is ALREADY on the inner (non-autodiff)
+/// backend. Re-wrapping that with `Tensor::from_inner(param.inner())` calls
+/// `.inner()` on an already-inner Dispatch tensor, which panics
+/// "Requires autodiff tensor." (burn-dispatch `backend.rs:584`) on the very
+/// first sparse step. The correct bridge is `lift_to_autodiff(param)`, which
+/// accepts either kind and sets `checkpointing` explicitly.
+///
+/// This module is compiled only where that branch exists, and the test drives
+/// the real production sequence (dense warm-up step, then a deferred render) so
+/// it cannot pass by silently falling through to the dense path — it asserts
+/// that the deferred payload really was produced and that the dense SH gradient
+/// really was withheld.
+#[cfg(test)]
+#[cfg(all(
+    feature = "native-msl",
+    target_os = "macos",
+    target_arch = "aarch64",
+    not(target_family = "wasm")
+))]
+mod sparse_sh_adam_autodiff_bridge_tests {
+    use super::*;
+    use brush_render::gaussian_splats::SplatRenderMode;
+
+    const IMG: glam::UVec2 = glam::uvec2(48, 48);
+    const LR: f64 = 1e-3;
+
+    fn test_camera() -> Camera {
+        Camera::new(
+            glam::vec3(0.0, 0.0, -5.0),
+            glam::Quat::IDENTITY,
+            0.7,
+            0.7,
+            glam::vec2(0.5, 0.5),
+            CameraModel::Pinhole,
+        )
+    }
+
+    /// A handful of near-opaque gaussians in front of the camera, carrying four
+    /// SH coefficients per channel (degree 1) so the sparse kernel runs one of
+    /// its real `coeffs` cases rather than the degenerate single-coefficient one.
+    fn test_splats(device: &Device) -> Splats {
+        let means = vec![
+            0.0, 0.0, 0.0, //
+            0.3, 0.0, 0.5, //
+            -0.3, 0.2, 1.0, //
+            0.1, -0.2, 1.5, //
+        ];
+        let n = means.len() / 3;
+        let rotations: Vec<f32> = (0..n).flat_map(|_| [1.0, 0.0, 0.0, 0.0]).collect();
+        let log_scales: Vec<f32> = (0..n).flat_map(|_| [-1.0, -1.0, -1.0]).collect();
+        // 4 coefficients x 3 channels per splat = SH degree 1.
+        let sh: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let base = 0.4 + i as f32 * 0.05;
+                [
+                    base, base, base, // dc
+                    0.02, -0.01, 0.03, //
+                    -0.02, 0.015, 0.01, //
+                    0.01, 0.02, -0.015, //
+                ]
+            })
+            .collect();
+        let opac: Vec<f32> = vec![4.0; n];
+
+        Splats::from_raw(
+            means,
+            rotations,
+            log_scales,
+            sh,
+            opac,
+            SplatRenderMode::Default,
+            device,
+        )
+    }
+
+    /// The optimizer the trainer builds for these splats: SH gets a per-degree
+    /// LR scaling of shape `[1, coeffs, 1]` and `reduce_moment_2`, which is what
+    /// `sparse_sh_compatible` requires.
+    fn test_optim(splats: &Splats, device: &Device) -> SplatOptim {
+        let num_coeffs = splats.sh_coeffs.val().dims()[1] as i32;
+        let scales: Vec<f32> = (0..num_coeffs)
+            .map(|c| if c == 0 { 1.0 } else { 0.05 })
+            .collect();
+        let sh_lr_scales = Tensor::<1>::from_floats(scales.as_slice(), &device.clone().inner())
+            .reshape([1, num_coeffs, 1]);
+        SplatOptim {
+            adam: AdamScaled::new(1e-15),
+            transforms: AdamState::new(None, false),
+            sh_coeffs: AdamState::new(Some(sh_lr_scales), true),
+            opacities: AdamState::new(None, false),
+        }
+    }
+
+    /// Render + backward once. Returns the gradients and, when `defer` is set,
+    /// the sparse SH payload the trainer would hand to `step_sh_coeffs`.
+    async fn render_backward(
+        splats: &Splats,
+        defer: bool,
+    ) -> (Gradients, Option<DeferredShGrad>, bool) {
+        let out = render_splats_for_training(
+            splats.clone(),
+            &test_camera(),
+            IMG,
+            glam::Vec3::ZERO,
+            false,
+            RasterizationMode::Rgba,
+            defer,
+        )
+        .await;
+        let handle = out.deferred_sh_grad;
+        let handle_present = handle.is_some();
+        // Any loss with a real gradient on every channel.
+        let loss = out
+            .img
+            .clone()
+            .slice(s![.., .., 0..3])
+            .powf_scalar(2.0)
+            .sum();
+        let mut grads = splats.bwd_validate(loss).await;
+        let deferred = handle.map(|h| {
+            h.take(&mut grads)
+                .expect("deferred SH gradient holder was not populated")
+        });
+        (grads, deferred, handle_present)
+    }
+
+    #[tokio::test]
+    async fn sparse_sh_step_returns_a_differentiable_parameter() {
+        let device = Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let mut splats = test_splats(&device);
+        let mut optim = test_optim(&splats, &device);
+
+        // The sparse kernel needs plane ops / a fixed plane size. The module is
+        // already gated to native-MSL macOS arm64, so an unsupported device here
+        // is a real problem, not a reason to quietly skip: a test that never
+        // enters the sparse branch would be worse than no test at all.
+        {
+            use brush_render::burn_glue::detach_autodiff;
+            let param = detach_autodiff(splats.sh_coeffs.val());
+            assert!(
+                crate::sh_adam::sparse_sh_adam_supported(&param),
+                "this device cannot run the sparse SH Adam kernel, so the \
+                 regression under test is not being exercised"
+            );
+        }
+
+        // --- Step 1: dense warm-up ---------------------------------------
+        // Production never defers on the first step: `can_defer_sh_grad` is
+        // false until Adam's moments exist. Take that step here so the sparse
+        // preconditions become true the same way they do in a real run.
+        let (mut grads, deferred, handle_present) = render_backward(&splats, false).await;
+        assert!(
+            !handle_present,
+            "a non-deferred render must not produce a sparse SH payload"
+        );
+        assert!(
+            splats.sh_coeffs.grad(&grads).is_some(),
+            "the dense warm-up step needs a dense SH gradient"
+        );
+        splats = step_sh_coeffs(&mut optim, splats, &mut grads, deferred, LR);
+
+        // --- Step 2: the deferred/sparse step ----------------------------
+        {
+            use brush_render::burn_glue::detach_autodiff;
+            let param = detach_autodiff(splats.sh_coeffs.val());
+            assert!(
+                AdamScaled::sparse_sh_compatible(&param, &optim.sh_coeffs),
+                "the warm-up step should have populated Adam's SH moments"
+            );
+        }
+
+        let (mut grads, deferred, handle_present) = render_backward(&splats, true).await;
+        assert!(
+            handle_present,
+            "the deferred render must hand back a sparse SH payload"
+        );
+        let deferred = deferred.expect("deferred SH payload");
+        // Contract of the deferred path: backward withholds the dense SH
+        // gradient, so `step_sh_coeffs` MUST consume the sparse payload. If this
+        // ever became `Some`, the test could pass through the dense branch
+        // without touching the code under test.
+        assert!(
+            splats.sh_coeffs.grad(&grads).is_none(),
+            "a deferred render must not also populate the dense SH gradient"
+        );
+
+        // The regression itself: this call panicked with
+        // "Requires autodiff tensor." while the bridge was
+        // `Tensor::from_inner(param.inner())`.
+        splats = step_sh_coeffs(&mut optim, splats, &mut grads, Some(deferred), LR);
+
+        // And the stepped parameter must be a real autodiff leaf again, not an
+        // inner tensor smuggled back into the module — otherwise the next
+        // backward would silently stop producing SH gradients.
+        assert!(
+            splats.sh_coeffs.val().is_require_grad(),
+            "the stepped SH parameter must still require grad"
+        );
+        let (grads, _, _) = render_backward(&splats, false).await;
+        assert!(
+            splats.sh_coeffs.grad(&grads).is_some(),
+            "the stepped SH parameter must still receive gradients"
         );
     }
 }

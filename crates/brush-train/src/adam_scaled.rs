@@ -121,7 +121,9 @@ impl AdamScaled {
         }
     }
 
-    pub(crate) fn sparse_sh_compatible(&self, param: &Tensor<3>, state: &AdamState<3>) -> bool {
+    /// Pure shape/state predicate for the sparse SH path — it reads nothing
+    /// off the optimizer, so it is an associated function rather than a method.
+    pub(crate) fn sparse_sh_compatible(param: &Tensor<3>, state: &AdamState<3>) -> bool {
         if !state.reduce_moment_2 {
             return false;
         }
@@ -152,7 +154,7 @@ impl AdamScaled {
         state: AdamState<3>,
     ) -> (Tensor<3>, AdamState<3>) {
         assert!(
-            self.sparse_sh_compatible(&param, &state),
+            Self::sparse_sh_compatible(&param, &state),
             "sparse SH Adam requires preflighted parameter and optimizer state"
         );
         let momentum = state
@@ -226,10 +228,9 @@ impl AdamScaled {
             let ready = shape[0] > 0
                 && shape[2] == 3
                 && matches!(coeffs, 1 | 4 | 9 | 16 | 25)
-                && state
-                    .momentum
-                    .as_ref()
-                    .is_some_and(|m| m.moment_1.dims() == shape && m.moment_2.dims() == reduced_shape)
+                && state.momentum.as_ref().is_some_and(|m| {
+                    m.moment_1.dims() == shape && m.moment_2.dims() == reduced_shape
+                })
                 && state
                     .scaling
                     .as_ref()
@@ -247,7 +248,7 @@ impl AdamScaled {
                 let next_time = momentum.time + 1;
                 let config = self.sh_adam_config(lr, next_time);
                 let (out, moment_1, moment_2) = crate::sh_adam::sh_adam(
-                    tensor.clone().reshape([shape[0], coeffs, 3]),
+                    tensor.reshape([shape[0], coeffs, 3]),
                     grad.clone().reshape([shape[0], coeffs, 3]),
                     momentum.moment_1.clone().reshape([shape[0], coeffs, 3]),
                     momentum.moment_2.clone().reshape([shape[0], 1, 1]),

@@ -148,7 +148,7 @@ impl LoadImage {
     /// is what training actually consumes; `dimensions()` is the raw header size.
     /// (Restored 2026-08-17: the burn spring-clean merge dropped it, and a bad
     /// "rename" to `dimensions()` silently fed raw dims to the Mip-Splatting
-    /// per-pixel floor on the default max_resolution=1920 path.)
+    /// per-pixel floor on the default `max_resolution=1920` path.)
     pub async fn output_dimensions(&self) -> image::ImageResult<(u32, u32)> {
         let (w, h) = self.dimensions().await?;
         let scale = self.output_scale(w, h);

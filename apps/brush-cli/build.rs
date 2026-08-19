@@ -23,7 +23,7 @@ fn git(dir: &PathBuf, args: &[&str]) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     if s.is_empty() { None } else { Some(s) }
 }
 
@@ -41,7 +41,7 @@ fn main() {
     // marks a tree with uncommitted changes, which is exactly the case where a
     // binary's provenance is otherwise unknowable.
     let build_id = git(&root, &["describe", "--tags", "--always", "--dirty"])
-        .unwrap_or_else(|| "nogit".to_string());
+        .unwrap_or_else(|| "nogit".to_owned());
 
     println!("cargo:rustc-env=BRUSH_BUILD_ID={build_id}");
 

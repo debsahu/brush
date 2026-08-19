@@ -480,7 +480,7 @@ pub struct TrainConfig {
     #[serde(default)]
     pub depth_grad_aware: bool,
 
-    /// Sigma for the gradient-aware weight, in [0,1] RGB intensity units of the
+    /// Sigma for the gradient-aware weight, in `[0, 1]` RGB intensity units of the
     /// channel-mean forward-difference gradient. Smaller = harsher edge
     /// down-weighting. Ignored unless --depth-grad-aware.
     #[arg(long, help_heading = "Training options", default_value = "0.1")]
@@ -747,7 +747,7 @@ pub struct TrainConfig {
     pub tidi_warmup_steps: u32,
 
     /// Visibility signal: candidate iff the number of refine WINDOWS in which
-    /// this gaussian was ever visible is <= this (paper τ_vis = 2.0). NOTE: the
+    /// this gaussian was ever visible is <= this (paper `τ_vis` = 2.0). NOTE: the
     /// unit is refine windows, not steps -- see `TidiState::accumulate_window`,
     /// which collapses each window to a 0/1 "seen" indicator so this threshold is
     /// reachable (raw per-step counts scale with training length).
@@ -755,19 +755,19 @@ pub struct TrainConfig {
     #[serde(default = "default_tidi_vis_threshold")]
     pub tidi_vis_threshold: f32,
 
-    /// Opacity signal: candidate iff opacity <= this (paper τ_α = 0.04).
+    /// Opacity signal: candidate iff opacity <= this (paper `τ_α` = 0.04).
     #[arg(long, help_heading = "TIDI options", default_value = "0.04")]
     #[serde(default = "default_tidi_opacity_threshold")]
     pub tidi_opacity_threshold: f32,
 
-    /// Learned-importance signal: candidate iff sigmoid(omega_i) <= this
-    /// (paper τ_ω = 0.35).
+    /// Learned-importance signal: candidate iff `sigmoid(omega_i)` <= this
+    /// (paper `τ_ω` = 0.35).
     #[arg(long, help_heading = "TIDI options", default_value = "0.35")]
     #[serde(default = "default_tidi_importance_threshold")]
     pub tidi_importance_threshold: f32,
 
     /// Position-gradient EMA signal: candidate iff EMA <= this (paper
-    /// τ_grad = 5e-4).
+    /// `τ_grad` = 5e-4).
     #[arg(long, help_heading = "TIDI options", default_value = "5e-4")]
     #[serde(default = "default_tidi_grad_threshold")]
     pub tidi_grad_threshold: f32,
@@ -792,7 +792,7 @@ pub struct TrainConfig {
     pub tidi_importance_lr: f64,
 
     /// SH high-frequency-energy detail-guard quantile: exempt a candidate whose
-    /// ||f_rest|| is at/above this quantile of the STABLE set (specular/detail).
+    /// ||`f_rest`|| is at/above this quantile of the STABLE set (specular/detail).
     /// 0 disables. ADAPTIVE: the flag sets the quantile, not a fixed threshold.
     #[arg(long, help_heading = "TIDI options", default_value = "0.95")]
     #[serde(default = "default_tidi_guard_sh_quantile")]
@@ -865,7 +865,7 @@ pub struct TrainConfig {
     /// Depth-residual margin: a Gaussian counts as "floating" only when its
     /// camera-space z is more than this in FRONT of the measured depth at its
     /// projected pixel. Units are the DEPTH map's units -- metres for
-    /// LiDAR/metric depth (the default 0.05 = 5 cm); an SfM dataset's depth may
+    /// LiDAR/metric depth (the default 0.05 = 5 cm); an `SfM` dataset's depth may
     /// be non-metric, so scale this accordingly.
     #[arg(long, help_heading = "TIDI options", default_value = "0.05")]
     #[serde(default = "default_tidi_depth_margin")]
@@ -879,7 +879,7 @@ pub struct TrainConfig {
 
     /// Depth path SAFETY gate: never prune a Gaussian unless at least this many
     /// views have a real depth return behind it. This is what keeps the depth
-    /// path from touching unscanned regions (no LiDAR return -> exempt).
+    /// path from touching unscanned regions (no `LiDAR` return -> exempt).
     #[arg(long, help_heading = "TIDI options", default_value = "4")]
     #[serde(default = "default_tidi_depth_min_valid_views")]
     pub tidi_depth_min_valid_views: u32,
@@ -909,10 +909,10 @@ pub struct TrainConfig {
     // ------------------------------------------------------------------
     /// Depth-coupled opacity-regularizer weight (lambda). 0 = OFF (inert).
     /// >0 adds `lambda * mean_i(p_i * sigmoid(opacity_i))` to the loss,
-    /// where `p_i` is a DETACHED smooth ramp that is ~1 for a Gaussian whose
-    /// centre is FAR (> margin) from the nearest seed/LiDAR cloud point and ~0
-    /// for one on/near the cloud. The gradient reaches ONLY the opacity leaf,
-    /// so far-from-cloud splats fade smoothly rather than being hard-deleted.
+    /// > where `p_i` is a DETACHED smooth ramp that is ~1 for a Gaussian whose
+    /// > centre is FAR (> margin) from the nearest seed/LiDAR cloud point and ~0
+    /// > for one on/near the cloud. The gradient reaches ONLY the opacity leaf,
+    /// > so far-from-cloud splats fade smoothly rather than being hard-deleted.
     #[arg(long, help_heading = "TIDI options", default_value = "0.0")]
     #[serde(default = "default_depth_opacity_reg_weight")]
     pub depth_opacity_reg_weight: f32,
@@ -920,7 +920,7 @@ pub struct TrainConfig {
     /// Depth-opacity-reg margin: a Gaussian is penalized once its centre is more
     /// than this far from the nearest seed/LiDAR cloud point in 3D. Units are
     /// SCENE 3D-distance units (metres for a LiDAR-metric scene; possibly
-    /// non-metric for SfM). Set it a few times the cloud's nearest-neighbour
+    /// non-metric for `SfM`). Set it a few times the cloud's nearest-neighbour
     /// spacing so on-surface splats stay safe -- e.g. spacing ~0.024 -> margin
     /// ~0.1-0.2. (Was a per-view depth residual; it is now a 3D distance.)
     #[arg(long, help_heading = "TIDI options", default_value = "0.15")]
@@ -1062,7 +1062,9 @@ impl TrainConfig {
             return Err("depth-weight-end must not be negative".to_owned());
         }
         if self.depth_grad_aware && self.depth_grad_sigma <= 0.0 {
-            return Err("depth-grad-sigma must be positive when depth-grad-aware is set".to_owned());
+            return Err(
+                "depth-grad-sigma must be positive when depth-grad-aware is set".to_owned(),
+            );
         }
         Ok(())
     }
@@ -1742,7 +1744,7 @@ mod tests {
         assert!((cos.depth_weight_at(150) - 0.853_553_4).abs() < 1e-6);
 
         // Nonzero end weight pins the endpoints for both shapes.
-        let mut lin_nz = lin.clone();
+        let mut lin_nz = lin;
         lin_nz.depth_weight_end = 0.25;
         assert!((lin_nz.depth_weight_at(100) - 1.0).abs() < 1e-6);
         assert!((lin_nz.depth_weight_at(300) - 0.25).abs() < 1e-6);

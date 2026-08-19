@@ -1797,7 +1797,11 @@ pub fn normals_from_depth(depth: Tensor<2>, fx: f32, fy: f32, cx: f32, cy: f32) 
     let py = depth.clone() * b_v;
     let pz = depth.clone();
     let p: Tensor<3> = Tensor::cat(
-        vec![px.reshape([h, w, 1]), py.reshape([h, w, 1]), pz.reshape([h, w, 1])],
+        vec![
+            px.reshape([h, w, 1]),
+            py.reshape([h, w, 1]),
+            pz.reshape([h, w, 1]),
+        ],
         2,
     );
 
@@ -1824,7 +1828,12 @@ pub fn normals_from_depth(depth: Tensor<2>, fx: f32, fy: f32, cx: f32, cy: f32) 
     // through the render depth backward into gradient_transforms. Clamping
     // sum_sq keeps the sqrt derivative finite; valid pixels (sum_sq >> floor)
     // pass through clamp_min unchanged, so their normal and gradient stay exact.
-    let len = cross.clone().powi_scalar(2).sum_dim(2).clamp_min(1e-24).sqrt();
+    let len = cross
+        .clone()
+        .powi_scalar(2)
+        .sum_dim(2)
+        .clamp_min(1e-24)
+        .sqrt();
     let normal = cross / len.clone().clamp_min(1e-12);
 
     // A degenerate (zero-length) cross product carries no orientation.
@@ -1911,9 +1920,10 @@ pub fn normal_smooth_loss(normal: Tensor<3>, alpha: Tensor<3>) -> Tensor<1> {
     let valid = covered * len.greater_elem(0.5).float();
 
     // Row differences: N[i+1, j] - N[i, j].
-    let d_row = (normal.clone().slice(s![1..h, .., ..]) - normal.clone().slice(s![0..h - 1, .., ..]))
-        .abs()
-        .sum_dim(2);
+    let d_row = (normal.clone().slice(s![1..h, .., ..])
+        - normal.clone().slice(s![0..h - 1, .., ..]))
+    .abs()
+    .sum_dim(2);
     let v_row = valid.clone().slice(s![1..h, .., ..]) * valid.clone().slice(s![0..h - 1, .., ..]);
 
     // Column differences: N[i, j+1] - N[i, j].

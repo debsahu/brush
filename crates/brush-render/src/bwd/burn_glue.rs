@@ -748,11 +748,11 @@ async fn render_splats_with_pass_and_refine_weight(
 /// Autodiff arm of the `#[backend_extension(Wgpu, Autodiff)]` `SplatOps`
 /// trait. The generated `Dispatch` impl routes autodiff tensors here.
 ///
-/// Production training goes through [`render_splats_with_pass_and_refine_weight`]
+/// Production training goes through `render_splats_with_pass_and_refine_weight`
 /// (hand-rolled so the rasterizer selector and deferred-SH path survive); this
 /// impl exists to satisfy the extension macro and to service any generic
 /// autodiff render. It threads a non-`require_grad` deferred-SH anchor so the
-/// 5-input [`RenderBackwards`] has its full parent set while always taking the
+/// 5-input `RenderBackwards` has its full parent set while always taking the
 /// dense-coefficient branch.
 impl SplatOps for AutodiffMain {
     #[allow(clippy::too_many_arguments)]
