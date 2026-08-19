@@ -223,6 +223,15 @@ pub struct SplatTrainer {
     /// on. Carried across LOD boundaries; `None` (inert) when `--cloud-prune` is
     /// off or there is no seed cloud.
     cloud_prune_grid: Option<CloudDistanceGrid>,
+    /// Scene scale captured ONCE from the training camera poses, for
+    /// `--normalize-metric-weights` (see `scene_scale_from_cameras`).
+    ///
+    /// Deliberately not the live, refine-updated `bounds` — a moving scale would
+    /// make the effective metric weights drift mid-run and confound the ramp
+    /// schedules, so an ablation could not attribute a result to either.
+    /// `set_init_scene_scale` is one-shot for the same reason: LOD phases
+    /// re-supply cameras, and the scale must not move there either.
+    init_scene_scale: Option<f32>,
     #[cfg(not(target_family = "wasm"))]
     lpips: Option<lpips::LpipsModel>,
 }
@@ -344,6 +353,114 @@ fn step_sh_coeffs(
     splats
 }
 
+/// Rodrigues rotation taking `up` (assumed unit-length) onto `+Z`.
+///
+/// Degenerate case: when `up × Z` is below the epsilon, `up` is already
+/// (anti)parallel to `+Z`. Parallel yields the identity; antiparallel is a 180°
+/// turn about an arbitrary axis perpendicular to `up`, chosen deterministically
+/// so the result does not depend on floating-point luck. (In the antiparallel
+/// case the choice of perpendicular axis does change the resulting X/Y
+/// coordinates, so a deterministic pick is what makes `scene_scale_from_cameras`
+/// reproducible.)
+fn rotation_up_to_z(up: glam::Vec3) -> glam::Mat3 {
+    let z = glam::Vec3::Z;
+    let axis = up.cross(z);
+    let axis_len = axis.length();
+    if axis_len < 1e-6 {
+        return if up.dot(z) >= 0.0 {
+            glam::Mat3::IDENTITY
+        } else {
+            let helper = if up.x.abs() < 0.9 {
+                glam::Vec3::X
+            } else {
+                glam::Vec3::Y
+            };
+            let perp = up.cross(helper).normalize();
+            glam::Mat3::from_axis_angle(perp, std::f32::consts::PI)
+        };
+    }
+    let angle = up.dot(z).clamp(-1.0, 1.0).acos();
+    glam::Mat3::from_axis_angle(axis / axis_len, angle)
+}
+
+/// Mean world-frame "up" direction of a camera set, unit-length.
+///
+/// **This is the one convention-sensitive line of `scene_scale_from_cameras`,
+/// which is why it is a separate, directly testable function.** The reference
+/// PGSR trainer's poses are OpenGL, where camera `+Y` is UP, so it averages the
+/// c2w `+Y` column as-is. Ours are `OpenCV`, where camera `+Y` points DOWN, so the
+/// world-frame up axis is `−(R_c2w · Ŷ)`. Getting the sign wrong yields a
+/// rotation that differs by a 180° turn about a horizontal axis, which silently
+/// changes the derived scale on any scene whose cameras are not symmetric about
+/// that axis.
+///
+/// Falls back to `+Z` when the camera up axes cancel exactly (a synthetic
+/// back-to-back pair), which skips the reorientation rather than normalizing
+/// numerical noise.
+pub fn mean_camera_up(cameras: &[Camera]) -> glam::Vec3 {
+    if cameras.is_empty() {
+        return glam::Vec3::Z;
+    }
+    let sum = cameras.iter().fold(glam::Vec3::ZERO, |acc, cam| {
+        acc - (cam.rotation * glam::Vec3::Y)
+    });
+    if sum.length() < 1e-6 {
+        glam::Vec3::Z
+    } else {
+        sum.normalize()
+    }
+}
+
+/// Scene scale in world (metric, for a metric capture) units, computed once from
+/// the training camera poses.
+///
+/// This is the reference PGSR trainer's `scene_scale` verbatim, and it is
+/// deliberately NOT `BoundingBox::median_size()` or
+/// `splat_init::estimate_scene_scale()` — neither has these semantics, and the
+/// reference's constant ratios only transfer if the scale they divide is the
+/// same quantity. The five steps:
+///
+/// 1. `translation = mean(camera origins)`
+/// 2. `up = normalize(mean(world-frame camera up axes))`
+/// 3. Rodrigues rotation `R` taking `up` onto `+Z`
+/// 4. `oriented = R · (origin − translation)` for every camera
+/// 5. `scene_scale = max(|component|)` over every oriented origin
+///
+/// **Convention note.** The reference's poses are OpenGL, where camera `+Y` is
+/// UP, so it averages c2w column 1 directly. Ours are `OpenCV`, where camera `+Y`
+/// is DOWN, so the world-frame up axis is `−(R_c2w · Ŷ)`. The sign matters: a
+/// flipped `up` produces a rotation that differs by 180°, which changes the
+/// oriented coordinates and hence the maximum. `scene_scale_from_camera_ring`
+/// pins this.
+///
+/// Returns `None` for an empty camera list or a non-finite/zero result; callers
+/// fall back to 1.0 (i.e. to unnormalized weights) rather than poisoning the
+/// loss.
+pub fn scene_scale_from_cameras(cameras: &[Camera]) -> Option<f32> {
+    if cameras.is_empty() {
+        return None;
+    }
+
+    let n = cameras.len() as f32;
+    let translation = cameras
+        .iter()
+        .fold(glam::Vec3::ZERO, |acc, cam| acc + cam.position)
+        / n;
+
+    let up = mean_camera_up(cameras);
+    let rot = rotation_up_to_z(up);
+
+    let scale = cameras
+        .iter()
+        .map(|cam| {
+            let oriented = rot * (cam.position - translation);
+            oriented.x.abs().max(oriented.y.abs()).max(oriented.z.abs())
+        })
+        .fold(0.0f32, f32::max);
+
+    (scale.is_finite() && scale > 0.0).then_some(scale)
+}
+
 pub async fn get_splat_bounds(splats: Splats, percentile: f32) -> BoundingBox {
     let means: Vec<f32> = splats
         .means()
@@ -416,6 +533,7 @@ impl SplatTrainer {
             opacity_reg_grid: None,
             plane_set: None,
             cloud_prune_grid: None,
+            init_scene_scale: None,
             #[cfg(not(target_family = "wasm"))]
             lpips,
         }
@@ -425,6 +543,53 @@ impl SplatTrainer {
     /// Mip-Splatting 3D filter.
     pub fn set_view_cams(&mut self, view_cams: Vec<(glam::Vec3, f32)>) {
         self.view_cams = view_cams;
+    }
+
+    /// Capture the fixed scene scale for `--normalize-metric-weights` from the
+    /// full set of training camera poses.
+    ///
+    /// **One-shot on purpose**: later calls (LOD phases re-supply cameras) are
+    /// ignored, so the effective metric weights never move mid-run. A no-op
+    /// unless `--normalize-metric-weights` is set, so a default run allocates
+    /// and logs nothing.
+    pub fn set_init_scene_scale(&mut self, cameras: &[Camera]) {
+        if !self.config.normalize_metric_weights || self.init_scene_scale.is_some() {
+            return;
+        }
+        // `log::`, not `tracing::` — brush-cli wires `env_logger` with no
+        // tracing-log bridge, so a `tracing::info!` here would be invisible in
+        // exactly the runs that need to record which scale was used (same note
+        // as the sparse SH Adam site above).
+        match scene_scale_from_cameras(cameras) {
+            Some(scale) => {
+                log::info!(
+                    "normalize-metric-weights: scene scale {scale} from {} camera poses \
+                     (flatten weight /= scale, scale-reg weight /= scale^2, \
+                     scale-reg threshold *= scale)",
+                    cameras.len()
+                );
+                self.init_scene_scale = Some(scale);
+            }
+            None => {
+                log::warn!(
+                    "normalize-metric-weights: could not derive a scene scale from {} camera \
+                     poses; falling back to 1.0 (weights stay unnormalized)",
+                    cameras.len()
+                );
+            }
+        }
+    }
+
+    /// Divisor applied to the METRIC-dimensioned loss weights. `1.0` (exact
+    /// identity) unless `--normalize-metric-weights` is on AND a usable scale
+    /// was captured.
+    fn metric_weight_scale(&self) -> f32 {
+        if !self.config.normalize_metric_weights {
+            return 1.0;
+        }
+        self.init_scene_scale
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(1.0)
     }
 
     /// Attach the Mip-Splatting scale floor for the trainer's active camera
@@ -968,14 +1133,28 @@ impl SplatTrainer {
             // Geometry-prior terms (all inert at their 0.0 defaults, gated
             // exactly like `use_depth`, so a run that does not pass the flags
             // takes the same path it always did).
-            let use_prior_normal = self.config.normal_loss_weight > 0.0 && batch.normal.is_some();
+            //
+            // The normal-term ramp (`--normal-ramp-start-iter`) multiplies BOTH
+            // normal weights. An exact 0 additionally DROPS `use_prior_normal` /
+            // `use_dn`, so the normal render pass is skipped rather than
+            // rendered and multiplied by zero — the same philosophy as
+            // `--depth-normal-start-iter` below. At the default it is an exact
+            // 1.0, so this is byte-identical.
+            let normal_ramp = self.config.normal_ramp_at(global_iter);
+            let use_prior_normal =
+                self.config.normal_loss_weight > 0.0 && batch.normal.is_some() && normal_ramp > 0.0;
             // 2DGS gates this term at 7k of 30k. Gating here rather than just
             // zeroing the weight also skips the depth channel and the normal
             // render pass entirely before the start iteration, so the gate costs
             // nothing instead of rendering work that gets multiplied by zero.
             let dn_started = self.config.depth_normal_start_iter == 0
                 || global_iter >= self.config.depth_normal_start_iter;
-            let use_dn = self.config.depth_normal_weight > 0.0 && dn_started;
+            // Gate on the EFFECTIVE weight (including the late consistency bump)
+            // rather than the base one, so a run that ramps a zero base up to a
+            // nonzero end still activates. With the bump off this is exactly
+            // `depth_normal_weight`, i.e. byte-identical.
+            let eff_dn_weight = self.config.depth_normal_weight_at(global_iter);
+            let use_dn = eff_dn_weight > 0.0 && dn_started && normal_ramp > 0.0;
             let use_smooth = self.config.normal_smooth_weight > 0.0;
             let use_normal_render = use_prior_normal || use_dn || use_smooth;
             let use_flatten = self.config.flatten_loss_weight > 0.0;
@@ -1346,8 +1525,23 @@ impl SplatTrainer {
 
                 if use_prior_normal && let Some(normal_data) = &batch.normal {
                     let gt_normal: Tensor<3> = Tensor::from_data(normal_data.clone(), &device);
+                    // NeuRIS per-pixel contradiction gate (arXiv:2206.13597).
+                    // `None` at the default is literally the pre-gate code path.
+                    //
+                    // NOTE (deliberate v1 omission): the plan also calls for
+                    // logging the surviving-pixel fraction and warning when it
+                    // stays below ~20%, which is the signature of a
+                    // systemically sign-flipped prior. That needs a per-step
+                    // device readback plumbed through `TrainStepStats`, so it is
+                    // not done here. The systemic case is already caught
+                    // upstream by `ingest/splatcam/normals_moge.py`'s
+                    // whole-frame median-cosine check, which REFUSES to write a
+                    // prior whose sign disagrees; this gate only handles
+                    // per-pixel contradictions inside frames that passed it.
+                    let gate_cos = self.config.normal_gate_cos_at(global_iter);
                     loss = loss
-                        + normal_loss(n_cam.clone(), gt_normal) * self.config.normal_loss_weight;
+                        + normal_loss(n_cam.clone(), gt_normal, gate_cos)
+                            * (self.config.normal_loss_weight * normal_ramp);
                 }
 
                 // TV smoothness on the rendered normal image. Needs no prior
@@ -1379,7 +1573,7 @@ impl SplatTrainer {
                         );
                         loss = loss
                             + depth_normal_loss(n_from_depth, n_cam, normal_alpha)
-                                * self.config.depth_normal_weight;
+                                * (eff_dn_weight * normal_ramp);
                     } else {
                         warn_depth_normal_needs_pinhole();
                     }
@@ -1392,9 +1586,33 @@ impl SplatTrainer {
             // scale so exports keep the thin axis and we do not fight the
             // anti-aliasing floor. MRNF's prune keys on `scale_max`, so there is
             // no interaction with it.
+            //
+            // ---- `--normalize-metric-weights` (default off = exact 1.0) ----
+            //
+            // These two terms are the only ones in the loss whose VALUE carries
+            // physical units, so they are the only ones whose weight has to be
+            // divided by the scene scale for a recipe to transfer between scenes
+            // of different physical size:
+            //
+            //   * flatten  = mean(min activated scale)      -> metres    -> / s
+            //   * scale-reg = mean(s² above a threshold)    -> metres²   -> / s²
+            //     and its THRESHOLD is itself a length      -> metres    -> × s
+            //
+            // **`--depth-loss-weight` is deliberately NOT in this list, and must
+            // not be "fixed" to match the reference.** The reference divides its
+            // depth weight by the scene scale because its depth loss is a metric
+            // L1 in metres. Ours is DISPARITY-space (`1/m`,
+            // `brush-loss/src/lib.rs` `depth_loss`), so its residual scales as
+            // `1/s`, not `s` — dividing by `s` would move the effective weight
+            // the WRONG WAY by a factor of `s²`. The dimensionless weights
+            // (`--normal-loss-weight`, `--depth-normal-weight`,
+            // `--normal-smooth-weight`, `--anti-needle-weight`) need no
+            // normalization for the same reason, and get none.
+            let metric_scale = self.metric_weight_scale();
             if use_flatten {
                 let scales = splats.transforms.val().slice(s![.., 7..10]).exp();
-                loss = loss + scales.min_dim(1).mean() * self.config.flatten_loss_weight;
+                loss = loss
+                    + scales.min_dim(1).mean() * (self.config.flatten_loss_weight / metric_scale);
             }
 
             // Scale-explosion + anti-needle regularizers (Stipple, arXiv:2608.00931).
@@ -1404,8 +1622,10 @@ impl SplatTrainer {
             if self.config.scale_reg_weight > 0.0 {
                 let scales = splats.transforms.val().slice(s![.., 7..10]).exp();
                 loss = loss
-                    + crate::tidi::scale_reg_loss(scales, self.config.scale_reg_threshold)
-                        * self.config.scale_reg_weight;
+                    + crate::tidi::scale_reg_loss(
+                        scales,
+                        self.config.scale_reg_threshold * metric_scale,
+                    ) * (self.config.scale_reg_weight / (metric_scale * metric_scale));
             }
             if self.config.anti_needle_weight > 0.0 {
                 let log_scales = splats.transforms.val().slice(s![.., 7..10]);
@@ -2975,7 +3195,7 @@ mod normal_prior_grad_tests {
             &device,
         );
 
-        let loss = normal_loss(n_cam, gt);
+        let loss = normal_loss(n_cam, gt, None);
         let loss_val = loss
             .clone()
             .into_data_async()
@@ -3362,5 +3582,193 @@ mod sparse_sh_adam_autodiff_bridge_tests {
             splats.sh_coeffs.grad(&grads).is_some(),
             "the stepped SH parameter must still receive gradients"
         );
+    }
+}
+
+/// Scene-scale helper (`--normalize-metric-weights`). CPU-only: no device, no
+/// tensors — these are pure `glam` arithmetic on camera poses.
+#[cfg(test)]
+mod scene_scale_tests {
+    use super::*;
+    use brush_render::kernels::camera_model::CameraModel;
+
+    /// Build an upright `OpenCV` camera at `pos` looking at `target`, with the
+    /// given world up direction.
+    ///
+    /// `OpenCV` camera frame: `+X` right, `+Y` DOWN, `+Z` forward. So the c2w
+    /// columns are `[right, -up, forward]` and `mean_camera_up` must negate
+    /// column 1 to recover `up`.
+    fn cam_at(pos: glam::Vec3, target: glam::Vec3, up: glam::Vec3) -> Camera {
+        let forward = (target - pos).normalize();
+        let down = -up.normalize();
+        let right = down.cross(forward).normalize();
+        // Re-orthogonalize so a non-perpendicular (pos, target, up) triple still
+        // yields a proper rotation.
+        let down = forward.cross(right).normalize();
+        let rotation =
+            glam::Quat::from_mat3(&glam::Mat3::from_cols(right, down, forward)).normalize();
+        Camera::new(
+            pos,
+            rotation,
+            0.8,
+            0.8,
+            glam::vec2(0.5, 0.5),
+            CameraModel::Pinhole,
+        )
+    }
+
+    /// A ring of `n` cameras of radius `r`, centred on `center`, orbiting about
+    /// `up` and all looking inward at `center`.
+    fn camera_ring(n: usize, r: f32, center: glam::Vec3, up: glam::Vec3) -> Vec<Camera> {
+        let up = up.normalize();
+        // Two orthonormal in-plane axes.
+        let a = if up.x.abs() < 0.9 {
+            up.cross(glam::Vec3::X).normalize()
+        } else {
+            up.cross(glam::Vec3::Y).normalize()
+        };
+        let b = up.cross(a).normalize();
+        (0..n)
+            .map(|k| {
+                let theta = std::f32::consts::TAU * k as f32 / n as f32;
+                let pos = center + (a * theta.cos() + b * theta.sin()) * r;
+                cam_at(pos, center, up)
+            })
+            .collect()
+    }
+
+    /// The `OpenCV` column choice, pinned on its own. This is the single line the
+    /// port's convention hangs on: the reference reads c2w column 1 directly
+    /// (OpenGL, `+Y` up), we must negate it (`OpenCV`, `+Y` down).
+    #[test]
+    fn mean_camera_up_negates_the_opencv_down_column() {
+        for up in [
+            glam::Vec3::Z,
+            glam::Vec3::Y,
+            -glam::Vec3::X,
+            glam::vec3(0.0, 1.0, 1.0).normalize(),
+        ] {
+            let cams = camera_ring(6, 2.0, glam::vec3(1.0, -2.0, 3.0), up);
+            let got = mean_camera_up(&cams);
+            assert!(
+                (got - up).length() < 1e-5,
+                "mean_camera_up = {got:?}, want {up:?} \
+                 (a result of {:?} would mean the OpenCV sign flip was missed)",
+                -up
+            );
+        }
+    }
+
+    /// Empty input, and a back-to-back pair whose up axes cancel: no panic, no
+    /// NaN, deterministic fallback.
+    #[test]
+    fn mean_camera_up_degenerate_cases() {
+        assert_eq!(mean_camera_up(&[]), glam::Vec3::Z);
+        let a = cam_at(glam::Vec3::ZERO, glam::Vec3::X, glam::Vec3::Z);
+        let b = cam_at(glam::Vec3::ZERO, glam::Vec3::X, -glam::Vec3::Z);
+        assert_eq!(mean_camera_up(&[a, b]), glam::Vec3::Z);
+    }
+
+    /// `rotation_up_to_z` really lands `up` on `+Z`, including both degenerate
+    /// (anti)parallel cases.
+    #[test]
+    fn rotation_up_to_z_lands_on_z() {
+        for up in [
+            glam::Vec3::Z,
+            -glam::Vec3::Z,
+            glam::Vec3::Y,
+            glam::Vec3::X,
+            glam::vec3(0.3, -0.5, 0.8).normalize(),
+            glam::vec3(1.0, 1.0, -1.0).normalize(),
+        ] {
+            let r = rotation_up_to_z(up);
+            let landed = r * up;
+            assert!(
+                (landed - glam::Vec3::Z).length() < 1e-5,
+                "up {up:?} landed on {landed:?}"
+            );
+            // Proper rotation: determinant +1.
+            assert!((r.determinant() - 1.0).abs() < 1e-5);
+        }
+    }
+
+    /// The whole pipeline on a synthetic ring whose answer is known by
+    /// construction.
+    ///
+    /// A ring of 8 cameras of radius `R` about `up`, translated anywhere: the
+    /// mean origin is the ring centre, so centring puts the ring at the origin;
+    /// the mean up is `up`, so the Rodrigues step lays the ring flat in the
+    /// world XY plane; and with 8 evenly spaced cameras two of them land exactly
+    /// on an in-plane axis, so the largest absolute coordinate is exactly `R`.
+    #[test]
+    fn scene_scale_from_camera_ring() {
+        // Z-up ring, offset far from the origin: centring must remove the offset
+        // entirely, so the answer is the radius, not the distance to the origin.
+        let cams = camera_ring(8, 2.0, glam::vec3(0.0, 0.0, 5.0), glam::Vec3::Z);
+        let scale = scene_scale_from_cameras(&cams).expect("ring has a scale");
+        assert!((scale - 2.0).abs() < 1e-4, "z-up ring scale = {scale}");
+
+        // Y-up ring (the COLMAP/SuperSplat-style frame): identical answer, but
+        // now the Rodrigues step does real work rotating +Y onto +Z.
+        let cams = camera_ring(8, 3.0, glam::vec3(-4.0, 9.0, 2.0), glam::Vec3::Y);
+        let scale = scene_scale_from_cameras(&cams).expect("ring has a scale");
+        assert!((scale - 3.0).abs() < 1e-4, "y-up ring scale = {scale}");
+
+        // A tilted up axis is still just a ring: the reorientation flattens it.
+        let up = glam::vec3(0.0, 1.0, 1.0).normalize();
+        let cams = camera_ring(8, 1.5, glam::vec3(2.0, 2.0, 2.0), up);
+        let scale = scene_scale_from_cameras(&cams).expect("ring has a scale");
+        assert!((scale - 1.5).abs() < 1e-4, "tilted ring scale = {scale}");
+
+        // The scale is a RADIUS, not a diameter, and it scales linearly.
+        let cams = camera_ring(8, 20.0, glam::Vec3::ZERO, glam::Vec3::Z);
+        let scale = scene_scale_from_cameras(&cams).expect("ring has a scale");
+        assert!((scale - 20.0).abs() < 1e-3, "scale = {scale}");
+
+        // Empty input yields None (callers fall back to 1.0, i.e. unnormalized).
+        assert_eq!(scene_scale_from_cameras(&[]), None);
+
+        // A single camera is its own mean, so every centred origin is zero and
+        // there is no usable scale.
+        let one = camera_ring(1, 2.0, glam::Vec3::ZERO, glam::Vec3::Z);
+        assert_eq!(scene_scale_from_cameras(&one), None);
+    }
+
+    /// `metric_weight_scale()` is an exact 1.0 unless the flag is on AND a scale
+    /// was captured — the default-inertness guarantee for L3, at the consumption
+    /// site rather than in config.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn metric_weight_scale_is_exactly_one_by_default() {
+        let device = Default::default();
+        let bounds = BoundingBox::from_min_max(glam::Vec3::ZERO, glam::Vec3::ONE);
+        let cams = camera_ring(8, 2.0, glam::Vec3::ZERO, glam::Vec3::Z);
+
+        // Flag off: the setter is a no-op and the divisor is an exact identity.
+        let mut off = SplatTrainer::new(&TrainConfig::default(), &device, bounds);
+        off.set_init_scene_scale(&cams);
+        assert_eq!(off.init_scene_scale, None);
+        assert_eq!(off.metric_weight_scale(), 1.0);
+
+        // Flag on: captured once, and later calls with a DIFFERENT camera set
+        // (the LOD re-supply) must not move it.
+        let mut cfg = TrainConfig::default();
+        cfg.normalize_metric_weights = true;
+        let mut on = SplatTrainer::new(&cfg, &device, bounds);
+        on.set_init_scene_scale(&cams);
+        assert!((on.metric_weight_scale() - 2.0).abs() < 1e-4);
+        let bigger = camera_ring(8, 50.0, glam::Vec3::ZERO, glam::Vec3::Z);
+        on.set_init_scene_scale(&bigger);
+        assert!(
+            (on.metric_weight_scale() - 2.0).abs() < 1e-4,
+            "set_init_scene_scale must be one-shot, got {}",
+            on.metric_weight_scale()
+        );
+
+        // Flag on but no usable scale: fall back to 1.0 rather than poisoning
+        // the loss with a zero or NaN divisor.
+        let mut none = SplatTrainer::new(&cfg, &device, bounds);
+        none.set_init_scene_scale(&[]);
+        assert_eq!(none.metric_weight_scale(), 1.0);
     }
 }

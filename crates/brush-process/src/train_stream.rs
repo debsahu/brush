@@ -204,6 +204,17 @@ pub(crate) async fn train_stream(
         process_config.seed,
     );
     trainer.set_view_cams(view_cams.clone());
+    // Fixed scene scale for `--normalize-metric-weights`, captured ONCE here
+    // from the full training pose set. Deliberately not re-supplied at the LOD
+    // boundaries below (the setter is one-shot anyway): a moving scale would
+    // drift the effective metric weights mid-run. A no-op without the flag.
+    let train_cameras: Vec<_> = dataset
+        .train
+        .views
+        .iter()
+        .map(|view| view.camera)
+        .collect();
+    trainer.set_init_scene_scale(&train_cameras);
 
     // Depth-coupled opacity regularizer: build the static distance-to-cloud grid
     // ONCE from the seed point cloud (the measured surface the run is seeded
