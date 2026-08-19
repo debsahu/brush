@@ -2213,5 +2213,4 @@ mod tests {
             .expect("--normalize-metric-weights must parse");
         assert!(on.normalize_metric_weights);
     }
-
 }
