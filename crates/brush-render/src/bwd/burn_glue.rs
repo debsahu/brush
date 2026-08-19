@@ -5,7 +5,7 @@ use crate::burn_glue::{
     wrap_wgpu_int,
 };
 use crate::{
-    SplatOps, SplatRasterizerOps,
+    SplatOps,
     camera::Camera,
     gaussian_splats::{Rasterizer, SplatRenderMode, Splats, fold_min_scale},
     sh::sh_coeffs_for_degree,
@@ -53,7 +53,8 @@ fn training_rasterizer() -> Rasterizer {
 ///
 /// Sparse buffer of shape `[num_visible, COMPACT_GRAD_LANES]`, indexed by
 /// `compact_gid`. Lanes: 0..=1 xy, 2..=4 conic, 5..=7 rgb, 8 alpha,
-/// 9 refine-weight, 10 expected-depth (see `bwd::kernels::rasterize_backwards`).
+/// 9 refine-weight, 10 expected-depth, 11..=14 PGSR plane-aux values
+/// (see `bwd::kernels::rasterize_backwards`).
 #[derive(Debug, Clone)]
 pub(crate) struct RasterizeGrads<B: Backend> {
     pub v_combined: FloatTensor<B>,
@@ -93,39 +94,49 @@ pub(crate) trait SplatBwdOps: Backend {
         projected_splats: FloatTensor<Self>,
         compact_gid_from_isect: IntTensor<Self>,
         tile_offsets: IntTensor<Self>,
+        plane_aux: Option<FloatTensor<Self>>,
+        global_from_compact_gid: IntTensor<Self>,
         background: Vec3,
         img_size: glam::UVec2,
         v_output: FloatTensor<Self>,
         smooth_cutoff: bool,
         render_depth: bool,
+        render_plane: bool,
     ) -> RasterizeGrads<Self>;
 
     /// Specialized raster backward which may omit the refinement-only
     /// statistic. Backends that do not override this retain the compatible
     /// full-gradient behavior.
+    #[allow(clippy::fn_params_excessive_bools)]
     #[allow(clippy::too_many_arguments)]
     fn rasterize_bwd_with_refine_weight(
         out_img: FloatTensor<Self>,
         projected_splats: FloatTensor<Self>,
         compact_gid_from_isect: IntTensor<Self>,
         tile_offsets: IntTensor<Self>,
+        plane_aux: Option<FloatTensor<Self>>,
+        global_from_compact_gid: IntTensor<Self>,
         background: Vec3,
         img_size: glam::UVec2,
         v_output: FloatTensor<Self>,
         smooth_cutoff: bool,
         _compute_refine_weight: bool,
         render_depth: bool,
+        render_plane: bool,
     ) -> RasterizeGrads<Self> {
         Self::rasterize_bwd(
             out_img,
             projected_splats,
             compact_gid_from_isect,
             tile_offsets,
+            plane_aux,
+            global_from_compact_gid,
             background,
             img_size,
             v_output,
             smooth_cutoff,
             render_depth,
+            render_plane,
         )
     }
 
@@ -189,6 +200,8 @@ pub(crate) struct ForwardRasterBackward<B: Backend> {
     projected_splats: FloatTensor<B>,
     compact_gid_from_isect: IntTensor<B>,
     tile_offsets: IntTensor<B>,
+    plane_aux: Option<FloatTensor<B>>,
+    global_from_compact_gid: IntTensor<B>,
     background: Vec3,
     img_size: glam::UVec2,
     v_output: FloatTensor<B>,
@@ -196,15 +209,19 @@ pub(crate) struct ForwardRasterBackward<B: Backend> {
     smooth_cutoff: bool,
     compute_refine_weight: bool,
     render_depth: bool,
+    render_plane: bool,
 }
 
 impl<B: Backend> ForwardRasterBackward<B> {
+    #[allow(clippy::fn_params_excessive_bools)]
     #[allow(clippy::too_many_arguments)]
     fn new(
         out_img: FloatTensor<B>,
         projected_splats: FloatTensor<B>,
         compact_gid_from_isect: IntTensor<B>,
         tile_offsets: IntTensor<B>,
+        plane_aux: Option<FloatTensor<B>>,
+        global_from_compact_gid: IntTensor<B>,
         background: Vec3,
         img_size: glam::UVec2,
         v_output: FloatTensor<B>,
@@ -212,12 +229,15 @@ impl<B: Backend> ForwardRasterBackward<B> {
         smooth_cutoff: bool,
         compute_refine_weight: bool,
         render_depth: bool,
+        render_plane: bool,
     ) -> Self {
         Self {
             out_img,
             projected_splats,
             compact_gid_from_isect,
             tile_offsets,
+            plane_aux,
+            global_from_compact_gid,
             background,
             img_size,
             v_output,
@@ -225,6 +245,7 @@ impl<B: Backend> ForwardRasterBackward<B> {
             smooth_cutoff,
             compute_refine_weight,
             render_depth,
+            render_plane,
         }
     }
 
@@ -236,10 +257,13 @@ impl<B: Backend> ForwardRasterBackward<B> {
         FloatTensor<B>,
         IntTensor<B>,
         IntTensor<B>,
+        Option<FloatTensor<B>>,
+        IntTensor<B>,
         Vec3,
         glam::UVec2,
         FloatTensor<B>,
         Rasterizer,
+        bool,
         bool,
         bool,
         bool,
@@ -249,6 +273,8 @@ impl<B: Backend> ForwardRasterBackward<B> {
             self.projected_splats,
             self.compact_gid_from_isect,
             self.tile_offsets,
+            self.plane_aux,
+            self.global_from_compact_gid,
             self.background,
             self.img_size,
             self.v_output,
@@ -256,6 +282,7 @@ impl<B: Backend> ForwardRasterBackward<B> {
             self.smooth_cutoff,
             self.compute_refine_weight,
             self.render_depth,
+            self.render_plane,
         )
     }
 }
@@ -282,6 +309,10 @@ struct GaussianBackwardState<B: Backend> {
     compact_gid_from_isect: IntTensor<B>,
     tile_offsets: IntTensor<B>,
 
+    /// PGSR plane-auxiliary per-splat channels `[N, PLANE_AUX_LANES]`, on the
+    /// inner backend. `None` unless the rasterization mode composites them.
+    plane_aux: Option<FloatTensor<B>>,
+
     render_mode: SplatRenderMode,
     pass: crate::gaussian_splats::RasterPass,
     rasterizer: Rasterizer,
@@ -293,7 +324,11 @@ struct GaussianBackwardState<B: Backend> {
 #[derive(Debug)]
 struct RenderBackwards;
 
-const NUM_BWD_ARGS: usize = 5;
+/// Parents of the hand-rolled render op, in `prepare` order:
+/// `transforms, refine_weight, sh_coeffs, raw_opacities, deferred_sh, plane_aux`.
+/// The sixth (plane-aux) parent is what makes the PGSR plane channels a real
+/// differentiable input rather than a read-only side channel.
+const NUM_BWD_ARGS: usize = 6;
 
 // Implement gradient registration when rendering backwards.
 impl<B: Backend + InternalSplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
@@ -318,14 +353,22 @@ impl<B: Backend + InternalSplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackw
             coeffs_parent,
             raw_opacity_parent,
             deferred_sh_parent,
+            plane_aux_parent,
         ] = ops.parents;
         let compute_refine_weight = refine_weight.is_some();
+        let render_plane = state.rasterization_mode.render_plane();
+        let global_from_compact_gid = state.global_from_compact_gid.clone();
+        let num_visible = state.project_uniforms.num_visible as usize;
+        let total_splats = state.project_uniforms.total_splats as usize;
+        let device = state.transforms.device();
 
         let rasterize_grads = B::rasterize_bwd_from_forward(ForwardRasterBackward::new(
             state.out_img,
             state.projected_splats,
             state.compact_gid_from_isect,
             state.tile_offsets,
+            state.plane_aux,
+            global_from_compact_gid.clone(),
             state.background,
             state.img_size,
             v_output,
@@ -333,7 +376,30 @@ impl<B: Backend + InternalSplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackw
             state.pass.smooth_cutoff(),
             compute_refine_weight,
             state.rasterization_mode.render_depth(),
+            render_plane,
         ));
+
+        // Scatter the compact plane-aux VALUE gradients back to the dense
+        // `[N, PLANE_AUX_LANES]` parent. `global_from_compact_gid` is injective
+        // over `0..num_visible` (one row per visible splat), so the index-add is
+        // a plain scatter. Lane bounds come from the shared constants — never
+        // restated — per the stride-drift history in `rasterize_backwards`.
+        if let Some(node) = plane_aux_parent {
+            let lanes = crate::kernels::helpers::PLANE_AUX_LANES as usize;
+            let start = crate::bwd::kernels::rasterize_backwards::PLANE_GRAD_LANE_START as usize;
+            let zeros = B::float_zeros([total_splats, lanes].into(), &device, FloatDType::F32);
+            let v_aux = if render_plane && num_visible > 0 {
+                let compact = B::float_slice(
+                    rasterize_grads.v_combined.clone(),
+                    &[(0..num_visible).into(), (start..start + lanes).into()],
+                );
+                let indices = B::int_slice(global_from_compact_gid, &[(0..num_visible).into()]);
+                B::float_select_add(zeros, 0, indices, compact)
+            } else {
+                zeros
+            };
+            grads.register::<B>(node.id, v_aux);
+        }
 
         if let Some(deferred_sh_parent) = deferred_sh_parent {
             let compact_sh_grads = rasterize_grads.v_combined.clone();
@@ -511,6 +577,7 @@ pub async fn render_splats_with_refine_weight(
         compute_refine_weight,
         crate::gaussian_splats::RasterizationMode::Rgba,
         false,
+        None,
     )
     .await
     .into_public()
@@ -531,6 +598,48 @@ pub async fn render_splats_for_training(
     rasterization_mode: crate::gaussian_splats::RasterizationMode,
     defer_sh_grad: bool,
 ) -> TrainingSplatOutputDiff {
+    render_splats_for_training_with_plane_aux(
+        splats,
+        camera,
+        img_size,
+        background,
+        compute_refine_weight,
+        rasterization_mode,
+        defer_sh_grad,
+        None,
+    )
+    .await
+}
+
+/// Training render with the PGSR plane-auxiliary channels (approach B).
+///
+/// `plane_aux` is the on-tape `[N, 4]` output of
+/// `brush_train::train::plane_features` — camera-frame normal + signed offset —
+/// and must be `Some` exactly when `rasterization_mode` is
+/// [`crate::gaussian_splats::RasterizationMode::RgbaDepthPlane`]. The channels
+/// are composited by the MAIN rasterizer and appear in `img` at channels
+/// `5..=8` (after rgba and centre depth); the alpha channel `3` is the coverage
+/// term `plane_depth_from_features` expects as its fifth input.
+///
+/// Backward contract (plan section 4.5, row 3): unlike the centre-depth channel,
+/// the plane channels' error DOES reach the blending weights — opacity, conic
+/// and screen-space position — by design. See `plane_channel_bwd` in
+/// `bwd::kernels::rasterize_backwards`.
+///
+/// [`render_splats_for_training`] is this with `plane_aux = None`, i.e.
+/// byte-identical to the pre-PGSR behaviour.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn render_splats_for_training_with_plane_aux(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    compute_refine_weight: bool,
+    rasterization_mode: crate::gaussian_splats::RasterizationMode,
+    defer_sh_grad: bool,
+    plane_aux: Option<Tensor<2>>,
+) -> TrainingSplatOutputDiff {
     let defer_sh_grad = defer_sh_grad
         && cfg!(all(
             feature = "native-msl",
@@ -548,6 +657,7 @@ pub async fn render_splats_for_training(
         compute_refine_weight,
         rasterization_mode,
         defer_sh_grad,
+        plane_aux,
     )
     .await
 }
@@ -598,6 +708,44 @@ pub async fn render_splats_with_pass_and_rasterizer(
         true,
         rasterization_mode,
         false,
+        None,
+    )
+    .await
+    .into_public()
+}
+
+/// Like [`render_splats_with_pass`] but also supplies the PGSR
+/// plane-auxiliary channels (approach B).
+///
+/// Exists for the gradient test suite, which needs a caller-chosen
+/// [`crate::gaussian_splats::RasterPass`] (the C^1 smooth-cutoff surrogate), a
+/// caller-chosen [`Rasterizer`] (so the 16x8 native-MSL training tile layout is
+/// covered for the plane lanes too — that is where lane bugs have hidden before)
+/// and the plane input. Production training goes through
+/// [`render_splats_for_training_with_plane_aux`].
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn render_splats_with_pass_and_plane_aux(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    pass: crate::gaussian_splats::RasterPass,
+    rasterizer: Rasterizer,
+    rasterization_mode: crate::gaussian_splats::RasterizationMode,
+    plane_aux: Option<Tensor<2>>,
+) -> SplatOutputDiff {
+    render_splats_with_pass_and_refine_weight(
+        splats,
+        camera,
+        img_size,
+        background,
+        pass,
+        rasterizer,
+        true,
+        rasterization_mode,
+        false,
+        plane_aux,
     )
     .await
     .into_public()
@@ -613,6 +761,7 @@ async fn render_splats_with_pass_and_refine_weight(
     compute_refine_weight: bool,
     rasterization_mode: crate::gaussian_splats::RasterizationMode,
     defer_sh_grad: bool,
+    plane_aux: Option<Tensor<2>>,
 ) -> TrainingSplatOutputDiff {
     splats.clone().validate_values().await;
 
@@ -635,6 +784,18 @@ async fn render_splats_with_pass_and_refine_weight(
         deferred_sh_holder
     };
 
+    let render_plane = rasterization_mode.render_plane();
+    assert!(
+        !render_plane || plane_aux.is_some(),
+        "RasterizationMode::RgbaDepthPlane requires the [N, PLANE_AUX_LANES] plane features"
+    );
+    // Non-grad anchor when the plane channels are off, mirroring the
+    // deferred-SH anchor above: `RenderBackwards` has a fixed parent set, so the
+    // sixth slot is always filled and simply stays untracked.
+    let plane_aux = plane_aux.unwrap_or_else(|| {
+        Tensor::<2>::zeros([1, crate::kernels::helpers::PLANE_AUX_LANES_USIZE], &device)
+    });
+
     // Fold the 3D-filter floor into scales/opacity for the render. `min_scale`
     // lives on the inner backend; `fold_min_scale` lifts it onto the autodiff
     // graph to match the param values.
@@ -652,6 +813,7 @@ async fn render_splats_with_pass_and_refine_weight(
     let raw_opac_ad = unwrap_ad_wgpu_float(raw_opac_val);
     let refine_weight_ad = unwrap_ad_wgpu_float(refine_weight_holder.clone());
     let deferred_sh_ad = unwrap_ad_wgpu_float(deferred_sh_holder.clone());
+    let plane_aux_ad = unwrap_ad_wgpu_float(plane_aux);
 
     let prep_nodes = RenderBackwards
         .prepare::<NoCheckpointing>([
@@ -660,6 +822,7 @@ async fn render_splats_with_pass_and_refine_weight(
             sh_coeffs_ad.node.clone(),
             raw_opac_ad.node.clone(),
             deferred_sh_ad.node.clone(),
+            plane_aux_ad.node.clone(),
         ])
         .compute_bound()
         .stateful();
@@ -673,6 +836,8 @@ async fn render_splats_with_pass_and_refine_weight(
     let transforms_inner: FloatTensor<MainBackend> = transforms_ad.primitive.clone();
     let sh_inner: FloatTensor<MainBackend> = sh_coeffs_ad.primitive;
     let raw_opac_inner: FloatTensor<MainBackend> = raw_opac_ad.primitive.clone();
+    let plane_aux_inner: Option<FloatTensor<MainBackend>> =
+        render_plane.then(|| plane_aux_ad.primitive.clone());
 
     assert!(
         pass.bwd_info(),
@@ -682,12 +847,13 @@ async fn render_splats_with_pass_and_refine_weight(
     // rasterizer selector (so the 16x8 `Candidate` tile layout survives — the
     // generic `SplatOps::render` path only ever uses `Rasterizer::Legacy`),
     // then wire the backward manually via `RenderBackwards`.
-    let output = <MainBackend as SplatRasterizerOps>::render_with_rasterizer(
+    let output = crate::burn_glue::render_fusion_with_plane_aux(
         camera,
         img_size,
         transforms_inner.clone(),
         sh_inner.clone(),
         raw_opac_inner.clone(),
+        plane_aux_inner.clone(),
         render_mode,
         rasterization_mode,
         background,
@@ -719,6 +885,7 @@ async fn render_splats_with_pass_and_refine_weight(
                 project_uniforms: output.project_uniforms,
                 tile_offsets: output.aux.tile_offsets.clone(),
                 compact_gid_from_isect: output.compact_gid_from_isect,
+                plane_aux: plane_aux_inner,
                 render_mode,
                 pass,
                 rasterizer,
@@ -773,6 +940,18 @@ impl SplatOps for AutodiffMain {
         // branch. Kept only to fill the fixed 5-input parent set.
         let device = transforms.device();
         let deferred_sh = Self::float_zeros(Shape::new([1, 1]), &device, FloatDType::F32);
+        // Likewise a non-grad anchor for the plane-aux parent: the generic
+        // dispatch never composites plane channels (it cannot — there is nowhere
+        // in `SplatOps::render` to pass them), so this stays untracked.
+        let plane_aux = Self::float_zeros(
+            Shape::new([1, crate::kernels::helpers::PLANE_AUX_LANES_USIZE]),
+            &device,
+            FloatDType::F32,
+        );
+        assert!(
+            !rasterization_mode.render_plane(),
+            "plane-mode rendering must go through bwd::render_splats_for_training_with_plane_aux"
+        );
 
         let prep_nodes = RenderBackwards
             .prepare::<NoCheckpointing>([
@@ -781,6 +960,7 @@ impl SplatOps for AutodiffMain {
                 sh_coeffs.node.clone(),
                 raw_opacities.node.clone(),
                 deferred_sh.node.clone(),
+                plane_aux.node.clone(),
             ])
             .compute_bound()
             .stateful();
@@ -816,6 +996,7 @@ impl SplatOps for AutodiffMain {
                     project_uniforms: output.project_uniforms,
                     tile_offsets: output.aux.tile_offsets.clone(),
                     compact_gid_from_isect: output.compact_gid_from_isect.clone(),
+                    plane_aux: None,
                     render_mode,
                     pass,
                     rasterizer: Rasterizer::Legacy,
@@ -861,6 +1042,8 @@ fn rasterize_bwd_fusion(
     projected_splats: FloatTensor<Fusion<MainBackendBase>>,
     compact_gid_from_isect: IntTensor<Fusion<MainBackendBase>>,
     tile_offsets: IntTensor<Fusion<MainBackendBase>>,
+    plane_aux: Option<FloatTensor<Fusion<MainBackendBase>>>,
+    global_from_compact_gid: IntTensor<Fusion<MainBackendBase>>,
     background: Vec3,
     img_size: glam::UVec2,
     v_output: FloatTensor<Fusion<MainBackendBase>>,
@@ -868,6 +1051,7 @@ fn rasterize_bwd_fusion(
     smooth_cutoff: bool,
     compute_refine_weight: bool,
     render_depth: bool,
+    render_plane: bool,
     trusted_forward: bool,
 ) -> RasterizeGrads<Fusion<MainBackendBase>> {
     #[derive(Debug)]
@@ -879,6 +1063,7 @@ fn rasterize_bwd_fusion(
         smooth_cutoff: bool,
         compute_refine_weight: bool,
         render_depth: bool,
+        render_plane: bool,
         trusted_forward: bool,
     }
 
@@ -886,15 +1071,24 @@ fn rasterize_bwd_fusion(
         fn execute(&self, h: &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>) {
             let (inputs, outputs) = self.desc.as_fixed();
 
+            // Order must match `input_tensors` below. `plane_aux` is always a
+            // real binding (a 1-element dummy when the plane mode is off) so the
+            // input arity stays fixed.
             let [
                 v_output,
                 out_img,
                 projected_splats,
                 compact_gid_from_isect,
                 tile_offsets,
+                plane_aux,
+                global_from_compact_gid,
             ] = inputs;
 
             let [v_combined] = outputs;
+
+            let plane_aux = self
+                .render_plane
+                .then(|| h.get_float_tensor::<MainBackendBase>(plane_aux));
 
             let grads = if self.trusted_forward {
                 <MainBackendBase as InternalSplatBwdOps>::rasterize_bwd_from_forward(
@@ -903,6 +1097,8 @@ fn rasterize_bwd_fusion(
                         h.get_float_tensor::<MainBackendBase>(projected_splats),
                         h.get_int_tensor::<MainBackendBase>(compact_gid_from_isect),
                         h.get_int_tensor::<MainBackendBase>(tile_offsets),
+                        plane_aux,
+                        h.get_int_tensor::<MainBackendBase>(global_from_compact_gid),
                         self.background,
                         self.img_size,
                         h.get_float_tensor::<MainBackendBase>(v_output),
@@ -910,6 +1106,7 @@ fn rasterize_bwd_fusion(
                         self.smooth_cutoff,
                         self.compute_refine_weight,
                         self.render_depth,
+                        self.render_plane,
                     ),
                 )
             } else {
@@ -918,12 +1115,15 @@ fn rasterize_bwd_fusion(
                     h.get_float_tensor::<MainBackendBase>(projected_splats),
                     h.get_int_tensor::<MainBackendBase>(compact_gid_from_isect),
                     h.get_int_tensor::<MainBackendBase>(tile_offsets),
+                    plane_aux,
+                    h.get_int_tensor::<MainBackendBase>(global_from_compact_gid),
                     self.background,
                     self.img_size,
                     h.get_float_tensor::<MainBackendBase>(v_output),
                     self.smooth_cutoff,
                     self.compute_refine_weight,
                     self.render_depth,
+                    self.render_plane,
                 )
             };
 
@@ -936,15 +1136,28 @@ fn rasterize_bwd_fusion(
 
     let client = v_output.client.clone();
     let num_visible = (num_visible_val as usize).max(1);
+    // Always a real binding: CubeCL takes every tensor argument even when a
+    // comptime flag removes all its accesses, so a 1-element dummy keeps the
+    // custom-op input arity fixed instead of forking the descriptor.
+    let plane_aux = plane_aux.unwrap_or_else(|| {
+        <Fusion<MainBackendBase> as FloatTensorOps<Fusion<MainBackendBase>>>::float_zeros(
+            [1].into(),
+            &v_output.device(),
+            FloatDType::F32,
+        )
+    });
     let input_tensors = [
         v_output,
         out_img,
         projected_splats,
         compact_gid_from_isect,
         tile_offsets,
+        plane_aux,
+        global_from_compact_gid,
     ];
     // Sparse [num_visible, COMPACT_GRAD_LANES] indexed by compact_gid. Lane 10
-    // is the expected-depth gradient (zero/unused when render_depth is false).
+    // is the expected-depth gradient (zero/unused when render_depth is false);
+    // lanes 11..=14 carry the PGSR plane-aux value gradients.
     // Stride owned by bwd::kernels::rasterize_backwards::COMPACT_GRAD_LANES.
     let v_combined_out = TensorIr::uninit(
         client.create_empty_handle(),
@@ -971,6 +1184,7 @@ fn rasterize_bwd_fusion(
                 smooth_cutoff,
                 compute_refine_weight,
                 render_depth,
+                render_plane,
                 trusted_forward,
             },
         )
@@ -986,17 +1200,22 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
         projected_splats: FloatTensor<Self>,
         compact_gid_from_isect: IntTensor<Self>,
         tile_offsets: IntTensor<Self>,
+        plane_aux: Option<FloatTensor<Self>>,
+        global_from_compact_gid: IntTensor<Self>,
         background: Vec3,
         img_size: glam::UVec2,
         v_output: FloatTensor<Self>,
         smooth_cutoff: bool,
         render_depth: bool,
+        render_plane: bool,
     ) -> RasterizeGrads<Self> {
         rasterize_bwd_fusion(
             out_img,
             projected_splats,
             compact_gid_from_isect,
             tile_offsets,
+            plane_aux,
+            global_from_compact_gid,
             background,
             img_size,
             v_output,
@@ -1004,6 +1223,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
             smooth_cutoff,
             true,
             render_depth,
+            render_plane,
             false,
         )
     }
@@ -1014,18 +1234,23 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
         projected_splats: FloatTensor<Self>,
         compact_gid_from_isect: IntTensor<Self>,
         tile_offsets: IntTensor<Self>,
+        plane_aux: Option<FloatTensor<Self>>,
+        global_from_compact_gid: IntTensor<Self>,
         background: Vec3,
         img_size: glam::UVec2,
         v_output: FloatTensor<Self>,
         smooth_cutoff: bool,
         compute_refine_weight: bool,
         render_depth: bool,
+        render_plane: bool,
     ) -> RasterizeGrads<Self> {
         rasterize_bwd_fusion(
             out_img,
             projected_splats,
             compact_gid_from_isect,
             tile_offsets,
+            plane_aux,
+            global_from_compact_gid,
             background,
             img_size,
             v_output,
@@ -1033,6 +1258,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
             smooth_cutoff,
             compute_refine_weight,
             render_depth,
+            render_plane,
             false,
         )
     }
@@ -1269,6 +1495,8 @@ impl InternalSplatBwdOps for Fusion<MainBackendBase> {
             projected_splats,
             compact_gid_from_isect,
             tile_offsets,
+            plane_aux,
+            global_from_compact_gid,
             background,
             img_size,
             v_output,
@@ -1276,12 +1504,15 @@ impl InternalSplatBwdOps for Fusion<MainBackendBase> {
             smooth_cutoff,
             compute_refine_weight,
             render_depth,
+            render_plane,
         ) = input.into_parts();
         rasterize_bwd_fusion(
             out_img,
             projected_splats,
             compact_gid_from_isect,
             tile_offsets,
+            plane_aux,
+            global_from_compact_gid,
             background,
             img_size,
             v_output,
@@ -1289,6 +1520,7 @@ impl InternalSplatBwdOps for Fusion<MainBackendBase> {
             smooth_cutoff,
             compute_refine_weight,
             render_depth,
+            render_plane,
             true,
         )
     }

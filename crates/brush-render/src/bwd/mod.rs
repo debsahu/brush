@@ -11,8 +11,10 @@ mod render_bwd;
 
 pub use burn_glue::{
     DeferredShGrad, DeferredShGradHandle, SplatOutputDiff, TrainingSplatOutputDiff,
-    lift_splats_to_autodiff, render_splats, render_splats_for_training, render_splats_with_pass,
-    render_splats_with_pass_and_rasterizer, render_splats_with_refine_weight,
+    lift_splats_to_autodiff, render_splats, render_splats_for_training,
+    render_splats_for_training_with_plane_aux, render_splats_with_pass,
+    render_splats_with_pass_and_plane_aux, render_splats_with_pass_and_rasterizer,
+    render_splats_with_refine_weight,
 };
 pub use features_bwd::render_splat_features;
 /// Stride of the compact per-splat backward-gradient buffer (`v_combined`),
