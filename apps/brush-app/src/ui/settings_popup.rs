@@ -442,28 +442,32 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
                          default. A depth loss against it constrains only where along the ray a \
                          gaussian sits, never its orientation.",
                     );
-                // The two plane sources are config-only until WS-A (feature
-                // pass) and WS-B (main kernel) wire their consumers. Selecting
-                // one today would silently train exactly like `Centre`, so they
-                // are DISABLED rather than left selectable: an inert control
-                // that looks active is the worse failure. Re-enable each one in
-                // the commit that lands its consumer.
-                ui.add_enabled_ui(false, |ui| {
-                    ui.selectable_value(&mut tc.depth_source, DepthSource::PlaneAux, "Plane (aux)")
-                        .on_hover_text(
-                            "PGSR ray-plane depth via the auxiliary feature pass. NOT YET WIRED \
-                             — the renderer side is still in progress, so this is disabled.",
-                        );
-                    ui.selectable_value(
-                        &mut tc.depth_source,
-                        DepthSource::PlaneFused,
-                        "Plane (fused)",
-                    )
+                // Both plane sources are live: WS-A wired the feature pass and
+                // WS-B the main kernel, so neither selects `Centre` behaviour
+                // any more. (They were disabled while the consumers were in
+                // flight — an inert control that looks active is the worse
+                // failure.) Both are pinhole-only and fall back to `Centre`
+                // with a logged warning on other camera models.
+                ui.selectable_value(&mut tc.depth_source, DepthSource::PlaneAux, "Plane (aux)")
                     .on_hover_text(
-                        "PGSR ray-plane depth composited in the main rasterize kernel. NOT YET \
-                         WIRED — the renderer side is still in progress, so this is disabled.",
+                        "PGSR ray-plane depth via an auxiliary feature pass. Unbiased surface \
+                         depth: the ray is intersected with each pixel's composited tangent \
+                         plane instead of reading the camera-z of splat means. Geometry \
+                         gradients reach means and rotations through the feature VALUES only — \
+                         depth error cannot reach opacity. Pinhole cameras only.",
                     );
-                });
+                ui.selectable_value(
+                    &mut tc.depth_source,
+                    DepthSource::PlaneFused,
+                    "Plane (fused)",
+                )
+                .on_hover_text(
+                    "PGSR ray-plane depth composited in the MAIN rasterize kernel. Same \
+                         forward values as Plane (aux) and one pass instead of two, but the \
+                         blending weights are LIVE for the plane channels, so plane error also \
+                         reaches opacity, conic and screen position. This is the faithful port; \
+                         Plane (aux) is the cheaper approximation. Pinhole cameras only.",
+                );
             });
         });
     });

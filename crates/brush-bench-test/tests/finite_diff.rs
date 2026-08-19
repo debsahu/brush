@@ -423,7 +423,7 @@ async fn deferred_sh_bridge_preserves_other_gradients_and_aux() {
         // were), and a stale literal makes the assertions below silently check the wrong
         // columns rather than fail loudly.
         const COMPACT_GRAD_LANES: usize = brush_render::bwd::COMPACT_GRAD_LANES as usize;
-        const DEPTH_LANE: usize = 10;
+        const DEPTH_LANE: usize = brush_render::bwd::DEPTH_LANE;
         let expected_rows = num_visible.max(1) as usize;
         assert_eq!(
             sparse.compact_grads.dims(),

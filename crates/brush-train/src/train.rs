@@ -25,7 +25,15 @@ use brush_render::gaussian_splats::{RasterizationMode, Splats, fold_min_scale};
 use brush_render::kernels::camera_model::CameraModel;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 // bwd crate dissolved into brush-render/src/bwd/ (upstream #517).
-use brush_render::bwd::{DeferredShGrad, render_splat_features, render_splats_for_training};
+use brush_render::bwd::{
+    DeferredShGrad, render_splat_features, render_splats_for_training_with_plane_aux,
+};
+// The `plane_aux = None` convenience wrapper. The trainer itself always
+// goes through the `_with_plane_aux` entry point (it is the same call for
+// `None`); the test modules below use the short form.
+#[cfg(test)]
+use brush_render::bwd::render_splats_for_training;
+use brush_render::kernels::helpers::{PLANE_AUX_LANES_USIZE, plane_channel_offset};
 use burn::{
     module::{AutodiffModule, Param, ParamId},
     optim::GradientsParams,
@@ -1298,12 +1306,70 @@ impl SplatTrainer {
             // The depth/normal consistency term reads the rendered depth, so it
             // needs the depth channel even without any gt depth map.
             let has_depth_channel = use_depth || use_dn;
-            let raster_mode = if has_depth_channel {
+
+            // ---- PGSR depth-source gating, hoisted above the render ----
+            //
+            // `center` and `plane-aux` leave the MAIN rasterization alone, so
+            // for them this block is pure boolean arithmetic and the render
+            // below is the call it always was. `plane-fused` (approach B)
+            // composites its plane channels IN the main kernel, so the mode and
+            // the aux tensor have to be decided before the render runs — which
+            // is the only reason these three lines live up here rather than
+            // beside the consumers.
+            //
+            // `normals_from_depth` and the ray-plane grid are both pinhole-only
+            // (our fisheye split path is KB4; interior cube faces are Pinhole).
+            // Same warn-and-skip contract the consistency term already had.
+            let plane_selected = !matches!(self.config.depth_source, DepthSource::Center);
+            let is_pinhole = matches!(camera.camera_model, CameraModel::Pinhole);
+            let depth_consumer = use_depth || use_dn;
+            if plane_selected && depth_consumer && !is_pinhole {
+                warn_plane_depth_needs_pinhole();
+            }
+            let use_plane_depth = plane_selected && depth_consumer && is_pinhole;
+            // Approach B. Falls back to nothing: when the plane depth is not
+            // usable at all (non-pinhole, or no depth consumer) `plane-fused`
+            // takes exactly the path `center` takes, as `plane-aux` does.
+            let use_fused =
+                use_plane_depth && matches!(self.config.depth_source, DepthSource::PlaneFused);
+
+            let raster_mode = if use_fused {
+                RasterizationMode::RgbaDepthPlane
+            } else if has_depth_channel {
                 RasterizationMode::RgbaAndDepth
             } else {
                 RasterizationMode::Rgba
             };
-            let diff_out = render_splats_for_training(
+
+            // The SAME on-tape `[N, 4]` construction approach A rasterizes in a
+            // separate feature pass — handed to the main kernel instead. That is
+            // deliberate: it makes the A/B delta exactly {weight-path gradients,
+            // single-pass fusion} and nothing else, with no duplicated
+            // smallest-axis/quaternion math in kernel code.
+            //
+            // Built from `splats` (not `render_input`) and folded exactly as the
+            // aux path folds it, so the two approaches composite identical
+            // per-splat values and any forward disagreement is a real bug.
+            //
+            // PGSR (Chen et al. 2024, arXiv:2406.06521), plane parameterization.
+            let plane_aux = use_fused.then(|| {
+                let t_fold = match &splats.min_scale {
+                    Some(f) => {
+                        fold_min_scale(
+                            splats.transforms.val(),
+                            splats.raw_opacities.val(),
+                            f.clone(),
+                        )
+                        .0
+                    }
+                    None => splats.transforms.val(),
+                };
+                plane_features(t_fold, &camera)
+            });
+
+            // `render_splats_for_training(..)` IS this with `plane_aux = None`
+            // (a direct delegation), so `center` and `plane-aux` are unchanged.
+            let diff_out = render_splats_for_training_with_plane_aux(
                 render_input,
                 &camera,
                 img_size,
@@ -1311,6 +1377,7 @@ impl SplatTrainer {
                 compute_refine_weight,
                 raster_mode,
                 defer_sh_grad,
+                plane_aux,
             )
             .instrument(trace_span!("Forward"))
             .await;
@@ -1328,10 +1395,17 @@ impl SplatTrainer {
             // bypass the correction. Split the RGBA channels off, correct
             // those, then re-attach the untouched depth so `pred_image` keeps
             // its [H, W, 5] layout for the depth-loss term below.
+            //
+            // Under `plane-fused` the same applies to the four plane channels
+            // that follow the depth one — also geometry, also not colour. The
+            // upper bound is `raster_mode.bwd_out_channels()` rather than a
+            // literal so the two cases stay one expression; at `RgbaAndDepth`
+            // it is 5, i.e. the `4..5` slice this always did.
             let pred_image = match &active_appearance {
                 Some(active) if has_depth_channel => {
+                    let geom_end = raster_mode.bwd_out_channels();
                     let rgba = diff_out.img.clone().slice(s![.., .., 0..4]);
-                    let depth = diff_out.img.slice(s![.., .., 4..5]);
+                    let depth = diff_out.img.slice(s![.., .., 4..geom_end]);
                     Tensor::cat(vec![active.apply(rgba), depth], 2)
                 }
                 Some(active) => active.apply(diff_out.img),
@@ -1521,6 +1595,11 @@ impl SplatTrainer {
             //                     Same rasterization COUNT as `center` whenever
             //                     a normal term was already on; one extra pass
             //                     when depth is the only consumer.
+            //   plane-fused       the same 4 channels, but composited by the
+            //                     MAIN kernel (channels 5..=8, alongside rgba
+            //                     and centre depth). NO feature rasterization
+            //                     at all — the render above already carries
+            //                     them, so this block only re-slices it.
             //
             // Why the plane path needs no per-pixel rotation: `plane_features`
             // rotates each splat's normal into the camera frame BEFORE
@@ -1533,19 +1612,9 @@ impl SplatTrainer {
             // PGSR (Chen et al. 2024, arXiv:2406.06521), unbiased depth
             // rendering; construction shared with approach B via
             // `plane_features`.
-            let plane_selected = !matches!(self.config.depth_source, DepthSource::Center);
-            if matches!(self.config.depth_source, DepthSource::PlaneFused) {
-                warn_plane_fused_falls_back_to_aux();
-            }
-            // `normals_from_depth` and the ray-plane grid are both pinhole-only
-            // (our fisheye split path is KB4; interior cube faces are Pinhole).
-            // Same warn-and-skip contract the consistency term already had.
-            let is_pinhole = matches!(camera.camera_model, CameraModel::Pinhole);
-            let depth_consumer = use_depth || use_dn;
-            if plane_selected && depth_consumer && !is_pinhole {
-                warn_plane_depth_needs_pinhole();
-            }
-            let use_plane_depth = plane_selected && depth_consumer && is_pinhole;
+            // `plane_selected` / `use_plane_depth` / `use_fused` and the
+            // pinhole warning are decided above the render (approach B needs
+            // them to pick the rasterization mode).
 
             // `(n_cam, normal_alpha)` — the rendered camera-frame normal image
             // and its DETACHED alpha, shared by every normal term below.
@@ -1555,34 +1624,62 @@ impl SplatTrainer {
             let mut plane_depth: Option<(Tensor<2>, Tensor<2>)> = None;
 
             if use_normal_render || use_plane_depth {
-                let (t_fold, o_fold) = match &splats.min_scale {
+                let render_mode = if splats.render_mip {
+                    brush_render::gaussian_splats::SplatRenderMode::Mip
+                } else {
+                    brush_render::gaussian_splats::SplatRenderMode::Default
+                };
+                // `plane-fused` re-slices the main render and rasterizes nothing
+                // here, so it needs no folded copy; `center` and `plane-aux`
+                // both run a feature pass and do. Selecting `render_mode` first
+                // is host-side only — no tensor op moved past another, so the
+                // `center` op sequence is unchanged.
+                let folded = (!use_fused).then(|| match &splats.min_scale {
                     Some(f) => fold_min_scale(
                         splats.transforms.val(),
                         splats.raw_opacities.val(),
                         f.clone(),
                     ),
                     None => (splats.transforms.val(), splats.raw_opacities.val()),
-                };
-                let render_mode = if splats.render_mip {
-                    brush_render::gaussian_splats::SplatRenderMode::Mip
-                } else {
-                    brush_render::gaussian_splats::SplatRenderMode::Default
-                };
+                });
 
                 if use_plane_depth {
-                    // [N, 4] -> [H, W, 5]: n_sum(3) + offset_sum(1) + alpha(1),
-                    // which is exactly `plane_depth_from_features`' contract.
-                    let feats = plane_features(t_fold.clone(), &camera);
-                    let feat_img = render_splat_features(
-                        t_fold,
-                        o_fold,
-                        feats,
-                        &camera,
-                        img_size,
-                        render_mode,
-                    )
-                    .instrument(trace_span!("Plane feature forward"))
-                    .await;
+                    // Either way the result is the [H, W, 5] `n_sum(3) +
+                    // offset_sum(1) + alpha(1)` that `plane_depth_from_features`
+                    // contracts for — approaches A and B differ in WHICH kernel
+                    // composited it, not in what it means.
+                    let feat_img = if use_fused {
+                        // Approach B: the main rasterizer already composited the
+                        // plane lanes, with the blending-weight gradient path
+                        // LIVE (plan section 4.5 row 3). Channel 3 is that
+                        // render's coverage alpha, which is the same Σw the
+                        // feature pass reports in its trailing channel.
+                        //
+                        // Offsets come from the shared const fns: re-literalizing
+                        // the stride is precisely what broke three call sites
+                        // when the depth lane was added.
+                        let plane_c = plane_channel_offset(raster_mode.render_depth()) as usize;
+                        Tensor::cat(
+                            vec![
+                                pred_image.clone().slice(s![
+                                    ..,
+                                    ..,
+                                    plane_c..plane_c + PLANE_AUX_LANES_USIZE
+                                ]),
+                                pred_image.clone().slice(s![.., .., 3..4]),
+                            ],
+                            2,
+                        )
+                    } else {
+                        // Approach A: a separate feature rasterization of the
+                        // same on-tape [N, 4] values.
+                        let (t_fold, o_fold) =
+                            folded.expect("the non-fused paths always fold min-scale");
+                        let feats = plane_features(t_fold.clone(), &camera);
+                        render_splat_features(t_fold, o_fold, feats, &camera, img_size, render_mode)
+                            .instrument(trace_span!("Plane feature forward"))
+                            .await
+                    };
 
                     let normal_alpha = feat_img.clone().slice(s![.., .., 4..5]).detach();
 
@@ -1638,6 +1735,8 @@ impl SplatTrainer {
                     plane_depth = Some((depth, valid));
                 } else {
                     // ---- UNCHANGED `center` path. Do not reorder. ----
+                    let (t_fold, o_fold) =
+                        folded.expect("the non-fused paths always fold min-scale");
                     let normals = splat_normals(t_fold.clone(), camera.position);
                     let normal_img = render_splat_features(
                         t_fold,
@@ -3178,28 +3277,6 @@ fn warn_plane_depth_needs_pinhole() {
              Pinhole; falling back to the centre-expected depth channel for \
              non-pinhole views (ray-plane intersection for fisheye models is not \
              implemented)."
-        );
-    });
-}
-
-/// Warn exactly once that `--depth-source plane-fused` is not implemented in
-/// this build and is being served by the feature-pass (`plane-aux`) path.
-///
-/// The two agree in their FORWARD values by construction — both composite the
-/// same `plane_features` and intersect the same ray — and differ only in the
-/// backward: `plane-fused` (WS-B) makes the blending weights live for the plane
-/// lanes, which `plane-aux` cannot express. So this fallback is numerically the
-/// right answer with the wrong gradient, and an ablation arm run against it is
-/// measuring `plane-aux`. Loud on purpose.
-fn warn_plane_fused_falls_back_to_aux() {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        log::warn!(
-            "--depth-source plane-fused is not implemented in this build; using \
-             the plane-aux feature-pass path instead. Forward values are the \
-             same, but the backward is plane-aux's (blending weights are \
-             constants, so depth error cannot reach opacity). Do NOT record a \
-             run made with this fallback as a plane-fused ablation arm."
         );
     });
 }

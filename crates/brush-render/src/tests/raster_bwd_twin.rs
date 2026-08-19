@@ -50,7 +50,11 @@ wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 const IMG_W: usize = 5;
 const IMG_H: usize = 4;
 const PIXELS: usize = IMG_W * IMG_H;
-const CHANS: usize = 9;
+/// Full plane-mode channel count: rgba (4) + centre depth (1) + plane (4).
+/// Derived from the shared `const fn` so a lane addition cannot leave this
+/// twin silently comparing the wrong stride — the exact drift that broke
+/// three call sites when the depth lane landed.
+const CHANS: usize = crate::kernels::helpers::raster_out_channels(true, true) as usize;
 /// Channels that are alpha-composited from a per-splat value: rgb (3), centre
 /// depth (1), plane (4). The remaining output channel is the coverage alpha,
 /// which is `1 - T` rather than a composited value.
@@ -573,7 +577,8 @@ async fn plane_lanes_are_inert_without_plane_mode() {
     let ids: Vec<u32> = (0..n as u32).collect();
 
     let full_cot = cotangent();
-    const DEPTH_CHANS: usize = 5;
+    // rgba + centre depth, no plane lanes. Derived, never literal.
+    const DEPTH_CHANS: usize = crate::kernels::helpers::raster_out_channels(true, false) as usize;
 
     // rgba + centre depth only.
     let depth_out = rasterize_reference_full(&projected, None, true, img, BG, true);
