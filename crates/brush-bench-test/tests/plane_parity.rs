@@ -44,6 +44,21 @@ const PARITY_TOL: f32 = 1e-5;
 
 const IMG: glam::UVec2 = glam::uvec2(48, 40);
 
+// Channel indices into the `RgbaDepthPlane` image, derived from the same
+// `const fn` the kernel uses rather than restated as literals.
+use brush_render::kernels::helpers::{
+    PLANE_AUX_LANES_USIZE, plane_channel_offset, raster_out_channels,
+};
+/// Coverage alpha: the last rgba channel, and the fifth input
+/// `plane_depth_from_features` expects.
+const ALPHA_CH: usize = raster_out_channels(false, false) as usize - 1;
+/// Alpha-composited camera-z of the splat centres.
+const DEPTH_CH: usize = raster_out_channels(false, false) as usize;
+/// The four PGSR plane channels, `PLANE_LO..PLANE_HI`.
+const PLANE_LO: usize = plane_channel_offset(true) as usize;
+const PLANE_HI: usize = PLANE_LO + PLANE_AUX_LANES_USIZE;
+const PLANE_CHANS: usize = raster_out_channels(true, true) as usize;
+
 fn test_camera() -> Camera {
     Camera::new(
         glam::vec3(0.0, 0.0, -3.0),
@@ -175,24 +190,30 @@ async fn plane_forward_parity_a_vs_b() {
 
     let (h, w) = (IMG.y as usize, IMG.x as usize);
     assert_eq!(a_img.dims(), [h, w, 5]);
-    assert_eq!(b_img.dims(), [h, w, 9]);
+    assert_eq!(b_img.dims(), [h, w, PLANE_CHANS]);
 
     // Channel layout contract: plane lanes follow rgba + centre depth, and the
     // alpha the plane reduction needs is the ordinary rgba alpha at channel 3.
     let b_feat = Tensor::cat(
         vec![
-            b_img.clone().slice(s![.., .., 5..9]),
-            b_img.clone().slice(s![.., .., 3..4]),
+            b_img.clone().slice(s![.., .., PLANE_LO..PLANE_HI]),
+            b_img.clone().slice(s![.., .., ALPHA_CH..ALPHA_CH + 1]),
         ],
         2,
     );
 
-    let a_plane = read_vec(a_img.clone().slice(s![.., .., 0..4])).await;
-    let b_plane = read_vec(b_img.slice(s![.., .., 5..9])).await;
+    let a_plane =
+        read_vec(
+            a_img
+                .clone()
+                .slice(s![.., .., 0..raster_out_channels(false, false) as usize]),
+        )
+        .await;
+    let b_plane = read_vec(b_img.slice(s![.., .., PLANE_LO..PLANE_HI])).await;
     assert_parity("composited plane channels", &b_plane, &a_plane);
 
-    let a_alpha = read_vec(a_img.clone().slice(s![.., .., 4..5])).await;
-    let b_alpha = read_vec(b_feat.clone().slice(s![.., .., 4..5])).await;
+    let a_alpha = read_vec(a_img.clone().slice(s![.., .., DEPTH_CH..DEPTH_CH + 1])).await;
+    let b_alpha = read_vec(b_feat.clone().slice(s![.., .., DEPTH_CH..DEPTH_CH + 1])).await;
     assert_parity("coverage alpha", &b_alpha, &a_alpha);
     assert!(
         a_alpha.iter().any(|&v| v > 0.5),
@@ -293,7 +314,7 @@ async fn plane_fused_depth_reaches_opacity() {
 
     // Loss on the PLANE channels only — no RGB term — so any opacity gradient
     // observed can only have come through the plane lanes.
-    let loss = out.img.slice(s![.., .., 5..9]).mean();
+    let loss = out.img.slice(s![.., .., PLANE_LO..PLANE_HI]).mean();
     let grads = loss.backward();
 
     let opac = read_vec(splats.raw_opacities.grad(&grads).expect("opacity grad")).await;
@@ -343,7 +364,11 @@ async fn plane_mode_keeps_centre_depth_detached_from_opacity() {
     .await;
 
     // One-hot on channel 4 (centre depth) only.
-    let grads = out.img.slice(s![.., .., 4..5]).mean().backward();
+    let grads = out
+        .img
+        .slice(s![.., .., DEPTH_CH..DEPTH_CH + 1])
+        .mean()
+        .backward();
     let opac = read_vec(splats.raw_opacities.grad(&grads).expect("opacity grad")).await;
     let transforms = read_vec(splats.transforms.grad(&grads).expect("transforms grad")).await;
 
@@ -403,8 +428,17 @@ async fn plane_mode_unselected_is_inert() {
         Some(feats),
     )
     .await;
-    let plane_rgba = read_vec(plane.img.clone().slice(s![.., .., 0..4])).await;
-    let plane_grads = plane.img.slice(s![.., .., 0..4]).mean().backward();
+    let plane_rgba = read_vec(plane.img.clone().slice(s![
+        ..,
+        ..,
+        0..raster_out_channels(false, false) as usize
+    ]))
+    .await;
+    let plane_grads = plane
+        .img
+        .slice(s![.., .., 0..raster_out_channels(false, false) as usize])
+        .mean()
+        .backward();
     let plane_transforms = read_vec(plane_splats.transforms.grad(&plane_grads).unwrap()).await;
     let plane_opac = read_vec(plane_splats.raw_opacities.grad(&plane_grads).unwrap()).await;
 
@@ -426,8 +460,19 @@ async fn plane_mode_unselected_is_inert() {
         None,
     )
     .await;
-    let depth_img = read_vec(depth.img.clone().slice(s![.., .., 0..5])).await;
-    let depth_grads = depth.img.slice(s![.., .., 0..5]).mean().backward();
+    let depth_img =
+        read_vec(
+            depth
+                .img
+                .clone()
+                .slice(s![.., .., 0..raster_out_channels(true, false) as usize]),
+        )
+        .await;
+    let depth_grads = depth
+        .img
+        .slice(s![.., .., 0..raster_out_channels(true, false) as usize])
+        .mean()
+        .backward();
     let depth_transforms = read_vec(depth_splats.transforms.grad(&depth_grads).unwrap()).await;
 
     let plane_depth_splats = test_splats(&device);
@@ -443,8 +488,17 @@ async fn plane_mode_unselected_is_inert() {
         Some(plane_depth_feats),
     )
     .await;
-    let plane_depth_img = read_vec(plane_depth.img.clone().slice(s![.., .., 0..5])).await;
-    let plane_depth_grads = plane_depth.img.slice(s![.., .., 0..5]).mean().backward();
+    let plane_depth_img = read_vec(plane_depth.img.clone().slice(s![
+        ..,
+        ..,
+        0..raster_out_channels(true, false) as usize
+    ]))
+    .await;
+    let plane_depth_grads = plane_depth
+        .img
+        .slice(s![.., .., 0..raster_out_channels(true, false) as usize])
+        .mean()
+        .backward();
     let plane_depth_transforms = read_vec(
         plane_depth_splats
             .transforms
@@ -496,7 +550,11 @@ async fn plane_candidate_selector_matches_legacy() {
         )
         .await;
         let img = read_vec(out.img.clone()).await;
-        let grads = out.img.slice(s![.., .., 5..9]).mean().backward();
+        let grads = out
+            .img
+            .slice(s![.., .., PLANE_LO..PLANE_HI])
+            .mean()
+            .backward();
         let transforms = read_vec(splats.transforms.grad(&grads).expect("transforms grad")).await;
         let opac = read_vec(splats.raw_opacities.grad(&grads).expect("opacity grad")).await;
         results.push((img, transforms, opac));

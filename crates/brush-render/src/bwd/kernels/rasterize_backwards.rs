@@ -17,8 +17,8 @@ use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
 
 use crate::kernels::helpers::{
-    ALPHA_CUTOFF_MID, PLANE_AUX_LANES, alpha_cutoff_weight, alpha_cutoff_weight_deriv,
-    plane_channel_offset, raster_out_channels, read_projected_splat,
+    ALPHA_CUTOFF_MID, PLANE_AUX_LANES, PLANE_AUX_LANES_USIZE, alpha_cutoff_weight,
+    alpha_cutoff_weight_deriv, plane_channel_offset, raster_out_channels, read_projected_splat,
 };
 use crate::kernels::types::{RasterizeUniforms, Splat, Sym2};
 
@@ -26,9 +26,31 @@ use crate::kernels::types::{RasterizeUniforms, Splat, Sym2};
 // sync_cube collapses to a SIMD-lockstep no-op on hardware.
 pub const SPLAT_BATCH: u32 = 32;
 
+// Lane indices within one `v_combined` row. This block is the single source of
+// truth for the layout: `PLANE_GRAD_LANE_START` and `COMPACT_GRAD_LANES` are
+// DERIVED from the last non-plane lane rather than written out, so adding a new
+// non-plane lane moves the plane block instead of silently overlapping it. A
+// hand-written `PLANE_GRAD_LANE_START = 11` encoded the pre-PGSR lane count and
+// would have compiled fine while aliasing the plane values.
+//
+/// Screen-space xy occupies `XY_LANE ..= XY_LANE + 1`.
+pub const XY_LANE: usize = 0;
+/// The symmetric 2D conic occupies `CONIC_LANE ..= CONIC_LANE + 2`.
+pub const CONIC_LANE: usize = XY_LANE + 2;
+/// Per-splat rgb occupies `RGB_LANE ..= RGB_LANE + 2`.
+pub const RGB_LANE: usize = CONIC_LANE + 3;
+/// Gradient w.r.t. the PROJECTED opacity (`Splat::color_a`), not the raw logit.
+pub const ALPHA_LANE: usize = RGB_LANE + 3;
+/// Refinement-only screen-space statistic; written only when
+/// `compute_refine_weight`.
+pub const REFINE_LANE: usize = ALPHA_LANE + 1;
+/// Alpha-composited camera-z of the splat CENTRE; written only when
+/// `render_depth`.
+pub const DEPTH_LANE: usize = REFINE_LANE + 1;
+
 /// First lane of the four PGSR plane-auxiliary VALUE gradients in
 /// `v_combined`. Everything below it is the pre-PGSR layout, unchanged.
-pub const PLANE_GRAD_LANE_START: u32 = 11;
+pub const PLANE_GRAD_LANE_START: usize = DEPTH_LANE + 1;
 
 /// Stride of the compact per-splat backward-gradient buffer (`v_combined`),
 /// indexed by `compact_gid`. The 15 lanes are:
@@ -45,7 +67,7 @@ pub const PLANE_GRAD_LANE_START: u32 = 11;
 /// (11..=14) were appended the same way; the same rule applies, and the sparse
 /// SH-Adam consumer in brush-train plus the finite-diff lane assertions in
 /// brush-bench-test both derive from this constant rather than restating it.
-pub const COMPACT_GRAD_LANES: u32 = PLANE_GRAD_LANE_START + PLANE_AUX_LANES;
+pub const COMPACT_GRAD_LANES: u32 = (PLANE_GRAD_LANE_START + PLANE_AUX_LANES_USIZE) as u32;
 
 /// Per-splat gradient accumulator for the rasterize backward.
 #[derive(CubeType, Copy, Clone)]
@@ -234,23 +256,23 @@ pub fn rasterize_backwards_kernel<A: AtomicAddF32>(
         );
         if splat_active {
             let base = (compact_gid * COMPACT_GRAD_LANES) as usize;
-            A::add(&v_splats[base], grad.xy_x);
-            A::add(&v_splats[base + 1], grad.xy_y);
-            A::add(&v_splats[base + 2], grad.conic_x);
-            A::add(&v_splats[base + 3], grad.conic_y);
-            A::add(&v_splats[base + 4], grad.conic_z);
-            A::add(&v_splats[base + 5], grad.rgb_r);
-            A::add(&v_splats[base + 6], grad.rgb_g);
-            A::add(&v_splats[base + 7], grad.rgb_b);
-            A::add(&v_splats[base + 8], grad.alpha);
+            A::add(&v_splats[base + XY_LANE], grad.xy_x);
+            A::add(&v_splats[base + XY_LANE + 1], grad.xy_y);
+            A::add(&v_splats[base + CONIC_LANE], grad.conic_x);
+            A::add(&v_splats[base + CONIC_LANE + 1], grad.conic_y);
+            A::add(&v_splats[base + CONIC_LANE + 2], grad.conic_z);
+            A::add(&v_splats[base + RGB_LANE], grad.rgb_r);
+            A::add(&v_splats[base + RGB_LANE + 1], grad.rgb_g);
+            A::add(&v_splats[base + RGB_LANE + 2], grad.rgb_b);
+            A::add(&v_splats[base + ALPHA_LANE], grad.alpha);
             if comptime![compute_refine_weight] {
-                A::add(&v_splats[base + 9], grad.refine);
+                A::add(&v_splats[base + REFINE_LANE], grad.refine);
             }
             if comptime![render_depth] {
-                A::add(&v_splats[base + 10], grad.depth);
+                A::add(&v_splats[base + DEPTH_LANE], grad.depth);
             }
             if comptime![render_plane] {
-                let p = base + comptime![PLANE_GRAD_LANE_START as usize];
+                let p = base + PLANE_GRAD_LANE_START;
                 A::add(&v_splats[p], grad.plane_0);
                 A::add(&v_splats[p + 1], grad.plane_1);
                 A::add(&v_splats[p + 2], grad.plane_2);
@@ -622,4 +644,52 @@ fn accumulate_grads_for_batch(
         i += 1u32;
     }
     grad
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ALPHA_LANE, COMPACT_GRAD_LANES, CONIC_LANE, DEPTH_LANE, PLANE_GRAD_LANE_START, REFINE_LANE,
+        RGB_LANE, XY_LANE,
+    };
+    use crate::kernels::helpers::PLANE_AUX_LANES_USIZE;
+
+    /// PINS the current lane layout. The constants above DERIVE from one
+    /// another, which is what stops a new lane from silently overlapping the
+    /// plane block — but a derivation alone would let the layout shift under
+    /// consumers that legitimately encode it out-of-band: the independent VJP
+    /// golden vectors, the derivation doc, and any recorded gradient dump.
+    /// Changing these numbers is therefore a deliberate act, and this test is
+    /// where you acknowledge it.
+    #[test]
+    fn lane_layout_is_pinned_and_the_plane_block_comes_last() {
+        assert_eq!(XY_LANE, 0);
+        assert_eq!(CONIC_LANE, 2);
+        assert_eq!(RGB_LANE, 5);
+        assert_eq!(ALPHA_LANE, 8);
+        assert_eq!(REFINE_LANE, 9);
+        assert_eq!(DEPTH_LANE, 10);
+        assert_eq!(PLANE_GRAD_LANE_START, 11);
+        assert_eq!(COMPACT_GRAD_LANES, 15);
+
+        // The structural invariant the derivation exists to preserve: the plane
+        // block starts after EVERY non-plane lane and the stride covers it.
+        for lane in [
+            XY_LANE + 1,
+            CONIC_LANE + 2,
+            RGB_LANE + 2,
+            ALPHA_LANE,
+            REFINE_LANE,
+            DEPTH_LANE,
+        ] {
+            assert!(
+                lane < PLANE_GRAD_LANE_START,
+                "lane {lane} overlaps the plane block at {PLANE_GRAD_LANE_START}"
+            );
+        }
+        assert_eq!(
+            COMPACT_GRAD_LANES as usize,
+            PLANE_GRAD_LANE_START + PLANE_AUX_LANES_USIZE
+        );
+    }
 }

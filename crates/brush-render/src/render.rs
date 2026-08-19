@@ -159,12 +159,40 @@ pub(crate) async fn render_base_with_plane_aux(
     );
     let plane_aux = plane_aux.map(into_contiguous);
 
-    DimCheck::new()
+    let dim_check = DimCheck::new()
         .check_dims("transforms", &transforms, &["D".into(), 10.into()])
         .check_dims("sh_coeffs", &sh_coeffs, &["D".into(), "C".into(), 3.into()])
         .check_dims("raw_opacities", &raw_opacities, &["D".into()]);
     if let Some(plane_aux) = plane_aux.as_ref() {
-        DimCheck::new().check_dims(
+        // MUST chain into the SAME `DimCheck`. `DimCheck::bound` is
+        // per-instance (dim_check.rs), so a fresh `DimCheck::new()` binds `"D"`
+        // to plane_aux's OWN row count and never compares it to the splat
+        // count — an `[N - 1, 4]` input would validate clean and then read out
+        // of bounds at `plane_aux[global_gid * PLANE_AUX_LANES + 3]` in both
+        // the forward and backward rasterizers. That is silently-zero garbage
+        // (a plausible-looking plane) under the bounds-checked wgpu launch and
+        // undefined behaviour on the unchecked native-MSL backward launch.
+        let shape = plane_aux.shape();
+        // `check_dims` zips the shape against the bound list, so a rank-1 input
+        // would skip the lane bound entirely. Pin the rank explicitly rather
+        // than relying on that zip.
+        assert_eq!(
+            shape.rank(),
+            2,
+            "plane_aux must be rank 2 [total_splats, PLANE_AUX_LANES], got rank {}",
+            shape.rank()
+        );
+        assert_eq!(
+            shape[0],
+            transforms.shape()[0],
+            "plane_aux row count must equal the splat count",
+        );
+        assert_eq!(
+            shape[1],
+            kernels::helpers::PLANE_AUX_LANES_USIZE,
+            "plane_aux must have PLANE_AUX_LANES columns",
+        );
+        dim_check.check_dims(
             "plane_aux",
             plane_aux,
             &[
@@ -203,11 +231,23 @@ pub(crate) async fn render_base_with_plane_aux(
     let device = transforms.device.clone();
     let client = transforms.client.clone();
 
-    // Bound unconditionally: CubeCL kernels take every tensor as a real binding
-    // even when a comptime flag removes all its accesses. A 1-element dummy
-    // keeps the non-plane launches allocation-free.
+    // CubeCL binds every tensor argument even when a comptime flag removes all
+    // of its accesses, so the plane slot always needs SOME buffer.
+    //
+    // `create_tensor` rather than `float_zeros`: the placeholder is never read,
+    // so zero-filling it costs a whole extra GPU dispatch per render — on the
+    // viewer's per-frame path — to initialise four bytes nothing looks at. What
+    // remains is a 4-byte suballocation from CubeCL's memory pool, with no
+    // driver allocation and no dispatch.
+    //
+    // Re-binding an already-bound tensor (e.g. `projected_splats`) instead would
+    // be free, but it does NOT work: CubeCL binds every tensor as
+    // `STORAGE_READ_WRITE` regardless of the kernel declaring `&Tensor`, so wgpu
+    // rejects the second binding with "conflicting usages ... exclusive usage".
+    // Measured, not assumed — it fails `brush-bench-test`'s render tests.
     let plane_aux_arg = plane_aux
-        .unwrap_or_else(|| MainBackendBase::float_zeros([1].into(), &device, FloatDType::F32));
+        .clone()
+        .unwrap_or_else(|| create_tensor([1], &device, DType::F32));
 
     // No projection buffer can be sliced or dispatched for an empty
     // scene. Rasterizing zero tile ranges still gives both output modes

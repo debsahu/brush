@@ -16,6 +16,7 @@ use burn::tensor::{Distribution, Tensor};
 use glam::Vec3;
 use wasm_bindgen_test::wasm_bindgen_test;
 
+mod plane_validation;
 mod raster_bwd_twin;
 mod raster_oracle;
 mod vjp_golden;

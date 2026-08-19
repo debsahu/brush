@@ -26,10 +26,20 @@
 //! Only the `__mixed_contract` cases are replayable. The `__all_live` siblings
 //! describe a configuration this kernel cannot produce (depth in the weight
 //! path); they exist in the reference to prove the drop is a clean subtraction.
+//!
+//! **Do not regenerate the vectors with different inputs to make a failure go
+//! away.** The alphas in particular are chosen, not arbitrary — see section 7
+//! (C3) of the derivation doc, which is the authority on why each case looks the
+//! way it does. `band_centre_cutoff_chain` puts one splat's alpha at the exact
+//! CENTRE of the smoothstep band, where `w = 0.5` and `w' = 1500` are both at
+//! their most discriminating; perturbing that alpha weakens the case's ability
+//! to catch a misplaced cutoff chain.
 
 use crate::{
-    bwd::burn_glue::SplatBwdOps,
-    kernels::helpers::{PLANE_AUX_LANES_USIZE, PROJECTED_LANES_USIZE},
+    bwd::{ALPHA_LANE, CONIC_LANE, DEPTH_LANE, RGB_LANE, XY_LANE, burn_glue::SplatBwdOps},
+    kernels::helpers::{
+        ALPHA_CUTOFF_BAND, ALPHA_CUTOFF_MID, PLANE_AUX_LANES_USIZE, PROJECTED_LANES_USIZE,
+    },
 };
 use brush_cube::{MainBackendBase, Runtime};
 use burn::{
@@ -93,6 +103,28 @@ async fn read_f32(tensor: CubeTensor<WgpuRuntime>) -> Vec<f32> {
         .await
         .expect("readback");
     data.as_slice::<f32>().expect("f32 tensor").to_vec()
+}
+
+/// Host-side twins of `helpers::alpha_cutoff_weight{,_deriv}`, which are
+/// `#[cube]` functions and so are not callable from the CPU. Constants come from
+/// the shared source, not from the golden file, so this decomposition is
+/// independent of the reference's own arithmetic.
+fn cutoff_weight(alpha: f64) -> f64 {
+    let band = f64::from(ALPHA_CUTOFF_BAND);
+    let low = f64::from(ALPHA_CUTOFF_MID) - 0.5 * band;
+    let t = ((alpha - low) / band).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn cutoff_weight_deriv(alpha: f64) -> f64 {
+    let band = f64::from(ALPHA_CUTOFF_BAND);
+    let low = f64::from(ALPHA_CUTOFF_MID) - 0.5 * band;
+    let high = f64::from(ALPHA_CUTOFF_MID) + 0.5 * band;
+    if alpha <= low || alpha >= high {
+        return 0.0;
+    }
+    let t = (alpha - low) / band;
+    (6.0 * t - 6.0 * t * t) / band
 }
 
 fn nums(value: &Value) -> Vec<f64> {
@@ -239,7 +271,7 @@ async fn raster_backward_matches_the_independent_vjp_reference() {
         );
 
         let lanes = crate::bwd::COMPACT_GRAD_LANES as usize;
-        let plane_start = crate::bwd::PLANE_GRAD_LANE_START as usize;
+        let plane_start = crate::bwd::PLANE_GRAD_LANE_START;
         let combined = read_f32(grads.v_combined).await;
         assert_eq!(combined.len(), n * lanes, "{name}: v_combined width");
         assert!(
@@ -249,6 +281,8 @@ async fn raster_backward_matches_the_independent_vjp_reference() {
 
         let expected = &case["expected"];
         let v_opacity = nums(&expected["v_opacity"]);
+        let v_alpha = nums(&expected["v_alpha"]);
+        let v_alpha_eff = nums(&expected["v_alpha_eff"]);
         let v_conic = expected["v_conic"].as_array().expect("v_conic");
         let v_means2d = expected["v_means2d"].as_array().expect("v_means2d");
         let v_values = expected["v_values"].as_array().expect("v_values");
@@ -259,37 +293,76 @@ async fn raster_backward_matches_the_independent_vjp_reference() {
             let c = nums(&v_conic[i]);
             let v = nums(&v_values[i]);
 
-            let mut push = |q: &str, actual: f32, expected: f64| {
-                if let Some(msg) = check(name, q, i, f64::from(actual), expected) {
-                    failures.push(msg);
+            let mut row_failures: Vec<String> = Vec::new();
+            {
+                let mut push = |q: &str, actual: f32, expected: f64| {
+                    if let Some(msg) = check(name, q, i, f64::from(actual), expected) {
+                        row_failures.push(msg);
+                    }
+                };
+                push("v_means2d.x", row[XY_LANE], m[0]);
+                push("v_means2d.y", row[XY_LANE + 1], m[1]);
+                push("v_conic.c00", row[CONIC_LANE], c[0]);
+                push("v_conic.c01", row[CONIC_LANE + 1], c[1]);
+                push("v_conic.c11", row[CONIC_LANE + 2], c[2]);
+                push("v_value.r", row[RGB_LANE], v[0]);
+                push("v_value.g", row[RGB_LANE + 1], v[1]);
+                push("v_value.b", row[RGB_LANE + 2], v[2]);
+                // `ALPHA_LANE` is the gradient w.r.t. the PROJECTED opacity
+                // (`Splat::color_a`), which is the reference's `v_opacity`.
+                // `REFINE_LANE` is the refine-weight statistic and has no
+                // counterpart in the reference.
+                push("v_opacity", row[ALPHA_LANE], v_opacity[i]);
+                push("v_value.depth", row[DEPTH_LANE], v[GOLDEN_DEPTH]);
+                for lane in 0..PLANE_AUX_LANES_USIZE {
+                    push(
+                        &format!("v_value.plane{lane}"),
+                        row[plane_start + lane],
+                        v[GOLDEN_PLANE + lane],
+                    );
                 }
-            };
-            push("v_means2d.x", row[0], m[0]);
-            push("v_means2d.y", row[1], m[1]);
-            push("v_conic.c00", row[2], c[0]);
-            push("v_conic.c01", row[3], c[1]);
-            push("v_conic.c11", row[4], c[2]);
-            push("v_value.r", row[5], v[0]);
-            push("v_value.g", row[6], v[1]);
-            push("v_value.b", row[7], v[2]);
-            // Lane 8 is the gradient w.r.t. the PROJECTED opacity (`color_a`),
-            // which is the reference's `v_opacity`. Lane 9 is the refine-weight
-            // statistic and has no counterpart in the reference.
-            push("v_opacity", row[8], v_opacity[i]);
-            push("v_value.depth", row[10], v[GOLDEN_DEPTH]);
-            for lane in 0..PLANE_AUX_LANES_USIZE {
-                push(
-                    &format!("v_value.plane{lane}"),
-                    row[plane_start + lane],
-                    v[GOLDEN_PLANE + lane],
-                );
             }
+
+            // Decompose the opacity lane back through the chain the kernel
+            // applies AFTER assembling `dot`:
+            //     v_opacity = v_alpha * g,   v_alpha = v_alpha_eff * (w + a*w')
+            // Both factors are recomputed here from the forward state and the
+            // shared cutoff constants, not read from the golden file, so
+            // agreement with the reference's `v_alpha` and `v_alpha_eff` is
+            // direct evidence the cutoff chain is applied exactly once and that
+            // `dot` was assembled BEFORE it. A plane term added after the chain
+            // would reach `v_alpha` without passing through `(w + a*w')`, and
+            // this decomposition would not close.
+            //
+            // `band_centre_cutoff_chain` is the case with teeth: its middle
+            // splat sits at the exact band centre, where the factor is
+            // 6.382353 rather than the 1.0 it collapses to outside the band.
+            let fwd = &case["forward"]["per_splat"][i];
+            if fwd["contributed"].as_bool().unwrap_or(false) {
+                let gaussian = fwd["gaussian"].as_f64().expect("gaussian");
+                let alpha = fwd["alpha"].as_f64().expect("alpha");
+                let chain = cutoff_weight(alpha) + alpha * cutoff_weight_deriv(alpha);
+                let v_alpha_actual = f64::from(row[ALPHA_LANE]) / gaussian;
+                if let Some(msg) = check(name, "v_alpha (derived)", i, v_alpha_actual, v_alpha[i]) {
+                    row_failures.push(msg);
+                }
+                if let Some(msg) = check(
+                    name,
+                    "v_alpha_eff (derived)",
+                    i,
+                    v_alpha_actual / chain,
+                    v_alpha_eff[i],
+                ) {
+                    row_failures.push(msg);
+                }
+            }
+            failures.extend(row_failures);
         }
     }
 
     assert_eq!(
-        checked_cases, 3,
-        "expected the three __mixed_contract golden cases; the JSON copy may be stale"
+        checked_cases, 4,
+        "expected the four __mixed_contract golden cases; the JSON copy may be stale"
     );
     assert!(
         failures.is_empty(),

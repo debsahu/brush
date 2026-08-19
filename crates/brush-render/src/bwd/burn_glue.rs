@@ -141,7 +141,8 @@ pub(crate) trait SplatBwdOps: Backend {
     }
 
     /// Backward pass for projection.
-    /// Reads sparse `v_combined` [`num_visible`, 9], writes dense outputs (scatter in kernel).
+    /// Reads sparse `v_combined` [`num_visible`, `COMPACT_GRAD_LANES`], writes dense
+    /// outputs (scatter in kernel).
     /// `sh_coeffs` is the original (input) SH coefficient tensor — needed
     /// so the kernel can backprop `v_color` through the SH basis to the
     /// view direction and then to the mean.
@@ -386,7 +387,7 @@ impl<B: Backend + InternalSplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackw
         // restated — per the stride-drift history in `rasterize_backwards`.
         if let Some(node) = plane_aux_parent {
             let lanes = crate::kernels::helpers::PLANE_AUX_LANES as usize;
-            let start = crate::bwd::kernels::rasterize_backwards::PLANE_GRAD_LANE_START as usize;
+            let start = crate::bwd::kernels::rasterize_backwards::PLANE_GRAD_LANE_START;
             let zeros = B::float_zeros([total_splats, lanes].into(), &device, FloatDType::F32);
             let v_aux = if render_plane && num_visible > 0 {
                 let compact = B::float_slice(
@@ -1069,12 +1070,18 @@ fn rasterize_bwd_fusion(
 
     impl Operation<FusionCubeRuntime<WgpuRuntime>> for CustomOp {
         fn execute(&self, h: &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>) {
-            let (inputs, outputs) = self.desc.as_fixed();
-
-            // Order must match `input_tensors` below. `plane_aux` is always a
-            // real binding (a 1-element dummy when the plane mode is off) so the
-            // input arity stays fixed.
-            let [
+            // The descriptor's input ARITY varies with the plane mode: the
+            // plane slot is simply absent when it is off. A fixed arity would
+            // need a placeholder tensor, and building one per call puts an
+            // allocation on every training step for a buffer nothing reads.
+            // Duplicating an existing input into the slot is NOT an option here
+            // (unlike the forward's read-only re-bind): `HandleContainer` only
+            // re-inserts a handle it hands out when the tensor's status is
+            // `ReadOnly`, so a uniquely-held input read twice would be removed
+            // on the first read and panic on the second.
+            //
+            // Order must match `input_tensors` below.
+            let (
                 v_output,
                 out_img,
                 projected_splats,
@@ -1082,13 +1089,34 @@ fn rasterize_bwd_fusion(
                 tile_offsets,
                 plane_aux,
                 global_from_compact_gid,
-            ] = inputs;
+                v_combined,
+            ) = if self.render_plane {
+                let (inputs, outputs) = self.desc.as_fixed::<7, 1>();
+                (
+                    &inputs[0],
+                    &inputs[1],
+                    &inputs[2],
+                    &inputs[3],
+                    &inputs[4],
+                    Some(&inputs[5]),
+                    &inputs[6],
+                    &outputs[0],
+                )
+            } else {
+                let (inputs, outputs) = self.desc.as_fixed::<6, 1>();
+                (
+                    &inputs[0],
+                    &inputs[1],
+                    &inputs[2],
+                    &inputs[3],
+                    &inputs[4],
+                    None,
+                    &inputs[5],
+                    &outputs[0],
+                )
+            };
 
-            let [v_combined] = outputs;
-
-            let plane_aux = self
-                .render_plane
-                .then(|| h.get_float_tensor::<MainBackendBase>(plane_aux));
+            let plane_aux = plane_aux.map(|ir| h.get_float_tensor::<MainBackendBase>(ir));
 
             let grads = if self.trusted_forward {
                 <MainBackendBase as InternalSplatBwdOps>::rasterize_bwd_from_forward(
@@ -1136,25 +1164,28 @@ fn rasterize_bwd_fusion(
 
     let client = v_output.client.clone();
     let num_visible = (num_visible_val as usize).max(1);
-    // Always a real binding: CubeCL takes every tensor argument even when a
-    // comptime flag removes all its accesses, so a 1-element dummy keeps the
-    // custom-op input arity fixed instead of forking the descriptor.
-    let plane_aux = plane_aux.unwrap_or_else(|| {
-        <Fusion<MainBackendBase> as FloatTensorOps<Fusion<MainBackendBase>>>::float_zeros(
-            [1].into(),
-            &v_output.device(),
-            FloatDType::F32,
-        )
-    });
-    let input_tensors = [
+    // Variable arity: the plane slot is present only when the plane mode is
+    // on, so the off path allocates nothing. `execute` destructures to match.
+    let mut input_tensors = vec![
         v_output,
         out_img,
         projected_splats,
         compact_gid_from_isect,
         tile_offsets,
-        plane_aux,
-        global_from_compact_gid,
     ];
+    if let Some(plane_aux) = plane_aux {
+        assert!(
+            render_plane,
+            "plane_aux supplied without the plane rasterization mode"
+        );
+        input_tensors.push(plane_aux);
+    } else {
+        assert!(
+            !render_plane,
+            "plane mode requires the [N, PLANE_AUX_LANES] forward input"
+        );
+    }
+    input_tensors.push(global_from_compact_gid);
     // Sparse [num_visible, COMPACT_GRAD_LANES] indexed by compact_gid. Lane 10
     // is the expected-depth gradient (zero/unused when render_depth is false);
     // lanes 11..=14 carry the PGSR plane-aux value gradients.
@@ -1167,11 +1198,11 @@ fn rasterize_bwd_fusion(
         ]),
         DType::F32,
     );
-    let desc = CustomOpIr::new(
-        "rasterize_bwd",
-        &input_tensors.map(|tensor| tensor.into_ir()),
-        &[v_combined_out],
-    );
+    let input_irs: Vec<_> = input_tensors
+        .into_iter()
+        .map(|tensor| tensor.into_ir())
+        .collect();
+    let desc = CustomOpIr::new("rasterize_bwd", &input_irs, &[v_combined_out]);
     let [v_combined] = client
         .register(
             StreamId::current(),

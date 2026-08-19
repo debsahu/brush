@@ -118,10 +118,32 @@ fn rasterize_bwd_impl(
         "plane-mode raster backward requires the [N, PLANE_AUX_LANES] forward input"
     );
     // Bound unconditionally; every access is comptime-removed when
-    // `render_plane` is false. Matches the forward's dummy binding.
+    // `render_plane` is false. Matches the forward's placeholder binding.
+    //
+    // The row count is validated in the forward (`render_base_with_plane_aux`)
+    // against the splat count, and the backward reuses that exact tensor
+    // handle. This entry point is also reachable directly from the in-crate
+    // gradient tests with a hand-built buffer, so re-check what is checkable
+    // here: `num_visible` is not the splat count, so the rows cannot be pinned,
+    // but the rank and lane count can — and those are what make
+    // `plane_aux[global_gid * PLANE_AUX_LANES + 3]` addressable under
+    // `launch_unchecked`.
     let plane_aux = plane_aux.map_or_else(
         || MainBackendBase::float_zeros([1].into(), &device, FloatDType::F32),
-        into_contiguous,
+        |plane_aux| {
+            let shape = plane_aux.shape();
+            assert_eq!(
+                shape.rank(),
+                2,
+                "plane_aux must be rank 2 [total_splats, PLANE_AUX_LANES]"
+            );
+            assert_eq!(
+                shape[1],
+                crate::kernels::helpers::PLANE_AUX_LANES_USIZE,
+                "plane_aux must have PLANE_AUX_LANES columns",
+            );
+            into_contiguous(plane_aux)
+        },
     );
 
     // Sparse [num_visible, COMPACT_GRAD_LANES] indexed by compact_gid. Lane 10

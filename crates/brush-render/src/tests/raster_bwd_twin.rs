@@ -27,7 +27,10 @@
 
 use super::raster_oracle::rasterize_reference_full;
 use crate::{
-    bwd::burn_glue::SplatBwdOps,
+    bwd::{
+        ALPHA_LANE, CONIC_LANE, DEPTH_LANE, PLANE_GRAD_LANE_START, REFINE_LANE, RGB_LANE, XY_LANE,
+        burn_glue::SplatBwdOps,
+    },
     kernels::helpers::{
         ALPHA_CUTOFF_BAND, ALPHA_CUTOFF_MID, PLANE_AUX_LANES_USIZE, PROJECTED_LANES_USIZE,
     },
@@ -347,7 +350,7 @@ async fn run_twin(scene: &[TwinSplat], v_out: &[f32]) -> TwinGrads {
 
     let read = |t: &Tensor<1>| -> Option<Tensor<1>> { t.grad(&grads) };
     let lanes = crate::bwd::COMPACT_GRAD_LANES as usize;
-    let plane_start = crate::bwd::PLANE_GRAD_LANE_START as usize;
+    let plane_start = PLANE_GRAD_LANE_START;
     let mut rows = vec![vec![0.0f32; lanes]; n];
 
     let mut place = |lane: usize, values: Vec<f32>| {
@@ -363,16 +366,16 @@ async fn run_twin(scene: &[TwinSplat], v_out: &[f32]) -> TwinGrads {
             .into_vec::<f32>()
             .expect("vec")
     }
-    place(0, to_vec(read(&xy_x)).await);
-    place(1, to_vec(read(&xy_y)).await);
-    place(2, to_vec(read(&c00)).await);
-    place(3, to_vec(read(&c01)).await);
-    place(4, to_vec(read(&c11)).await);
-    place(8, to_vec(read(&opac)).await);
+    place(XY_LANE, to_vec(read(&xy_x)).await);
+    place(XY_LANE + 1, to_vec(read(&xy_y)).await);
+    place(CONIC_LANE, to_vec(read(&c00)).await);
+    place(CONIC_LANE + 1, to_vec(read(&c01)).await);
+    place(CONIC_LANE + 2, to_vec(read(&c11)).await);
+    place(ALPHA_LANE, to_vec(read(&opac)).await);
     for c in 0..VALUE_CHANS {
         let lane = match c {
-            0..=2 => 5 + c,
-            3 => 10,
+            0..=2 => RGB_LANE + c,
+            3 => DEPTH_LANE,
             _ => plane_start + (c - 4),
         };
         place(lane, to_vec(read(&chan[c])).await);
@@ -477,19 +480,15 @@ async fn check_twin_agreement(opacities: [f32; 3]) {
     let combined = read_f32(grads.v_combined).await;
     assert_eq!(combined.len(), n * lanes);
 
-    // Lane 9 is the refine-weight statistic; it has no twin counterpart.
-    const REFINE_LANE: usize = 9;
+    // The refine-weight lane is a training statistic with no twin counterpart.
     let lane_name = |lane: usize| -> String {
         match lane {
-            0 | 1 => format!("v_means2d[{lane}]"),
-            2..=4 => format!("v_conic[{}]", lane - 2),
-            5..=7 => format!("v_rgb[{}]", lane - 5),
-            8 => "v_opacity".to_owned(),
-            10 => "v_depth".to_owned(),
-            _ => format!(
-                "v_plane[{}]",
-                lane - crate::bwd::PLANE_GRAD_LANE_START as usize
-            ),
+            l if l < CONIC_LANE => format!("v_means2d[{}]", l - XY_LANE),
+            l if l < RGB_LANE => format!("v_conic[{}]", l - CONIC_LANE),
+            l if l < ALPHA_LANE => format!("v_rgb[{}]", l - RGB_LANE),
+            ALPHA_LANE => "v_opacity".to_owned(),
+            DEPTH_LANE => "v_depth".to_owned(),
+            _ => format!("v_plane[{}]", lane - PLANE_GRAD_LANE_START),
         }
     };
 
@@ -628,7 +627,7 @@ async fn plane_lanes_are_inert_without_plane_mode() {
     let plane_lanes = read_f32(plane_grads.v_combined).await;
 
     let lanes = crate::bwd::COMPACT_GRAD_LANES as usize;
-    let plane_start = crate::bwd::PLANE_GRAD_LANE_START as usize;
+    let plane_start = PLANE_GRAD_LANE_START;
     for i in 0..n {
         for lane in plane_start..lanes {
             assert_eq!(

@@ -2015,6 +2015,12 @@ fn plane_scene() -> Scene {
 /// discontinuity and central differences must not straddle one.
 const PLANE_MIN_ALPHA: f32 = 0.1;
 
+// Channel indices, derived from the same `const fn` the kernel uses.
+const ALPHA_CH: usize =
+    brush_render::kernels::helpers::raster_out_channels(false, false) as usize - 1;
+const PLANE_LO: usize = brush_render::kernels::helpers::plane_channel_offset(true) as usize;
+const PLANE_HI: usize = PLANE_LO + brush_render::kernels::helpers::PLANE_AUX_LANES_USIZE;
+
 /// Distinct per-channel weights so no plane channel drops out of the scalar
 /// loss by cancellation (equal weights would let a sign error in one normal
 /// component hide behind another).
@@ -2059,13 +2065,16 @@ fn plane_loss(
     let [h, w, _] = img.dims();
 
     // Channel layout: 0..=3 rgba, 4 centre depth, 5..=8 plane.
-    let plane = img.clone().slice(s![.., .., 5..9]);
+    let plane = img.clone().slice(s![.., .., PLANE_LO..PLANE_HI]);
     let weights = Tensor::<1>::from_floats(PLANE_CHANNEL_WEIGHTS, &device).reshape([1, 1, 4]);
     let channel_term = (plane.clone() * weights).sum();
 
     // The [H, W, 5] contract `plane_depth_from_features` expects: the four plane
     // sums plus the ordinary coverage alpha at channel 3.
-    let feat = Tensor::cat(vec![plane, img.slice(s![.., .., 3..4])], 2);
+    let feat = Tensor::cat(
+        vec![plane, img.slice(s![.., .., ALPHA_CH..ALPHA_CH + 1])],
+        2,
+    );
     let focal = cam.focal(img_size);
     let center = cam.center(img_size);
     let (depth, _, _) = brush_loss::plane_depth_from_features(
@@ -2096,8 +2105,8 @@ async fn plane_depth_mask(
     let [h, w, _] = img.dims();
     let feat = Tensor::cat(
         vec![
-            img.clone().slice(s![.., .., 5..9]),
-            img.clone().slice(s![.., .., 3..4]),
+            img.clone().slice(s![.., .., PLANE_LO..PLANE_HI]),
+            img.clone().slice(s![.., .., ALPHA_CH..ALPHA_CH + 1]),
         ],
         2,
     );
@@ -2114,7 +2123,9 @@ async fn plane_depth_mask(
         0.05,
         100.0,
     );
-    let alpha = img.slice(s![.., .., 3..4]).reshape([h, w]);
+    let alpha = img
+        .slice(s![.., .., ALPHA_CH..ALPHA_CH + 1])
+        .reshape([h, w]);
     let mask: Vec<f32> = read_vec(valid)
         .await
         .into_iter()
@@ -2321,7 +2332,7 @@ async fn fuzz_plane_fused_gradients_stay_finite() {
 
         let img_size = glam::uvec2(24 + (seed as u32 % 3) * 8, 24 + (seed as u32 % 5) * 4);
         let (splats, img) = plane_render(&scene, &std_cam(), img_size, &device).await;
-        let grads = img.slice(s![.., .., 5..9]).mean().backward();
+        let grads = img.slice(s![.., .., PLANE_LO..PLANE_HI]).mean().backward();
 
         for (name, values) in [
             (
