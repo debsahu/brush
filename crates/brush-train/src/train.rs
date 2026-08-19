@@ -4719,7 +4719,7 @@ mod plane_aux_consumer_tests {
     /// rounding. That is exactly why `step()` keeps BOTH orders instead of
     /// unifying them: the `center` order is the one the byte-identity gate pins,
     /// and swapping it for the (equally correct) plane order would perturb the
-    /// recorded playroom_0812 baseline in the last bits.
+    /// recorded `playroom_0812` baseline in the last bits.
     #[tokio::test]
     async fn plane_normal_channels_match_the_center_normal_render() {
         let device =

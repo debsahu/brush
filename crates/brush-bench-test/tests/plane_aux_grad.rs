@@ -161,7 +161,6 @@ async fn plane_aux_gradients_match_finite_diff() {
         let device = device.clone();
         let base_transforms = base_transforms.clone();
         let base_opac = base_opac.clone();
-        let camera = camera.clone();
         let gt = gt.clone();
         async move {
             let theta: Tensor<2> =
