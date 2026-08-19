@@ -260,6 +260,17 @@ async fn plane_forward_parity_a_vs_b() {
 /// which pins that the CENTRE-depth channel's analogous term stays dropped.
 /// A reviewer who "fixes" this test to assert a zero opacity gradient has
 /// misread the design and has silently converted B into A.
+///
+/// **This assertion is nonzero-only and is not sufficient on its own** — if the
+/// plane alpha term were never written, the gradient would still be nonzero
+/// through the value path and this test would pass. The VALUE checks that close
+/// that gap live in brush-render:
+/// `tests::vjp_golden::raster_backward_matches_the_independent_vjp_reference`
+/// (against the float64 reference in `analyze/vjp_reference/`) and
+/// `tests::raster_bwd_twin::raster_backward_matches_the_autodiff_twin` (against
+/// a Burn-autodiff reimplementation of the same contract). This test is the
+/// end-to-end sibling: it is the only one of the three that runs through the
+/// real projection, tiling and autodiff bridge.
 #[tokio::test]
 async fn plane_fused_depth_reaches_opacity() {
     let device =
@@ -302,8 +313,58 @@ async fn plane_fused_depth_reaches_opacity() {
     );
 }
 
+/// Contract row 1 must SURVIVE the plane extension: the CENTRE-depth channel's
+/// alpha term stays dropped even in plane mode.
+///
+/// The two `dot` contributions sit two lines apart in the same function, and a
+/// plane-lane edit that generalised the accumulator over "all aux channels"
+/// would silently resurrect the depth term. The term is linear in `v_out`, so a
+/// cotangent that is one-hot on the centre-depth channel must give **bit-zero**
+/// opacity gradient — not "small". The plane-mode sibling of brush-train's
+/// `depth_loss_does_not_touch_opacity`, which only covers `RgbaAndDepth`.
+#[tokio::test]
+async fn plane_mode_keeps_centre_depth_detached_from_opacity() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let camera = test_camera();
+    let splats = test_splats(&device);
+    let feats = plane_features(splats.transforms.val(), &camera);
+
+    let out = render_splats_with_pass_and_plane_aux(
+        splats.clone(),
+        &camera,
+        IMG,
+        Vec3::ZERO,
+        PASS,
+        Rasterizer::Legacy,
+        RasterizationMode::RgbaDepthPlane,
+        Some(feats),
+    )
+    .await;
+
+    // One-hot on channel 4 (centre depth) only.
+    let grads = out.img.slice(s![.., .., 4..5]).mean().backward();
+    let opac = read_vec(splats.raw_opacities.grad(&grads).expect("opacity grad")).await;
+    let transforms = read_vec(splats.transforms.grad(&grads).expect("transforms grad")).await;
+
+    assert!(
+        opac.iter().all(|v| *v == 0.0),
+        "centre-depth error must not reach opacity even in plane mode; got {opac:?}"
+    );
+    // ...but it must still reach positions through the depth VALUE lane, or the
+    // test would pass on a render that produced no depth gradient at all.
+    assert!(
+        transforms.iter().any(|v| v.abs() > 1e-6),
+        "centre-depth error must still move gaussian positions"
+    );
+}
+
 /// Default-inertness: with the plane mode unselected, the rendered image and
 /// every model gradient are unchanged by the existence of the plane path.
+///
+/// Checked against BOTH pre-existing modes: `Rgba` (4 channels) and
+/// `RgbaAndDepth` (5). The second matters because the plane lanes are appended
+/// after the depth lane, so a stale channel stride would land on depth first.
 #[tokio::test]
 async fn plane_mode_unselected_is_inert() {
     let device =
@@ -350,6 +411,54 @@ async fn plane_mode_unselected_is_inert() {
     assert_parity("rgba forward", &plane_rgba, &rgba_img);
     assert_parity("rgba transforms grad", &plane_transforms, &rgba_transforms);
     assert_parity("rgba opacity grad", &plane_opac, &rgba_opac);
+
+    // The 5-channel mode: rgba + centre depth must be untouched by the plane
+    // extension, forward and backward.
+    let depth_splats = test_splats(&device);
+    let depth = render_splats_with_pass_and_plane_aux(
+        depth_splats.clone(),
+        &camera,
+        IMG,
+        Vec3::ZERO,
+        PASS,
+        Rasterizer::Legacy,
+        RasterizationMode::RgbaAndDepth,
+        None,
+    )
+    .await;
+    let depth_img = read_vec(depth.img.clone().slice(s![.., .., 0..5])).await;
+    let depth_grads = depth.img.slice(s![.., .., 0..5]).mean().backward();
+    let depth_transforms = read_vec(depth_splats.transforms.grad(&depth_grads).unwrap()).await;
+
+    let plane_depth_splats = test_splats(&device);
+    let plane_depth_feats = plane_features(plane_depth_splats.transforms.val(), &camera);
+    let plane_depth = render_splats_with_pass_and_plane_aux(
+        plane_depth_splats.clone(),
+        &camera,
+        IMG,
+        Vec3::ZERO,
+        PASS,
+        Rasterizer::Legacy,
+        RasterizationMode::RgbaDepthPlane,
+        Some(plane_depth_feats),
+    )
+    .await;
+    let plane_depth_img = read_vec(plane_depth.img.clone().slice(s![.., .., 0..5])).await;
+    let plane_depth_grads = plane_depth.img.slice(s![.., .., 0..5]).mean().backward();
+    let plane_depth_transforms = read_vec(
+        plane_depth_splats
+            .transforms
+            .grad(&plane_depth_grads)
+            .unwrap(),
+    )
+    .await;
+
+    assert_parity("rgba+depth forward", &plane_depth_img, &depth_img);
+    assert_parity(
+        "rgba+depth transforms grad",
+        &plane_depth_transforms,
+        &depth_transforms,
+    );
 }
 
 /// The 16x8 "candidate" training tile layout (native-MSL `FINE_RASTER_TILES`)

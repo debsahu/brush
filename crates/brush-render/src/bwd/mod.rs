@@ -23,3 +23,7 @@ pub use features_bwd::render_splat_features;
 /// count the render backward writes, instead of a hand-copied literal that can
 /// drift when a lane is added. See `kernels::rasterize_backwards`.
 pub use kernels::rasterize_backwards::COMPACT_GRAD_LANES;
+/// First lane of the four PGSR plane-auxiliary VALUE gradients inside that
+/// buffer, re-exported for the same reason: consumers slice `11..15` off a
+/// derived constant rather than a hand-copied literal.
+pub use kernels::rasterize_backwards::PLANE_GRAD_LANE_START;

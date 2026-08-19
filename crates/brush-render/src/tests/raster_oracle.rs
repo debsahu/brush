@@ -81,7 +81,7 @@ fn rasterize_reference(
 ///
 /// Depth and the plane lanes have NO background term (matching the kernel) and
 /// are raw composited sums with no alpha division.
-fn rasterize_reference_full(
+pub(super) fn rasterize_reference_full(
     projected: &[f32],
     plane_compact: Option<&[f32]>,
     render_depth: bool,

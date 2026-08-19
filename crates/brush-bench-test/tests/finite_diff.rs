@@ -2161,6 +2161,29 @@ async fn plane_analytical_grads(
 /// comment above. `depth_loss_does_not_touch_opacity` (brush-train) pins the
 /// opposite property for the CENTRE-depth channel; both are correct, and the
 /// asymmetry is the design (plan section 4.5).
+///
+/// # Why finite-differencing the MIXED contract is legitimate here
+///
+/// The shipped backward is a deliberately modified gradient — the centre-depth
+/// channel's alpha term is dropped — so in general it is NOT the derivative of
+/// any scalar function and central differences would rightly disagree. That is
+/// only true when the cotangent on the dropped channel is nonzero. **This loss
+/// puts exactly zero cotangent on channel 4**: it reads channels 5..=8 (plane)
+/// and channel 3 (coverage alpha, which is the ordinary output-alpha term, not
+/// a dropped one) and never channel 4. The dropped term is linear in
+/// `v_out[4]`, so it contributes nothing and the mixed contract coincides with
+/// the true gradient on this loss. Agreement here is therefore evidence the
+/// algebra is right, not evidence the drop is missing —
+/// `plane_mode_keeps_centre_depth_detached_from_opacity` (`plane_parity.rs`) pins
+/// the drop separately with a one-hot cotangent on channel 4.
+///
+/// # Why the scene is not faint
+///
+/// `raw_opac` sits at 1.0-1.3, i.e. alpha ~0.73-0.79 before the gaussian
+/// falloff. A suffix-buffer read/write ordering slip mis-scales the alpha VJP by
+/// `alpha/(1 - alpha)`, which is ~5% at alpha = 0.05 (swallowable by FD noise)
+/// but >3x here. A version of this test on a faint scene would pass through that
+/// bug; this one does not.
 #[tokio::test]
 async fn finite_diff_plane_fused() {
     let device =
