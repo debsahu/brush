@@ -215,6 +215,56 @@ async fn plane_aux_gradients_match_finite_diff() {
         }
     }
 
+    // --- Gradient-sparsity assertion (gsplat's `min_ratio` idea, adapted) ---
+    //
+    // Borrowed from how gsplat validates its own backward: comparing VALUES at a
+    // handful of probe points cannot see a lane/slice off-by-one, which zeroes or
+    // misplaces whole swaths while every surviving value still looks plausible.
+    // The analogous hazard here is `plane_features`' `Tensor::cat` boundary —
+    // channels 0..3 are the normal, channel 3 the offset — and a slice slip there
+    // would silently kill either the quaternion or the mean path.
+    //
+    // Expected pattern, derived from the geometry rather than tuned to the
+    // output: `∂d/∂mean = n_world`, and this slab is tilted about `+Y` ONLY, so
+    // `n_world.y` is exactly 0 and the means' y-column must be exactly 0 for
+    // every splat. The x and z columns and all four quaternion columns must be
+    // live everywhere.
+    let mut live_mean_xz = 0usize;
+    let mut live_quat = 0usize;
+    let mut nonzero_mean_y = 0usize;
+    for i in 0..n {
+        for c in [0usize, 2] {
+            if analytic[i * 10 + c] != 0.0 {
+                live_mean_xz += 1;
+            }
+        }
+        if analytic[i * 10 + 1] != 0.0 {
+            nonzero_mean_y += 1;
+        }
+        for c in 3..7 {
+            if analytic[i * 10 + c] != 0.0 {
+                live_quat += 1;
+            }
+        }
+    }
+    let mean_ratio = live_mean_xz as f32 / (2 * n) as f32;
+    let quat_ratio = live_quat as f32 / (4 * n) as f32;
+    println!(
+        "plane-aux gradient sparsity: mean(x,z) live {mean_ratio:.3}, quat live          {quat_ratio:.3}, mean-y nonzero {nonzero_mean_y} (expected 0)"
+    );
+    assert!(
+        mean_ratio > 0.9,
+        "only {mean_ratio} of the means' in-normal columns carry a gradient; a          slice/lane slip in the plane offset channel looks exactly like this"
+    );
+    assert!(
+        quat_ratio > 0.9,
+        "only {quat_ratio} of the quaternion columns carry a gradient; a slice/lane          slip in the plane normal channels looks exactly like this"
+    );
+    assert_eq!(
+        nonzero_mean_y, 0,
+        "this slab is tilted about +Y only, so the world normal's y component —          and therefore the means' y gradient — must be exactly zero"
+    );
+
     // Probe means (channels 0..3) and quaternions (channels 3..7) on splats
     // spread across the slab. `eps` is small against the 0.4 log-scale margin and
     // against the plane's extent, but large against f32 noise in the loss.
