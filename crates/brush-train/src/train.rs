@@ -4466,3 +4466,332 @@ mod scene_scale_tests {
         assert_eq!(none.metric_weight_scale(), 1.0);
     }
 }
+
+/// WS-A pins for the `--depth-source` consumer wiring: the backward contract of
+/// the plane-aux depth path (§4.5 row 2), and the two bit-identity claims the
+/// `center` default rests on.
+///
+/// The plane MATH is pinned in `plane_feature_tests` and in brush-loss'
+/// `plane_depth_tests`. What is pinned HERE is the wiring the trainer does
+/// around it: which gradients a depth loss on plane depth is allowed to reach,
+/// and that selecting `center` still runs the pre-change op sequence.
+#[cfg(test)]
+mod plane_aux_consumer_tests {
+    use super::*;
+    use brush_loss::plane_depth_from_features;
+    use brush_render::gaussian_splats::SplatRenderMode;
+    use brush_render::kernels::camera_model::CameraModel;
+
+    const IMG: glam::UVec2 = glam::uvec2(48, 48);
+
+    /// A camera that is NOT axis-aligned with the world, so the world→camera
+    /// rotation is a real rotation. `plane_feature_tests` deliberately uses an
+    /// identity-rotation camera to keep its hand-derived signs readable; here the
+    /// rotation is the thing under test, so an identity would pass vacuously.
+    fn tilted_camera() -> Camera {
+        Camera::new(
+            glam::vec3(0.3, -0.4, -5.0),
+            glam::Quat::from_euler(glam::EulerRot::XYZ, 0.12, -0.21, 0.07),
+            0.7,
+            0.7,
+            glam::vec2(0.5, 0.5),
+            CameraModel::Pinhole,
+        )
+    }
+
+    /// A tilted slab of gaussians with WELL-SEPARATED log scales per splat.
+    ///
+    /// The separation is not cosmetic. `splat_normals` picks the thinnest axis
+    /// with a detached `argmin`, so two axes of nearly equal scale put the splat
+    /// on a discontinuity: an infinitesimal parameter change flips which axis is
+    /// "the" normal and the plane jumps. Every gradient assertion below (and the
+    /// finite-difference test in brush-bench-test) requires the scene to sit away
+    /// from that boundary.
+    fn slab(device: &Device) -> Splats {
+        let q = glam::Quat::from_rotation_y(0.5);
+        let e1 = q * glam::vec3(1.0, 0.0, 0.0);
+        let e2 = q * glam::vec3(0.0, 1.0, 0.0);
+
+        let mut means = vec![];
+        let n_side = 7;
+        for iy in 0..n_side {
+            for ix in 0..n_side {
+                let f = |i: i32| (i as f32 / (n_side - 1) as f32) * 2.0 - 1.0;
+                let p = e1 * f(ix) + e2 * f(iy);
+                means.extend_from_slice(&[p.x, p.y, p.z]);
+            }
+        }
+        let n = means.len() / 3;
+        let rotations: Vec<f32> = (0..n).flat_map(|_| [q.w, q.x, q.y, q.z]).collect();
+        // -1.2 / -1.6 / -3.0: every pair is > 0.4 apart in log space, so the
+        // argmin is unambiguous and stays that way under perturbation.
+        let log_scales: Vec<f32> = (0..n).flat_map(|_| [-1.2, -1.6, -3.0]).collect();
+        let sh: Vec<f32> = (0..n).flat_map(|_| [0.5, 0.5, 0.5]).collect();
+        let opac: Vec<f32> = vec![4.0; n];
+
+        Splats::from_raw(
+            means,
+            rotations,
+            log_scales,
+            sh,
+            opac,
+            SplatRenderMode::Default,
+            device,
+        )
+    }
+
+    async fn read<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+        t.into_data_async()
+            .await
+            .expect("tensor readback")
+            .to_vec::<f32>()
+            .expect("f32 tensor")
+    }
+
+    async fn absmax<const D: usize>(t: Tensor<D>) -> f32 {
+        read(t.abs().max()).await[0]
+    }
+
+    /// Render the plane feature pass exactly the way `step()` does, and take the
+    /// production depth loss on the result.
+    ///
+    /// Deliberately the SAME call sequence and the SAME thresholds as the
+    /// trainer, including zeroing the GT at invalid pixels — a pin written
+    /// against a simplified stand-in would not be pinning the shipped path.
+    async fn plane_depth_loss(splats: &Splats, camera: &Camera) -> Tensor<1> {
+        let transforms = splats.transforms.val();
+        let feats = plane_features(transforms.clone(), camera);
+        let feat_img = render_splat_features(
+            transforms,
+            splats.raw_opacities.val(),
+            feats,
+            camera,
+            IMG,
+            SplatRenderMode::Default,
+        )
+        .await;
+
+        let focal = camera.focal(IMG);
+        let center = camera.center(IMG);
+        let (depth, _normal, valid) = plane_depth_from_features(
+            feat_img,
+            focal.x,
+            focal.y,
+            center.x,
+            center.y,
+            PLANE_MIN_ALPHA,
+            PLANE_MIN_DENOM,
+            PLANE_MIN_DEPTH,
+            PLANE_MAX_DEPTH,
+        );
+
+        // A GT that is 10% nearer than the prediction everywhere, so every valid
+        // pixel carries a real, same-signed disparity error. `* valid` is the
+        // trainer's own masking of unsupervised pixels.
+        let gt = depth.clone().detach().mul_scalar(0.9) * valid;
+        depth_loss(depth, gt, None)
+    }
+
+    /// §4.5 row 2: with `plane-aux`, depth error must NOT be able to reach
+    /// opacity.
+    ///
+    /// Approach A gets this for free rather than by construction — the feature
+    /// rasterizer's backward tracks the feature VALUES only (`features_bwd.rs`
+    /// registers a single parent), so the compositing weights are constants and
+    /// there is no alpha VJP to leak through. That is exactly the property
+    /// approach B (`plane-fused`) deliberately gives up, which is why the two
+    /// arms of the ablation are comparable only if this holds here.
+    #[tokio::test]
+    async fn plane_aux_depth_does_not_touch_opacity() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = slab(&device);
+        let camera = tilted_camera();
+
+        let loss = plane_depth_loss(&splats, &camera).await;
+        // Guard against a vacuous pass: a zero loss would satisfy every
+        // assertion below without exercising anything.
+        assert!(
+            read(loss.clone()).await[0] > 1e-6,
+            "the plane depth loss must be nonzero for this pin to mean anything"
+        );
+        let grads = splats.bwd_validate(loss).await;
+
+        match splats.raw_opacities.grad(&grads) {
+            None => {}
+            Some(g) => {
+                let worst = absmax(g).await;
+                assert_eq!(
+                    worst, 0.0,
+                    "plane-aux depth error reached opacity (max |grad| {worst}); \
+                     that is the plane-FUSED contract, not this one"
+                );
+            }
+        }
+    }
+
+    /// §4.5 row 2, the positive half: geometry gradients arrive through the
+    /// feature VALUES — means via the plane offset, quaternions via the normal.
+    ///
+    /// Scales are asserted EXACTLY zero. That is not an oversight to fix later:
+    /// `splat_normals` detaches the thinnest-axis `argmin`, so the plane is a
+    /// function of the quaternion and of a discrete axis CHOICE, and
+    /// differentiating the choice means differentiating a permutation.
+    /// `--flatten-loss-weight` is the scale-side pressure in this design.
+    #[tokio::test]
+    async fn plane_aux_depth_moves_means_and_quats() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = slab(&device);
+        let camera = tilted_camera();
+
+        let loss = plane_depth_loss(&splats, &camera).await;
+        let grads = splats.bwd_validate(loss).await;
+        let g = splats
+            .transforms
+            .grad(&grads)
+            .expect("plane depth must reach the transforms at all");
+
+        let means = absmax(g.clone().slice(s![.., 0..3])).await;
+        let quats = absmax(g.clone().slice(s![.., 3..7])).await;
+        let scales = absmax(g.slice(s![.., 7..10])).await;
+
+        assert!(
+            means > 1e-8,
+            "plane depth must move gaussian MEANS (via the offset channel), got {means}"
+        );
+        assert!(
+            quats > 1e-8,
+            "plane depth must move gaussian QUATERNIONS (via the normal channels), got {quats}"
+        );
+        assert_eq!(
+            scales, 0.0,
+            "the thinnest-axis argmin is detached, so scales must get EXACTLY no \
+             gradient from the plane path; got {scales}"
+        );
+    }
+
+    /// Byte-identity pin 1: the `center` branch now builds its world→camera
+    /// rotation with [`world_to_cam_rot_t`] instead of the inline `glam` unroll
+    /// it used before. That is the ONLY edit inside the default path, so this
+    /// test asserts the two constructions agree BIT for bit — not to a
+    /// tolerance, because a tolerance would not pin byte-identity.
+    #[tokio::test]
+    async fn world_to_cam_rot_t_is_the_inline_construction() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let camera = tilted_camera();
+
+        // Verbatim copy of the pre-change inline construction.
+        let rot = camera.world_to_local().matrix3;
+        let legacy: Tensor<2> = Tensor::<1>::from_floats(
+            [
+                rot.x_axis.x,
+                rot.x_axis.y,
+                rot.x_axis.z,
+                rot.y_axis.x,
+                rot.y_axis.y,
+                rot.y_axis.z,
+                rot.z_axis.x,
+                rot.z_axis.y,
+                rot.z_axis.z,
+            ],
+            &device,
+        )
+        .reshape([3, 3]);
+
+        let got = read(world_to_cam_rot_t(&camera, &device)).await;
+        let want = read(legacy).await;
+        assert_eq!(
+            got, want,
+            "world_to_cam_rot_t must reproduce the inline construction exactly"
+        );
+    }
+
+    /// Byte-identity pin 2, and the claim §4.3 makes about the plane path's
+    /// normal channels: compositing WORLD normals and rotating the image (the
+    /// `center` order) agrees with compositing CAMERA-frame normals directly
+    /// (the `plane-aux` order, which `plane_features` enables by rotating
+    /// per-splat before the rasterizer sees them).
+    ///
+    /// `Σwᵢ(R·nᵢ) = R·(Σwᵢnᵢ)` and `normalize(R·v) = R·normalize(v)` for an
+    /// orthonormal `R`, so they agree analytically; in f32 they agree to
+    /// rounding. That is exactly why `step()` keeps BOTH orders instead of
+    /// unifying them: the `center` order is the one the byte-identity gate pins,
+    /// and swapping it for the (equally correct) plane order would perturb the
+    /// recorded playroom_0812 baseline in the last bits.
+    #[tokio::test]
+    async fn plane_normal_channels_match_the_center_normal_render() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = slab(&device);
+        let camera = tilted_camera();
+        let transforms = splats.transforms.val();
+        let opac = splats.raw_opacities.val();
+        let (h, w) = (IMG.y as usize, IMG.x as usize);
+
+        // --- `center` order: world normals -> composite -> /a -> unit -> R ---
+        let normal_img = render_splat_features(
+            transforms.clone(),
+            opac.clone(),
+            splat_normals(transforms.clone(), camera.position),
+            &camera,
+            IMG,
+            SplatRenderMode::Default,
+        )
+        .await;
+        let a = normal_img.clone().slice(s![.., .., 3..4]).detach();
+        let n_world = normal_img.slice(s![.., .., 0..3]) / a.clone().clamp_min(1e-10);
+        let n_len = n_world
+            .clone()
+            .powi_scalar(2)
+            .sum_dim(2)
+            .sqrt()
+            .clamp_min(1e-6);
+        let n_world = n_world / n_len;
+        let center_n = (n_world.reshape([(h * w) as i32, 3]))
+            .matmul(world_to_cam_rot_t(&camera, &device))
+            .reshape([h, w, 3]);
+
+        // --- `plane-aux` order: camera normals -> composite -> /a -> unit ---
+        let feat_img = render_splat_features(
+            transforms.clone(),
+            opac,
+            plane_features(transforms, &camera),
+            &camera,
+            IMG,
+            SplatRenderMode::Default,
+        )
+        .await;
+        let plane_a = feat_img.clone().slice(s![.., .., 4..5]).detach();
+        let plane_n = normal_alpha_normalize(feat_img.slice(s![.., .., 0..3]), plane_a.clone());
+
+        // Compare only where the pixel is actually covered: the uncovered
+        // background is `0/1e-10` in both, i.e. a normalized zero vector whose
+        // direction is meaningless and whose agreement would prove nothing.
+        let cover = read(plane_a.reshape([h, w])).await;
+        let got = read(plane_n).await;
+        let want = read(center_n).await;
+
+        let mut covered = 0usize;
+        let mut worst = 0.0f32;
+        for i in 0..h * w {
+            if cover[i] < PLANE_MIN_ALPHA {
+                continue;
+            }
+            covered += 1;
+            for c in 0..3 {
+                worst = worst.max((got[i * 3 + c] - want[i * 3 + c]).abs());
+            }
+        }
+        assert!(
+            covered > 400,
+            "expected the slab to cover a real region, got {covered} covered pixels"
+        );
+        assert!(
+            worst < 1e-5,
+            "compositing order changed the rendered normal by {worst}; the two \
+             orders are the same linear map and must agree to f32 rounding"
+        );
+    }
+}
