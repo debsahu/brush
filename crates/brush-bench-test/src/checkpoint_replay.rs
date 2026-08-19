@@ -13,7 +13,7 @@ mod native {
     use brush_dataset::{
         config::LoadDatasetConfig,
         load_dataset,
-        scene::{SceneBatch, sample_to_packed_data, view_to_sample_image},
+        scene::{SceneBatch, view_to_packed_data},
     };
     use brush_render::bwd::burn_glue::lift_splats_to_autodiff;
     use brush_render::{AlphaMode, gaussian_splats::SplatRenderMode};
@@ -121,6 +121,7 @@ mod native {
             alpha_mode: args.alpha_mode,
             train_on_eval: false,
             estimate_metric_scale: false,
+            invert_masks: false,
             // The replay owns its few decoded views directly, so the scene-loader
             // cache is unused. Keep the conventional value for config parity.
             max_scene_batch_cache_size: 6 * 1024 * 1024 * 1024,
@@ -143,8 +144,7 @@ mod native {
                     scene.views.len()
                 )
             })?;
-            let sample = view_to_sample_image(image, view.image.alpha_mode());
-            let (img_packed, has_alpha) = sample_to_packed_data(sample);
+            let (img_packed, has_alpha) = view_to_packed_data(image, view.image.alpha_mode());
             let batch = SceneBatch {
                 img_packed,
                 has_alpha,
