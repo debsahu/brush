@@ -4,3 +4,11 @@ Lod = "Lod"
 ba = "ba"
 # Short for "n delta" in the appearance kernels/tests.
 nd = "nd"
+# Past tense of "to mean" (averaged), not a misspelling of "meant".
+meaned = "meaned"
+# Half of the hyphenated adjective "mis-set" (mis-configured).
+mis = "mis"
+# Loop variable for the y-axis grid index, paired with `ix`.
+iy = "iy"
+# Tensor-library function name (numpy/torch/burn arange), not "arrange".
+arange = "arange"
