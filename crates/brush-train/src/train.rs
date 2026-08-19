@@ -91,6 +91,64 @@ const MIN_SCALE_FACTOR: f32 = 0.1;
 /// contributes roughly this many views to the per-gaussian edge accumulator.
 const EDGE_MIN_VIEW_SAMPLES: u32 = 10;
 
+/// Surviving-pixel fraction below which the normal contradiction gate
+/// (`--normal-gate-degrees`) is suspected of over-masking rather than doing its
+/// job (plan §4.7).
+///
+/// What this detects: the gate is meant to drop LOCALLY contradicted pixels —
+/// transients, reflections, isolated prior-model failures — inside a frame whose
+/// prior is broadly correct. If it is instead discarding most of the frame, the
+/// prior and the render disagree systematically, and the normal loss is being
+/// silently starved of supervision rather than cleaned up.
+///
+/// **Nothing else in the pipeline can see this state**, which is what makes the
+/// guard load-bearing rather than decorative. Verified by reading
+/// `ingest/splatcam/normals_moge.py:120-166` directly:
+///
+/// * That check runs at prior-GENERATION time and compares `MoGe`'s normals
+///   against normals DIFFERENTIATED FROM DEPTH — never against the trained
+///   renderer's output. It cannot observe prior-vs-geometry disagreement at all.
+/// * It reduces to a median across per-frame medians, so it is doubly robust to
+///   outliers by construction and insensitive to any single bad frame.
+/// * It only aborts when that median is ANTI-correlated past `-min_cos`; a
+///   near-zero median passes. And it writes every `.tiff` before evaluating,
+///   so "it refuses to write a bad prior" is not accurate either.
+///
+/// So a miscalibrated threshold — or a gate armed before the renderer's normals
+/// are plausible — sails through that check untouched. And it is invisible in
+/// the trainer too: the masked-mean denominator is the GATED count, so the loss
+/// magnitude stays perfectly normal while the supervision behind it collapses.
+/// There is no loss-curve signal. This log is the only signal.
+const NORMAL_GATE_LOW_FRACTION: f32 = 0.20;
+
+/// Consecutive low samples before the over-masking warning fires.
+///
+/// "Sustained" per plan §4.7: a single low frame is ordinary (a close-up, a
+/// transient filling the view) and must not warn. A run of them is the
+/// systematic case. One good sample resets the counter.
+///
+/// Known transient (measured 2026-08-19, and the reason the run must be
+/// consecutive rather than cumulative): EARLY in training the splats have not
+/// yet covered the frame, so prior pixels with nothing rendered behind them
+/// score `cos ≈ 0` and the gate drops them. On a synthetic 500-step run with a
+/// correct prior this bottomed out at 12% around step 100, warned once, then
+/// climbed to 26% by step 300 and the counter reset — exactly the intended
+/// behaviour. It does not arise under the documented recipe at all, because the
+/// reference arms the gate at ~37.5% of the run (`--normal-gate-start-iter`), by
+/// which time the geometry exists. A run that arms the gate at step 0 should
+/// expect one early warning and read a LATER sustained run as the real signal.
+const NORMAL_GATE_LOW_SAMPLES_TO_WARN: u32 = 3;
+
+/// Target number of contradiction-gate diagnostic samples per refine window.
+///
+/// The sampling stride is derived from `refine_every` (same idiom as
+/// `EDGE_MIN_VIEW_SAMPLES`) rather than being a fresh absolute constant, so the
+/// diagnostic's readback rides a cadence the training loop already runs periodic
+/// device work on instead of introducing a new stall rhythm of its own. On every
+/// other step the diagnostic costs nothing at all — no tensor is built and
+/// nothing is read back.
+const NORMAL_GATE_SAMPLES_PER_WINDOW: u32 = 2;
+
 /// The three per-parameter Adam states of a [`Splats`] module, owned directly
 /// so the trainer can update LR scaling every step and surgically edit the
 /// momentum tensors during refine — all GPU-side, no record round-trips. burn
@@ -232,6 +290,11 @@ pub struct SplatTrainer {
     /// `set_init_scene_scale` is one-shot for the same reason: LOD phases
     /// re-supply cameras, and the scale must not move there either.
     init_scene_scale: Option<f32>,
+    /// Consecutive contradiction-gate samples whose surviving fraction was below
+    /// `NORMAL_GATE_LOW_FRACTION`. Drives the "sustained" half of the
+    /// over-masking warning; reset by any healthy sample. Never touched unless
+    /// `--normal-gate-degrees` is set.
+    normal_gate_low_samples: u32,
     #[cfg(not(target_family = "wasm"))]
     lpips: Option<lpips::LpipsModel>,
 }
@@ -386,7 +449,7 @@ fn rotation_up_to_z(up: glam::Vec3) -> glam::Mat3 {
 /// Mean world-frame "up" direction of a camera set, unit-length.
 ///
 /// **This is the one convention-sensitive line of `scene_scale_from_cameras`,
-/// which is why it is a separate, directly testable function.** The reference
+/// which is why it is a separate, directly testable function.** The `gauss-surf`
 /// PGSR trainer's poses are OpenGL, where camera `+Y` is UP, so it averages the
 /// c2w `+Y` column as-is. Ours are `OpenCV`, where camera `+Y` points DOWN, so the
 /// world-frame up axis is `−(R_c2w · Ŷ)`. Getting the sign wrong yields a
@@ -414,10 +477,16 @@ pub fn mean_camera_up(cameras: &[Camera]) -> glam::Vec3 {
 /// Scene scale in world (metric, for a metric capture) units, computed once from
 /// the training camera poses.
 ///
-/// This is the reference PGSR trainer's `scene_scale` verbatim, and it is
-/// deliberately NOT `BoundingBox::median_size()` or
-/// `splat_init::estimate_scene_scale()` — neither has these semantics, and the
-/// reference's constant ratios only transfer if the scale they divide is the
+/// This is `scene_scale` from the `gauss-surf` PGSR trainer
+/// (rerun-io/examples-monorepo, Apache-2.0, by Pablo Vela), measured from its
+/// `train_gsplat/cache.py` — an implementation detail, not something the PGSR
+/// paper (arXiv:2406.06521) defines. Credited explicitly because the weights
+/// below are divided by this quantity, so anyone questioning a ratio needs to
+/// be able to find what the ratio was calibrated against.
+///
+/// It is deliberately NOT `BoundingBox::median_size()` or
+/// `splat_init::estimate_scene_scale()` — neither has these semantics, and
+/// `gauss-surf`'s constant ratios only transfer if the scale they divide is the
 /// same quantity. The five steps:
 ///
 /// 1. `translation = mean(camera origins)`
@@ -426,7 +495,7 @@ pub fn mean_camera_up(cameras: &[Camera]) -> glam::Vec3 {
 /// 4. `oriented = R · (origin − translation)` for every camera
 /// 5. `scene_scale = max(|component|)` over every oriented origin
 ///
-/// **Convention note.** The reference's poses are OpenGL, where camera `+Y` is
+/// **Convention note.** `gauss-surf`'s poses are OpenGL, where camera `+Y` is
 /// UP, so it averages c2w column 1 directly. Ours are `OpenCV`, where camera `+Y`
 /// is DOWN, so the world-frame up axis is `−(R_c2w · Ŷ)`. The sign matters: a
 /// flipped `up` produces a rotation that differs by 180°, which changes the
@@ -534,6 +603,7 @@ impl SplatTrainer {
             plane_set: None,
             cloud_prune_grid: None,
             init_scene_scale: None,
+            normal_gate_low_samples: 0,
             #[cfg(not(target_family = "wasm"))]
             lpips,
         }
@@ -860,6 +930,68 @@ impl SplatTrainer {
         (self.config.refine_every / EDGE_MIN_VIEW_SAMPLES).max(1)
     }
 
+    /// Steps between contradiction-gate diagnostic samples, derived from the
+    /// refine window like `edge_sample_stride`.
+    fn normal_gate_sample_stride(&self) -> u32 {
+        (self.config.refine_every / NORMAL_GATE_SAMPLES_PER_WINDOW).max(1)
+    }
+
+    /// Whether this step should measure the contradiction gate's surviving
+    /// fraction (plan §4.7).
+    ///
+    /// **False for every step of a default run.** With `--normal-gate-degrees`
+    /// unset `normal_gate_cos_at` is `None`, so the caller builds no diagnostic
+    /// tensor and performs no readback — the diagnostic is as inert as the gate
+    /// it observes. Counts GLOBAL iterations, like the gate's own arming step.
+    fn should_sample_normal_gate(&self, global_iter: u32) -> bool {
+        self.config.normal_gate_cos_at(global_iter).is_some()
+            && global_iter.is_multiple_of(self.normal_gate_sample_stride())
+    }
+
+    /// Record one contradiction-gate sample: log the surviving fraction, and
+    /// warn when it has been low for `NORMAL_GATE_LOW_SAMPLES_TO_WARN`
+    /// consecutive samples. Returns whether the warning fired, for tests.
+    ///
+    /// `surviving` / `valid` are the two counts from
+    /// `brush_loss::normal_gate_counts`. A frame with `valid == 0` carried no
+    /// usable prior, which says nothing about the gate: it is neither logged nor
+    /// counted toward the sustained-low run, and it does not reset it either.
+    ///
+    /// `log::`, not `tracing::` — brush-cli wires `env_logger` with no
+    /// tracing-log bridge, so a `tracing::warn!` here would be invisible in
+    /// exactly the headless runs this guard exists for.
+    fn record_normal_gate_sample(&mut self, global_iter: u32, surviving: f32, valid: f32) -> bool {
+        if !(valid.is_finite() && valid > 0.0) || !surviving.is_finite() {
+            return false;
+        }
+        let fraction = surviving / valid;
+        log::info!(
+            "normal gate: iter {global_iter} kept {:.1}% of prior pixels ({} of {})",
+            fraction * 100.0,
+            surviving as u64,
+            valid as u64
+        );
+        if fraction < NORMAL_GATE_LOW_FRACTION {
+            self.normal_gate_low_samples += 1;
+            if self.normal_gate_low_samples >= NORMAL_GATE_LOW_SAMPLES_TO_WARN {
+                log::warn!(
+                    "normal gate: surviving fraction has been under {:.0}% for {} consecutive \
+                     samples (now {:.1}%). The gate is masking most of the prior rather than \
+                     cleaning it up, so --normal-loss-weight is being starved. Check the \
+                     normal prior's sign/frame convention for this capture, or widen \
+                     --normal-gate-degrees.",
+                    NORMAL_GATE_LOW_FRACTION * 100.0,
+                    self.normal_gate_low_samples,
+                    fraction * 100.0
+                );
+                return true;
+            }
+        } else {
+            self.normal_gate_low_samples = 0;
+        }
+        false
+    }
+
     /// Accumulate this step's GT-view edge score into the refine record (MRNF
     /// port, delta #4). No-op unless `--use-edge-map` is set and this step lands
     /// on the sampling stride. `splats` are the render-time (pre-optimizer-step)
@@ -1105,6 +1237,11 @@ impl SplatTrainer {
             .appearance
             .as_mut()
             .map(|state| state.begin_step(batch.view_index));
+
+        // Contradiction-gate diagnostic sample for this step, if one was taken.
+        // Declared out here so the loss block only ever borrows `self`
+        // immutably; the sustained-low bookkeeping runs after the block.
+        let mut normal_gate_sample: Option<(f32, f32)> = None;
 
         let (mut grads, visible, num_visible, loss_inner, deferred_sh_grad) = {
             // The splats already carry their 3D-filter floor (set at refine);
@@ -1525,20 +1662,38 @@ impl SplatTrainer {
 
                 if use_prior_normal && let Some(normal_data) = &batch.normal {
                     let gt_normal: Tensor<3> = Tensor::from_data(normal_data.clone(), &device);
-                    // NeuRIS per-pixel contradiction gate (arXiv:2206.13597).
-                    // `None` at the default is literally the pre-gate code path.
-                    //
-                    // NOTE (deliberate v1 omission): the plan also calls for
-                    // logging the surviving-pixel fraction and warning when it
-                    // stays below ~20%, which is the signature of a
-                    // systemically sign-flipped prior. That needs a per-step
-                    // device readback plumbed through `TrainStepStats`, so it is
-                    // not done here. The systemic case is already caught
-                    // upstream by `ingest/splatcam/normals_moge.py`'s
-                    // whole-frame median-cosine check, which REFUSES to write a
-                    // prior whose sign disagrees; this gate only handles
-                    // per-pixel contradictions inside frames that passed it.
+                    // NeuRIS per-pixel contradiction gate (arXiv:2206.13597);
+                    // the 30 degree value and its arming step come from the
+                    // `gauss-surf` PGSR trainer (rerun-io/examples-monorepo,
+                    // Apache-2.0, by Pablo Vela). `None` at the default is
+                    // literally the pre-gate code path.
                     let gate_cos = self.config.normal_gate_cos_at(global_iter);
+
+                    // Over-masking diagnostic (plan §4.7). Built ONLY on the
+                    // sampling stride and ONLY when the gate is on, so a default
+                    // run constructs no tensor and reads nothing back. The
+                    // readback is a real device sync, which is why it rides the
+                    // refine-derived cadence rather than firing every step; the
+                    // condition it detects is by definition not a single-step
+                    // event. Counts are stashed here and acted on after this
+                    // block, so the loss path keeps its immutable borrow of
+                    // `self`.
+                    if let Some(gate_cos) = gate_cos
+                        && self.should_sample_normal_gate(global_iter)
+                    {
+                        let counts = brush_loss::normal_gate_counts(
+                            n_cam.clone(),
+                            gt_normal.clone(),
+                            gate_cos,
+                        );
+                        if let Ok(data) = counts.inner().into_data_async().await
+                            && let Ok(v) = data.to_vec::<f32>()
+                            && v.len() == 2
+                        {
+                            normal_gate_sample = Some((v[0], v[1]));
+                        }
+                    }
+
                     loss = loss
                         + normal_loss(n_cam.clone(), gt_normal, gate_cos)
                             * (self.config.normal_loss_weight * normal_ramp);
@@ -1599,9 +1754,10 @@ impl SplatTrainer {
             //     and its THRESHOLD is itself a length      -> metres    -> × s
             //
             // **`--depth-loss-weight` is deliberately NOT in this list, and must
-            // not be "fixed" to match the reference.** The reference divides its
-            // depth weight by the scene scale because its depth loss is a metric
-            // L1 in metres. Ours is DISPARITY-space (`1/m`,
+            // not be "fixed" to match the reference.** The `gauss-surf` PGSR
+            // trainer (rerun-io/examples-monorepo, Apache-2.0, by Pablo Vela)
+            // divides its depth weight by the scene scale because its depth loss
+            // is a metric L1 in metres. Ours is DISPARITY-space (`1/m`,
             // `brush-loss/src/lib.rs` `depth_loss`), so its residual scales as
             // `1/s`, not `s` — dividing by `s` would move the effective weight
             // the WRONG WAY by a factor of `s²`. The dimensionless weights
@@ -1732,6 +1888,13 @@ impl SplatTrainer {
                 deferred_sh_grad,
             )
         };
+
+        // Contradiction-gate over-masking diagnostic (plan §4.7). `None` on
+        // every step of a default run, and on every non-sampling step even when
+        // the gate is on.
+        if let Some((surviving, valid)) = normal_gate_sample {
+            self.record_normal_gate_sample(global_iter, surviving, valid);
+        }
 
         // The optimizer strips autodiff before stepping, so optimizer state
         // (scaling, momentum) lives on the inner device.
@@ -3175,6 +3338,117 @@ mod normal_prior_grad_tests {
     /// (thinnest axis, camera-facing sign). So the only live path from this loss
     /// back into the model is the quaternion, transforms columns 3..7 — not
     /// means, not scales, not opacity. That is the contract this test guards.
+    /// **The over-masking warning, observed firing on real render output.**
+    ///
+    /// A diagnostic that has never been seen to fire is not yet a diagnostic, so
+    /// this drives the whole §4.7 path end to end: render normals, build a prior
+    /// from them, feed the real `normal_gate_counts`, and hand the counts to the
+    /// real `record_normal_gate_sample`.
+    ///
+    /// The contradicted prior here is a SIGN FLIP, chosen only because it is the
+    /// cleanest way to manufacture total disagreement — the counts it produces
+    /// (0 survivors of a nonzero valid count) are the same shape a
+    /// miscalibrated threshold produces, which is the case that actually
+    /// motivates the guard. `ingest/splatcam/normals_moge.py`'s check would
+    /// likely have flagged this particular prior upstream; it could not have
+    /// flagged the miscalibrated one, because it never compares the prior
+    /// against the renderer at all (see `NORMAL_GATE_LOW_FRACTION`).
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)]
+    async fn normal_gate_warning_fires_on_a_contradicted_prior() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = tilted_plane_splats(&device, 0.0);
+        let camera = test_camera();
+
+        let n_cam = render_camera_normals(&splats, &camera).await;
+        let rendered: Vec<f32> = n_cam
+            .clone()
+            .into_data_async()
+            .await
+            .expect("normal readback")
+            .to_vec()
+            .expect("f32 normals");
+
+        // Build the prior FROM the render: exact agreement on covered pixels,
+        // `(0,0,0)` (no prior) where nothing rendered. That isolates the gate —
+        // any masking observed below is the gate's doing, not missing coverage.
+        let mut agreeing = vec![0.0f32; rendered.len()];
+        let mut covered = 0usize;
+        for (dst, src) in agreeing.chunks_exact_mut(3).zip(rendered.chunks_exact(3)) {
+            let len = (src[0] * src[0] + src[1] * src[1] + src[2] * src[2]).sqrt();
+            if len > 0.5 {
+                dst.copy_from_slice(src);
+                covered += 1;
+            }
+        }
+        assert!(
+            covered > 100,
+            "test scene must actually render normals, covered = {covered}"
+        );
+
+        let dims = [IMG.y as usize, IMG.x as usize, 3];
+        let cos30 = 30.0_f32.to_radians().cos();
+
+        let gt_ok = Tensor::<3>::from_data(TensorData::new(agreeing.clone(), dims), &device);
+        let ok: Vec<f32> = brush_loss::normal_gate_counts(n_cam.clone(), gt_ok, cos30)
+            .inner()
+            .into_data_async()
+            .await
+            .expect("counts readback")
+            .to_vec()
+            .expect("f32 counts");
+        assert!((ok[1] - covered as f32).abs() < 1e-3, "valid = {}", ok[1]);
+        assert!(
+            (ok[0] - ok[1]).abs() < 1e-3,
+            "an exactly-agreeing prior must survive the gate entirely: {} of {}",
+            ok[0],
+            ok[1]
+        );
+
+        // Now the sign-flipped prior: same valid pixels, all contradicted.
+        let flipped: Vec<f32> = agreeing.iter().map(|v| -v).collect();
+        let gt_bad = Tensor::<3>::from_data(TensorData::new(flipped, dims), &device);
+        let bad: Vec<f32> = brush_loss::normal_gate_counts(n_cam, gt_bad, cos30)
+            .inner()
+            .into_data_async()
+            .await
+            .expect("counts readback")
+            .to_vec()
+            .expect("f32 counts");
+        assert!((bad[1] - covered as f32).abs() < 1e-3, "valid = {}", bad[1]);
+        assert_eq!(bad[0], 0.0, "a sign-flipped prior must survive nothing");
+
+        // Feed both through the real bookkeeping. The healthy counts never warn;
+        // the contradicted ones warn once the run is sustained.
+        let mut cfg = TrainConfig::default();
+        cfg.normal_gate_degrees = 30.0;
+        let mut trainer = SplatTrainer::new(
+            &cfg,
+            &Default::default(),
+            BoundingBox::from_min_max(glam::Vec3::ZERO, glam::Vec3::ONE),
+        );
+        for i in 0..5 {
+            assert!(
+                !trainer.record_normal_gate_sample(i, ok[0], ok[1]),
+                "a healthy prior must never warn"
+            );
+        }
+        let mut fired = None;
+        for i in 0..NORMAL_GATE_LOW_SAMPLES_TO_WARN {
+            if trainer.record_normal_gate_sample(100 + i, bad[0], bad[1]) {
+                fired = Some(i + 1);
+                break;
+            }
+        }
+        assert_eq!(
+            fired,
+            Some(NORMAL_GATE_LOW_SAMPLES_TO_WARN),
+            "the over-masking warning must fire on the {NORMAL_GATE_LOW_SAMPLES_TO_WARN}th \
+             consecutive contradicted sample"
+        );
+    }
+
     #[tokio::test]
     async fn normal_loss_moves_rotations_only() {
         let device =
@@ -3585,8 +3859,16 @@ mod sparse_sh_adam_autodiff_bridge_tests {
     }
 }
 
-/// Scene-scale helper (`--normalize-metric-weights`). CPU-only: no device, no
-/// tensors — these are pure `glam` arithmetic on camera poses.
+/// WS-L config-surface tests: the scene-scale helper
+/// (`--normalize-metric-weights`) and the contradiction-gate diagnostic's
+/// decision logic. CPU-only — pure `glam` arithmetic on camera poses and pure
+/// bookkeeping; no device and no tensors.
+///
+/// **Merge note.** This module is appended at the end of `train.rs`, as is
+/// WS-1's `plane_feature_tests`. Git's line-level heuristic interleaves the two
+/// into invalid Rust, so integration treats each `#[cfg(test)] mod` as ONE
+/// opaque block. Keep this module self-contained (it takes nothing from outside
+/// `super::*`) and do not append unrelated items after it.
 #[cfg(test)]
 mod scene_scale_tests {
     use super::*;
@@ -3732,6 +4014,102 @@ mod scene_scale_tests {
         // there is no usable scale.
         let one = camera_ring(1, 2.0, glam::Vec3::ZERO, glam::Vec3::Z);
         assert_eq!(scene_scale_from_cameras(&one), None);
+    }
+
+    /// The gate diagnostic must be completely inert at the default.
+    ///
+    /// With `--normal-gate-degrees` unset there is no gate to observe, so the
+    /// trainer must never take a sample — which is what keeps the readback (a
+    /// real device sync) out of every default run.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn normal_gate_diagnostic_is_inert_by_default() {
+        let device = Default::default();
+        let bounds = BoundingBox::from_min_max(glam::Vec3::ZERO, glam::Vec3::ONE);
+
+        let def = SplatTrainer::new(&TrainConfig::default(), &device, bounds);
+        for i in [0u32, 1, 99, 100, 200, 5_000, 15_000, 30_000] {
+            assert!(
+                !def.should_sample_normal_gate(i),
+                "default config sampled the gate at iter {i}"
+            );
+        }
+
+        // Gate on: sampling happens, on the refine-derived stride only.
+        let mut on = TrainConfig::default();
+        on.normal_gate_degrees = 30.0;
+        let stride = on.refine_every / NORMAL_GATE_SAMPLES_PER_WINDOW;
+        assert!(stride > 1, "test assumes a nontrivial stride, got {stride}");
+        let trainer = SplatTrainer::new(&on, &device, bounds);
+        assert!(trainer.should_sample_normal_gate(0));
+        assert!(trainer.should_sample_normal_gate(stride));
+        assert!(trainer.should_sample_normal_gate(stride * 3));
+        assert!(!trainer.should_sample_normal_gate(stride + 1));
+        assert!(!trainer.should_sample_normal_gate(stride - 1));
+
+        // Gate armed later: no sampling before its start iter, even on-stride.
+        let mut late = on;
+        late.normal_gate_start_iter = stride * 4;
+        let trainer = SplatTrainer::new(&late, &device, bounds);
+        assert!(!trainer.should_sample_normal_gate(stride * 2));
+        assert!(trainer.should_sample_normal_gate(stride * 4));
+    }
+
+    /// The sustained-low warning: fires only after a RUN of low samples, resets
+    /// on a healthy one, and ignores frames that carried no prior at all.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn normal_gate_warns_only_when_sustained() {
+        let device = Default::default();
+        let bounds = BoundingBox::from_min_max(glam::Vec3::ZERO, glam::Vec3::ONE);
+        let mut cfg = TrainConfig::default();
+        cfg.normal_gate_degrees = 30.0;
+        let mut t = SplatTrainer::new(&cfg, &device, bounds);
+
+        // A healthy fraction never warns, however often it is sampled.
+        for i in 0..10 {
+            assert!(!t.record_normal_gate_sample(i, 900.0, 1000.0));
+        }
+        assert_eq!(t.normal_gate_low_samples, 0);
+
+        // Low samples accumulate; the warning fires on the Nth, not the first.
+        assert!(!t.record_normal_gate_sample(100, 50.0, 1000.0));
+        assert!(!t.record_normal_gate_sample(200, 50.0, 1000.0));
+        assert!(
+            t.record_normal_gate_sample(300, 50.0, 1000.0),
+            "warning must fire after {NORMAL_GATE_LOW_SAMPLES_TO_WARN} consecutive low samples"
+        );
+        // It keeps firing while the condition persists — it is a sustained state.
+        assert!(t.record_normal_gate_sample(400, 50.0, 1000.0));
+
+        // One healthy sample resets the run.
+        assert!(!t.record_normal_gate_sample(500, 900.0, 1000.0));
+        assert_eq!(t.normal_gate_low_samples, 0);
+        assert!(!t.record_normal_gate_sample(600, 50.0, 1000.0));
+
+        // Exactly at the threshold is NOT low (the comparison is strict).
+        let mut edge = SplatTrainer::new(&cfg, &device, bounds);
+        for i in 0..5 {
+            assert!(!edge.record_normal_gate_sample(i, NORMAL_GATE_LOW_FRACTION * 1000.0, 1000.0));
+        }
+
+        // A frame with no usable prior says nothing about the gate: it must not
+        // count toward the run, and must not reset it either.
+        let mut empty = SplatTrainer::new(&cfg, &device, bounds);
+        assert!(!empty.record_normal_gate_sample(0, 50.0, 1000.0));
+        assert!(!empty.record_normal_gate_sample(1, 0.0, 0.0));
+        assert_eq!(
+            empty.normal_gate_low_samples, 1,
+            "an empty-prior frame must neither advance nor reset the run"
+        );
+        assert!(!empty.record_normal_gate_sample(2, 50.0, 1000.0));
+        assert!(empty.record_normal_gate_sample(3, 50.0, 1000.0));
+
+        // Non-finite counts are ignored rather than propagated into the run.
+        let mut nan = SplatTrainer::new(&cfg, &device, bounds);
+        assert!(!nan.record_normal_gate_sample(0, f32::NAN, 1000.0));
+        assert!(!nan.record_normal_gate_sample(1, 50.0, f32::NAN));
+        assert_eq!(nan.normal_gate_low_samples, 0);
     }
 
     /// `metric_weight_scale()` is an exact 1.0 unless the flag is on AND a scale

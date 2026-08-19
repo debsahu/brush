@@ -588,7 +588,10 @@ pub struct TrainConfig {
     /// so a resumed run does not restart the countdown and an LOD transition
     /// does not re-close the gate.
     ///
-    /// Recipe (reference: start at 20% of the run, ramp over 12.5%):
+    /// Recipe, from the `gauss-surf` PGSR trainer (rerun-io/examples-monorepo,
+    /// Apache-2.0, by Pablo Vela), which starts at step 1,400 and ramps over 875
+    /// of its 7,000 — i.e. 20% of the run, ramping over 12.5%. These are its
+    /// implementation constants, not values either paper states:
     ///   * 15k ablation run: `--normal-ramp-start-iter 3000 --normal-ramp-iters 1875`
     ///   * 30k default run (`--total-train-iters` defaults to 30000):
     ///     `--normal-ramp-start-iter 6000 --normal-ramp-iters 3750`
@@ -609,9 +612,11 @@ pub struct TrainConfig {
     /// Final value of `--depth-normal-weight` after the late consistency bump.
     /// **0.0 = OFF** (constant weight, previous behaviour, byte-identical).
     ///
-    /// The reference bumps its consistency weight 0.50 -> 0.55 late in training
-    /// (from 78.6% of the run, over 7.1%). Units: same dimensionless weight as
-    /// `--depth-normal-weight`.
+    /// The `gauss-surf` PGSR trainer (rerun-io/examples-monorepo, Apache-2.0, by
+    /// Pablo Vela) bumps its consistency weight 0.50 -> 0.55 late in training,
+    /// from step 5,500 over 500 of its 7,000 — 78.6% of the run, over 7.1%.
+    /// Another implementation constant with no counterpart in the papers.
+    /// Units: same dimensionless weight as `--depth-normal-weight`.
     ///
     /// Recipe: at 15k, `--depth-normal-weight-end-start-iter 11800
     /// --depth-normal-weight-end-ramp-iters 1050`; at the 30k default,
@@ -636,7 +641,7 @@ pub struct TrainConfig {
     /// Per-pixel normal contradiction gate, in DEGREES. **0 = OFF** (previous
     /// behaviour, byte-identical).
     ///
-    /// NeuRIS-style (arXiv:2206.13597): a prior-normal pixel whose angle to the
+    /// `NeuRIS`-style (arXiv:2206.13597): a prior-normal pixel whose angle to the
     /// RENDERED normal exceeds this threshold is dropped from
     /// `--normal-loss-weight`'s mask for that step. Both operands are detached
     /// — it is a mask, not a gradient path. The mean is taken over the GATED
@@ -658,8 +663,10 @@ pub struct TrainConfig {
     /// step 0 whenever the gate is on. Units: iterations. Inert unless
     /// `--normal-gate-degrees` > 0.
     ///
-    /// Recipe (reference arms it at 37.5% of the run): ~5600 at 15k, ~11250 at
-    /// the 30k default.
+    /// Recipe: the `gauss-surf` PGSR trainer (rerun-io/examples-monorepo,
+    /// Apache-2.0, by Pablo Vela) arms its 30 degree gate at step 2,625 of
+    /// 7,000 — 37.5% of the run, which is ~5600 at 15k and ~11250 at the 30k
+    /// default. The 30 degrees is `NeuRIS`'s; the arming step is `gauss-surf`'s.
     #[arg(long, help_heading = "Training options", default_value = "0")]
     #[serde(default)]
     pub normal_gate_start_iter: u32,
@@ -1319,12 +1326,18 @@ impl TrainConfig {
     }
 }
 
-/// The reference trainer's linear ramp primitive: `0` before `start`, then
+/// Linear ramp primitive: `0` before `start`, then
 /// `min(1, (step - start + 1) / ramp)`.
+///
+/// Taken from the `gauss-surf` PGSR trainer (rerun-io/examples-monorepo,
+/// Apache-2.0, by Pablo Vela), NOT from the PGSR paper — neither PGSR
+/// (arXiv:2406.06521) nor `NeuRIS` (arXiv:2206.13597) specifies a ramp shape at
+/// all, let alone this one. Credited here so a reader who wants to question the
+/// formula knows where to go and look.
 ///
 /// **The `+ 1` is load-bearing and deliberate.** The ramp is NONZERO at the
 /// start step (it is `1/ramp`, not `0`) and saturates at `start + ramp - 1`,
-/// which is why the reference's stated saturation for `start=1400, ramp=875` is
+/// which is why `gauss-surf`'s saturation for `start=1400, ramp=875` is
 /// step 2274 rather than 2275. An off-by-one here is silent: the run trains
 /// fine, one step out of phase, and never exactly reproduces the reference.
 ///

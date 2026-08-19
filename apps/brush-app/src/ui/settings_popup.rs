@@ -1,7 +1,7 @@
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
-use brush_process::config::TrainStreamConfig;
+use brush_process::config::{DepthSource, TrainConfig, TrainStreamConfig};
 use brush_render::AlphaMode;
 use brush_render::gaussian_splats::SplatRenderMode;
 use egui::{Align2, Slider, Ui};
@@ -38,10 +38,243 @@ fn slider<T>(
     ui.add_enabled(enabled, s);
 }
 
+/// A slider that also carries a hover tooltip, and that CLAMPS typed input to
+/// the range rather than merely displaying it.
+///
+/// Both differences from [`slider`] are deliberate and load-bearing for the
+/// PGSR controls below. `slider` uses `SliderClamping::Never`, so a user can
+/// type a value outside the range; several of the new fields have a
+/// `TrainConfig::validate()` rule behind them, and a config the UI let you build
+/// but the trainer then rejects is worse than one you cannot build. The tooltip
+/// carries what the CLI doc comment carries — units, the OFF sentinel, and the
+/// recipe mapping — so the GUI is not a strictly worse surface than `--help`.
+fn slider_tip<T>(
+    ui: &mut Ui,
+    value: &mut T,
+    range: RangeInclusive<T>,
+    text: &str,
+    enabled: bool,
+    tip: &str,
+) where
+    T: egui::emath::Numeric,
+{
+    let s = Slider::new(value, range)
+        .clamping(egui::SliderClamping::Always)
+        .text(text);
+    ui.add_enabled(enabled, s).on_hover_text(tip);
+}
+
+/// Body of the "Geometry priors" section.
+///
+/// Split out from [`draw_settings`] so the headless tests can lay these
+/// widgets out directly. egui skips a closed `CollapsingHeader`'s closure
+/// entirely, so a test that only calls `draw_settings` never touches any of
+/// them and passes vacuously.
+fn draw_geometry_prior_settings(ui: &mut Ui, tc: &mut TrainConfig, enabled: bool) {
+
+    ui.label("Normal prior");
+    slider_tip(
+        ui,
+        &mut tc.normal_loss_weight,
+        0.0..=1.0,
+        "Normal loss weight (0 disables)",
+        enabled,
+        "L1 against an external normal prior (normal/<stem>.tiff, camera-frame OpenCV unit \
+         normals). Needs prior data; inert without it. Dimensionless. PlanarGS suggests ~0.2.",
+    );
+
+    // NeuRIS-style per-pixel contradiction gate. Range is clamped to
+    // [0, 180] at the widget because `validate()` rejects anything outside
+    // it — the invalid state is unreachable rather than merely refused.
+    slider_tip(
+        ui,
+        &mut tc.normal_gate_degrees,
+        0.0..=180.0,
+        "Contradiction gate (0 disables)",
+        enabled && tc.normal_loss_weight > 0.0,
+        "DEGREES. Drops prior pixels whose angle to the RENDERED normal exceeds this, so \
+         locally contradicted pixels (transients, reflections, prior failures) stop being \
+         supervised. 0 = OFF. Reference value: 30. NeuRIS, arXiv:2206.13597.",
+    );
+    if tc.normal_gate_degrees > 0.0 {
+        slider_tip(
+            ui,
+            &mut tc.normal_gate_start_iter,
+            0..=30000,
+            "Gate start iter (0 = from step 0)",
+            enabled,
+            "Global iteration at which the gate arms. Arming it before the renderer's \
+             normals are plausible makes it mask most of the frame. Recipe: ~5600 at a 15k \
+             run, ~11250 at the 30k default (37.5% of the run).",
+        );
+    }
+
+    ui.separator();
+    ui.label("Depth / normal consistency");
+    slider_tip(
+        ui,
+        &mut tc.depth_normal_weight,
+        0.0..=1.0,
+        "Consistency weight (0 disables)",
+        enabled,
+        "1 - dot between normals derived from the RENDERED depth and the rendered \
+         per-gaussian normals (PlanarGS L_dn). Needs NO prior data at all, so it is the \
+         cheapest of these to try. Dimensionless. PlanarGS suggests ~0.05.",
+    );
+    slider_tip(
+        ui,
+        &mut tc.depth_normal_start_iter,
+        0..=30000,
+        "Consistency start iter (0 = never gate)",
+        enabled && tc.depth_normal_weight > 0.0,
+        "Global iteration at which the consistency term switches on; before it, its render \
+         work is skipped entirely. 2DGS gates the same term at 7k of 30k (~23% of the run).",
+    );
+    slider_tip(
+        ui,
+        &mut tc.depth_normal_weight_end,
+        0.0..=1.0,
+        "Late bump target (0 disables)",
+        enabled && tc.depth_normal_weight > 0.0,
+        "Final consistency weight after a late linear bump. 0 = OFF (constant weight). \
+         gauss-surf bumps 0.50 -> 0.55 from step 5,500 over 500 of its 7,000.",
+    );
+    if tc.depth_normal_weight_end > 0.0 {
+        slider_tip(
+            ui,
+            &mut tc.depth_normal_weight_end_start_iter,
+            0..=30000,
+            "Bump start iter",
+            enabled,
+            "Global iteration at which the late bump starts ramping. Recipe: 11800 at a 15k \
+             run, 23600 at the 30k default (78.6% of the run).",
+        );
+        slider_tip(
+            ui,
+            &mut tc.depth_normal_weight_end_ramp_iters,
+            0..=10000,
+            "Bump ramp length (0 = hard step)",
+            enabled,
+            "Iterations over which the bump ramps. Recipe: 1050 at a 15k run, 2100 at the \
+             30k default (7.1% of the run).",
+        );
+    }
+
+    ui.separator();
+    ui.label("Normal-term ramp");
+    slider_tip(
+        ui,
+        &mut tc.normal_ramp_start_iter,
+        0..=30000,
+        "Ramp start iter (0 disables)",
+        enabled,
+        "Global iteration at which BOTH normal weights above start ramping in from zero. \
+         0 = OFF (full weight from step 0). While the ramp is at exactly 0 the normal render \
+         pass is skipped entirely, not multiplied by zero. Recipe: 3000 at a 15k run, 6000 \
+         at the 30k default (20% of the run).",
+    );
+    if tc.normal_ramp_start_iter > 0 {
+        slider_tip(
+            ui,
+            &mut tc.normal_ramp_iters,
+            0..=10000,
+            "Ramp length (0 = hard step)",
+            enabled,
+            "Iterations over which the ramp climbs to full weight. Recipe: 1875 at a 15k \
+             run, 3750 at the 30k default (12.5% of the run).",
+        );
+    } else {
+        // `validate()` rejects a ramp LENGTH with no start, so the field is
+        // forced back to its inert value while the ramp is off. That makes
+        // the rejected combination unreachable from the UI instead of
+        // letting the user build it and fail at launch.
+        tc.normal_ramp_iters = 0;
+    }
+
+    ui.separator();
+    ui.label("Scale terms (metric-dimensioned)");
+    slider_tip(
+        ui,
+        &mut tc.flatten_loss_weight,
+        0.0..=2.0,
+        "Flatten weight (0 disables)",
+        enabled,
+        "Population mean of each gaussian's smallest activated scale — a soft push toward \
+         surface-aligned gaussians. The term is in METRES. PlanarGS suggests ~1.0.",
+    );
+    slider_tip(
+        ui,
+        &mut tc.scale_reg_weight,
+        0.0..=1.0,
+        "Scale-explosion weight (0 disables)",
+        enabled,
+        "Mean s^2 over activated scales above the threshold below. The term is in METRES \
+         SQUARED. Stipple, arXiv:2608.00931.",
+    );
+    slider_tip(
+        ui,
+        &mut tc.scale_reg_threshold,
+        0.0..=10.0,
+        "Scale-explosion threshold",
+        enabled && tc.scale_reg_weight > 0.0,
+        "Activated-scale threshold above which the regularizer bites. World units (metres \
+         on a metric capture); set it above the surface population's p99 so only the \
+         exploded tail is gated.",
+    );
+    ui.add_enabled(
+        enabled,
+        egui::Checkbox::new(
+            &mut tc.normalize_metric_weights,
+            "Normalize metric weights by scene scale",
+        ),
+    )
+    .on_hover_text(
+        "Divides the two METRIC-dimensioned weights above by the scene scale (flatten by \
+         scale, scale-explosion by scale squared, and its threshold multiplied by scale) so \
+         one recipe transfers between scenes of different physical size. The scale is \
+         captured ONCE from the training camera poses. Depth loss weight is deliberately \
+         NOT normalized: ours is disparity-space, so dividing it would move the effective \
+         weight the wrong way. Default off = byte-identical.",
+    );
+}
+
+/// Force the config into a state `TrainConfig::validate()` accepts.
+///
+/// **Runs unconditionally at the top of [`draw_settings`], deliberately NOT
+/// inside the collapsing section that owns these widgets.** egui does not call a
+/// `CollapsingHeader`'s body closure while the header is closed, so any
+/// invariant enforced inside one holds only while the user happens to have that
+/// section expanded. A config validity rule cannot depend on which panel section
+/// is open. (Found by the headless panel tests below, which is exactly the class
+/// of bug a compile-only check cannot see.)
+///
+/// Silent normalization is the intent: the point is that the rejected states are
+/// UNREACHABLE from the UI, not that they are reported after the fact.
+fn normalize_pgsr_config(tc: &mut TrainConfig) {
+    // validate(): must be finite and within [0, 180].
+    if !tc.normal_gate_degrees.is_finite() {
+        tc.normal_gate_degrees = 0.0;
+    }
+    tc.normal_gate_degrees = tc.normal_gate_degrees.clamp(0.0, 180.0);
+
+    // validate(): a ramp LENGTH with no start is silently inert, so it is
+    // rejected. Zero it whenever the ramp is off.
+    if tc.normal_ramp_start_iter == 0 {
+        tc.normal_ramp_iters = 0;
+    }
+
+    // validate(): must not be negative.
+    if !(tc.depth_normal_weight_end.is_finite() && tc.depth_normal_weight_end >= 0.0) {
+        tc.depth_normal_weight_end = 0.0;
+    }
+}
+
 /// Draw all settings controls for a `TrainStreamConfig`.
 /// When `enabled` is false, individual widgets are greyed out and non-interactive,
 /// but collapsing sections and layout remain fully functional.
 pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: bool) {
+    normalize_pgsr_config(&mut args.train_config);
+
     ui.heading("Training");
     slider(
         ui,
@@ -198,6 +431,52 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
             false,
             enabled,
         );
+
+        // Which depth the loss (and the depth/normal consistency term) is
+        // supervised against. PGSR, arXiv:2406.06521.
+        ui.label("Depth source");
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut tc.depth_source, DepthSource::Center, "Centre")
+                    .on_hover_text(
+                        "Alpha-composited camera-z of splat means. Previous behaviour, and the \
+                         default. A depth loss against it constrains only where along the ray a \
+                         gaussian sits, never its orientation.",
+                    );
+                // The two plane sources are config-only until WS-A (feature
+                // pass) and WS-B (main kernel) wire their consumers. Selecting
+                // one today would silently train exactly like `Centre`, so they
+                // are DISABLED rather than left selectable: an inert control
+                // that looks active is the worse failure. Re-enable each one in
+                // the commit that lands its consumer.
+                ui.add_enabled_ui(false, |ui| {
+                    ui.selectable_value(&mut tc.depth_source, DepthSource::PlaneAux, "Plane (aux)")
+                        .on_hover_text(
+                            "PGSR ray-plane depth via the auxiliary feature pass. NOT YET WIRED \
+                             — the renderer side is still in progress, so this is disabled.",
+                        );
+                    ui.selectable_value(
+                        &mut tc.depth_source,
+                        DepthSource::PlaneFused,
+                        "Plane (fused)",
+                    )
+                    .on_hover_text(
+                        "PGSR ray-plane depth composited in the main rasterize kernel. NOT YET \
+                         WIRED — the renderer side is still in progress, so this is disabled.",
+                    );
+                });
+            });
+        });
+    });
+
+    // Geometry priors: the normal half of DN-Splatter / PlanarGS, plus the PGSR
+    // schedule and gate controls that modulate them. Grouped together because
+    // every knob here is inert on its own — the ramp multiplies the two normal
+    // weights, the gate masks the normal-prior loss, and the metric-weight
+    // normalization divides exactly the flatten / scale-reg pair below. Showing
+    // any of them without its parent weight would be unreadable.
+    ui.collapsing("Geometry priors (normals, PGSR)", |ui| {
+        draw_geometry_prior_settings(ui, &mut args.train_config, enabled);
     });
 
     ui.collapsing("Background", |ui| {
@@ -711,5 +990,127 @@ impl SettingsPopup {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         self.send_args = Some(sender);
         async move { receiver.await.expect("Must be some") }
+    }
+}
+
+/// Headless smoke tests for the settings panel.
+///
+/// `egui::__run_test_ui` runs a real `Ui` against a real `Context` with no
+/// window and no GPU, so these DRIVE the panel rather than merely compiling it:
+/// every widget is laid out and every closure body executes. What they cannot
+/// check is visual layout — that is still unverified by machine.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drawing the panel must not panic, and must leave a config that
+    /// `TrainConfig::validate()` accepts — at defaults and with each of the new
+    /// PGSR controls driven to a live value.
+    #[test]
+    fn draw_settings_produces_only_valid_configs() {
+        let mut args = TrainStreamConfig::default();
+        for enabled in [true, false] {
+            egui::__run_test_ui(|ui| {
+                draw_settings(ui, &mut args, enabled);
+                // Also lay out the collapsed section's body directly: egui
+                // skips a closed CollapsingHeader's closure, so `draw_settings`
+                // alone never touches these widgets.
+                draw_geometry_prior_settings(ui, &mut args.train_config, enabled);
+            });
+            assert_eq!(
+                args.train_config.validate(),
+                Ok(()),
+                "drawing the panel at defaults must leave a valid config"
+            );
+        }
+
+        // Defaults must survive a draw untouched — the panel is a view, and a
+        // widget that writes back a subtly different value on first paint would
+        // break the byte-identity guarantee every one of these fields carries.
+        let def = TrainStreamConfig::default();
+        assert_eq!(args.train_config.depth_source, def.train_config.depth_source);
+        assert_eq!(args.train_config.normal_ramp_start_iter, 0);
+        assert_eq!(args.train_config.normal_ramp_iters, 0);
+        assert_eq!(args.train_config.depth_normal_weight_end, 0.0);
+        assert_eq!(args.train_config.normal_gate_degrees, 0.0);
+        assert!(!args.train_config.normalize_metric_weights);
+
+        // Every new control driven to a live value: the panel must lay them all
+        // out (the conditional sub-controls only exist on this path) and the
+        // result must still validate.
+        let tc = &mut args.train_config;
+        tc.normal_loss_weight = 0.2;
+        tc.depth_normal_weight = 0.05;
+        tc.depth_normal_start_iter = 3000;
+        tc.normal_ramp_start_iter = 3000;
+        tc.normal_ramp_iters = 1875;
+        tc.depth_normal_weight_end = 0.055;
+        tc.depth_normal_weight_end_start_iter = 11800;
+        tc.depth_normal_weight_end_ramp_iters = 1050;
+        tc.normal_gate_degrees = 30.0;
+        tc.normal_gate_start_iter = 5600;
+        tc.normalize_metric_weights = true;
+        tc.flatten_loss_weight = 1.0;
+        tc.scale_reg_weight = 0.1;
+        egui::__run_test_ui(|ui| {
+            draw_settings(ui, &mut args, true);
+            draw_geometry_prior_settings(ui, &mut args.train_config, true);
+        });
+        assert_eq!(args.train_config.validate(), Ok(()));
+        // The panel must not have disturbed any of them.
+        assert_eq!(args.train_config.normal_ramp_iters, 1875);
+        assert_eq!(args.train_config.normal_gate_start_iter, 5600);
+        assert!(args.train_config.normalize_metric_weights);
+    }
+
+    /// The orphan-ramp rule, made UNREACHABLE rather than merely rejected.
+    ///
+    /// `validate()` refuses `normal_ramp_iters != 0` with
+    /// `normal_ramp_start_iter == 0`, because a ramp length with no start is
+    /// silently inert. A user who sets a length and then walks the start back to
+    /// 0 would otherwise build exactly that config and only find out at launch.
+    /// The panel forces the length back to 0 on the same frame.
+    #[test]
+    fn panel_forces_the_orphan_ramp_length_back_to_zero() {
+        let mut args = TrainStreamConfig::default();
+        args.train_config.normal_ramp_start_iter = 3000;
+        args.train_config.normal_ramp_iters = 1875;
+        egui::__run_test_ui(|ui| draw_settings(ui, &mut args, true));
+        assert_eq!(args.train_config.normal_ramp_iters, 1875, "ramp is on: kept");
+
+        // Now the user zeroes the start. Without the guard this is the exact
+        // config `validate()` rejects.
+        args.train_config.normal_ramp_start_iter = 0;
+        let mut orphan = args.clone();
+        orphan.train_config.normal_ramp_iters = 1875;
+        assert!(
+            orphan.train_config.validate().is_err(),
+            "this test is only meaningful while validate() still rejects the orphan"
+        );
+
+        egui::__run_test_ui(|ui| draw_settings(ui, &mut args, true));
+        assert_eq!(
+            args.train_config.normal_ramp_iters, 0,
+            "the panel must zero an orphaned ramp length"
+        );
+        assert_eq!(args.train_config.validate(), Ok(()));
+    }
+
+    /// `normal_gate_degrees` is clamped at the widget, so the out-of-range
+    /// config `validate()` rejects cannot be built by dragging or typing.
+    #[test]
+    fn panel_clamps_the_gate_angle_into_range() {
+        for bad in [-30.0f32, 400.0] {
+            let mut args = TrainStreamConfig::default();
+            args.train_config.normal_gate_degrees = bad;
+            args.train_config.normal_loss_weight = 0.2;
+            egui::__run_test_ui(|ui| draw_settings(ui, &mut args, true));
+            let got = args.train_config.normal_gate_degrees;
+            assert!(
+                (0.0..=180.0).contains(&got),
+                "gate angle {bad} must be clamped into [0, 180], got {got}"
+            );
+            assert_eq!(args.train_config.validate(), Ok(()));
+        }
     }
 }

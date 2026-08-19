@@ -1781,31 +1781,72 @@ pub fn normal_loss(
     gt_normal: Tensor<3>,
     gate_cos: Option<f32>,
 ) -> Tensor<1> {
-    let gt_len = gt_normal.clone().powi_scalar(2).sum_dim(2).sqrt();
-    let mut valid = gt_len.greater_elem(0.5).float();
+    let mut valid = normal_prior_valid_mask(gt_normal.clone());
 
     if let Some(gate_cos) = gate_cos {
-        // Detached on both sides — a mask, never a gradient path. Lengths are
-        // clamped away from zero because invalid `(0,0,0)` prior pixels are
-        // still present here; they are removed by `valid` regardless, and the
-        // clamp keeps the division finite so no NaN can reach the multiply
-        // (the 0·∞ lesson from `normals_from_depth`).
-        let pred_d = pred_normal.clone().detach();
-        let gt_d = gt_normal.clone().detach();
-        let pred_len = pred_d
-            .clone()
-            .powi_scalar(2)
-            .sum_dim(2)
-            .sqrt()
-            .clamp_min(1e-6);
-        let gt_len_d = gt_d.clone().powi_scalar(2).sum_dim(2).sqrt().clamp_min(1e-6);
-        let cos = (pred_d * gt_d).sum_dim(2) / (pred_len * gt_len_d);
-        valid = valid * cos.greater_equal_elem(gate_cos).float();
+        valid = valid * normal_gate_mask(pred_normal.clone(), gt_normal.clone(), gate_cos);
     }
 
     let abs_err = (pred_normal - gt_normal).abs().sum_dim(2) * valid.clone();
 
     abs_err.sum() / valid.sum().mul_scalar(3.0).clamp_min(1.0)
+}
+
+/// Prior-validity mask, `[H, W, 1]`: 1.0 where the prior writer stored a unit
+/// normal, 0.0 at the `(0, 0, 0)` "no prior" sentinel.
+fn normal_prior_valid_mask(gt_normal: Tensor<3>) -> Tensor<3> {
+    gt_normal
+        .powi_scalar(2)
+        .sum_dim(2)
+        .sqrt()
+        .greater_elem(0.5)
+        .float()
+}
+
+/// The contradiction-gate mask, `[H, W, 1]`: 1.0 where the rendered and prior
+/// normals agree to within `gate_cos`.
+///
+/// **Detached on both sides.** This decides WHICH pixels are supervised; it is
+/// never a second gradient path into the rendered normals. Lengths are clamped
+/// away from zero because invalid `(0, 0, 0)` prior pixels are still present
+/// here — they are removed by the validity mask regardless, and the clamp keeps
+/// the division finite so no NaN can reach the multiply (the 0·∞ lesson from
+/// `normals_from_depth`).
+fn normal_gate_mask(pred_normal: Tensor<3>, gt_normal: Tensor<3>, gate_cos: f32) -> Tensor<3> {
+    let pred_d = pred_normal.detach();
+    let gt_d = gt_normal.detach();
+    let pred_len = pred_d
+        .clone()
+        .powi_scalar(2)
+        .sum_dim(2)
+        .sqrt()
+        .clamp_min(1e-6);
+    let gt_len = gt_d.clone().powi_scalar(2).sum_dim(2).sqrt().clamp_min(1e-6);
+    let cos = (pred_d * gt_d).sum_dim(2) / (pred_len * gt_len);
+    cos.greater_equal_elem(gate_cos).float()
+}
+
+/// Diagnostic counts for the contradiction gate, as a 2-element tensor
+/// `[surviving, valid]`.
+///
+/// `valid` is the number of pixels carrying a usable prior; `surviving` is how
+/// many of those the gate kept. **Two counts rather than a ready-made fraction**
+/// so the caller can tell "the gate masked almost everything" (the failure this
+/// exists to surface) apart from "this frame had almost no prior to begin with"
+/// (which says nothing about the gate). A single ratio collapses those into the
+/// same number.
+///
+/// Fully detached and off the autodiff tape: purely observational. Only
+/// meaningful when the gate is on, and only built on the steps the trainer
+/// actually samples — see `SplatTrainer::should_sample_normal_gate`.
+pub fn normal_gate_counts(
+    pred_normal: Tensor<3>,
+    gt_normal: Tensor<3>,
+    gate_cos: f32,
+) -> Tensor<1> {
+    let valid = normal_prior_valid_mask(gt_normal.clone());
+    let surviving = valid.clone() * normal_gate_mask(pred_normal, gt_normal, gate_cos);
+    Tensor::cat(vec![surviving.sum(), valid.sum()], 0).detach()
 }
 
 /// Surface normals derived from a depth map by unprojecting to camera-frame
@@ -2492,6 +2533,79 @@ mod normal_loss_tests {
         // `sum / max(count, 1)` discipline.
         let empty = read(normal_loss(pred, gt, Some(0.999_999))).await[0];
         assert_eq!(empty, 0.0);
+    }
+
+    /// `normal_gate_counts` is the diagnostic behind the "gate is over-masking"
+    /// warning, so it has to be right about both halves of the ratio.
+    ///
+    /// The two-count return is what lets the trainer distinguish "the gate
+    /// masked almost everything" from "this frame barely had a prior" — a
+    /// pre-divided fraction cannot express the difference, and the second case
+    /// must never trip the warning.
+    #[tokio::test]
+    async fn normal_gate_counts_report_survivors_and_valid_pixels() {
+        let device = device().await;
+        let cos30 = 30.0_f32.to_radians().cos();
+
+        // Four pixels: two priors agreeing with the prediction to ~16.7 deg,
+        // two exactly opposed, all four priors valid.
+        let gt = Tensor::<3>::from_data(
+            TensorData::new(
+                vec![
+                    0.0, 0.0, -1.0, //
+                    0.0, 0.0, -1.0, //
+                    0.0, 0.0, -1.0, //
+                    0.0, 0.0, -1.0, //
+                ],
+                [1, 4, 3],
+            ),
+            &device,
+        );
+        let pred = Tensor::<3>::from_data(
+            TensorData::new(
+                vec![
+                    0.0, 0.3, -1.0, //
+                    0.0, 0.3, -1.0, //
+                    0.0, 0.0, 1.0, //
+                    0.0, 0.0, 1.0, //
+                ],
+                [1, 4, 3],
+            ),
+            &device,
+        );
+
+        let counts = read(normal_gate_counts(pred.clone(), gt.clone(), cos30)).await;
+        assert_eq!(counts.len(), 2, "counts must be [surviving, valid]");
+        assert!((counts[0] - 2.0).abs() < 1e-6, "surviving = {}", counts[0]);
+        assert!((counts[1] - 4.0).abs() < 1e-6, "valid = {}", counts[1]);
+
+        // A gate wide enough to admit everything: every valid pixel survives.
+        let wide = read(normal_gate_counts(pred.clone(), gt.clone(), -1.0)).await;
+        assert!((wide[0] - 4.0).abs() < 1e-6, "surviving = {}", wide[0]);
+        assert!((wide[1] - 4.0).abs() < 1e-6, "valid = {}", wide[1]);
+
+        // A gate nothing survives: this is the shape the warning keys on —
+        // zero survivors out of a NONZERO valid count.
+        let none = read(normal_gate_counts(pred, gt, 0.999_999)).await;
+        assert_eq!(none[0], 0.0);
+        assert!((none[1] - 4.0).abs() < 1e-6, "valid = {}", none[1]);
+    }
+
+    /// A frame with no usable prior reports `valid == 0`, NOT a zero fraction.
+    ///
+    /// This is the case that must never trip the over-masking warning: the gate
+    /// discarded nothing, there was simply nothing to discard. Collapsing to a
+    /// ratio here would divide by zero or report 0%, either of which reads as a
+    /// broken gate.
+    #[tokio::test]
+    async fn normal_gate_counts_separate_empty_prior_from_full_masking() {
+        let device = device().await;
+        let gt = Tensor::<3>::from_data(TensorData::new(vec![0.0f32; 12], [1, 4, 3]), &device);
+        let pred = Tensor::<3>::from_data(TensorData::new(vec![1.0f32; 12], [1, 4, 3]), &device);
+
+        let counts = read(normal_gate_counts(pred, gt, 30.0_f32.to_radians().cos())).await;
+        assert_eq!(counts[0], 0.0, "no valid prior means no survivors");
+        assert_eq!(counts[1], 0.0, "valid count must be 0, not clamped to 1");
     }
 
     /// `depth_normal_loss` is 0 when the two normal fields agree, 2 when they
