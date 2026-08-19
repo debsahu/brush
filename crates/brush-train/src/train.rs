@@ -3677,7 +3677,6 @@ mod sparse_sh_adam_autodiff_bridge_tests {
     }
 }
 
-
 /// WS-1 pins for the shared PGSR plane math: the gradient contract of
 /// [`plane_features`], and an end-to-end check that a real rasterized slab's
 /// composited plane features intersect back to the slab.
@@ -3987,7 +3986,6 @@ mod plane_feature_tests {
         }
     }
 }
-
 
 /// Scene-scale helper (`--normalize-metric-weights`). CPU-only: no device, no
 /// tensors — these are pure `glam` arithmetic on camera poses.
