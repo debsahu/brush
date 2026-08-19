@@ -132,7 +132,12 @@ fn resolve_camera_model(
 ) -> Result<CameraModel, FormatError> {
     let f = |o: Option<f64>| o.unwrap_or(0.0) as f32;
     match model_name {
-        None | Some("PERSPECTIVE" | "perspective") => Ok(Pinhole),
+        // `PINHOLE` is COLMAP's name for the same zero-distortion model, and it
+        // turns up in transforms.json routinely (SplatCam writes it; the LFS
+        // recipes push people toward PINHOLE everywhere). Genuinely unsupported
+        // model names still hard-error below -- a silently substituted camera
+        // model is worse than a failed load.
+        None | Some("PERSPECTIVE" | "perspective" | "PINHOLE" | "pinhole") => Ok(Pinhole),
         Some("OPENCV" | "opencv") => Ok(RadialTangential8(RadialTangential8Params {
             k1: f(k1),
             k2: f(k2),
@@ -533,47 +538,24 @@ mod tests {
 /// in a native-only module, in the style of the COLMAP loader's tests.
 #[cfg(all(test, not(target_family = "wasm")))]
 mod prior_tests {
-    use crate::config::LoadDatasetConfig;
-    use crate::formats::{DatasetLoadResult, load_dataset};
+    use crate::formats::prior_test_support::{test_config, write_depth_tiff, write_normal_tiff};
+    use crate::formats::{DatasetError, DatasetLoadResult, FormatError, load_dataset};
+    use brush_render::kernels::camera_model::CameraModel;
     use brush_vfs::BrushVfs;
-    use std::io::Cursor;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use tiff::encoder::{TiffEncoder, colortype};
 
     const IMG_W: u32 = 4;
     const IMG_H: u32 = 3;
 
-    fn encode_gray_f32(values: &[f32], w: u32, h: u32) -> Vec<u8> {
-        let mut buf = Cursor::new(Vec::new());
-        {
-            let mut encoder = TiffEncoder::new(&mut buf).expect("tiff encoder");
-            encoder
-                .write_image::<colortype::Gray32Float>(w, h, values)
-                .expect("write gray f32 tiff");
-        }
-        buf.into_inner()
-    }
-
-    fn encode_rgb_f32(values: &[f32], w: u32, h: u32) -> Vec<u8> {
-        let mut buf = Cursor::new(Vec::new());
-        {
-            let mut encoder = TiffEncoder::new(&mut buf).expect("tiff encoder");
-            encoder
-                .write_image::<colortype::RGB32Float>(w, h, values)
-                .expect("write rgb f32 tiff");
-        }
-        buf.into_inner()
-    }
-
     /// `transforms.json` with a single frame, plus that frame's PNG. Extra
-    /// per-frame keys are spliced in as raw json so each test can declare
-    /// exactly the prior keys it means to exercise.
-    async fn write_dataset(dir: &Path, extra_frame_keys: &str) {
+    /// scene-level and per-frame keys are spliced in as raw json so each test
+    /// can declare exactly what it means to exercise.
+    async fn write_dataset(dir: &Path, extra_scene_keys: &str, extra_frame_keys: &str) {
         let transforms = format!(
             r#"{{
                 "fl_x": 4.0, "fl_y": 3.0, "cx": 2.0, "cy": 1.5,
-                "w": {IMG_W}, "h": {IMG_H},
+                "w": {IMG_W}, "h": {IMG_H}{extra_scene_keys},
                 "frames": [
                     {{
                         "file_path": "images/frame_001.png",
@@ -600,57 +582,23 @@ mod prior_tests {
             .expect("write png");
     }
 
-    async fn write_depth_tiff(path: &Path) {
-        let values = vec![1.5f32; (IMG_W * IMG_H) as usize];
-        tokio::fs::create_dir_all(path.parent().expect("has parent"))
-            .await
-            .expect("create prior dir");
-        tokio::fs::write(path, encode_gray_f32(&values, IMG_W, IMG_H))
-            .await
-            .expect("write depth tiff");
-    }
-
-    async fn write_normal_tiff(path: &Path) {
-        let values: Vec<f32> = (0..(IMG_W * IMG_H))
-            .flat_map(|_| [0.0f32, 0.0, -1.0])
-            .collect();
-        tokio::fs::create_dir_all(path.parent().expect("has parent"))
-            .await
-            .expect("create prior dir");
-        tokio::fs::write(path, encode_rgb_f32(&values, IMG_W, IMG_H))
-            .await
-            .expect("write normal tiff");
-    }
-
-    fn test_config() -> LoadDatasetConfig {
-        LoadDatasetConfig {
-            max_frames: None,
-            max_resolution: 1920,
-            eval_split_every: None,
-            subsample_frames: None,
-            subsample_points: None,
-            alpha_mode: None,
-            invert_masks: false,
-            max_scene_batch_cache_size: 0,
-            train_on_eval: false,
-            estimate_metric_scale: false,
-            features_dir_name: "dino_features".to_owned(),
-        }
-    }
-
     async fn load(dir: &Path) -> DatasetLoadResult {
+        try_load(dir).await.expect("load")
+    }
+
+    async fn try_load(dir: &Path) -> Result<DatasetLoadResult, DatasetError> {
         let vfs = Arc::new(BrushVfs::from_path(dir).await.expect("build vfs"));
-        load_dataset(vfs, &test_config()).await.expect("load")
+        load_dataset(vfs, &test_config()).await
     }
 
     /// The COLMAP-side `depth/<stem>.tiff` + `normal/<stem>.tiff` layout must
-    /// resolve here too — that is the whole point of mirroring the convention.
+    /// resolve here too -- that is the whole point of mirroring the convention.
     #[tokio::test]
     async fn discovers_priors_by_directory_convention() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_dataset(dir.path(), "").await;
-        write_depth_tiff(&dir.path().join("depth/frame_001.tiff")).await;
-        write_normal_tiff(&dir.path().join("normal/frame_001.tiff")).await;
+        write_dataset(dir.path(), "", "").await;
+        write_depth_tiff(&dir.path().join("depth/frame_001.tiff"), IMG_W, IMG_H).await;
+        write_normal_tiff(&dir.path().join("normal/frame_001.tiff"), IMG_W, IMG_H).await;
 
         let result = load(dir.path()).await;
         let view = &result.dataset.train.views[0];
@@ -686,18 +634,19 @@ mod prior_tests {
     }
 
     /// Explicit per-frame keys win, and may point anywhere relative to the
-    /// transforms file — not just at the conventional directories.
+    /// transforms file -- not just at the conventional directories.
     #[tokio::test]
     async fn declared_frame_keys_resolve() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_dataset(
             dir.path(),
+            "",
             ",\n \"depth_file_path\": \"priors/d/frame_001.tiff\",\n \
              \"normal_file_path\": \"priors/n/frame_001.tiff\"",
         )
         .await;
-        write_depth_tiff(&dir.path().join("priors/d/frame_001.tiff")).await;
-        write_normal_tiff(&dir.path().join("priors/n/frame_001.tiff")).await;
+        write_depth_tiff(&dir.path().join("priors/d/frame_001.tiff"), IMG_W, IMG_H).await;
+        write_normal_tiff(&dir.path().join("priors/n/frame_001.tiff"), IMG_W, IMG_H).await;
 
         let result = load(dir.path()).await;
         let view = &result.dataset.train.views[0];
@@ -718,7 +667,7 @@ mod prior_tests {
     #[tokio::test]
     async fn dataset_without_priors_is_unchanged() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_dataset(dir.path(), "").await;
+        write_dataset(dir.path(), "", "").await;
 
         let result = load(dir.path()).await;
         let views = &result.dataset.train.views;
@@ -734,7 +683,12 @@ mod prior_tests {
     #[tokio::test]
     async fn declared_prior_that_is_missing_warns() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_dataset(dir.path(), ",\n \"normal_file_path\": \"normal/nope.tiff\"").await;
+        write_dataset(
+            dir.path(),
+            "",
+            ",\n \"normal_file_path\": \"normal/nope.tiff\"",
+        )
+        .await;
 
         let result = load(dir.path()).await;
         assert!(result.dataset.train.views[0].normal.is_none());
@@ -745,6 +699,49 @@ mod prior_tests {
                 .any(|w| w.contains("normal") && w.contains("nope.tiff")),
             "expected a warning naming the missing prior, got {:?}",
             result.warnings
+        );
+    }
+
+    /// `PINHOLE` is COLMAP's spelling of the zero-distortion model and shows up
+    /// in real transforms.json files (`SplatCam` writes it). It used to fail the
+    /// whole load.
+    #[tokio::test]
+    async fn accepts_pinhole_camera_model() {
+        for spelling in ["PINHOLE", "pinhole", "PERSPECTIVE", "perspective"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_dataset(
+                dir.path(),
+                &format!(", \"camera_model\": \"{spelling}\""),
+                "",
+            )
+            .await;
+
+            let result = load(dir.path()).await;
+            let cam = &result.dataset.train.views[0].camera;
+            assert!(
+                matches!(cam.camera_model, CameraModel::Pinhole),
+                "`{spelling}` must resolve to a pinhole camera",
+            );
+        }
+    }
+
+    /// ...but an unknown model still hard-errors. A silently substituted camera
+    /// model would train a wrong scene without ever saying so.
+    #[tokio::test]
+    async fn rejects_an_unknown_camera_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_dataset(dir.path(), ", \"camera_model\": \"EQUIRECTANGULAR\"", "").await;
+
+        // `DatasetLoadResult` isn't `Debug`, so unwrap the Err arm by hand.
+        let Err(err) = try_load(dir.path()).await else {
+            panic!("an unsupported camera model must fail the load");
+        };
+        assert!(
+            matches!(
+                err,
+                DatasetError::FormatError(FormatError::InvalidCamera(_))
+            ),
+            "expected an InvalidCamera error, got {err:?}"
         );
     }
 }

@@ -315,6 +315,11 @@ fn find_points3d_path<'a>(vfs: &'a BrushVfs, points_dir: &'a Path) -> Option<(&'
 /// tail matches the image's own directory tail, with a stem matching either the
 /// image's full file name or its stem (so both `depth/img.png.tiff` and
 /// `depth/img.tiff` resolve for `images/img.png`).
+///
+/// Matching is by **stem only** -- the candidate's extension is never inspected,
+/// so `depth/img.tif` is found just as `depth/img.tiff` is. The flip side is
+/// that a stray non-TIFF sibling (`depth/img.png`) is also "found" and then
+/// fails in [`crate::load_depth::LoadDepth`] at decode time, not here.
 fn find_prior_path<'a>(vfs: &'a BrushVfs, path: &'a Path, prior_dir: &str) -> Option<&'a Path> {
     let search_name = path.file_name().expect("File must have a name");
     let search_stem = path.file_stem().expect("File must have a name");
@@ -347,6 +352,78 @@ fn find_depth_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Option<&'a Path> {
 /// matching rules as [`find_depth_path`], different directory component.
 fn find_normal_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Option<&'a Path> {
     find_prior_path(vfs, path, "normal")
+}
+
+/// Shared fixtures for the per-format prior-discovery tests (nerfstudio,
+/// `RealityCapture`). Native-only: they write real files, because prior
+/// discovery walks the VFS and can't be exercised on synthesised paths alone.
+#[cfg(all(test, not(target_family = "wasm")))]
+pub(crate) mod prior_test_support {
+    use crate::config::LoadDatasetConfig;
+    use std::io::Cursor;
+    use std::path::Path;
+    use tiff::encoder::{TiffEncoder, colortype};
+
+    /// Single-channel float32 TIFF, the depth-prior wire format.
+    pub(crate) fn encode_gray_f32(values: &[f32], w: u32, h: u32) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut buf).expect("tiff encoder");
+            encoder
+                .write_image::<colortype::Gray32Float>(w, h, values)
+                .expect("write gray f32 tiff");
+        }
+        buf.into_inner()
+    }
+
+    /// 3-channel float32 TIFF, the normal-prior wire format.
+    pub(crate) fn encode_rgb_f32(values: &[f32], w: u32, h: u32) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut buf).expect("tiff encoder");
+            encoder
+                .write_image::<colortype::RGB32Float>(w, h, values)
+                .expect("write rgb f32 tiff");
+        }
+        buf.into_inner()
+    }
+
+    pub(crate) async fn write_depth_tiff(path: &Path, w: u32, h: u32) {
+        let values = vec![1.5f32; (w * h) as usize];
+        tokio::fs::create_dir_all(path.parent().expect("has parent"))
+            .await
+            .expect("create prior dir");
+        tokio::fs::write(path, encode_gray_f32(&values, w, h))
+            .await
+            .expect("write depth tiff");
+    }
+
+    pub(crate) async fn write_normal_tiff(path: &Path, w: u32, h: u32) {
+        // Camera-frame OpenCV unit normals facing the camera (n.z <= 0).
+        let values: Vec<f32> = (0..(w * h)).flat_map(|_| [0.0f32, 0.0, -1.0]).collect();
+        tokio::fs::create_dir_all(path.parent().expect("has parent"))
+            .await
+            .expect("create prior dir");
+        tokio::fs::write(path, encode_rgb_f32(&values, w, h))
+            .await
+            .expect("write normal tiff");
+    }
+
+    pub(crate) fn test_config() -> LoadDatasetConfig {
+        LoadDatasetConfig {
+            max_frames: None,
+            max_resolution: 1920,
+            eval_split_every: None,
+            subsample_frames: None,
+            subsample_points: None,
+            alpha_mode: None,
+            invert_masks: false,
+            max_scene_batch_cache_size: 0,
+            train_on_eval: false,
+            estimate_metric_scale: false,
+            features_dir_name: "dino_features".to_owned(),
+        }
+    }
 }
 
 #[cfg(test)]
