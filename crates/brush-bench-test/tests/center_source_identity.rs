@@ -38,9 +38,14 @@ use brush_render::{
     bounding_box::BoundingBox,
     camera::Camera,
     gaussian_splats::{SplatRenderMode, Splats},
+    kernels::camera_model::CameraModel,
     kernels::camera_model::CameraModel::Pinhole,
+    kernels::camera_model::kannala_brandt_4::KannalaBrandt4Params,
 };
-use brush_train::{config::TrainConfig, train::SplatTrainer};
+use brush_train::{
+    config::{DepthSource, TrainConfig},
+    train::SplatTrainer,
+};
 use burn::tensor::{Device, TensorData};
 use glam::{Quat, Vec3};
 use rand::{RngExt, SeedableRng};
@@ -57,6 +62,83 @@ fn test_camera() -> Camera {
         glam::vec2(0.5, 0.5),
         Pinhole,
     )
+}
+
+/// The same camera with a `KannalaBrandt4` fisheye model instead of a pinhole.
+///
+/// Both the ray-plane grid and `normals_from_depth` assume a pinhole
+/// unprojection, so a plane depth source must WARN AND FALL BACK here rather
+/// than supervise with wrong math.
+fn fisheye_camera() -> Camera {
+    Camera::new(
+        Vec3::new(0.2, -0.3, -5.0),
+        Quat::from_euler(glam::EulerRot::XYZ, 0.10, -0.18, 0.05),
+        0.7,
+        0.7,
+        glam::vec2(0.5, 0.5),
+        CameraModel::KannalaBrandt4(KannalaBrandt4Params {
+            k1: 0.05,
+            k2: -0.01,
+            k3: 0.002,
+            k4: 0.0,
+        }),
+    )
+}
+
+/// A fixed batch: deterministic RGB, and a tilted depth map in front of the
+/// camera with every 11th row invalid so the masked-denominator path is live.
+fn make_batch(camera: Camera) -> SceneBatch {
+    let (h, w) = (IMG.y as usize, IMG.x as usize);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(SEED ^ 0x5eed);
+    let img_packed = TensorData::new(
+        (0..h * w)
+            .map(|_| rng.random_range(0..0x00ff_ffffi32) | 0xff00_0000u32 as i32)
+            .collect::<Vec<i32>>(),
+        [h, w],
+    );
+    let depth: Vec<f32> = (0..h * w)
+        .map(|i| {
+            let (y, x) = (i / w, i % w);
+            if y % 11 == 0 {
+                0.0
+            } else {
+                4.2 + 0.01 * x as f32 + 0.004 * y as f32
+            }
+        })
+        .collect();
+
+    SceneBatch {
+        img_packed,
+        has_alpha: false,
+        alpha_mode: AlphaMode::Transparent,
+        features: None,
+        depth: Some(TensorData::new(depth, [h, w])),
+        normal: None,
+        camera,
+        view_index: 0,
+    }
+}
+
+/// One `SplatTrainer::step` from a fresh trainer and a fresh splat set, as raw
+/// loss bits. Fresh because only step 0 is bit-reproducible (see the module
+/// comment).
+async fn step0_loss_bits(depth_source: DepthSource, camera: Camera, device: &Device) -> u32 {
+    let config = TrainConfig {
+        depth_source,
+        depth_loss_weight: 1.0,
+        depth_normal_weight: 0.05,
+        normal_smooth_weight: 0.1,
+        ..Default::default()
+    };
+    let mut trainer = SplatTrainer::new(
+        &config,
+        device,
+        BoundingBox::from_min_max(Vec3::splat(-2.0), Vec3::splat(2.0)),
+    );
+    let (_next, stats) = trainer.step(make_batch(camera), test_splats(device)).await;
+    let loss: f32 = stats.loss.into_scalar_async().await.expect("loss readback");
+    assert!(loss.is_finite(), "step 0 produced a non-finite loss");
+    loss.to_bits()
 }
 
 fn test_splats(device: &Device) -> Splats {
@@ -125,37 +207,7 @@ async fn center_depth_source_step_loss_bits() {
         BoundingBox::from_min_max(Vec3::splat(-2.0), Vec3::splat(2.0)),
     );
 
-    let (h, w) = (IMG.y as usize, IMG.x as usize);
-    let mut rng = rand::rngs::StdRng::seed_from_u64(SEED ^ 0x5eed);
-    let img_packed = TensorData::new(
-        (0..h * w)
-            .map(|_| rng.random_range(0..0x00ff_ffffi32) | 0xff00_0000u32 as i32)
-            .collect::<Vec<i32>>(),
-        [h, w],
-    );
-    // A depth map in front of the camera with a tilt, plus a band of invalid
-    // (0) pixels so the masked-denominator path is exercised too.
-    let depth: Vec<f32> = (0..h * w)
-        .map(|i| {
-            let (y, x) = (i / w, i % w);
-            if y % 11 == 0 {
-                0.0
-            } else {
-                4.2 + 0.01 * x as f32 + 0.004 * y as f32
-            }
-        })
-        .collect();
-
-    let batch = SceneBatch {
-        img_packed,
-        has_alpha: false,
-        alpha_mode: AlphaMode::Transparent,
-        features: None,
-        depth: Some(TensorData::new(depth, [h, w])),
-        normal: None,
-        camera: test_camera(),
-        view_index: 0,
-    };
+    let batch = make_batch(test_camera());
 
     // --- The gate: the FIRST step's loss, from a fresh trainer. ---
     //
@@ -199,4 +251,81 @@ async fn center_depth_source_step_loss_bits() {
             loss.to_bits()
         );
     }
+}
+
+/// **The `--depth-source` dispatch must be observable in `step()`'s output.**
+///
+/// # The failure mode this guards
+///
+/// Every other WS-A test drives `plane_features` → `render_splat_features` →
+/// `plane_depth_from_features` DIRECTLY. None of them touches the conjunct that
+/// decides whether `step()` actually takes that path:
+///
+/// ```text
+/// use_plane_depth = plane_selected && (use_depth || use_dn) && is_pinhole
+/// ```
+///
+/// Invert any one of those three and `--depth-source plane-aux` silently trains
+/// exactly like `center`. Nothing announces it: the plane math is still correct
+/// and still unit-tested, the loss curve looks normal, the run completes. The
+/// damage lands in the ablation, where **arm 4 silently degenerates into arm 0**
+/// and the recorded conclusion becomes "plane-aux ≈ baseline" for the wrong
+/// reason — the same shape as the verifier's top-ranked hazard for approach B
+/// (B degenerating into A), one layer up.
+///
+/// The centre-vs-plane residual diagnostic only executes INSIDE the
+/// `use_plane_depth` branch, so it is evidence the path is live — but it is a
+/// log line, not a gate. This is the gate.
+///
+/// # Both directions
+///
+/// Asserting only "the losses differ" pins the positive half. A test suite that
+/// stopped there would accept an implementation that took the plane path
+/// unconditionally, ignoring `is_pinhole` — which is worse than not dispatching
+/// at all, because the ray-plane grid assumes a pinhole unprojection and would
+/// supervise fisheye views with wrong math. So the fisheye arm asserts the
+/// complementary thing: on a non-pinhole camera, `plane-aux` must be **bit-equal**
+/// to `center`, because it is required to warn and fall back.
+#[tokio::test]
+async fn plane_aux_dispatch_is_live_in_step() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+
+    // --- Pinhole: the plane path must engage and change the number. ---
+    let center = step0_loss_bits(DepthSource::Center, test_camera(), &device).await;
+    let plane = step0_loss_bits(DepthSource::PlaneAux, test_camera(), &device).await;
+    println!("DISPATCH pinhole  center=0x{center:08x} plane-aux=0x{plane:08x}");
+    assert_ne!(
+        plane, center,
+        "--depth-source plane-aux produced a bit-identical step loss to center on \
+         a PINHOLE camera with a depth loss active: the plane path is not being \
+         taken, and ablation arm 4 would silently be a rerun of arm 0"
+    );
+
+    // Guard the guard: `center` must be reproducible, or `assert_ne!` above
+    // would pass on run-to-run noise rather than on the dispatch.
+    let center_again = step0_loss_bits(DepthSource::Center, test_camera(), &device).await;
+    assert_eq!(
+        center, center_again,
+        "the center step-0 loss is not reproducible, so the inequality above \
+         cannot be attributed to the depth source"
+    );
+
+    // --- Fisheye: the plane path must NOT engage, and must fall back exactly. ---
+    let fish_center = step0_loss_bits(DepthSource::Center, fisheye_camera(), &device).await;
+    let fish_plane = step0_loss_bits(DepthSource::PlaneAux, fisheye_camera(), &device).await;
+    println!("DISPATCH fisheye  center=0x{fish_center:08x} plane-aux=0x{fish_plane:08x}");
+    assert_eq!(
+        fish_plane, fish_center,
+        "--depth-source plane-aux changed the step loss on a NON-PINHOLE camera; \
+         it is required to warn and fall back to centre depth there, because the \
+         ray-plane grid assumes a pinhole unprojection"
+    );
+
+    // And the fisheye arm must not have passed by both sides being degenerate.
+    assert_ne!(
+        fish_center, center,
+        "the fisheye and pinhole cameras produced identical losses, so the \
+         fallback assertion above proves nothing"
+    );
 }
