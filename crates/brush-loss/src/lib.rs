@@ -1758,13 +1758,100 @@ pub fn rgb_grad_weight(gt_rgb: Tensor<3>, sigma: f32) -> Tensor<2> {
 /// yields 0 rather than NaN.
 ///
 /// L1 (not `1 - cos`) matches DN-Splatter's default normal loss.
-pub fn normal_loss(pred_normal: Tensor<3>, gt_normal: Tensor<3>) -> Tensor<1> {
-    let gt_len = gt_normal.clone().powi_scalar(2).sum_dim(2).sqrt();
-    let valid = gt_len.greater_elem(0.5).float();
+///
+/// `gate_cos` is the optional NeuRIS-style per-pixel contradiction gate
+/// (arXiv:2206.13597), as a COSINE threshold (the caller converts from degrees;
+/// `TrainConfig::normal_gate_cos_at` does this). `None` is the pre-gate code
+/// path exactly — no extra tensor op is constructed at all.
+///
+/// When set, a pixel additionally requires
+/// `dot(normalize(pred.detach()), normalize(gt.detach())) >= gate_cos`. **Both
+/// operands are detached**: this is a mask on which pixels are supervised, not a
+/// second gradient path into the rendered normals. Locally contradicted pixels
+/// — transients, reflections, prior-model failures inside an otherwise-good
+/// frame — drop out.
+///
+/// The denominator is the GATED valid count, so surviving pixels keep full
+/// per-pixel magnitude. An unrenormalized denominator would silently anneal the
+/// entire term as the gate tightens, conflating gate strength with the weight
+/// schedule. An empty mask still yields a differentiable exact 0 via the
+/// `clamp_min(1.0)`, matching the reference's `sum / max(count, 1)` discipline.
+pub fn normal_loss(
+    pred_normal: Tensor<3>,
+    gt_normal: Tensor<3>,
+    gate_cos: Option<f32>,
+) -> Tensor<1> {
+    let mut valid = normal_prior_valid_mask(gt_normal.clone());
+
+    if let Some(gate_cos) = gate_cos {
+        valid = valid * normal_gate_mask(pred_normal.clone(), gt_normal.clone(), gate_cos);
+    }
 
     let abs_err = (pred_normal - gt_normal).abs().sum_dim(2) * valid.clone();
 
     abs_err.sum() / valid.sum().mul_scalar(3.0).clamp_min(1.0)
+}
+
+/// Prior-validity mask, `[H, W, 1]`: 1.0 where the prior writer stored a unit
+/// normal, 0.0 at the `(0, 0, 0)` "no prior" sentinel.
+fn normal_prior_valid_mask(gt_normal: Tensor<3>) -> Tensor<3> {
+    gt_normal
+        .powi_scalar(2)
+        .sum_dim(2)
+        .sqrt()
+        .greater_elem(0.5)
+        .float()
+}
+
+/// The contradiction-gate mask, `[H, W, 1]`: 1.0 where the rendered and prior
+/// normals agree to within `gate_cos`.
+///
+/// **Detached on both sides.** This decides WHICH pixels are supervised; it is
+/// never a second gradient path into the rendered normals. Lengths are clamped
+/// away from zero because invalid `(0, 0, 0)` prior pixels are still present
+/// here — they are removed by the validity mask regardless, and the clamp keeps
+/// the division finite so no NaN can reach the multiply (the 0·∞ lesson from
+/// `normals_from_depth`).
+fn normal_gate_mask(pred_normal: Tensor<3>, gt_normal: Tensor<3>, gate_cos: f32) -> Tensor<3> {
+    let pred_d = pred_normal.detach();
+    let gt_d = gt_normal.detach();
+    let pred_len = pred_d
+        .clone()
+        .powi_scalar(2)
+        .sum_dim(2)
+        .sqrt()
+        .clamp_min(1e-6);
+    let gt_len = gt_d
+        .clone()
+        .powi_scalar(2)
+        .sum_dim(2)
+        .sqrt()
+        .clamp_min(1e-6);
+    let cos = (pred_d * gt_d).sum_dim(2) / (pred_len * gt_len);
+    cos.greater_equal_elem(gate_cos).float()
+}
+
+/// Diagnostic counts for the contradiction gate, as a 2-element tensor
+/// `[surviving, valid]`.
+///
+/// `valid` is the number of pixels carrying a usable prior; `surviving` is how
+/// many of those the gate kept. **Two counts rather than a ready-made fraction**
+/// so the caller can tell "the gate masked almost everything" (the failure this
+/// exists to surface) apart from "this frame had almost no prior to begin with"
+/// (which says nothing about the gate). A single ratio collapses those into the
+/// same number.
+///
+/// Fully detached and off the autodiff tape: purely observational. Only
+/// meaningful when the gate is on, and only built on the steps the trainer
+/// actually samples — see `SplatTrainer::should_sample_normal_gate`.
+pub fn normal_gate_counts(
+    pred_normal: Tensor<3>,
+    gt_normal: Tensor<3>,
+    gate_cos: f32,
+) -> Tensor<1> {
+    let valid = normal_prior_valid_mask(gt_normal.clone());
+    let surviving = valid.clone() * normal_gate_mask(pred_normal, gt_normal, gate_cos);
+    Tensor::cat(vec![surviving.sum(), valid.sum()], 0).detach()
 }
 
 /// Surface normals derived from a depth map by unprojecting to camera-frame
@@ -2338,7 +2425,7 @@ mod normal_loss_tests {
             &device,
         );
 
-        let loss = read(normal_loss(pred, gt)).await[0];
+        let loss = read(normal_loss(pred, gt, None)).await[0];
         // |0.3| spread over 1 valid pixel * 3 channels.
         assert!((loss - 0.1).abs() < 1e-6, "loss = {loss}");
     }
@@ -2364,8 +2451,166 @@ mod normal_loss_tests {
         let device = device().await;
         let gt = Tensor::<3>::from_data(TensorData::new(vec![0.0f32; 6], [1, 2, 3]), &device);
         let pred = Tensor::<3>::from_data(TensorData::new(vec![1.0f32; 6], [1, 2, 3]), &device);
-        let loss = read(normal_loss(pred, gt)).await[0];
+        let loss = read(normal_loss(pred, gt, None)).await[0];
         assert_eq!(loss, 0.0);
+    }
+
+    /// The NeuRIS-style per-pixel contradiction gate (`gate_cos`).
+    ///
+    /// Pins the three things that can silently go wrong: `None` must be the
+    /// literal pre-gate code path, a gate wide enough to admit everything must
+    /// equal the ungated result, and — the load-bearing one — the denominator
+    /// must be the GATED valid count, so a surviving pixel keeps its full
+    /// per-pixel magnitude instead of the whole term annealing as the gate
+    /// tightens.
+    #[tokio::test]
+    async fn normal_loss_gate_none_matches_old() {
+        let device = device().await;
+
+        // Four pixels, all with a valid (unit-length) prior pointing at the
+        // camera. Two predictions agree closely with the prior, two are
+        // opposed and must be gated out at 30 degrees.
+        //
+        // Priors: all (0, 0, -1).
+        let gt = Tensor::<3>::from_data(
+            TensorData::new(
+                vec![
+                    0.0, 0.0, -1.0, // agreeing pixel A
+                    0.0, 0.0, -1.0, // agreeing pixel B
+                    0.0, 0.0, -1.0, // contradicted pixel C
+                    0.0, 0.0, -1.0, // contradicted pixel D
+                ],
+                [1, 4, 3],
+            ),
+            &device,
+        );
+        // A and B: exactly (0,0,-1) offset by 0.3 in one channel -> cos to the
+        // prior is 1/sqrt(1+0.09) = 0.9578 -> 16.7 degrees, INSIDE a 30 degree
+        // gate. C and D: (0,0,+1), exactly opposed -> cos = -1, gated out.
+        let pred = Tensor::<3>::from_data(
+            TensorData::new(
+                vec![
+                    0.0, 0.3, -1.0, // A
+                    0.0, 0.3, -1.0, // B
+                    0.0, 0.0, 1.0, // C
+                    0.0, 0.0, 1.0, // D
+                ],
+                [1, 4, 3],
+            ),
+            &device,
+        );
+
+        // Ungated: |0.3| twice from A/B plus |2.0| twice from C/D, over
+        // 4 valid pixels * 3 channels.
+        let ungated = read(normal_loss(pred.clone(), gt.clone(), None)).await[0];
+        let want_ungated = (0.3 + 0.3 + 2.0 + 2.0) / 12.0;
+        assert!(
+            (ungated - want_ungated).abs() < 1e-6,
+            "ungated = {ungated}, want {want_ungated}"
+        );
+
+        // A gate at 180 degrees (cos = -1) admits every pixel, so it must be
+        // numerically identical to `None`.
+        let wide = read(normal_loss(pred.clone(), gt.clone(), Some(-1.0))).await[0];
+        assert!(
+            (wide - ungated).abs() < 1e-6,
+            "180-degree gate = {wide}, ungated = {ungated}"
+        );
+
+        // A 30 degree gate keeps exactly A and B. Denominator is the GATED
+        // count: 2 pixels * 3 channels, NOT the ungated 4 * 3.
+        let cos30 = 30.0_f32.to_radians().cos();
+        let gated = read(normal_loss(pred.clone(), gt.clone(), Some(cos30))).await[0];
+        let want_gated = (0.3 + 0.3) / 6.0;
+        assert!(
+            (gated - want_gated).abs() < 1e-6,
+            "30-degree gate = {gated}, want {want_gated} (denominator must be the gated count)"
+        );
+
+        // An unrenormalized denominator would have given (0.3+0.3)/12 = 0.05.
+        assert!(
+            (gated - 0.05).abs() > 1e-3,
+            "the gate must not silently anneal the whole term"
+        );
+
+        // A gate that survives nothing yields a differentiable exact 0, not
+        // NaN: the `clamp_min(1.0)` denominator, matching the reference's
+        // `sum / max(count, 1)` discipline.
+        let empty = read(normal_loss(pred, gt, Some(0.999_999))).await[0];
+        assert_eq!(empty, 0.0);
+    }
+
+    /// `normal_gate_counts` is the diagnostic behind the "gate is over-masking"
+    /// warning, so it has to be right about both halves of the ratio.
+    ///
+    /// The two-count return is what lets the trainer distinguish "the gate
+    /// masked almost everything" from "this frame barely had a prior" — a
+    /// pre-divided fraction cannot express the difference, and the second case
+    /// must never trip the warning.
+    #[tokio::test]
+    async fn normal_gate_counts_report_survivors_and_valid_pixels() {
+        let device = device().await;
+        let cos30 = 30.0_f32.to_radians().cos();
+
+        // Four pixels: two priors agreeing with the prediction to ~16.7 deg,
+        // two exactly opposed, all four priors valid.
+        let gt = Tensor::<3>::from_data(
+            TensorData::new(
+                vec![
+                    0.0, 0.0, -1.0, //
+                    0.0, 0.0, -1.0, //
+                    0.0, 0.0, -1.0, //
+                    0.0, 0.0, -1.0, //
+                ],
+                [1, 4, 3],
+            ),
+            &device,
+        );
+        let pred = Tensor::<3>::from_data(
+            TensorData::new(
+                vec![
+                    0.0, 0.3, -1.0, //
+                    0.0, 0.3, -1.0, //
+                    0.0, 0.0, 1.0, //
+                    0.0, 0.0, 1.0, //
+                ],
+                [1, 4, 3],
+            ),
+            &device,
+        );
+
+        let counts = read(normal_gate_counts(pred.clone(), gt.clone(), cos30)).await;
+        assert_eq!(counts.len(), 2, "counts must be [surviving, valid]");
+        assert!((counts[0] - 2.0).abs() < 1e-6, "surviving = {}", counts[0]);
+        assert!((counts[1] - 4.0).abs() < 1e-6, "valid = {}", counts[1]);
+
+        // A gate wide enough to admit everything: every valid pixel survives.
+        let wide = read(normal_gate_counts(pred.clone(), gt.clone(), -1.0)).await;
+        assert!((wide[0] - 4.0).abs() < 1e-6, "surviving = {}", wide[0]);
+        assert!((wide[1] - 4.0).abs() < 1e-6, "valid = {}", wide[1]);
+
+        // A gate nothing survives: this is the shape the warning keys on —
+        // zero survivors out of a NONZERO valid count.
+        let none = read(normal_gate_counts(pred, gt, 0.999_999)).await;
+        assert_eq!(none[0], 0.0);
+        assert!((none[1] - 4.0).abs() < 1e-6, "valid = {}", none[1]);
+    }
+
+    /// A frame with no usable prior reports `valid == 0`, NOT a zero fraction.
+    ///
+    /// This is the case that must never trip the over-masking warning: the gate
+    /// discarded nothing, there was simply nothing to discard. Collapsing to a
+    /// ratio here would divide by zero or report 0%, either of which reads as a
+    /// broken gate.
+    #[tokio::test]
+    async fn normal_gate_counts_separate_empty_prior_from_full_masking() {
+        let device = device().await;
+        let gt = Tensor::<3>::from_data(TensorData::new(vec![0.0f32; 12], [1, 4, 3]), &device);
+        let pred = Tensor::<3>::from_data(TensorData::new(vec![1.0f32; 12], [1, 4, 3]), &device);
+
+        let counts = read(normal_gate_counts(pred, gt, 30.0_f32.to_radians().cos())).await;
+        assert_eq!(counts[0], 0.0, "no valid prior means no survivors");
+        assert_eq!(counts[1], 0.0, "valid count must be 0, not clamped to 1");
     }
 
     /// `depth_normal_loss` is 0 when the two normal fields agree, 2 when they
