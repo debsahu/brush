@@ -11,6 +11,37 @@ pub enum DepthWeightDecay {
     Cosine,
 }
 
+/// Where the trainer's supervised depth comes from (`--depth-source`).
+///
+/// PGSR (Chen et al. 2024, arXiv:2406.06521) observes that the alpha-composited
+/// camera-z of splat MEANS is a centre-biased surface estimate: a depth loss
+/// against it constrains only where along the ray a gaussian sits, never its
+/// orientation, so gaussians satisfy it while forming a thick shell of tilted
+/// ellipsoids around the true surface. The plane sources composite per-splat
+/// tangent-plane parameters instead and intersect the pixel ray with the
+/// composited plane, which is unbiased.
+///
+/// The three variants have deliberately DIFFERENT backward semantics; see the
+/// contract table at the dispatch site in `train.rs` before reading an ablation
+/// result. `Center` is the default and is byte-identical to the pre-PGSR
+/// trainer.
+#[derive(Default, Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DepthSource {
+    /// Alpha-composited camera-z of splat means (previous behaviour).
+    #[default]
+    Center,
+    /// PGSR plane-intersection depth via the auxiliary feature pass (approach A).
+    /// Geometry gradients arrive exclusively through feature VALUES; the
+    /// compositing weights are constants, so depth error cannot reach opacity.
+    PlaneAux,
+    /// PGSR plane-intersection depth via the main rasterize kernel (approach B).
+    /// Blending-weight gradients are LIVE for the plane channels, so depth error
+    /// does reach opacity — by design, and the one thing `PlaneAux` cannot
+    /// express.
+    PlaneFused,
+}
+
 #[derive(Clone, Parser, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct TrainConfig {
@@ -525,6 +556,128 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options", default_value = "0")]
     #[serde(default)]
     pub depth_normal_start_iter: u32,
+
+    // ------------------------------------------------------------------
+    // PGSR plane-render config surface (WS-L). Every field below defaults to
+    // an OFF sentinel that leaves the trainer byte-identical to its pre-change
+    // behaviour; the `playroom_0812` 15k baseline (opacity p50 0.2132, scale
+    // p50 0.0082, on-seed 92.2%, dark splats 1.79%) must stay reproducible
+    // with defaults.
+    // ------------------------------------------------------------------
+    /// Source of the supervised depth map.
+    ///
+    /// `center` (default) is the alpha-composited camera-z of splat means —
+    /// previous behaviour, byte-identical. `plane-aux` and `plane-fused` use
+    /// PGSR ray-plane depth (arXiv:2406.06521) and differ from each other only
+    /// in their BACKWARD contract, not their forward values; see `DepthSource`.
+    #[arg(long, help_heading = "Training options", default_value = "center")]
+    #[serde(default)]
+    pub depth_source: DepthSource,
+
+    /// Global iteration at which the normal-term ramp starts. **0 = OFF**
+    /// (full weight from step 0, previous behaviour, byte-identical).
+    ///
+    /// When set, `--normal-loss-weight` and `--depth-normal-weight` are both
+    /// multiplied by a ramp that is 0 before this iteration and climbs linearly
+    /// to 1 over `--normal-ramp-iters`. A ramp value of exactly 0 also SKIPS
+    /// the normal render pass entirely (same philosophy as
+    /// `--depth-normal-start-iter`), so the gate costs nothing rather than
+    /// rendering work that gets multiplied by zero.
+    ///
+    /// Counts GLOBAL iterations, like every other schedule knob in this fork,
+    /// so a resumed run does not restart the countdown and an LOD transition
+    /// does not re-close the gate.
+    ///
+    /// Recipe (reference: start at 20% of the run, ramp over 12.5%):
+    ///   * 15k ablation run: `--normal-ramp-start-iter 3000 --normal-ramp-iters 1875`
+    ///   * 30k default run (`--total-train-iters` defaults to 30000):
+    ///     `--normal-ramp-start-iter 6000 --normal-ramp-iters 3750`
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    #[serde(default)]
+    pub normal_ramp_start_iter: u32,
+
+    /// Length of the normal-term ramp in global iterations, after
+    /// `--normal-ramp-start-iter`. 0 = hard step to full weight at the start
+    /// iteration. Inert unless `--normal-ramp-start-iter` is nonzero (setting
+    /// it alone is rejected by `validate()` rather than silently ignored).
+    ///
+    /// Units: iterations. See `--normal-ramp-start-iter` for the recipe.
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    #[serde(default)]
+    pub normal_ramp_iters: u32,
+
+    /// Final value of `--depth-normal-weight` after the late consistency bump.
+    /// **0.0 = OFF** (constant weight, previous behaviour, byte-identical).
+    ///
+    /// The reference bumps its consistency weight 0.50 -> 0.55 late in training
+    /// (from 78.6% of the run, over 7.1%). Units: same dimensionless weight as
+    /// `--depth-normal-weight`.
+    ///
+    /// Recipe: at 15k, `--depth-normal-weight-end-start-iter 11800
+    /// --depth-normal-weight-end-ramp-iters 1050`; at the 30k default,
+    /// `23600` / `2100`.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub depth_normal_weight_end: f32,
+
+    /// Global iteration at which the late consistency bump starts ramping.
+    /// Units: iterations. Inert unless `--depth-normal-weight-end` > 0.
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    #[serde(default)]
+    pub depth_normal_weight_end_start_iter: u32,
+
+    /// Length of the late consistency bump ramp, in global iterations. 0 = hard
+    /// step at `--depth-normal-weight-end-start-iter`. Inert unless
+    /// `--depth-normal-weight-end` > 0.
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    #[serde(default)]
+    pub depth_normal_weight_end_ramp_iters: u32,
+
+    /// Per-pixel normal contradiction gate, in DEGREES. **0 = OFF** (previous
+    /// behaviour, byte-identical).
+    ///
+    /// NeuRIS-style (arXiv:2206.13597): a prior-normal pixel whose angle to the
+    /// RENDERED normal exceeds this threshold is dropped from
+    /// `--normal-loss-weight`'s mask for that step. Both operands are detached
+    /// — it is a mask, not a gradient path. The mean is taken over the GATED
+    /// valid count, so surviving pixels keep full per-pixel magnitude instead of
+    /// the whole term silently annealing as the gate tightens.
+    ///
+    /// This is the per-pixel refinement of the whole-frame median-cosine check
+    /// `ingest/splatcam/normals_moge.py` already performs at prior-generation
+    /// time: the frame check catches sign-flipped priors, the gate drops
+    /// locally-contradicted pixels (transients, reflections, `MoGe` failures)
+    /// inside otherwise-good frames.
+    ///
+    /// Units: degrees, in `[0, 180]`. Reference value: 30.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub normal_gate_degrees: f32,
+
+    /// Global iteration at which `--normal-gate-degrees` arms. 0 = armed from
+    /// step 0 whenever the gate is on. Units: iterations. Inert unless
+    /// `--normal-gate-degrees` > 0.
+    ///
+    /// Recipe (reference arms it at 37.5% of the run): ~5600 at 15k, ~11250 at
+    /// the 30k default.
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    #[serde(default)]
+    pub normal_gate_start_iter: u32,
+
+    /// Divide the METRIC-DIMENSIONED loss weights by the scene scale, so a
+    /// single recipe transfers between scenes of different physical size.
+    /// **Default off = byte-identical.**
+    ///
+    /// The scale is captured ONCE from the training camera poses at trainer
+    /// construction and never updated — a live, refine-updated value would make
+    /// the effective weights drift mid-run and confound the ramp schedules.
+    ///
+    /// Which weights this touches, and why, is spelled out at the consumption
+    /// site in `train.rs`; the short version is that `--depth-loss-weight` is
+    /// deliberately NOT in the list because our depth loss is disparity-space.
+    #[arg(long, help_heading = "Training options", default_value = "false")]
+    #[serde(default)]
+    pub normalize_metric_weights: bool,
 
     /// Weight of total-variation smoothness on the rendered normal image
     /// (DN-Splatter's `L_smooth`). Needs no prior data.
@@ -1066,6 +1219,24 @@ impl TrainConfig {
                 "depth-grad-sigma must be positive when depth-grad-aware is set".to_owned(),
             );
         }
+        // `--normal-ramp-start-iter 0` means the ramp is OFF, so a ramp LENGTH
+        // with no start would be silently inert. Reject rather than ignore:
+        // a config that quietly does nothing is the failure mode this whole
+        // default-inertness discipline exists to make impossible.
+        if self.normal_ramp_iters != 0 && self.normal_ramp_start_iter == 0 {
+            return Err(
+                "normal-ramp-iters requires a nonzero normal-ramp-start-iter (0 = ramp OFF)"
+                    .to_owned(),
+            );
+        }
+        if self.depth_normal_weight_end < 0.0 {
+            return Err("depth-normal-weight-end must not be negative".to_owned());
+        }
+        if !(self.normal_gate_degrees.is_finite()
+            && (0.0..=180.0).contains(&self.normal_gate_degrees))
+        {
+            return Err("normal-gate-degrees must be finite and in [0, 180]".to_owned());
+        }
         Ok(())
     }
 
@@ -1094,6 +1265,51 @@ impl TrainConfig {
         }
     }
 
+    /// Multiplier applied to BOTH `--normal-loss-weight` and the effective
+    /// `--depth-normal-weight` at `global_iter`.
+    ///
+    /// `normal_ramp_start_iter == 0` disables the ramp entirely and returns an
+    /// exact `1.0`, which is what makes the default byte-identical. Counts
+    /// global iterations.
+    pub fn normal_ramp_at(&self, global_iter: u32) -> f32 {
+        if self.normal_ramp_start_iter == 0 {
+            return 1.0;
+        }
+        linear_ramp_weight(
+            global_iter,
+            self.normal_ramp_start_iter,
+            self.normal_ramp_iters,
+        )
+    }
+
+    /// Effective `--depth-normal-weight` at `global_iter`, including the late
+    /// consistency bump. `depth_normal_weight_end == 0.0` disables the bump and
+    /// returns `depth_normal_weight` unchanged.
+    ///
+    /// Does NOT include `normal_ramp_at`; the two multiply at the call site.
+    pub fn depth_normal_weight_at(&self, global_iter: u32) -> f32 {
+        let w0 = self.depth_normal_weight;
+        if self.depth_normal_weight_end <= 0.0 {
+            return w0;
+        }
+        let t = linear_ramp_weight(
+            global_iter,
+            self.depth_normal_weight_end_start_iter,
+            self.depth_normal_weight_end_ramp_iters,
+        );
+        w0 + (self.depth_normal_weight_end - w0) * t
+    }
+
+    /// Cosine threshold for the per-pixel normal contradiction gate at
+    /// `global_iter`, or `None` when the gate is off or not yet armed.
+    ///
+    /// `None` is the pre-gate code path exactly; `normal_loss` takes this
+    /// straight through.
+    pub fn normal_gate_cos_at(&self, global_iter: u32) -> Option<f32> {
+        (self.normal_gate_degrees > 0.0 && global_iter >= self.normal_gate_start_iter)
+            .then(|| self.normal_gate_degrees.to_radians().cos())
+    }
+
     pub fn total_iters(&self) -> u32 {
         self.total_train_iters + self.lod_levels * self.lod_refine_steps
     }
@@ -1101,6 +1317,28 @@ impl TrainConfig {
     pub fn appearance_enabled(&self) -> bool {
         self.bilateral_grid || self.ppisp
     }
+}
+
+/// The reference trainer's linear ramp primitive: `0` before `start`, then
+/// `min(1, (step - start + 1) / ramp)`.
+///
+/// **The `+ 1` is load-bearing and deliberate.** The ramp is NONZERO at the
+/// start step (it is `1/ramp`, not `0`) and saturates at `start + ramp - 1`,
+/// which is why the reference's stated saturation for `start=1400, ramp=875` is
+/// step 2274 rather than 2275. An off-by-one here is silent: the run trains
+/// fine, one step out of phase, and never exactly reproduces the reference.
+///
+/// `ramp == 0` degenerates to a hard step to `1.0` at `start`.
+pub fn linear_ramp_weight(step: u32, start: u32, ramp: u32) -> f32 {
+    if step < start {
+        return 0.0;
+    }
+    if ramp == 0 {
+        return 1.0;
+    }
+    // `step >= start`, so this cannot underflow.
+    let progressed = (step - start) as f32 + 1.0;
+    (progressed / ramp as f32).min(1.0)
 }
 
 fn parse_learning_rate(value: &str) -> Result<f64, String> {
@@ -1749,4 +1987,231 @@ mod tests {
         assert!((lin_nz.depth_weight_at(100) - 1.0).abs() < 1e-6);
         assert!((lin_nz.depth_weight_at(300) - 0.25).abs() < 1e-6);
     }
+
+    // ------------------------------------------------------------------
+    // PGSR plane-render config surface (WS-L). Every one of these pins the
+    // DEFAULT to a value that leaves the trainer byte-identical to its
+    // pre-change behaviour; the parse half proves the flag is reachable.
+    // ------------------------------------------------------------------
+
+    /// `--depth-source` defaults to `center` (the alpha-composited camera-z of
+    /// splat means, i.e. exactly what the trainer did before the plane paths
+    /// existed) and round-trips all three values.
+    #[test]
+    fn depth_source_defaults_to_center_and_parses() {
+        let def = TrainConfig::default();
+        assert_eq!(def.depth_source, DepthSource::Center);
+
+        // An unrelated flag must not disturb it.
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert_eq!(other.depth_source, DepthSource::Center);
+
+        for (arg, want) in [
+            ("center", DepthSource::Center),
+            ("plane-aux", DepthSource::PlaneAux),
+            ("plane-fused", DepthSource::PlaneFused),
+        ] {
+            let cfg = TrainConfig::try_parse_from(["brush", "--depth-source", arg])
+                .unwrap_or_else(|e| panic!("--depth-source {arg} must parse: {e}"));
+            assert_eq!(cfg.depth_source, want);
+        }
+
+        assert!(TrainConfig::try_parse_from(["brush", "--depth-source", "plane"]).is_err());
+    }
+
+    /// The raw ramp primitive, pinned on its own because of the `+ 1`. The
+    /// reference's ramp is `min(1, (step - start + 1) / ramp)`, which is
+    /// NONZERO at the start step. An off-by-one here is silent: the run still
+    /// trains, it just supervises on a schedule that is one step out of phase
+    /// and never exactly reproduces the reference.
+    #[test]
+    fn linear_ramp_weight_is_nonzero_at_the_start_step() {
+        // Before the start: hard zero.
+        assert_eq!(linear_ramp_weight(1399, 1400, 875), 0.0);
+        // AT the start: 1/875, not 0.
+        assert!((linear_ramp_weight(1400, 1400, 875) - 1.0 / 875.0).abs() < 1e-9);
+        // Saturates at start + ramp - 1 = 2274 (the reference's stated value).
+        assert!((linear_ramp_weight(2273, 1400, 875) - 874.0 / 875.0).abs() < 1e-6);
+        assert_eq!(linear_ramp_weight(2274, 1400, 875), 1.0);
+        assert_eq!(linear_ramp_weight(u32::MAX, 1400, 875), 1.0);
+        // ramp == 0 is a hard step at `start`.
+        assert_eq!(linear_ramp_weight(99, 100, 0), 0.0);
+        assert_eq!(linear_ramp_weight(100, 100, 0), 1.0);
+    }
+
+    /// L1 ramp: default-inert, unrelated flags leave it, all five flags parse,
+    /// and `validate()` rejects the two nonsense combos.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn normal_ramp_defaults_noop_and_parse() {
+        let def = TrainConfig::default();
+        assert_eq!(def.normal_ramp_start_iter, 0);
+        assert_eq!(def.normal_ramp_iters, 0);
+        assert_eq!(def.depth_normal_weight_end, 0.0);
+        assert_eq!(def.depth_normal_weight_end_start_iter, 0);
+        assert_eq!(def.depth_normal_weight_end_ramp_iters, 0);
+
+        // Defaults: the ramp is EXACTLY 1.0 everywhere, so the two normal
+        // weights are multiplied by an exact identity.
+        for i in [0u32, 15_000, 30_000, u32::MAX] {
+            assert_eq!(def.normal_ramp_at(i), 1.0);
+        }
+
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert_eq!(other.normal_ramp_start_iter, 0);
+        assert_eq!(other.normal_ramp_iters, 0);
+        assert_eq!(other.depth_normal_weight_end, 0.0);
+        for i in [0u32, 15_000, u32::MAX] {
+            assert_eq!(other.normal_ramp_at(i), 1.0);
+        }
+
+        let on = TrainConfig::try_parse_from([
+            "brush",
+            "--normal-ramp-start-iter",
+            "3000",
+            "--normal-ramp-iters",
+            "1875",
+            "--depth-normal-weight-end",
+            "0.055",
+            "--depth-normal-weight-end-start-iter",
+            "11800",
+            "--depth-normal-weight-end-ramp-iters",
+            "1050",
+        ])
+        .expect("normal-ramp flags must parse");
+        assert_eq!(on.normal_ramp_start_iter, 3000);
+        assert_eq!(on.normal_ramp_iters, 1875);
+        assert!((on.depth_normal_weight_end - 0.055).abs() < 1e-9);
+        assert_eq!(on.depth_normal_weight_end_start_iter, 11800);
+        assert_eq!(on.depth_normal_weight_end_ramp_iters, 1050);
+
+        // validate(): a ramp length with no start is the silent-no-op trap.
+        let mut orphan = TrainConfig::default();
+        orphan.normal_ramp_iters = 1875;
+        assert!(orphan.validate().is_err());
+
+        // validate(): a negative end weight is rejected.
+        let mut neg = TrainConfig::default();
+        neg.depth_normal_weight_end = -0.1;
+        assert!(neg.validate().is_err());
+    }
+
+    /// `normal_ramp_at` schedule pins at the documented 15k recipe
+    /// (`--normal-ramp-start-iter 3000 --normal-ramp-iters 1875`).
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn normal_ramp_schedule_pins() {
+        let mut cfg = TrainConfig::default();
+        cfg.normal_ramp_start_iter = 3000;
+        cfg.normal_ramp_iters = 1875;
+
+        assert_eq!(cfg.normal_ramp_at(0), 0.0);
+        assert_eq!(cfg.normal_ramp_at(2999), 0.0);
+        // Nonzero AT the start step: (3000 - 3000 + 1) / 1875.
+        assert!((cfg.normal_ramp_at(3000) - 1.0 / 1875.0).abs() < 1e-9);
+        // Midpoint: (3937 - 3000 + 1) / 1875 = 938/1875.
+        assert!((cfg.normal_ramp_at(3937) - 938.0 / 1875.0).abs() < 1e-6);
+        // Saturates at start + ramp - 1.
+        assert_eq!(cfg.normal_ramp_at(3000 + 1875 - 1), 1.0);
+        assert_eq!(cfg.normal_ramp_at(15_000), 1.0);
+
+        // ramp 0 = hard step at start.
+        let mut step = TrainConfig::default();
+        step.normal_ramp_start_iter = 3000;
+        assert_eq!(step.normal_ramp_at(2999), 0.0);
+        assert_eq!(step.normal_ramp_at(3000), 1.0);
+    }
+
+    /// `depth_normal_weight_at`: identity at defaults, and the reference's
+    /// late consistency bump (0.50 -> 0.55 from 5500 over 500) when armed.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn depth_normal_weight_schedule_pins() {
+        let def = TrainConfig::default();
+        for i in [0u32, 15_000, u32::MAX] {
+            assert_eq!(def.depth_normal_weight_at(i), def.depth_normal_weight);
+        }
+
+        // Even with a base weight set, end == 0.0 means OFF -> constant.
+        let mut base_only = TrainConfig::default();
+        base_only.depth_normal_weight = 0.05;
+        for i in [0u32, 5_500, u32::MAX] {
+            assert_eq!(base_only.depth_normal_weight_at(i), 0.05);
+        }
+
+        // The reference bump, verbatim.
+        let mut bump = TrainConfig::default();
+        bump.depth_normal_weight = 0.50;
+        bump.depth_normal_weight_end = 0.55;
+        bump.depth_normal_weight_end_start_iter = 5500;
+        bump.depth_normal_weight_end_ramp_iters = 500;
+        assert!((bump.depth_normal_weight_at(5499) - 0.50).abs() < 1e-6);
+        // (5500 - 5500 + 1)/500 = 0.002 -> 0.50 + 0.05*0.002
+        assert!((bump.depth_normal_weight_at(5500) - (0.50 + 0.05 * 0.002)).abs() < 1e-6);
+        // Saturates at 5999 per the reference.
+        assert!((bump.depth_normal_weight_at(5999) - 0.55).abs() < 1e-6);
+        assert!((bump.depth_normal_weight_at(15_000) - 0.55).abs() < 1e-6);
+    }
+
+    /// L2 gate: default-inert and parses; `validate()` bounds the angle.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn normal_gate_defaults_noop_and_parse() {
+        let def = TrainConfig::default();
+        assert_eq!(def.normal_gate_degrees, 0.0);
+        assert_eq!(def.normal_gate_start_iter, 0);
+        // 0 degrees = OFF -> no cosine threshold is ever produced.
+        for i in [0u32, 15_000, u32::MAX] {
+            assert_eq!(def.normal_gate_cos_at(i), None);
+        }
+
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert_eq!(other.normal_gate_degrees, 0.0);
+        assert_eq!(other.normal_gate_start_iter, 0);
+
+        let on = TrainConfig::try_parse_from([
+            "brush",
+            "--normal-gate-degrees",
+            "30",
+            "--normal-gate-start-iter",
+            "5600",
+        ])
+        .expect("normal-gate flags must parse");
+        assert!((on.normal_gate_degrees - 30.0).abs() < 1e-9);
+        assert_eq!(on.normal_gate_start_iter, 5600);
+        assert_eq!(on.normal_gate_cos_at(5599), None);
+        let cos30 = on
+            .normal_gate_cos_at(5600)
+            .expect("gate is armed from its start iter");
+        assert!((cos30 - 30.0_f32.to_radians().cos()).abs() < 1e-6);
+
+        // validate(): out-of-range angles are rejected.
+        for bad_deg in [-1.0, 180.5, f32::NAN] {
+            let mut bad = TrainConfig::default();
+            bad.normal_gate_degrees = bad_deg;
+            assert!(
+                bad.validate().is_err(),
+                "accepted normal-gate-degrees {bad_deg}"
+            );
+        }
+    }
+
+    /// L3 metric-weight normalization: default OFF and parses.
+    #[test]
+    fn normalize_metric_weights_defaults_off_and_parse() {
+        let def = TrainConfig::default();
+        assert!(!def.normalize_metric_weights);
+
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert!(!other.normalize_metric_weights);
+
+        let on = TrainConfig::try_parse_from(["brush", "--normalize-metric-weights"])
+            .expect("--normalize-metric-weights must parse");
+        assert!(on.normalize_metric_weights);
+    }
+
 }

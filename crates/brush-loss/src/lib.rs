@@ -1758,9 +1758,50 @@ pub fn rgb_grad_weight(gt_rgb: Tensor<3>, sigma: f32) -> Tensor<2> {
 /// yields 0 rather than NaN.
 ///
 /// L1 (not `1 - cos`) matches DN-Splatter's default normal loss.
-pub fn normal_loss(pred_normal: Tensor<3>, gt_normal: Tensor<3>) -> Tensor<1> {
+///
+/// `gate_cos` is the optional NeuRIS-style per-pixel contradiction gate
+/// (arXiv:2206.13597), as a COSINE threshold (the caller converts from degrees;
+/// `TrainConfig::normal_gate_cos_at` does this). `None` is the pre-gate code
+/// path exactly — no extra tensor op is constructed at all.
+///
+/// When set, a pixel additionally requires
+/// `dot(normalize(pred.detach()), normalize(gt.detach())) >= gate_cos`. **Both
+/// operands are detached**: this is a mask on which pixels are supervised, not a
+/// second gradient path into the rendered normals. Locally contradicted pixels
+/// — transients, reflections, prior-model failures inside an otherwise-good
+/// frame — drop out.
+///
+/// The denominator is the GATED valid count, so surviving pixels keep full
+/// per-pixel magnitude. An unrenormalized denominator would silently anneal the
+/// entire term as the gate tightens, conflating gate strength with the weight
+/// schedule. An empty mask still yields a differentiable exact 0 via the
+/// `clamp_min(1.0)`, matching the reference's `sum / max(count, 1)` discipline.
+pub fn normal_loss(
+    pred_normal: Tensor<3>,
+    gt_normal: Tensor<3>,
+    gate_cos: Option<f32>,
+) -> Tensor<1> {
     let gt_len = gt_normal.clone().powi_scalar(2).sum_dim(2).sqrt();
-    let valid = gt_len.greater_elem(0.5).float();
+    let mut valid = gt_len.greater_elem(0.5).float();
+
+    if let Some(gate_cos) = gate_cos {
+        // Detached on both sides — a mask, never a gradient path. Lengths are
+        // clamped away from zero because invalid `(0,0,0)` prior pixels are
+        // still present here; they are removed by `valid` regardless, and the
+        // clamp keeps the division finite so no NaN can reach the multiply
+        // (the 0·∞ lesson from `normals_from_depth`).
+        let pred_d = pred_normal.clone().detach();
+        let gt_d = gt_normal.clone().detach();
+        let pred_len = pred_d
+            .clone()
+            .powi_scalar(2)
+            .sum_dim(2)
+            .sqrt()
+            .clamp_min(1e-6);
+        let gt_len_d = gt_d.clone().powi_scalar(2).sum_dim(2).sqrt().clamp_min(1e-6);
+        let cos = (pred_d * gt_d).sum_dim(2) / (pred_len * gt_len_d);
+        valid = valid * cos.greater_equal_elem(gate_cos).float();
+    }
 
     let abs_err = (pred_normal - gt_normal).abs().sum_dim(2) * valid.clone();
 
@@ -2524,7 +2565,7 @@ mod normal_loss_tests {
             &device,
         );
 
-        let loss = read(normal_loss(pred, gt)).await[0];
+        let loss = read(normal_loss(pred, gt, None)).await[0];
         // |0.3| spread over 1 valid pixel * 3 channels.
         assert!((loss - 0.1).abs() < 1e-6, "loss = {loss}");
     }
@@ -2550,8 +2591,93 @@ mod normal_loss_tests {
         let device = device().await;
         let gt = Tensor::<3>::from_data(TensorData::new(vec![0.0f32; 6], [1, 2, 3]), &device);
         let pred = Tensor::<3>::from_data(TensorData::new(vec![1.0f32; 6], [1, 2, 3]), &device);
-        let loss = read(normal_loss(pred, gt)).await[0];
+        let loss = read(normal_loss(pred, gt, None)).await[0];
         assert_eq!(loss, 0.0);
+    }
+
+    /// The NeuRIS-style per-pixel contradiction gate (`gate_cos`).
+    ///
+    /// Pins the three things that can silently go wrong: `None` must be the
+    /// literal pre-gate code path, a gate wide enough to admit everything must
+    /// equal the ungated result, and — the load-bearing one — the denominator
+    /// must be the GATED valid count, so a surviving pixel keeps its full
+    /// per-pixel magnitude instead of the whole term annealing as the gate
+    /// tightens.
+    #[tokio::test]
+    async fn normal_loss_gate_none_matches_old() {
+        let device = device().await;
+
+        // Four pixels, all with a valid (unit-length) prior pointing at the
+        // camera. Two predictions agree closely with the prior, two are
+        // opposed and must be gated out at 30 degrees.
+        //
+        // Priors: all (0, 0, -1).
+        let gt = Tensor::<3>::from_data(
+            TensorData::new(
+                vec![
+                    0.0, 0.0, -1.0, // agreeing pixel A
+                    0.0, 0.0, -1.0, // agreeing pixel B
+                    0.0, 0.0, -1.0, // contradicted pixel C
+                    0.0, 0.0, -1.0, // contradicted pixel D
+                ],
+                [1, 4, 3],
+            ),
+            &device,
+        );
+        // A and B: exactly (0,0,-1) offset by 0.3 in one channel -> cos to the
+        // prior is 1/sqrt(1+0.09) = 0.9578 -> 16.7 degrees, INSIDE a 30 degree
+        // gate. C and D: (0,0,+1), exactly opposed -> cos = -1, gated out.
+        let pred = Tensor::<3>::from_data(
+            TensorData::new(
+                vec![
+                    0.0, 0.3, -1.0, // A
+                    0.0, 0.3, -1.0, // B
+                    0.0, 0.0, 1.0, // C
+                    0.0, 0.0, 1.0, // D
+                ],
+                [1, 4, 3],
+            ),
+            &device,
+        );
+
+        // Ungated: |0.3| twice from A/B plus |2.0| twice from C/D, over
+        // 4 valid pixels * 3 channels.
+        let ungated = read(normal_loss(pred.clone(), gt.clone(), None)).await[0];
+        let want_ungated = (0.3 + 0.3 + 2.0 + 2.0) / 12.0;
+        assert!(
+            (ungated - want_ungated).abs() < 1e-6,
+            "ungated = {ungated}, want {want_ungated}"
+        );
+
+        // A gate at 180 degrees (cos = -1) admits every pixel, so it must be
+        // numerically identical to `None`.
+        let wide = read(normal_loss(pred.clone(), gt.clone(), Some(-1.0))).await[0];
+        assert!(
+            (wide - ungated).abs() < 1e-6,
+            "180-degree gate = {wide}, ungated = {ungated}"
+        );
+
+        // A 30 degree gate keeps exactly A and B. Denominator is the GATED
+        // count: 2 pixels * 3 channels, NOT the ungated 4 * 3.
+        let cos30 = 30.0_f32.to_radians().cos();
+        let gated = read(normal_loss(pred.clone(), gt.clone(), Some(cos30))).await[0];
+        let want_gated = (0.3 + 0.3) / 6.0;
+        assert!(
+            (gated - want_gated).abs() < 1e-6,
+            "30-degree gate = {gated}, want {want_gated} (denominator must be the gated count)"
+        );
+
+        // An unrenormalized denominator would have given (0.3+0.3)/12 = 0.05.
+        assert!(
+            (gated - 0.05).abs() > 1e-3,
+            "the gate must not silently anneal the whole term"
+        );
+
+        // A gate that survives nothing yields a differentiable exact 0, not
+        // NaN: the `clamp_min(1.0)` denominator, matching the reference's
+        // `sum / max(count, 1)` discipline.
+        let empty = read(normal_loss(pred, gt, Some(0.999_999))).await[0];
+        assert_eq!(empty, 0.0);
     }
 
     /// `depth_normal_loss` is 0 when the two normal fields agree, 2 when they
