@@ -1821,7 +1821,12 @@ fn normal_gate_mask(pred_normal: Tensor<3>, gt_normal: Tensor<3>, gate_cos: f32)
         .sum_dim(2)
         .sqrt()
         .clamp_min(1e-6);
-    let gt_len = gt_d.clone().powi_scalar(2).sum_dim(2).sqrt().clamp_min(1e-6);
+    let gt_len = gt_d
+        .clone()
+        .powi_scalar(2)
+        .sum_dim(2)
+        .sqrt()
+        .clamp_min(1e-6);
     let cos = (pred_d * gt_d).sum_dim(2) / (pred_len * gt_len);
     cos.greater_equal_elem(gate_cos).float()
 }

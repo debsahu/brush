@@ -71,7 +71,6 @@ fn slider_tip<T>(
 /// entirely, so a test that only calls `draw_settings` never touches any of
 /// them and passes vacuously.
 fn draw_geometry_prior_settings(ui: &mut Ui, tc: &mut TrainConfig, enabled: bool) {
-
     ui.label("Normal prior");
     slider_tip(
         ui,
@@ -1028,7 +1027,10 @@ mod tests {
         // widget that writes back a subtly different value on first paint would
         // break the byte-identity guarantee every one of these fields carries.
         let def = TrainStreamConfig::default();
-        assert_eq!(args.train_config.depth_source, def.train_config.depth_source);
+        assert_eq!(
+            args.train_config.depth_source,
+            def.train_config.depth_source
+        );
         assert_eq!(args.train_config.normal_ramp_start_iter, 0);
         assert_eq!(args.train_config.normal_ramp_iters, 0);
         assert_eq!(args.train_config.depth_normal_weight_end, 0.0);
@@ -1076,7 +1078,10 @@ mod tests {
         args.train_config.normal_ramp_start_iter = 3000;
         args.train_config.normal_ramp_iters = 1875;
         egui::__run_test_ui(|ui| draw_settings(ui, &mut args, true));
-        assert_eq!(args.train_config.normal_ramp_iters, 1875, "ramp is on: kept");
+        assert_eq!(
+            args.train_config.normal_ramp_iters, 1875,
+            "ramp is on: kept"
+        );
 
         // Now the user zeroes the start. Without the guard this is the exact
         // config `validate()` rejects.

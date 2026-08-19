@@ -208,12 +208,7 @@ pub(crate) async fn train_stream(
     // from the full training pose set. Deliberately not re-supplied at the LOD
     // boundaries below (the setter is one-shot anyway): a moving scale would
     // drift the effective metric weights mid-run. A no-op without the flag.
-    let train_cameras: Vec<_> = dataset
-        .train
-        .views
-        .iter()
-        .map(|view| view.camera)
-        .collect();
+    let train_cameras: Vec<_> = dataset.train.views.iter().map(|view| view.camera).collect();
     trainer.set_init_scene_scale(&train_cameras);
 
     // Depth-coupled opacity regularizer: build the static distance-to-cloud grid
