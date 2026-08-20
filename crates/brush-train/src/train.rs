@@ -3309,6 +3309,28 @@ fn warn_depth_opacity_reg_no_cloud() {
 const PLANE_MIN_ALPHA: f32 = 0.5;
 /// `|n_sum · ray|` below this is a plane seen edge-on: the intersection runs off
 /// to infinity and its gradient with it. Reject rather than clamp.
+///
+/// **The test is against the ALPHA-WEIGHTED composited sum, not the geometric
+/// `n̂ · ray`.** `n_sum` is `Σ wᵢ nᵢ`, so at coverage α the quantity compared here
+/// is `α · (n̂ · ray)` and the effective GEOMETRIC cutoff is `min_denom / α` —
+/// tighter as coverage falls (at α = 0.7, ≈ 0.071). This is the one place alpha
+/// does not cancel: it divides out of the quotient `offset_sum / (n_sum · ray)`
+/// exactly, but not out of this validity comparison. Defensible — a thinly
+/// covered pixel is a worse plane estimate as well as a more grazing one, and
+/// `PLANE_MIN_ALPHA` only bounds α from below, it does not make α equal 1 — but
+/// it is a coupling of two thresholds and it is not obvious from the call, so it
+/// is written down. Anyone building a test fixture at a chosen denominator must
+/// tilt the geometric normal to `denom/α`; `plane_depth_grazing_tests` does.
+///
+/// **0.05, where the reference uses 1e-4 — a choice, not a transcription slip.**
+/// `gauss-surf` computes in float64, where the quotient is still accurate to
+/// ~2e-7 at 1.01x a 1e-4 cutoff. We are f32 end to end, and near-grazing is
+/// ill-conditioned: `n_sum · ray` cancels from O(1) down to `O(min_denom)`, so its
+/// ~`eps·‖ray‖` absolute rounding becomes a `eps·‖ray‖/|denom|` RELATIVE error in
+/// the depth. At 1e-4 that is ~2e-3 relative — a plane pixel accurate to two
+/// digits, fed straight into the depth loss. At 0.05 it is ~4e-6, which is the
+/// accuracy `plane_depth_grazing_tests` measures and pins. The 500x gap is the
+/// price of f32; do not "restore parity" with the reference by lowering it.
 const PLANE_MIN_DENOM: f32 = 0.05;
 /// `min_depth > 0` is what rejects a plane BEHIND the camera — an `|z| < max`
 /// test alone would accept `z = -3`.
@@ -5132,6 +5154,23 @@ mod plane_aux_consumer_tests {
 
     const IMG: glam::UVec2 = glam::uvec2(48, 48);
 
+    /// Last-bit budget, in ULPs, for two expression trees that apply the SAME
+    /// operations to the SAME inputs and are only expected to agree to the
+    /// arithmetic's own precision.
+    ///
+    /// Derived, not tuned. Two textually identical sequences are not one
+    /// program on a GPU: the shader compiler may contract a multiply-add into an
+    /// FMA in one and not the other, and may reassociate the 3-term sum inside
+    /// `sum_dim`. Each rounding costs at most half an ULP and there are a
+    /// handful of them in the divide/square/sum/sqrt/divide chain, so 4 ULP
+    /// bounds the honest disagreement with room to spare. Independently the same
+    /// number `brush-bench-test/tests/center_source_identity.rs` reached for the
+    /// same reason (`SAME_PATH_MARGIN`).
+    ///
+    /// **Do not replace this with `assert_eq!`.** That claim was made here once
+    /// and measured false — see `center_normalize_matches_plane_helper`.
+    const SAME_PATH_ULPS: f32 = 4.0;
+
     /// A camera that is NOT axis-aligned with the world, so the world→camera
     /// rotation is a real rotation. `plane_feature_tests` deliberately uses an
     /// identity-rotation camera to keep its hand-derived signs readable; here the
@@ -5452,11 +5491,45 @@ mod plane_aux_consumer_tests {
     /// re-proven rather than assumed. The cost of the duplication is that the two
     /// copies can drift.
     ///
-    /// This pins that they have not. Asserted with `assert_eq!` on the raw f32s,
-    /// not a tolerance: these are the same ops applied in the same order, so
-    /// anything other than bit-equality is a real divergence, and a tolerance
-    /// would let one copy drift under the other. The comparison covers EVERY
-    /// pixel, background included, rather than filtering to the covered region.
+    /// This pins that they have not. The comparison covers EVERY pixel,
+    /// background included, rather than filtering to the covered region.
+    ///
+    /// # Why this is a MARGIN and not `assert_eq!` — corrected 2026-08-20
+    ///
+    /// It was written as `assert_eq!` on the raw f32s, on the reasoning that the
+    /// same ops in the same order must be bit-equal. **That reasoning is wrong
+    /// on a GPU, and it was measured wrong here**: on the M4 Max this failed 9
+    /// runs out of 9, with **340 of 6912 elements differing by exactly one ULP**
+    /// (1.19e-7 at component magnitudes of 0.48-0.88), on both the default
+    /// backend and `native-msl`. Two textually identical expression trees are
+    /// not one program: the shader compiler is free to contract a multiply-add
+    /// into an FMA in one and not the other, and to reassociate, and the
+    /// autotuner's kernel choice differs between the two dispatch shapes.
+    ///
+    /// It is the fifth member of the class commit `08f60b6f` converted for four
+    /// other assertions in this port, and this one was missed because — and this
+    /// is the part worth recording — **it evidently PASSED on the integrator's
+    /// build** (405 tests green, 60/60 stabilization runs). So the divergence is
+    /// **build-environment-dependent**, which is worse than flaky: a machine
+    /// that happens to contract the same way sees nothing at all, and the test
+    /// silently means something different on every box it runs on.
+    ///
+    /// Hence the margin is derived from FIRST PRINCIPLES, not from this
+    /// machine's measurement. The two sequences apply the same four operations
+    /// (divide, square, sum-of-3, sqrt, divide) to the same inputs, so each
+    /// output can differ by at most the accumulated last-bit error of that
+    /// chain: a handful of roundings, each at most half an ULP, plus one
+    /// FMA-contraction difference per multiply-add. [`SAME_PATH_ULPS`] = 4 is
+    /// that budget rounded up — the same constant `center_source_identity.rs`
+    /// arrived at independently for the same reason. It is NOT tuned to the
+    /// observed 1 ULP; if it were, this test would only be meaningful here.
+    ///
+    /// The thing a margin gives up is the ability to see a sub-ULP drift, and
+    /// there is no such thing: any REAL divergence between these two sequences —
+    /// a reordered normalize, a different clamp target, a wrong slice — moves
+    /// components by 1e-2 or more, i.e. five orders of magnitude above this
+    /// budget. The mutation record below is the evidence for that claim: the
+    /// reordered-normalize mutation lands at 8.4e6 ULP.
     ///
     /// # What this does and does NOT pin — verified by mutation, not assumed
     ///
@@ -5464,8 +5537,13 @@ mod plane_aux_consumer_tests {
     ///
     /// - Reordering the sequence (normalize before the alpha divide instead of
     ///   after) **fails** the test. That is the drift worth guarding, and it is
-    ///   guarded.
-    /// - Changing a clamp CONSTANT (`1e-10` -> `1e-9`) **passes**. That is not a
+    ///   guarded. Re-measured 2026-08-20 under the ULP margin: it still fails,
+    ///   at **8.4e6 ULP** (worst element -119.76 vs -0.479, 2162 of 6912
+    ///   elements differing) against a 4-ULP budget — six orders of magnitude
+    ///   clear, so the margin costs this test nothing.
+    /// - Changing a clamp CONSTANT (`1e-10` -> `1e-9`) **passes**, under the
+    ///   margin exactly as it did under `assert_eq!` (re-measured 2026-08-20).
+    ///   That is not a
     ///   weakness to fix by tightening the test; it is a property of the
     ///   expression. Wherever alpha is ~0 the composited feature numerator is ~0
     ///   too, so the quotient is 0 for any clamp value — the clamps exist to keep
@@ -5512,9 +5590,32 @@ mod plane_aux_consumer_tests {
         let got = read(helper).await;
         let want = read(inline).await;
         assert_eq!(got.len(), want.len());
-        assert_eq!(
-            got, want,
-            "normal_alpha_normalize has drifted from the center branch's inline              sequence; the two are supposed to be the same ops in the same order,              and the doc comment on the helper claims exactly that"
+
+        // Worst deviation, in ULPs at the larger of the two magnitudes. `ulp()`
+        // floors at `f32::MIN_POSITIVE` so a pair of exact zeros — most of the
+        // background — yields a finite, non-zero epsilon rather than 0/0.
+        let ulp = |x: f32| f32::EPSILON * x.abs().max(f32::MIN_POSITIVE);
+        let (worst_ulps, worst_at) = got
+            .iter()
+            .zip(want.iter())
+            .enumerate()
+            .map(|(i, (a, b))| ((a - b).abs() / ulp(a.abs().max(b.abs())), i))
+            .fold((0.0f32, 0usize), |acc, x| if x.0 > acc.0 { x } else { acc });
+        let differing = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+
+        assert!(
+            worst_ulps <= SAME_PATH_ULPS,
+            "normal_alpha_normalize has drifted from the center branch's inline \
+             sequence: worst deviation {worst_ulps:.2} ULP at element {worst_at} \
+             ({} vs {}), over the {SAME_PATH_ULPS}-ULP same-path budget, with \
+             {differing} of {} elements differing at all. A REAL drift (a \
+             reordered normalize, a different clamp target, a wrong slice) lands \
+             ~1e5 ULP out — see the mutation record on this test — so anything \
+             in this range is a genuine change to the expression, not FMA \
+             contraction.",
+            got[worst_at],
+            want[worst_at],
+            got.len()
         );
 
         // Guard against a vacuous pass: if the render produced nothing, two

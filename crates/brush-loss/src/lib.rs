@@ -1699,11 +1699,31 @@ pub fn depth_loss(
     gt_depth: Tensor<2>,
     pixel_weight: Option<Tensor<2>>,
 ) -> Tensor<1> {
+    let gt_valid = gt_depth.clone().greater_elem(0.0);
+    let gt_invalid = gt_depth.clone().lower_equal_elem(0.0);
+    let gt_invalid_w = gt_invalid.clone();
+
+    // NON-FINITE DISCIPLINE — this `mask_fill` must stay BEFORE the arithmetic.
+    // A masked-out pixel has to contribute exactly nothing, and `x * 0.0` does
+    // not deliver that when `x` is `inf` or `NaN`: `0 · ∞ = NaN`, and autodiff
+    // reproduces the same product in the VJP even if the forward is repaired
+    // afterwards. Substituting the value up front is the only spelling that
+    // works, and it is the same idiom `plane_depth_from_features` uses for the
+    // identical reason. Note `NaN` in particular defeats the `pred <= 0` guard
+    // below all on its own, because every comparison against `NaN` is false.
+    //
+    // **Byte-identical for all-finite inputs**, which is what makes it safe
+    // against the recorded identity hashes: at a masked-out pixel the old code
+    // computed some finite `|disp_pred - 0|` and multiplied it by `valid == 0`,
+    // giving `0`; the new code computes `|0 - 0| * 0`, also `0`. Valid pixels
+    // are not touched at all (`mask_fill` is a select, so their bits pass
+    // through unchanged), and its VJP is an elementwise `grad * !mask` — no
+    // reduction, hence no reassociation that could move a last bit.
+    let pred_depth = pred_depth.mask_fill(gt_invalid.clone(), 0.0);
+
     let pred_invalid = pred_depth.clone().lower_equal_elem(0.0);
     let disp_pred = pred_depth.recip().mask_fill(pred_invalid, 0.0);
 
-    let gt_valid = gt_depth.clone().greater_elem(0.0);
-    let gt_invalid = gt_depth.clone().lower_equal_elem(0.0);
     let disp_gt = gt_depth.recip().mask_fill(gt_invalid, 0.0);
 
     let valid = gt_valid.float();
@@ -1713,7 +1733,13 @@ pub fn depth_loss(
     // denominator stays the UNweighted valid count, so w == 1 (and None) is
     // byte-identical to the old fn.
     let abs_err = match pixel_weight {
-        Some(w) => abs_err * w,
+        // Same discipline for the weight: it is caller-supplied (today
+        // `rgb_grad_weight`, always finite), but "the caller is careful" is not
+        // a property the type system carries, and `abs_err` is already 0 here,
+        // so a non-finite weight outside the mask would re-poison a term that
+        // was just made safe. Byte-identical for finite weights, and the
+        // `None` arm — the default path — constructs no op at all.
+        Some(w) => abs_err * w.mask_fill(gt_invalid_w, 0.0),
         None => abs_err,
     };
 
@@ -1786,6 +1812,16 @@ pub fn normal_loss(
     if let Some(gate_cos) = gate_cos {
         valid = valid * normal_gate_mask(pred_normal.clone(), gt_normal.clone(), gate_cos);
     }
+
+    // NON-FINITE DISCIPLINE: substitute before the subtract, never rely on the
+    // `* valid` to erase a non-finite value — see the block comment in
+    // `depth_loss` for why `0 · ∞` makes the multiply-only spelling wrong, and
+    // why this is byte-identical on all-finite inputs. Both operands are
+    // sanitised: a `NaN` in the PRIOR fails `|gt| > 0.5` (so the pixel is
+    // already invalid) but would still poison `pred - gt`.
+    let invalid3 = valid.clone().lower_elem(0.5).repeat_dim(2, 3);
+    let pred_normal = pred_normal.mask_fill(invalid3.clone(), 0.0);
+    let gt_normal = gt_normal.mask_fill(invalid3, 0.0);
 
     let abs_err = (pred_normal - gt_normal).abs().sum_dim(2) * valid.clone();
 
@@ -2140,6 +2176,14 @@ pub fn depth_normal_loss(
     let len_r = normal_rendered.clone().powi_scalar(2).sum_dim(2).sqrt();
     let valid = covered * len_d.greater_elem(0.5).float() * len_r.greater_elem(0.5).float();
 
+    // NON-FINITE DISCIPLINE: substitute before the dot product. Same reasoning
+    // and same byte-identity argument as `depth_loss` — an uncovered pixel holds
+    // `raw / alpha.clamp_min(1e-10)`, which is exactly where a non-finite value
+    // would come from if one ever did.
+    let invalid3 = valid.clone().lower_elem(0.5).repeat_dim(2, 3);
+    let normal_from_depth = normal_from_depth.mask_fill(invalid3.clone(), 0.0);
+    let normal_rendered = normal_rendered.mask_fill(invalid3, 0.0);
+
     let dot = (normal_from_depth * normal_rendered).sum_dim(2);
     let err = dot.neg().add_scalar(1.0) * valid.clone();
 
@@ -2191,6 +2235,18 @@ pub fn normal_smooth_loss(normal: Tensor<3>, alpha: Tensor<3>) -> Tensor<1> {
     let covered = alpha.greater_elem(0.5).float();
     let len = normal.clone().powi_scalar(2).sum_dim(2).sqrt();
     let valid = covered * len.greater_elem(0.5).float();
+
+    // NON-FINITE DISCIPLINE, the fourth member of the family — see the block
+    // comment in `depth_loss`. This one matters MORE than the others, not less:
+    // the caller builds `normal` as `normal_img / alpha.clamp_min(1e-10)`, and
+    // the doc comment above says in as many words that an uncovered pixel
+    // therefore holds amplified numerical noise. A difference that touches such
+    // a pixel is zeroed by `v_row`/`v_col`, which is exactly the `0 · ∞`
+    // situation. Byte-identical for finite input: a difference with an invalid
+    // endpoint is multiplied by 0 either way, and covered↔covered differences
+    // never see the substitution.
+    let invalid3 = valid.clone().lower_elem(0.5).repeat_dim(2, 3);
+    let normal = normal.mask_fill(invalid3, 0.0);
 
     // Row differences: N[i+1, j] - N[i, j].
     let d_row = (normal.clone().slice(s![1..h, .., ..])
@@ -3838,6 +3894,13 @@ mod masked_mean_and_gate_tests {
         Tensor::<3>::from_data(TensorData::new(data, [1, n, 1]), device)
     }
 
+    /// An explicitly-shaped `[H, W, C]` image, for the smoothness term, which
+    /// needs a real 2-D neighbourhood rather than the `[1, N, C]` strip the
+    /// other helpers build.
+    fn grid3(data: Vec<f32>, shape: [usize; 3], device: &burn::tensor::Device) -> Tensor<3> {
+        Tensor::<3>::from_data(TensorData::new(data, shape), device)
+    }
+
     fn img2(data: Vec<f32>, device: &burn::tensor::Device) -> Tensor<2> {
         let n = data.len();
         Tensor::<2>::from_data(TensorData::new(data, [1, n]), device)
@@ -3948,22 +4011,27 @@ mod masked_mean_and_gate_tests {
         assert!(base > 0.0, "the fixture must produce a nonzero loss");
     }
 
-    /// **§10d item 4, second half — CURRENTLY FAILING BY DESIGN, see the
-    /// `#[ignore]`.** A NON-FINITE value outside the mask must contribute exact
-    /// zero, forward and backward.
+    /// **§10d item 4, second half.** A NON-FINITE value outside the mask must
+    /// contribute exact zero, forward and backward.
     ///
     /// Ported from `test_masked_out_nonfinite_values_do_not_poison_loss_or_gradients`.
     /// This is the contract that forbids implementing a masked mean as
     /// `value * mask`: `0.0 * inf` is `NaN`, so one non-finite value in a region
-    /// the loss is supposed to ignore takes down the whole frame — and the
-    /// autodiff backward reproduces the same `0 · ∞` in the VJP even when the
-    /// forward is repaired afterwards. `plane_depth_from_features` already takes
-    /// the safe route (`mask_fill` BEFORE any arithmetic — see its sanitisation
-    /// block), and the reference uses `torch.where`. The three masked-mean
-    /// losses in this file do not: they all end in `err * valid`.
+    /// the loss is supposed to ignore takes down the whole frame — and autodiff
+    /// reproduces the same `0 · ∞` in the VJP even when the forward is repaired
+    /// afterwards. The fix is to substitute the value BEFORE the arithmetic,
+    /// which is the idiom `plane_depth_from_features` already used and which the
+    /// three masked-mean losses now use too (see the `NON-FINITE DISCIPLINE`
+    /// comments at each site).
     ///
-    /// **Measured, 2026-08-20 (M4 Max, Metal): 8 of the 9 (loss x poison)
-    /// combinations violate it.**
+    /// Five losses x three poisons = 15 combinations: `normal_loss`,
+    /// `depth_loss` (bare and with a poisoned per-pixel weight),
+    /// `depth_normal_loss` and `normal_smooth_loss`.
+    ///
+    /// # History — this test was red when it was written, and that was the point
+    ///
+    /// As first measured on 2026-08-20, **8 of the original 9 (loss × poison)
+    /// combinations failed**, because every masked mean ended in `err * valid`:
     ///
     /// ```text
     ///   normal_loss       [inf/-inf/NaN]: forward = NaN, want 0.06666667
@@ -3972,38 +4040,39 @@ mod masked_mean_and_gate_tests {
     ///   depth_loss        [NaN]         : backward = [-0.27700832, NaN]
     /// ```
     ///
-    /// The one survivor is `depth_loss` under ±inf, and only by accident of its
-    /// shape: `recip()` maps `+inf` to 0 and the `pred <= 0` guard catches
-    /// `-inf` before the multiply. `NaN` defeats both (every comparison against
-    /// `NaN` is false, so `mask_fill` never fires).
+    /// The single survivor was `depth_loss` under ±inf, and only by accident of
+    /// its shape: `recip()` maps `+inf` to 0 and the `pred <= 0` guard catches
+    /// `-inf` before the multiply. `NaN` defeated both, because every comparison
+    /// against `NaN` is false and `mask_fill` therefore never fired.
     ///
-    /// Note WHERE the damage shows: for `normal_loss` the backward is finite
-    /// even though the forward is `NaN` (`d|x|/dx · valid` is an honest 0), so
-    /// the poison travels as a `NaN` SCALAR LOSS. Summed into the total it takes
-    /// the gradient of every OTHER term in the step with it, which is a worse
-    /// failure than a local one and an easy one to misattribute.
+    /// Note WHERE the damage showed, since it is the part that makes this worth
+    /// a contract rather than a shrug: for `normal_loss` the backward stayed
+    /// finite while the forward was `NaN` (`d|x|/dx · valid` is an honest 0), so
+    /// the poison travelled as a `NaN` SCALAR LOSS. Summed into the total it
+    /// takes the gradient of every OTHER term in the step with it — a worse
+    /// failure than a local one, and an easy one to misattribute.
     ///
-    /// The finite half of the contract holds everywhere — see
-    /// `losses_ignore_finite_perturbations_outside_the_mask` (±1e6, bit-identical).
-    /// This test is left `#[ignore]`d rather than deleted or weakened because
-    /// WS-T's remit is tests only: the fix is to sanitise before the multiply in
-    /// `normal_loss`, `depth_loss` and `depth_normal_loss` (the `mask_fill`
-    /// idiom `plane_depth_from_features` already uses), which is a production
-    /// change and an owner's decision.
+    /// Not reachable from a healthy render today (the rendered normal is
+    /// `normal_img / alpha.clamp_min(1e-10)` re-normalised and the rendered
+    /// depth is `accum / alpha.clamp_min(1e-10)`; neither division reaches `inf`
+    /// at rasterizer magnitudes), so this is a robustness contract rather than a
+    /// live-bug regression test — which is exactly why it needs a test and not a
+    /// runtime symptom.
     ///
-    /// Reachability, so the severity is legible rather than assumed: the
-    /// rendered normal fed to `normal_loss` is
-    /// `normal_img / alpha.clamp_min(1e-10)` re-normalised, and the rendered
-    /// depth fed to `depth_loss` is `accum / alpha.clamp_min(1e-10)`. Those
-    /// divisions cannot reach `inf` from the magnitudes a rasterizer emits, so
-    /// this is a robustness contract rather than a live bug today — which is
-    /// precisely why it needs a test and not a runtime symptom. Run it with
-    /// `cargo test -p brush-loss -- --ignored` to re-measure.
+    /// The other two members of the family were then swept in rather than filed:
+    /// `normal_smooth_loss` (whose own doc comment already says an uncovered
+    /// pixel holds amplified noise from `raw / alpha.clamp_min(1e-10)`, so it
+    /// was the most exposed of the five) and `depth_loss`'s optional per-pixel
+    /// weight. Both were vulnerable to ±inf as well as `NaN`.
+    ///
+    /// # Mutation-checked, 2026-08-20
+    ///
+    /// - Reverting the three original `mask_fill` calls returns all 8 original
+    ///   failures verbatim.
+    /// - Reverting only the two later ones fails 6 of 15 — every
+    ///   `normal_smooth_loss` and `depth_loss[weighted]` combination — which is
+    ///   what makes those two hunks load-bearing rather than defensive.
     #[tokio::test]
-    #[ignore = "known gap: the masked-mean losses multiply by the mask, so a \
-                non-finite value OUTSIDE the mask still yields 0 * inf = NaN. \
-                Tests-only workstream; the fix is a production change. See the \
-                doc comment."]
     async fn losses_ignore_nonfinite_values_outside_the_mask() {
         let device = autodiff_device().await;
         let mut violations: Vec<String> = Vec::new();
@@ -4060,12 +4129,53 @@ mod masked_mean_and_gate_tests {
             let grads = loss.backward();
             let g = read(n_r.grad(&grads).expect("rendered-normal gradient")).await;
             check("depth_normal_loss", value, 1.0, g);
+
+            // --- normal_smooth_loss, on an UNCOVERED pixel. A 2x2 (its row and
+            // column differences both need two rows AND two columns, or the
+            // function early-returns a constant and the test proves nothing):
+            // three covered pixels that agree, and one uncovered + poisoned. So
+            // there are two covered-covered differences to score, both 0, and
+            // two that touch the poisoned pixel and must be dropped.
+            let alpha = grid3(vec![1.0, 1.0, 1.0, 0.0], [2, 2, 1], &device);
+            let n_s = lift_to_autodiff(grid3(
+                vec![
+                    0.0, 0.0, -1.0, //
+                    0.0, 0.0, -1.0, //
+                    0.0, 0.0, -1.0, //
+                    poison, poison, poison,
+                ],
+                [2, 2, 3],
+                &device,
+            ))
+            .require_grad();
+            let loss = normal_smooth_loss(n_s.clone(), alpha);
+            let value = read(loss.clone()).await[0];
+            let grads = loss.backward();
+            let g = read(n_s.grad(&grads).expect("smoothness gradient")).await;
+            check("normal_smooth_loss", value, 0.0, g);
+
+            // --- depth_loss's optional per-pixel weight, poisoned outside the
+            // mask. `abs_err` is already 0 there, so this is purely about the
+            // weight multiply.
+            let gt_d = img2(vec![2.0, 0.0], &device);
+            let pred_d = lift_to_autodiff(img2(vec![1.9, 1.0], &device)).require_grad();
+            let w = img2(vec![1.0, poison], &device);
+            let loss = depth_loss(pred_d.clone(), gt_d, Some(w));
+            let value = read(loss.clone()).await[0];
+            let grads = loss.backward();
+            let g = read(pred_d.grad(&grads).expect("weighted depth gradient")).await;
+            check(
+                "depth_loss[weighted]",
+                value,
+                (1.0f32 / 1.9 - 1.0 / 2.0).abs(),
+                g,
+            );
         }
 
         assert!(
             violations.is_empty(),
             "a non-finite value OUTSIDE the validity mask changed the loss or its \
-             gradient in {} of 9 (loss x poison) combinations:\n  {}",
+             gradient in {} of 15 (loss x poison) combinations:\n  {}",
             violations.len(),
             violations.join("\n  ")
         );
