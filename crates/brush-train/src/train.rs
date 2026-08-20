@@ -17,8 +17,8 @@ use crate::{
 use brush_appearance::{AppearanceConfig, AppearanceTrainState};
 use brush_dataset::scene::SceneBatch;
 use brush_loss::{
-    ImageLossConfig, depth_loss, depth_normal_loss, image_loss, normal_loss, normal_smooth_loss,
-    normals_from_depth, plane_depth_from_features, rgb_grad_weight,
+    DepthLossSpace, ImageLossConfig, depth_loss, depth_normal_loss, image_loss, normal_loss,
+    normal_smooth_loss, normals_from_depth, plane_depth_from_features, rgb_grad_weight,
 };
 use brush_render::camera::Camera;
 use brush_render::gaussian_splats::{RasterizationMode, Splats, fold_min_scale};
@@ -711,6 +711,24 @@ impl SplatTrainer {
             .unwrap_or(1.0)
     }
 
+    /// Divisor applied to `--depth-loss-weight`, which — unlike flatten and
+    /// scale-reg — is only SOMETIMES metric-dimensioned.
+    ///
+    /// An exact `1.0` under `--depth-loss-space disparity` (the default)
+    /// whatever `--normalize-metric-weights` says: a disparity residual is in
+    /// `1/m`, so dividing its weight by a length moves the effective weight the
+    /// wrong way by `s²` (plan §4.8, and the long comment at the flatten site
+    /// below). Under `--depth-loss-space metric` the residual is in metres,
+    /// like flatten's, so the depth weight JOINS the normalized set and this
+    /// returns `metric_weight_scale()` — turning a scene-independent `3.2` into
+    /// the `gauss-surf` reference's `3.2 / scene_scale`.
+    fn depth_weight_divisor(&self) -> f32 {
+        match self.config.depth_loss_space {
+            DepthLossSpace::Disparity => 1.0,
+            DepthLossSpace::Metric => self.metric_weight_scale(),
+        }
+    }
+
     /// Attach the Mip-Splatting scale floor for the trainer's active camera
     /// resolution. Replaces any existing floor without baking it; callers
     /// that change splat count must drop or select the old floor first.
@@ -1337,7 +1355,14 @@ impl SplatTrainer {
                 }
                 _ => splats.clone(),
             };
-            let eff_depth_weight = self.config.depth_weight_at(global_iter);
+            // `depth_weight_divisor()` is an exact 1.0 on the default path
+            // (disparity space), and stays 1.0 under `--normalize-metric-weights`
+            // too — only `--depth-loss-space metric` opts the depth weight into
+            // scene-scale normalization. Applied HERE, before the `> 0.0` gate,
+            // so the gate reads the weight the loss will actually be multiplied
+            // by rather than the pre-normalization one.
+            let eff_depth_weight =
+                self.config.depth_weight_at(global_iter) / self.depth_weight_divisor();
             let use_depth = batch.depth.is_some() && eff_depth_weight > 0.0;
             // Geometry-prior terms (all inert at their 0.0 defaults, gated
             // exactly like `use_depth`, so a run that does not pass the flags
@@ -1839,7 +1864,10 @@ impl SplatTrainer {
                 }
             }
 
-            // Depth Disparity L1 loss on rendered expected depth
+            // Depth L1 loss on rendered expected depth. Disparity-space by
+            // default; `--depth-loss-space metric` scores `|pred - gt|` instead
+            // (and, unlike disparity, is normalized by the scene scale when
+            // `--normalize-metric-weights` is on — see `depth_weight_divisor`).
             if use_depth && let Some(depth_data) = &batch.depth {
                 let gt_depth: Tensor<2> = Tensor::from_data(depth_data.clone(), &device);
                 // ---- DEPTH SOURCE DISPATCH — backward contracts (§4.5) ----
@@ -1906,7 +1934,13 @@ impl SplatTrainer {
                 } else {
                     None
                 };
-                loss = loss + depth_loss(expected_depth, gt_depth, pixel_weight) * eff_depth_weight;
+                loss = loss
+                    + depth_loss(
+                        expected_depth,
+                        gt_depth,
+                        pixel_weight,
+                        self.config.depth_loss_space,
+                    ) * eff_depth_weight;
             }
 
             // Depth-coupled opacity regularizer (3D distance-to-cloud gate). For
@@ -2093,14 +2127,17 @@ impl SplatTrainer {
             //   * scale-reg = mean(s² above a threshold)    -> metres²   -> / s²
             //     and its THRESHOLD is itself a length      -> metres    -> × s
             //
-            // **`--depth-loss-weight` is deliberately NOT in this list, and must
-            // not be "fixed" to match the reference.** The `gauss-surf` PGSR
-            // trainer (rerun-io/examples-monorepo, Apache-2.0, by Pablo Vela)
-            // divides its depth weight by the scene scale because its depth loss
-            // is a metric L1 in metres. Ours is DISPARITY-space (`1/m`,
-            // `brush-loss/src/lib.rs` `depth_loss`), so its residual scales as
-            // `1/s`, not `s` — dividing by `s` would move the effective weight
-            // the WRONG WAY by a factor of `s²`. The dimensionless weights
+            // **`--depth-loss-weight` is in this list only when
+            // `--depth-loss-space metric` is set** (applied at the depth term
+            // itself, via `depth_weight_divisor`, not here). The `gauss-surf`
+            // PGSR trainer (rerun-io/examples-monorepo, Apache-2.0, by Pablo
+            // Vela) divides its depth weight by the scene scale because its
+            // depth loss is a metric L1 in metres; ours is DISPARITY-space by
+            // default (`1/m`, `brush-loss/src/lib.rs` `depth_loss`), so its
+            // residual scales as `1/s`, not `s` — dividing by `s` there would
+            // move the effective weight the WRONG WAY by a factor of `s²`. So
+            // the exclusion follows the SPACE, not the term: switch the space
+            // and the same argument reverses. The dimensionless weights
             // (`--normal-loss-weight`, `--depth-normal-weight`,
             // `--normal-smooth-weight`, `--anti-needle-weight`) need no
             // normalization for the same reason, and get none.
@@ -3951,7 +3988,7 @@ mod depth_loss_grad_tests {
         // A positive constant target, so the disparity error and its gradient are
         // nonzero wherever a gaussian was rendered.
         let gt_depth = Tensor::<2>::ones([img_h, img_w], &device) * 3.0;
-        let loss = depth_loss(expected_depth, gt_depth, None);
+        let loss = depth_loss(expected_depth, gt_depth, None, DepthLossSpace::Disparity);
 
         let grads = splats.bwd_validate(loss).await;
 
@@ -4937,6 +4974,71 @@ mod scene_scale_tests {
         assert_eq!(none.metric_weight_scale(), 1.0);
     }
 
+    /// **The scale-normalization semantics FLIP with `--depth-loss-space`.**
+    ///
+    /// `--normalize-metric-weights` divides the weights whose loss VALUE
+    /// carries physical units. Whether the depth weight qualifies is a property
+    /// of the residual, not of the term: a disparity residual is in `1/m` (so
+    /// dividing its weight by a length moves it the wrong way by `s²` — plan
+    /// §4.8), a metric residual is in metres like flatten's (so it divides
+    /// exactly like flatten does — the `gauss-surf` reference's
+    /// `3.2 / scene_scale`).
+    ///
+    /// All four cells of the 2x2 are pinned, because three of them are exact
+    /// identities and only one is not; a regression that normalized the depth
+    /// weight unconditionally would still pass a test of the fourth cell alone.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn depth_weight_is_normalized_only_in_metric_space() {
+        let device = Default::default();
+        let bounds = BoundingBox::from_min_max(glam::Vec3::ZERO, glam::Vec3::ONE);
+        // The same ring the test above measures at scale 2.0.
+        let cams = camera_ring(8, 2.0, glam::Vec3::ZERO, glam::Vec3::Z);
+
+        let build = |space: DepthLossSpace, normalize: bool| {
+            let mut cfg = TrainConfig::default();
+            cfg.depth_loss_space = space;
+            cfg.normalize_metric_weights = normalize;
+            let mut trainer = SplatTrainer::new(&cfg, &device, bounds);
+            trainer.set_init_scene_scale(&cams);
+            trainer
+        };
+
+        // Normalization OFF: an exact 1.0 in BOTH spaces.
+        assert_eq!(
+            build(DepthLossSpace::Disparity, false).depth_weight_divisor(),
+            1.0
+        );
+        assert_eq!(
+            build(DepthLossSpace::Metric, false).depth_weight_divisor(),
+            1.0
+        );
+
+        // Normalization ON: disparity is still an exact 1.0 — the depth weight
+        // is NOT in the normalized set there, even though flatten's is.
+        let disparity_on = build(DepthLossSpace::Disparity, true);
+        assert!((disparity_on.metric_weight_scale() - 2.0).abs() < 1e-4);
+        assert_eq!(
+            disparity_on.depth_weight_divisor(),
+            1.0,
+            "a disparity residual is 1/m; normalizing its weight by a length is \
+             dimensionally inverted"
+        );
+
+        // Normalization ON + metric: the depth weight joins the set, so an
+        // entered 3.2 becomes the reference's 3.2 / scene_scale.
+        let metric_on = build(DepthLossSpace::Metric, true);
+        let divisor = metric_on.depth_weight_divisor();
+        assert!(
+            (divisor - 2.0).abs() < 1e-4,
+            "metric depth weight must be divided by the scene scale, got {divisor}"
+        );
+        assert!(
+            (3.2 / divisor - 1.6).abs() < 1e-4,
+            "3.2 at scene scale 2.0 must land at 1.6"
+        );
+    }
+
     /// **§10d item 9.** A common world translation cannot change the scene
     /// scale.
     ///
@@ -5572,7 +5674,7 @@ mod plane_aux_consumer_tests {
         // pixel carries a real, same-signed disparity error. `* valid` is the
         // trainer's own masking of unsupervised pixels.
         let gt = depth.clone().detach().mul_scalar(0.9) * valid;
-        depth_loss(depth, gt, None)
+        depth_loss(depth, gt, None, DepthLossSpace::Disparity)
     }
 
     /// §4.5 row 2: with `plane-aux`, depth error must NOT be able to reach

@@ -1,7 +1,7 @@
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
-use brush_process::config::{DepthSource, TrainConfig, TrainStreamConfig};
+use brush_process::config::{DepthLossSpace, DepthSource, TrainConfig, TrainStreamConfig};
 use brush_render::AlphaMode;
 use brush_render::gaussian_splats::SplatRenderMode;
 use egui::{Align2, Slider, Ui};
@@ -436,6 +436,35 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
             false,
             enabled,
         );
+
+        // Which SPACE the depth residual is measured in. Sits directly under
+        // the weight it reinterprets, because the two only make sense read
+        // together: the same numeric weight means different things either side
+        // of this control.
+        ui.label("Depth loss space");
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(
+                    &mut tc.depth_loss_space,
+                    DepthLossSpace::Disparity,
+                    "Disparity",
+                )
+                .on_hover_text(
+                    "|1/pred - 1/gt|. Previous behaviour, and the default. The per-pixel \
+                     gradient scales as 1/d², so near-camera splats receive far more depth \
+                     gradient than distant ones. NOT scaled by 'Normalize metric weights' \
+                     below — a 1/m residual's weight would move the wrong way by s².",
+                );
+                ui.selectable_value(&mut tc.depth_loss_space, DepthLossSpace::Metric, "Metric")
+                    .on_hover_text(
+                        "|pred - gt|, in the depth prior's own units (metres). Constant \
+                         per-pixel gradient magnitude, independent of range — which is what \
+                         the gauss-surf PGSR reference trains with (weight 3.2 / scene_scale) \
+                         while running Plane (fused). IS scaled by 'Normalize metric weights': \
+                         with it on, enter the reference's scene-independent 3.2 directly.",
+                    );
+            });
+        });
 
         // Which depth the loss (and the depth/normal consistency term) is
         // supervised against. PGSR, arXiv:2406.06521.
@@ -1057,6 +1086,10 @@ mod tests {
         assert_eq!(
             args.train_config.depth_source,
             def.train_config.depth_source
+        );
+        assert_eq!(
+            args.train_config.depth_loss_space,
+            def.train_config.depth_loss_space
         );
         assert_eq!(args.train_config.normal_ramp_start_iter, 0);
         assert_eq!(args.train_config.normal_ramp_iters, 0);
