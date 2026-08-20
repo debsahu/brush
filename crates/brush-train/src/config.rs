@@ -686,6 +686,29 @@ pub struct TrainConfig {
     #[serde(default)]
     pub normalize_metric_weights: bool,
 
+    /// Keep training after a non-finite (NaN / inf) total loss instead of
+    /// aborting the run.
+    ///
+    /// **This default is a DELIBERATE BEHAVIOUR CHANGE.** Before this flag
+    /// existed there was no check at all: a single NaN loss step wrote NaN
+    /// gradients through the optimizer into the parameters, and the run
+    /// continued for hours producing garbage that only surfaced at export. The
+    /// trainer now aborts instead, matching the reference trainer, which raises
+    /// `FloatingPointError` on any non-finite loss term rather than warning.
+    ///
+    /// So a run that previously "succeeded" on a poisoned scene will now STOP.
+    /// That is the point: the output of such a run was never usable. Pass this
+    /// flag only to reproduce or debug the poisoning itself — the resulting
+    /// splats are not a deliverable.
+    ///
+    /// The check is not free (it reads a scalar back from the GPU, which
+    /// synchronises), so it does not run every step. See
+    /// `NONFINITE_LOSS_CHECK_STEPS` in `train.rs` for the cadence and the
+    /// blast-radius argument for the gaps between checks.
+    #[arg(long, help_heading = "Training options", default_value = "false")]
+    #[serde(default)]
+    pub allow_nonfinite_loss: bool,
+
     /// Weight of total-variation smoothness on the rendered normal image
     /// (DN-Splatter's `L_smooth`). Needs no prior data.
     ///
@@ -2242,5 +2265,49 @@ mod tests {
         let on = TrainConfig::try_parse_from(["brush", "--normalize-metric-weights"])
             .expect("--normalize-metric-weights must parse");
         assert!(on.normalize_metric_weights);
+    }
+
+    /// `--allow-nonfinite-loss` defaults OFF, i.e. a non-finite loss ABORTS.
+    ///
+    /// Note this is the one flag in this file whose inert default is not the
+    /// pre-change behaviour: before the guard existed, a NaN loss was silently
+    /// trained through. The default pinned here is the new, strict behaviour;
+    /// the flag exists to restore the old one deliberately rather than by
+    /// accident. See the field's doc comment.
+    #[test]
+    fn allow_nonfinite_loss_defaults_off_and_parse() {
+        let def = TrainConfig::default();
+        assert!(
+            !def.allow_nonfinite_loss,
+            "a non-finite loss must abort by default"
+        );
+
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert!(!other.allow_nonfinite_loss);
+
+        let on = TrainConfig::try_parse_from(["brush", "--allow-nonfinite-loss"])
+            .expect("--allow-nonfinite-loss must parse");
+        assert!(on.allow_nonfinite_loss);
+
+        // Serde default: a config file written before this flag existed still
+        // loads, and loads as the strict setting. Built by round-tripping a
+        // default config with the key REMOVED, which is exactly what an older
+        // file looks like — `TrainConfig` is not fully serde-defaulted, so a
+        // bare `{}` would fail on unrelated required fields and prove nothing.
+        let mut value =
+            serde_json::to_value(TrainConfig::default()).expect("config must serialize");
+        let removed = value
+            .as_object_mut()
+            .expect("config serializes to a JSON object")
+            .remove("allow-nonfinite-loss");
+        assert!(
+            removed.is_some(),
+            "the field must serialize under this key, or the removal below is a no-op \
+             and this test would pass vacuously"
+        );
+        let from_json: TrainConfig =
+            serde_json::from_value(value).expect("a config without the key must deserialize");
+        assert!(!from_json.allow_nonfinite_loss);
     }
 }

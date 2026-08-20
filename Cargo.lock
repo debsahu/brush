@@ -1252,6 +1252,7 @@ dependencies = [
  "rand 0.10.2",
  "rayon",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "wasm-bindgen-test",

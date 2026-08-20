@@ -157,6 +157,34 @@ const NORMAL_GATE_LOW_SAMPLES_TO_WARN: u32 = 3;
 /// nothing is read back.
 const NORMAL_GATE_SAMPLES_PER_WINDOW: u32 = 2;
 
+/// Steps from the start of training for which the TOTAL LOSS is checked for
+/// finiteness on EVERY iteration.
+///
+/// # Why a cadence at all
+///
+/// Reading the loss scalar forces a GPU readback, which synchronises. The
+/// trainer deliberately avoids that on the hot path — it is why the rerun and
+/// JSONL loggers gate their own reads. An unconditional per-step check would
+/// hand every run a permanent stall to protect against a rare event.
+///
+/// # Why EVERY step early, and only sampled later
+///
+/// Explosions happen early: the learning rate is at its highest, the scene is
+/// least settled, and densification is at its most aggressive. Several hundred
+/// readbacks at the very start cost a fraction of a second against a run that
+/// would otherwise spend hours training on NaN and produce nothing.
+///
+/// # Blast radius between checks
+///
+/// After the early window the check rides the refine cadence, and that is not
+/// only a cost argument — it is a containment one. While refinement is active,
+/// the non-finite parameter prune inside `refine_for_phase` runs on exactly
+/// those iterations, so any parameter that NaNs between two checks is swept at
+/// the very step the next check happens. The unbounded window is therefore only
+/// the one AFTER refinement stops, which is precisely the window
+/// `prune_non_finite_splats` was added to cover from the eval cadence.
+const NONFINITE_LOSS_CHECK_STEPS: u32 = 250;
+
 /// The three per-parameter Adam states of a [`Splats`] module, owned directly
 /// so the trainer can update LR scaling every step and surgically edit the
 /// momentum tensors during refine — all GPU-side, no record round-trips. burn
@@ -2069,6 +2097,29 @@ impl SplatTrainer {
             // Strip the autodiff graph off the loss so consumers can read the
             // scalar later without keeping the backward pass alive.
             let loss_inner = loss.clone().inner();
+
+            // ---- Total-loss finiteness guard ----
+            //
+            // Deliberately BEFORE the backward and the optimizer step: a NaN
+            // loss produces NaN gradients, which the optimizer then writes into
+            // every parameter it touches. Checking here means the run aborts
+            // with the parameters still clean, so whatever the caller does next
+            // (checkpoint, inspect) sees the last good state rather than a
+            // scene that has already been overwritten with NaN.
+            //
+            // Cadence and its rationale: `NONFINITE_LOSS_CHECK_STEPS`.
+            if self.should_check_loss_finite(global_iter) {
+                let loss_value: f32 = loss_inner
+                    .clone()
+                    .into_scalar_async()
+                    .await
+                    .expect("total-loss readback for the finiteness guard");
+                if !loss_value.is_finite() {
+                    self.report_nonfinite_loss(loss_value, &splats, global_iter)
+                        .await;
+                }
+            }
+
             let mut grads = splats.bwd_validate(loss).await;
 
             let deferred_sh_grad = deferred_sh_grad.map(|handle| {
@@ -2408,6 +2459,143 @@ impl SplatTrainer {
         (splats, stats)
     }
 
+    /// Whether this step's total loss should be read back and checked.
+    ///
+    /// See [`NONFINITE_LOSS_CHECK_STEPS`] for why this is sampled rather than
+    /// unconditional, and why the sampled cadence is the refine cadence.
+    fn should_check_loss_finite(&self, global_iter: u32) -> bool {
+        if self.step_count <= NONFINITE_LOSS_CHECK_STEPS {
+            return true;
+        }
+        // The refine cadence is a step that ALREADY synchronises (the refine
+        // prune reads its own counts back), so the marginal cost here is one
+        // extra scalar rather than a new stall.
+        global_iter.is_multiple_of(self.config.refine_every.max(1))
+    }
+
+    /// Report — and by default ABORT on — a non-finite total loss.
+    ///
+    /// The reference trainer raises `FloatingPointError` on any non-finite loss
+    /// term rather than warning, and that is the right posture: a step whose
+    /// loss is NaN writes NaN gradients into the parameters, and every
+    /// subsequent step trains on garbage. A run that continues past this point
+    /// has no usable output, so continuing only wastes GPU hours and, worse,
+    /// produces a file that LOOKS like a deliverable.
+    ///
+    /// `--allow-nonfinite-loss` restores the old continue-anyway behaviour for
+    /// debugging the poisoning itself.
+    async fn report_nonfinite_loss(&self, loss_value: f32, splats: &Splats, global_iter: u32) {
+        // This path is already failing, so the extra readbacks below are free in
+        // any sense that matters. WHICH parameter group is non-finite is the
+        // only cheap diagnostic available — the per-TERM loss breakdown is not,
+        // because the terms are accumulated into one scalar (`loss = loss + ..`)
+        // and are not retained separately. Splat-side counts still separate the
+        // two cases that matter: parameters already poisoned before this step
+        // (counts > 0) versus a loss that went non-finite on clean parameters
+        // (counts == 0, i.e. look at the batch and the loss terms instead).
+        let counts = non_finite_splat_masks(splats).counts().await;
+        log::error!(
+            "NON-FINITE TOTAL LOSS ({loss_value}) at iter {global_iter}. {}",
+            counts.report(global_iter, "loss guard")
+        );
+
+        assert!(
+            self.config.allow_nonfinite_loss,
+            "non-finite total loss ({loss_value}) at iter {global_iter}: aborting before the \
+             backward pass writes NaN gradients into the parameters. Splat parameters \
+             non-finite at this point: {} of {} [transforms {} | sh {} | opacity {}]. \
+             Training past this point produces an export that cannot be used — one \
+             non-finite value poisons an entire SOG codebook downstream. Pass \
+             --allow-nonfinite-loss to continue anyway (for debugging the cause only; \
+             the result is not a deliverable).",
+            counts.any, counts.total, counts.transforms, counts.sh, counts.opacities
+        );
+
+        log::error!(
+            "--allow-nonfinite-loss is set: continuing to train on a non-finite loss. \
+             The resulting splats are NOT a deliverable."
+        );
+    }
+
+    /// Prune non-finite splats OUTSIDE the refine cadence.
+    ///
+    /// # The gap this closes
+    ///
+    /// The non-finite prune inside `refine_for_phase` only runs on refine
+    /// steps, so any splat that goes NaN/inf AFTER the last refinement survives
+    /// all the way to export. Measured on `ARKitScenes`: **14-25 non-finite
+    /// splats in every exported ply**. That number was only ever visible
+    /// because `analyze/splatstats/` counts them after the fact; the trainer
+    /// should own it, which is what the log line here does.
+    ///
+    /// Downstream this is not cosmetic — one non-finite value poisons an entire
+    /// SOG codebook at Stage 7, which is a whole-scene failure, not a
+    /// three-splat one.
+    ///
+    /// # Cost, and where to call it
+    ///
+    /// Counting synchronises with the GPU, so this is for cadences that already
+    /// sync (eval) or paths where a sync is free relative to what follows
+    /// (immediately before an export writes a file).
+    ///
+    /// # Byte-identity
+    ///
+    /// When nothing is non-finite this returns EARLY — before taking the
+    /// optimizer, before touching the refine record, before `prune_points`.
+    /// A clean run therefore executes exactly the sequence it did before this
+    /// method existed, and only the (value-free) count readback is added.
+    pub async fn prune_non_finite_splats(
+        &mut self,
+        iter: u32,
+        splats: Splats,
+        site: &str,
+    ) -> (Splats, u32) {
+        let masks = non_finite_splat_masks(&splats);
+        let counts = masks.counts().await;
+        if counts.any == 0 {
+            return (splats, 0);
+        }
+        log::warn!("{}", counts.report(iter, site));
+
+        // The optimizer is created lazily on the first step. Without it there
+        // is no moment state to keep in lockstep, but `prune_points` needs one
+        // to reindex; nothing has trained yet either, so leave it alone.
+        let Some(mut optim) = self.optim.take() else {
+            log::warn!(
+                "non-finite splats found at iter {iter} ({site}) before the optimizer exists; \
+                 leaving them in place"
+            );
+            return (splats, 0);
+        };
+
+        // `refine_record` is None only right after a refine consumed it; `step`
+        // recreates it on the next iteration regardless, so a fresh zeroed
+        // record loses nothing that was going to survive anyway.
+        let device = splats.device();
+        let refiner = self
+            .refine_record
+            .take()
+            .unwrap_or_else(|| RefineRecord::new(splats.num_splats(), &device));
+
+        let (splats, refiner, pruned) = prune_points(
+            splats,
+            &mut optim,
+            refiner,
+            masks.any(),
+            self.dig.as_mut(),
+            self.tidi.as_mut(),
+        )
+        .await;
+        self.optim = Some(optim);
+        self.refine_record = Some(refiner);
+
+        log::warn!(
+            "pruned {pruned} non-finite splats at iter {iter} ({site}); {} remain",
+            splats.num_splats()
+        );
+        (splats, pruned)
+    }
+
     pub async fn refine(&mut self, iter: u32, splats: Splats) -> (Splats, RefineStats) {
         self.refine_for_phase(iter, iter, self.config.total_train_iters, splats)
             .await
@@ -2519,21 +2707,17 @@ impl SplatTrainer {
                 .squeeze_dim(1)
         };
 
-        // Prune parameter that's NaN.
-        fn row_non_finite(t: &Tensor<2>) -> Tensor<1, Bool> {
-            t.clone().is_finite().bool_not().any_dim(1).squeeze_dim(1)
+        // Prune parameters that are NaN/inf. ONE definition of "non-finite
+        // splat" lives in `non_finite_splat_masks`, shared by this prune, the
+        // out-of-refine sweep (`prune_non_finite_splats`) and the loss guard's
+        // diagnostic — three callers that must agree on what they are counting.
+        let non_finite = non_finite_splat_masks(&splats);
+        let non_finite_mask = non_finite.any();
+        let non_finite_counts = non_finite.counts().await;
+        let num_pruned_non_finite = non_finite_counts.any;
+        if num_pruned_non_finite > 0 {
+            log::info!("{}", non_finite_counts.report(global_iter, "refine"));
         }
-        let transforms_bad = row_non_finite(&splats.transforms.val());
-        let sh_bad = row_non_finite(&splats.sh_coeffs.val().flatten(1, 2));
-        let opac_bad = row_non_finite(&splats.raw_opacities.val().unsqueeze_dim(1));
-        let non_finite_mask = transforms_bad.bool_or(sh_bad).bool_or(opac_bad);
-        let num_pruned_non_finite = non_finite_mask
-            .clone()
-            .int()
-            .sum()
-            .into_scalar_async::<i32>()
-            .await
-            .expect("Failed to count non-finite splats") as u32;
 
         let prune_mask = alpha_mask
             .bool_or(scale_big)
@@ -3164,6 +3348,83 @@ fn tidi_params(config: &TrainConfig) -> TidiPruneParams {
         depth_float_frac: config.tidi_depth_float_frac,
         depth_min_valid_views: config.tidi_depth_min_valid_views as f32,
         depth_cap_frac: config.tidi_depth_cap_frac,
+    }
+}
+
+/// Per-parameter-group "this splat has a non-finite value" masks.
+///
+/// Split by group rather than pre-`or`ed because WHICH parameter went bad is
+/// the only cheap diagnostic available when a run poisons itself, and it is
+/// what a future root-cause pass will start from. The combined mask is
+/// [`Self::any`].
+struct NonFiniteSplatMasks {
+    transforms: Tensor<1, Bool>,
+    sh: Tensor<1, Bool>,
+    opacities: Tensor<1, Bool>,
+}
+
+/// Counts behind [`NonFiniteSplatMasks`]. `any` is the number of splats with a
+/// non-finite value ANYWHERE, so it is <= the sum of the three groups (one
+/// splat can be bad in more than one).
+struct NonFiniteSplatCounts {
+    transforms: u32,
+    sh: u32,
+    opacities: u32,
+    any: u32,
+    total: u32,
+}
+
+impl NonFiniteSplatCounts {
+    /// One-line report, shared by every site that prunes or detects. Kept
+    /// identical across sites so the numbers are greppable across a whole run.
+    fn report(&self, iter: u32, site: &str) -> String {
+        format!(
+            "non-finite splats at iter {iter} ({site}): {} of {}              [transforms {} | sh {} | opacity {}]",
+            self.any, self.total, self.transforms, self.sh, self.opacities
+        )
+    }
+}
+
+impl NonFiniteSplatMasks {
+    fn any(&self) -> Tensor<1, Bool> {
+        self.transforms
+            .clone()
+            .bool_or(self.sh.clone())
+            .bool_or(self.opacities.clone())
+    }
+
+    /// Reads all four counts back from the GPU. This SYNCHRONISES — callers are
+    /// responsible for only doing it on a cadence that already syncs, or on a
+    /// path that is already failing.
+    async fn counts(&self) -> NonFiniteSplatCounts {
+        async fn count(mask: Tensor<1, Bool>) -> u32 {
+            mask.int()
+                .sum()
+                .into_scalar_async::<i32>()
+                .await
+                .expect("Failed to count non-finite splats") as u32
+        }
+        let total = self.transforms.dims()[0] as u32;
+        NonFiniteSplatCounts {
+            transforms: count(self.transforms.clone()).await,
+            sh: count(self.sh.clone()).await,
+            opacities: count(self.opacities.clone()).await,
+            any: count(self.any()).await,
+            total,
+        }
+    }
+}
+
+/// The single definition of "this splat is non-finite", used by the refine
+/// prune, the out-of-refine sweep and the loss guard's diagnostic.
+fn non_finite_splat_masks(splats: &Splats) -> NonFiniteSplatMasks {
+    fn row_non_finite(t: &Tensor<2>) -> Tensor<1, Bool> {
+        t.clone().is_finite().bool_not().any_dim(1).squeeze_dim(1)
+    }
+    NonFiniteSplatMasks {
+        transforms: row_non_finite(&splats.transforms.val()),
+        sh: row_non_finite(&splats.sh_coeffs.val().flatten(1, 2)),
+        opacities: row_non_finite(&splats.raw_opacities.val().unsqueeze_dim(1)),
     }
 }
 
@@ -5631,6 +5892,350 @@ mod plane_aux_consumer_tests {
         assert!(
             background > 100,
             "expected real uncovered background (where the clamps bite), got              {background} pixels"
+        );
+    }
+}
+
+/// WS-F pins for the two NaN-containment guards: the total-loss finiteness
+/// check (gap 1) and the out-of-refine non-finite splat sweep (gap 2).
+///
+/// Both are guards, so the only test that means anything is one that makes them
+/// FIRE. A guard whose trigger path is never executed is indistinguishable from
+/// a guard that was accidentally wired to a condition that can never be true —
+/// which is the same class of defect as a dispatch that silently selects the
+/// default path. So every pin here poisons real state and observes the error
+/// path, rather than asserting that clean input stays clean.
+///
+/// **Merge note.** This module is appended at the end of `train.rs`, as are
+/// `scene_scale_tests` and `plane_feature_tests`. Git's line-level 3-way
+/// heuristic interleaves fragments of such modules into invalid Rust that still
+/// looks like a plausible merge, so integration must treat each `#[cfg(test)]
+/// mod` as ONE opaque block and concatenate whole modules. Keep this module
+/// self-contained (it takes nothing from outside `super::*`) and do not append
+/// unrelated items after it.
+#[cfg(test)]
+mod nonfinite_guard_tests {
+    use super::*;
+    use brush_render::gaussian_splats::SplatRenderMode;
+    use brush_render::kernels::camera_model::CameraModel;
+
+    const IMG: glam::UVec2 = glam::uvec2(32, 32);
+    const N_SIDE: usize = 4;
+
+    fn guard_camera() -> Camera {
+        Camera::new(
+            glam::vec3(0.0, 0.0, -5.0),
+            glam::Quat::IDENTITY,
+            0.7,
+            0.7,
+            glam::vec2(0.5, 0.5),
+            CameraModel::Pinhole,
+        )
+    }
+
+    /// A small fronto-parallel slab at `z = 0`, entirely inside the frame.
+    ///
+    /// With `poison`, splat 0's SH DC term is `NaN`. SH is chosen deliberately
+    /// over the mean: a `NaN` mean projects to a `NaN` screen position and the
+    /// visibility test rejects it (every float comparison against `NaN` is
+    /// false), so the splat is CULLED and the loss stays finite — the poison
+    /// would never reach the thing under test. A `NaN` colour on a splat that
+    /// still rasterizes normally does reach it.
+    fn guard_splats(device: &Device, poison: bool) -> Splats {
+        let mut means = Vec::new();
+        for iy in 0..N_SIDE {
+            for ix in 0..N_SIDE {
+                let f = |i: usize| (i as f32 / (N_SIDE - 1) as f32) * 2.0 - 1.0;
+                means.extend_from_slice(&[f(ix), f(iy), 0.0]);
+            }
+        }
+        let n = means.len() / 3;
+        let rotations: Vec<f32> = (0..n).flat_map(|_| [1.0, 0.0, 0.0, 0.0]).collect();
+        let log_scales: Vec<f32> = (0..n).flat_map(|_| [-1.2, -1.6, -2.5]).collect();
+        let mut sh: Vec<f32> = (0..n).flat_map(|_| [0.5, 0.5, 0.5]).collect();
+        if poison {
+            sh[0] = f32::NAN;
+        }
+        let opac: Vec<f32> = vec![4.0; n];
+        Splats::from_raw(
+            means,
+            rotations,
+            log_scales,
+            sh,
+            opac,
+            SplatRenderMode::Default,
+            device,
+        )
+    }
+
+    fn guard_batch() -> SceneBatch {
+        let (h, w) = (IMG.y as usize, IMG.x as usize);
+        let img_packed = TensorData::new(
+            (0..h * w)
+                .map(|i| {
+                    // Deterministic opaque RGBA. Wrapping on purpose: this is a
+                    // hash, not arithmetic, and a plain multiply overflows.
+                    let rgb = (i as u32).wrapping_mul(2_654_435_761) & 0x00ff_ffff;
+                    (rgb | 0xff00_0000) as i32
+                })
+                .collect::<Vec<i32>>(),
+            [h, w],
+        );
+        SceneBatch {
+            img_packed,
+            has_alpha: false,
+            alpha_mode: AlphaMode::Transparent,
+            features: None,
+            depth: None,
+            normal: None,
+            camera: guard_camera(),
+            view_index: 0,
+        }
+    }
+
+    fn guard_trainer(allow_nonfinite_loss: bool, device: &Device) -> SplatTrainer {
+        let config = TrainConfig {
+            allow_nonfinite_loss,
+            ..Default::default()
+        };
+        SplatTrainer::new(
+            &config,
+            device,
+            BoundingBox::from_min_max(glam::Vec3::splat(-2.0), glam::Vec3::splat(2.0)),
+        )
+    }
+
+    /// The cadence: every step early, then aligned to the refine cadence.
+    ///
+    /// Pins BOTH halves. Only asserting the early window would accept a guard
+    /// that stops checking forever afterwards; only asserting the late stride
+    /// would accept one that skips the explosion-prone opening.
+    #[test]
+    fn loss_check_cadence_is_early_then_refine_aligned() {
+        let device = Default::default();
+        let mut trainer = guard_trainer(false, &device);
+        let every = trainer.config.refine_every;
+        assert!(every > 1, "test assumes a nontrivial refine cadence");
+
+        // Early window: every step, whatever the iteration number.
+        for step in [1u32, 2, 7, NONFINITE_LOSS_CHECK_STEPS] {
+            trainer.step_count = step;
+            assert!(
+                trainer.should_check_loss_finite(step),
+                "step {step} is inside the early window and must be checked"
+            );
+            // Even on an iteration that is NOT on the refine stride.
+            assert!(trainer.should_check_loss_finite(every * 3 + 1));
+        }
+
+        // After it: only on the refine stride.
+        trainer.step_count = NONFINITE_LOSS_CHECK_STEPS + 1;
+        assert!(trainer.should_check_loss_finite(every * 4));
+        assert!(!trainer.should_check_loss_finite(every * 4 + 1));
+        assert!(!trainer.should_check_loss_finite(every * 4 - 1));
+    }
+
+    /// The escape hatch is off by default, so a non-finite loss ABORTS.
+    #[tokio::test]
+    #[should_panic(expected = "non-finite total loss")]
+    async fn nonfinite_loss_aborts_by_default() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let trainer = guard_trainer(false, &device);
+        let splats = guard_splats(&device, false);
+        trainer.report_nonfinite_loss(f32::NAN, &splats, 42).await;
+    }
+
+    /// `--allow-nonfinite-loss` restores the old continue-anyway behaviour.
+    #[tokio::test]
+    async fn nonfinite_loss_escape_hatch_allows_continuing() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let trainer = guard_trainer(true, &device);
+        let splats = guard_splats(&device, false);
+        // Must return rather than panic. Both non-finite kinds, since `inf` and
+        // `NaN` reach the check by different arithmetic.
+        trainer.report_nonfinite_loss(f32::NAN, &splats, 7).await;
+        trainer
+            .report_nonfinite_loss(f32::INFINITY, &splats, 8)
+            .await;
+    }
+
+    /// **The guard must be WIRED INTO `step`, not merely defined.**
+    ///
+    /// The sibling failure to a dispatch that never selects its branch: a
+    /// perfectly correct `report_nonfinite_loss` is worth nothing if
+    /// `should_check_loss_finite` is never consulted. So poison the accumulated
+    /// total loss for real, run a real `step`, and require the abort.
+    ///
+    /// # Why the poison is a weight and not a splat
+    ///
+    /// The obvious injection — a `NaN` splat parameter — does NOT work, and
+    /// finding that out is worth more than the test itself. Measured here: a
+    /// splat whose SH DC term is `NaN` is pruned by
+    /// `prune_non_finite_splats` (the sibling test proves that) yet leaves the
+    /// step-0 loss perfectly FINITE. The rasterizer never lets the poison
+    /// through: `NaN` colours are clamped away and `NaN` geometry fails the
+    /// visibility and alpha-cutoff comparisons (every float compare against
+    /// `NaN` is false), so the splat is simply skipped.
+    ///
+    /// That is exactly why gap 2 exists as a separate problem from gap 1: a
+    /// non-finite splat is INVISIBLE to the loss, so no loss-side guard will
+    /// ever catch it, and it survives all the way to the exported ply. The two
+    /// guards are not redundant — neither one subsumes the other.
+    ///
+    /// So this pin injects on the side the loss guard actually watches: a
+    /// non-finite weight makes the accumulated total non-finite, which is the
+    /// shape a real numerical blow-up takes.
+    #[tokio::test]
+    #[should_panic(expected = "non-finite total loss")]
+    async fn nonfinite_loss_guard_is_live_in_step() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let config = TrainConfig {
+            anti_needle_weight: f32::INFINITY,
+            ..Default::default()
+        };
+        let mut trainer = SplatTrainer::new(
+            &config,
+            &device,
+            BoundingBox::from_min_max(glam::Vec3::splat(-2.0), glam::Vec3::splat(2.0)),
+        );
+        let _ = trainer
+            .step(guard_batch(), guard_splats(&device, false))
+            .await;
+    }
+
+    /// A `NaN` splat parameter does NOT reach the rendered image.
+    ///
+    /// Pinned as its own fact because the whole justification for gap 2's
+    /// separate sweep rests on it: the loss guard cannot cover non-finite
+    /// splats, because they never reach the loss. If a future rasterizer change
+    /// DID start propagating splat `NaN`s into the image, this test fails and
+    /// tells the reader that the containment argument needs revisiting — rather
+    /// than the sweep quietly looking redundant.
+    ///
+    /// Stated on the RENDER rather than on a full `step`, deliberately. A step
+    /// runs the backward, and `bwd_validate` asserts on `NaN` gradients
+    /// whenever `brush-render`'s `debug-validation` is on — which a workspace
+    /// build turns on for every crate through feature unification, even though
+    /// `cargo test -p brush-train` alone does not. A step-level version of this
+    /// test therefore passes standalone and fails under `cargo test
+    /// --workspace`. The render is also simply where the mechanism lives.
+    #[tokio::test]
+    async fn a_nonfinite_splat_never_reaches_the_image() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let poisoned = guard_splats(&device, true);
+        let counts = non_finite_splat_masks(&poisoned).counts().await;
+        assert_eq!(counts.any, 1, "fixture must actually be poisoned");
+        assert_eq!(
+            counts.sh, 1,
+            "the poison must be in the SH, as the fixture intends"
+        );
+
+        // A debug-validation build panics on the non-finite INPUT before the
+        // renderer can demonstrate anything about its output, so there is
+        // nothing here to observe. Skip rather than assert something weaker:
+        // the claim this test makes is about the DEFAULT build, which is the
+        // one that ships and the one gap 2 was measured on.
+        if brush_render::validation::HARD_FAILS_ON_NON_FINITE {
+            return;
+        }
+
+        let out = render_splats_for_training(
+            poisoned,
+            &guard_camera(),
+            IMG,
+            glam::Vec3::ZERO,
+            false,
+            RasterizationMode::Rgba,
+            false,
+        )
+        .await;
+        let img = out
+            .img
+            .into_data_async()
+            .await
+            .expect("image readback")
+            .into_vec::<f32>()
+            .expect("image as f32");
+        let bad = img.iter().filter(|v| !v.is_finite()).count();
+        assert_eq!(
+            bad,
+            0,
+            "{bad} of {} rendered values are non-finite. A non-finite splat now DOES \
+             reach the image, so the loss guard partly covers gap 2 and the sweep's \
+             rationale needs updating.",
+            img.len()
+        );
+    }
+
+    /// The complementary half: a clean step must NOT trip the guard.
+    ///
+    /// Without this, a guard hard-wired to `true` would pass the test above and
+    /// break every real run.
+    #[tokio::test]
+    async fn clean_step_does_not_trip_the_guard() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let mut trainer = guard_trainer(false, &device);
+        let splats = guard_splats(&device, false);
+        let (_next, stats) = trainer.step(guard_batch(), splats).await;
+        let loss: f32 = stats.loss.into_scalar_async().await.expect("loss readback");
+        assert!(loss.is_finite(), "a clean scene produced a non-finite loss");
+    }
+
+    /// The out-of-refine sweep removes non-finite splats, and is INERT when
+    /// there are none.
+    ///
+    /// The inert half is the byte-identity argument in test form: on a clean
+    /// scene the sweep must report zero and return the same population, having
+    /// touched neither the optimizer nor the refine record.
+    #[tokio::test]
+    async fn prune_non_finite_splats_removes_them_and_is_inert_when_clean() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let mut trainer = guard_trainer(false, &device);
+
+        // One clean step so the optimizer and refine record exist, which is the
+        // state the sweep has to keep in lockstep when it prunes.
+        let (stepped, _stats) = trainer
+            .step(guard_batch(), guard_splats(&device, false))
+            .await;
+        let n = stepped.num_splats();
+
+        // Inert on a clean population.
+        let (clean, pruned) = trainer
+            .prune_non_finite_splats(100, stepped, "unit test (clean)")
+            .await;
+        assert_eq!(pruned, 0, "a clean scene must prune nothing");
+        assert_eq!(
+            clean.num_splats(),
+            n,
+            "the inert path must not change the population"
+        );
+
+        // And it fires on a poisoned one. Same count as the stepped population,
+        // so the optimizer state the sweep reindexes lines up.
+        let poisoned = guard_splats(&device, true);
+        assert_eq!(
+            poisoned.num_splats(),
+            n,
+            "test fixture must match the stepped splat count"
+        );
+        let (swept, pruned) = trainer
+            .prune_non_finite_splats(101, poisoned, "unit test (poisoned)")
+            .await;
+        assert_eq!(pruned, 1, "the single poisoned splat must be pruned");
+        assert_eq!(swept.num_splats(), n - 1);
+
+        // And what survives is actually finite — the point of the exercise.
+        let counts = non_finite_splat_masks(&swept).counts().await;
+        assert_eq!(
+            counts.any, 0,
+            "the sweep left {} non-finite splats behind",
+            counts.any
         );
     }
 }
