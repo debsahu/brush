@@ -4618,6 +4618,111 @@ mod scene_scale_tests {
         none.set_init_scene_scale(&[]);
         assert_eq!(none.metric_weight_scale(), 1.0);
     }
+
+    /// **§10d item 9.** A common world translation cannot change the scene
+    /// scale.
+    ///
+    /// Ported from the reference's `test_scene_scale_is_translation_invariant`,
+    /// including its `(17, −11, 5)` offset and its `4 · eps` budget. The
+    /// existing `scene_scale_from_camera_ring` centres its rings away from the
+    /// origin, which exercises the same code — but it re-derives the expected
+    /// answer from the radius, so a centring bug that scaled the offset instead
+    /// of removing it could in principle be absorbed by the 1e-4 comparison.
+    /// This states the invariance directly: two DIFFERENT inputs, one number.
+    ///
+    /// The tolerance is a real budget, not a formality. `translation` is a mean
+    /// of the origins, so the subtraction `origin − translation` cancels the
+    /// offset to within its own rounding: with coordinates ~17 and a result
+    /// ~2.7, a few eps of `17.0` is the whole error term.
+    #[test]
+    fn scene_scale_is_translation_invariant() {
+        let offset = glam::vec3(17.0, -11.0, 5.0);
+
+        for (n, r, center, up) in [
+            (8usize, 2.0f32, glam::Vec3::ZERO, glam::Vec3::Z),
+            (8, 3.0, glam::vec3(-4.0, 9.0, 2.0), glam::Vec3::Y),
+            (
+                5,
+                1.5,
+                glam::vec3(2.0, 2.0, 2.0),
+                glam::vec3(0.0, 1.0, 1.0).normalize(),
+            ),
+        ] {
+            let here =
+                scene_scale_from_cameras(&camera_ring(n, r, center, up)).expect("ring has a scale");
+            let there = scene_scale_from_cameras(&camera_ring(n, r, center + offset, up))
+                .expect("translated ring has a scale");
+            assert!(
+                (here - there).abs() <= 4.0 * f32::EPSILON * here.max(1.0),
+                "scene scale moved under a pure translation: {here} vs {there}"
+            );
+        }
+    }
+
+    /// **§10d item 9, second half.** The reference's three-pose fixture, whose
+    /// answer is exactly `8/3`.
+    ///
+    /// From `test_training_cameras_keep_metric_centers_and_reproduce_applied_scale`.
+    /// Camera centres `(0,0,0)`, `(2,0,0)`, `(0,4,0)` with a common up axis:
+    /// the mean is `(2/3, 4/3, 0)`, so the centred origins are `(−2/3, −4/3, 0)`,
+    /// `(4/3, −4/3, 0)` and `(−2/3, 8/3, 0)`, and the largest absolute
+    /// coordinate of any of them is `8/3`. Reorienting up onto `+Z` permutes
+    /// which axis holds it but cannot change the maximum.
+    ///
+    /// Worth its own test alongside the ring fixtures because a ring is
+    /// SYMMETRIC: its answer is the radius under almost any plausible
+    /// mis-definition of "scale" (RMS, mean distance, half the extent, the
+    /// largest coordinate). This asymmetric triple separates them — an RMS would
+    /// give 1.63, a mean distance 1.80, half the bounding extent 2.0.
+    ///
+    /// The reference's poses are `OpenGL` (c2w column 1 IS up); ours are
+    /// `OpenCV` (column 1 is DOWN), so the fixture's rotation is a 180-degree
+    /// turn about `+X` — which is what makes our `mean_camera_up` recover `+Y`
+    /// from the same geometry. That difference is pinned on its own in
+    /// `mean_camera_up_negates_the_opencv_down_column`.
+    #[test]
+    fn scene_scale_matches_the_reference_three_pose_fixture() {
+        let flip_x = glam::Quat::from_rotation_x(std::f32::consts::PI);
+        let cams: Vec<Camera> = [
+            glam::vec3(0.0, 0.0, 0.0),
+            glam::vec3(2.0, 0.0, 0.0),
+            glam::vec3(0.0, 4.0, 0.0),
+        ]
+        .into_iter()
+        .map(|pos| {
+            Camera::new(
+                pos,
+                flip_x,
+                0.8,
+                0.8,
+                glam::vec2(0.5, 0.5),
+                CameraModel::Pinhole,
+            )
+        })
+        .collect();
+
+        // Sanity: these poses really are +Y-up under our OpenCV reading.
+        let up = mean_camera_up(&cams);
+        assert!(
+            (up - glam::Vec3::Y).length() < 1e-6,
+            "fixture up = {up:?}, want +Y"
+        );
+
+        // The reference asserts this at 2 eps ABSOLUTE, in float32, on its own
+        // parser path. Ours goes through a Rodrigues rotation of the centred
+        // origins, so the budget is stated relative and measured rather than
+        // copied: worst observed deviation is 0 eps (the rotation for a +Y up
+        // axis is an exact axis permutation), and 8 eps leaves headroom for a
+        // tilted-up variant without becoming meaningless — it is still five
+        // orders of magnitude tighter than the 1e-4 the ring fixtures use.
+        let want = 8.0f32 / 3.0;
+        let scale = scene_scale_from_cameras(&cams).expect("three poses have a scale");
+        assert!(
+            (scale - want).abs() <= 8.0 * f32::EPSILON * want,
+            "scene scale = {scale}, want 8/3 = {want} (the reference's pinned value); \
+             an RMS would give 1.63, a mean distance 1.80, half the extent 2.0"
+        );
+    }
 }
 
 /// WS-1 pins for the shared PGSR plane math: the gradient contract of
@@ -4927,6 +5032,86 @@ mod plane_feature_tests {
                 "tilt {tilt}: worst relative depth error {worst} against the closed-form plane"
             );
         }
+    }
+
+    /// **§10d item 2.** `q` and `−q` are the same rotation, so they must give
+    /// the same plane features.
+    ///
+    /// Ported from the reference's
+    /// `test_gaussian_plane_features_face_along_camera_ray`
+    /// (`gauss-surf`, Apache-2.0, Pablo Vela), which uses this exact fixture —
+    /// two gaussians on the optical axis at z = 2 and z = 3, thin along local
+    /// +Z, quaternions `+[1,0,0,0]` and `−[1,0,0,0]`.
+    ///
+    /// **The reference pins `n = (0, 0, +1)` and offsets `(2, 3)`; we produce
+    /// `n = (0, 0, −1)` and `(−2, −3)`, and that is correct, not a port bug.**
+    /// `splat_normals` turns the normal to FACE the camera (`n·(mean − cam) < 0`
+    /// — see its sign block), the reference points it away. Every consumer on
+    /// our side agrees with our choice: `normals_from_depth` emits `n_z ≤ 0` by
+    /// construction, and the offset follows the normal's sign because
+    /// `d = n·(mean − cam)`. The depth `d/(n·ray)` is invariant to the pair
+    /// flipping together, which is why the two conventions produce identical
+    /// depth maps. Pinned by value here so that a future half-flip — normal
+    /// negated without the offset, or the other way round — cannot pass.
+    ///
+    /// Bit-identity is the right assertion for the sign half, not an
+    /// approximation: every entry of a rotation matrix built from a quaternion
+    /// is a sum of PRODUCTS OF TWO quaternion components, so negating all four
+    /// leaves each product unchanged exactly under IEEE-754, and the
+    /// normalisation divides by the same length. There is no reordering and no
+    /// atomic accumulation anywhere in this path.
+    #[tokio::test]
+    async fn plane_features_are_invariant_to_quaternion_sign() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+
+        // Camera at the origin, identity rotation: the world frame IS the
+        // camera frame, so every number below is readable by hand.
+        let camera = Camera::new(
+            glam::Vec3::ZERO,
+            glam::Quat::IDENTITY,
+            0.7,
+            0.7,
+            glam::vec2(0.5, 0.5),
+            CameraModel::Pinhole,
+        );
+
+        let means = vec![0.0, 0.0, 2.0, 0.0, 0.0, 3.0];
+        // Thinnest axis is local +Z, so the plane normal is the quaternion's
+        // third rotation column.
+        let log_scales: Vec<f32> = (0..2).flat_map(|_| [1.0, 1.0, -2.0]).collect();
+        let sh: Vec<f32> = (0..2).flat_map(|_| [0.5, 0.5, 0.5]).collect();
+        let opac = vec![4.0; 2];
+
+        let features_for = |quats: Vec<f32>| {
+            let splats = Splats::from_raw(
+                means.clone(),
+                quats,
+                log_scales.clone(),
+                sh.clone(),
+                opac.clone(),
+                SplatRenderMode::Default,
+                &device,
+            );
+            plane_features(splats.transforms.val(), &camera)
+        };
+
+        let positive = read(features_for(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])).await;
+        let negative = read(features_for(vec![-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0])).await;
+
+        assert_eq!(
+            positive, negative,
+            "q and -q are the same rotation and must give bit-identical plane features"
+        );
+
+        // The values themselves, so this cannot pass by both sides being wrong
+        // in the same way.
+        assert_eq!(
+            positive,
+            vec![0.0, 0.0, -1.0, -2.0, 0.0, 0.0, -1.0, -3.0],
+            "camera-facing normal (0,0,-1) with offsets (-2,-3); the reference's \
+             away-facing convention is the exact negation of this pair"
+        );
     }
 }
 

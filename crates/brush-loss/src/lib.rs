@@ -3371,3 +3371,980 @@ mod plane_depth_tests {
         );
     }
 }
+
+/// Near-grazing accuracy and the exact validity cutoff of the ray-plane solve,
+/// ported from the reference suite (`gauss-surf`, Apache-2.0, Pablo Vela:
+/// `tests/test_gaussurf_geometry.py`,
+/// `test_plane_depth_matches_exact_world_ray_plane_intersection` and
+/// `test_plane_depth_uses_the_documented_degenerate_cutoff`).
+///
+/// `plane_depth_tests` above pins the well-conditioned case at a flat `1e-4`.
+/// That tolerance is far LOOSER than the arithmetic actually delivers there
+/// (measured worst error on the tilted slab: 4.8e-7), so a regression that
+/// degraded accuracy by two orders of magnitude would still pass it. These
+/// tests close that gap from the other end: they drive the denominator down to
+/// the validity cutoff, where the quotient is worst-conditioned, and compare
+/// against an f64 host-side oracle under a tolerance derived from the
+/// conditioning rather than picked round.
+///
+/// **Why the reference's flat `2e-7` absolute tolerance does not port.** The
+/// reference computes the whole chain in float64; we are f32 end to end, and
+/// `depth = offset / (n·ray)` near-grazing is genuinely ill-conditioned: `n·ray`
+/// is an O(1) sum that cancels down to O(`min_denom`), so its ~`eps·‖ray‖`
+/// absolute rounding error becomes a `eps·‖ray‖/|denom|` RELATIVE error in the
+/// quotient. At our production `min_denom = 0.05` that is ~4e-6 relative, i.e.
+/// about 30x the raw f32 epsilon and ~200x the reference's absolute figure at a
+/// depth of 1 m. Asserting 2e-7 here would not be a stricter test, it would be a
+/// test of float64 that we cannot run. The conditioning-scaled bound below is
+/// the strongest statement the arithmetic supports, and it is much tighter than
+/// a flat `1e-4` everywhere except right at the cutoff.
+#[cfg(all(test, not(target_family = "wasm")))]
+mod plane_depth_grazing_tests {
+    use super::*;
+    use burn::tensor::TensorData;
+
+    const W: usize = 8;
+    const H: usize = 8;
+    const FX: f32 = 3.0;
+    const FY: f32 = 2.5;
+    const CX: f32 = 4.0;
+    const CY: f32 = 4.0;
+
+    // The PRODUCTION thresholds (train.rs `PLANE_MIN_*`), not the softer ones
+    // `plane_depth_tests` uses: the point of this module is the behaviour AT the
+    // real cutoff, so mirroring the real constant is load-bearing. If train.rs
+    // changes `PLANE_MIN_DENOM`, this module is meant to be updated with it.
+    const MIN_ALPHA: f32 = 0.5;
+    const MIN_DENOM: f32 = 0.05;
+    const MIN_DEPTH: f32 = 1e-3;
+    const MAX_DEPTH: f32 = 1e4;
+
+    /// How many f32 epsilons of conditioning-scaled slack the assertions allow.
+    /// Measured, not guessed: the worst of the 64 cases lands at 0.32 (see
+    /// `plane_depth_near_grazing_matches_a_float64_oracle`), so 2.0 is ~6x
+    /// headroom. Do not raise it to make a failure go away — the whole point of
+    /// the conditioning scaling is that the budget stays constant while the
+    /// conditioning varies by 40x across the fixture.
+    const TOL_EPS_MULTIPLE: f64 = 2.0;
+
+    async fn device() -> burn::tensor::Device {
+        brush_cube::test_helpers::test_device().await.into()
+    }
+
+    async fn read<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+        t.into_data_async()
+            .await
+            .expect("tensor readback")
+            .to_vec::<f32>()
+            .expect("f32 tensor")
+    }
+
+    /// `(fx, fy, cx, cy)`, bundled so the runner keeps a readable arity.
+    type Intrinsics = (f32, f32, f32, f32);
+
+    async fn run(
+        data: Vec<f32>,
+        (h, w): (usize, usize),
+        (fx, fy, cx, cy): Intrinsics,
+        device: &burn::tensor::Device,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let feat = Tensor::<3>::from_data(TensorData::new(data, [h, w, 5]), device);
+        let (depth, _normal, valid) = plane_depth_from_features(
+            feat, fx, fy, cx, cy, MIN_ALPHA, MIN_DENOM, MIN_DEPTH, MAX_DEPTH,
+        );
+        (read(depth).await, read(valid).await)
+    }
+
+    /// A tiny deterministic PRNG. The reference randomises with `hypothesis`;
+    /// we have no such dependency and would not want a differently-shrunk
+    /// counterexample on every CI run anyway — a fixed seed makes a failure
+    /// reproducible from the test name alone.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn unit(&mut self) -> f64 {
+            // Knuth/MMIX constants.
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+
+        fn range(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + (hi - lo) * self.unit()
+        }
+    }
+
+    fn norm3(v: [f64; 3]) -> [f64; 3] {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        [v[0] / l, v[1] / l, v[2] / l]
+    }
+
+    fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    }
+
+    fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    /// **§10d item 1.** 64 randomised plane/ray constructions, each with a
+    /// prescribed `n·ray`, compared against an f64 oracle.
+    ///
+    /// Structure ported from the reference's 64-example `hypothesis` property
+    /// test. Two deliberate deviations, both stated so a reader can judge them:
+    ///
+    /// 1. **Camera-frame only.** The reference randomises a world rotation and
+    ///    translation because its `gaussian_plane_features` runs inside the
+    ///    property. `plane_depth_from_features` never sees the world frame — it
+    ///    consumes `n_cam` and `d` — so a random rotation would test nothing
+    ///    here. The world→camera half is pinned separately, and by VALUE, in
+    ///    brush-train (`plane_feature_tests`).
+    /// 2. **One pixel per case, 64 pixels in one image.** Every case gets a
+    ///    different ray because the ray grid varies across the frame, which is
+    ///    the same coverage the reference buys with a per-case principal-point
+    ///    offset — and it costs one dispatch instead of 64.
+    ///
+    /// The first eight pixels pin the near-cutoff multipliers the reference
+    /// samples explicitly (±1.01x, ±1.1x, ±2x the cutoff, plus ±1.5x); the rest
+    /// spread over the well-conditioned range. Each carries a random coverage
+    /// weight, so the "no alpha division" cancellation is exercised here too.
+    ///
+    /// # Mutation-checked, 2026-08-20
+    ///
+    /// Injecting a 1e-5 RELATIVE depth error (`depth_raw * (1.0 + 1e-5)`) into
+    /// `plane_depth_from_features`:
+    ///
+    /// - `plane_depth_flat_slab_exact`, tolerance 1e-4: **passes**. The
+    ///   regression is invisible to it.
+    /// - this test: **fails** at 24.5 conditioning-epsilons against a budget of
+    ///   2.0, i.e. 12x over.
+    ///
+    /// That pair IS §10d item 1: the flat tolerance would miss a real accuracy
+    /// regression, and this bound would not.
+    #[tokio::test]
+    async fn plane_depth_near_grazing_matches_a_float64_oracle() {
+        let device = device().await;
+
+        // Multiples of MIN_DENOM. 1.01 is the reference's tightest case: just
+        // inside the cutoff, where the quotient is worst-conditioned.
+        const PINNED: [f64; 8] = [1.01, -1.01, 1.1, -1.1, 1.5, -1.5, 2.0, -2.0];
+
+        let mut rng = Lcg(0x5eed_1234_abcd_0001);
+        let mut data = vec![0.0f32; H * W * 5];
+        // Per-case bookkeeping for the assertions: (oracle depth, |ray|, denom).
+        let mut cases: Vec<(f64, f64, f64)> = Vec::with_capacity(H * W);
+
+        for v in 0..H {
+            for u in 0..W {
+                let k = v * W + u;
+
+                // The ray this pixel's centre subtends, in f64.
+                let ru = (u as f64 + 0.5 - f64::from(CX)) / f64::from(FX);
+                let rv = (v as f64 + 0.5 - f64::from(CY)) / f64::from(FY);
+                let ray = [ru, rv, 1.0];
+                let ray_len = (ru * ru + rv * rv + 1.0).sqrt();
+                let ray_unit = [ru / ray_len, rv / ray_len, 1.0 / ray_len];
+
+                // An orthonormal pair spanning the plane perpendicular to the
+                // ray, so the normal's transverse part can point anywhere.
+                let p0 = norm3([1.0, 0.0, -ru]);
+                let p1 = cross3(ray_unit, p0);
+                let theta = rng.range(0.0, std::f64::consts::TAU);
+                let (st, ct) = theta.sin_cos();
+                let perp = [
+                    p0[0] * ct + p1[0] * st,
+                    p0[1] * ct + p1[1] * st,
+                    p0[2] * ct + p1[2] * st,
+                ];
+
+                // A varying coverage weight. NOTE, and this is not obvious:
+                // `min_denom` is compared against the ALPHA-WEIGHTED composited
+                // sum, not against the geometric `n·ray` — the weight cancels
+                // out of the quotient but NOT out of the validity test. So the
+                // geometric normal is tilted to `denom/w` in order to land the
+                // STORED denominator on the value this case means to pin. (An
+                // earlier draft set the geometric denominator instead and every
+                // near-cutoff case was rejected at `w ~ 0.7`, which is how the
+                // coupling surfaced.)
+                let w = rng.range(0.55, 0.95);
+
+                // Prescribe the stored `n_sum · ray` exactly: with |n| = 1, the
+                // component of n along the unit ray is (denom/w)/|ray|.
+                let denom = if k < PINNED.len() {
+                    PINNED[k] * f64::from(MIN_DENOM)
+                } else {
+                    // Capped at 0.5 (not the reference's 0.95) so `denom/w`
+                    // stays inside the unit sphere for every weight above.
+                    let mag = rng.range(2.0 * f64::from(MIN_DENOM), 0.5);
+                    if rng.unit() < 0.5 { -mag } else { mag }
+                };
+                let c = denom / w / ray_len;
+                assert!(c.abs() <= 1.0, "case {k}: unrealisable tilt {c}");
+                let s = (1.0 - c * c).sqrt();
+                let n = [
+                    c * ray_unit[0] + s * perp[0],
+                    c * ray_unit[1] + s * perp[1],
+                    c * ray_unit[2] + s * perp[2],
+                ];
+
+                // The oracle: put the plane through a point at a known depth
+                // along this very ray, so `offset = n·(ray·z)`.
+                let depth = rng.range(0.25, 20.0);
+                let offset = dot3(n, ray) * depth;
+
+                // f64 self-consistency of the construction itself — this is the
+                // reference's `assert_close(means @ n, plane_offset)` step. It
+                // catches a typo in the basis math that would otherwise be
+                // absorbed silently into the f32 tolerance below.
+                let stored_denom = dot3(n, ray) * w;
+                assert!(
+                    (stored_denom - denom).abs() < 1e-12,
+                    "case {k}: constructed stored n_sum·ray = {stored_denom}, want {denom}"
+                );
+                let oracle = offset / dot3(n, ray);
+                assert!(
+                    (oracle - depth).abs() < 1e-9 * depth,
+                    "case {k}: f64 oracle {oracle} disagrees with the construction depth {depth}"
+                );
+
+                let i = k * 5;
+                data[i] = (w * n[0]) as f32;
+                data[i + 1] = (w * n[1]) as f32;
+                data[i + 2] = (w * n[2]) as f32;
+                data[i + 3] = (w * offset) as f32;
+                data[i + 4] = w as f32;
+
+                cases.push((oracle, ray_len, denom));
+            }
+        }
+
+        let (depth, valid) = run(data, (H, W), (FX, FY, CX, CY), &device).await;
+
+        // The measured error, expressed in units of the predicted conditioning
+        // bound. Reported at the end so the headroom is visible in the failure
+        // message rather than folded into a pass/fail.
+        let mut worst_ratio = 0.0f64;
+        let mut worst_case = (0usize, 0.0f64, 0.0f64);
+
+        for (k, &(oracle, ray_len, denom)) in cases.iter().enumerate() {
+            assert_eq!(
+                valid[k], 1.0,
+                "case {k} (denom {denom}, depth {oracle}) must be valid: \
+                 every generated denominator is strictly above the cutoff"
+            );
+
+            let err = (f64::from(depth[k]) - oracle).abs();
+            // Predicted relative error: `eps` from rounding the offset channel,
+            // plus `eps·‖ray‖/|denom|` from the cancellation in `n·ray`.
+            let conditioning = 1.0 + ray_len / denom.abs();
+            let unit_bound = f64::from(f32::EPSILON) * conditioning * oracle.abs();
+            let ratio = err / unit_bound;
+            if ratio > worst_ratio {
+                worst_ratio = ratio;
+                worst_case = (k, err, oracle);
+            }
+        }
+
+        assert!(
+            worst_ratio < TOL_EPS_MULTIPLE,
+            "worst error was {worst_ratio:.2} conditioning-epsilons \
+             (case {}, absolute error {:.3e} on an oracle depth of {:.4}); \
+             the budget is {TOL_EPS_MULTIPLE}. A ratio that grew without the \
+             conditioning changing means the SOLVE regressed, not the float type.",
+            worst_case.0,
+            worst_case.1,
+            worst_case.2,
+        );
+
+        // Guard the guard: if the measured worst case ever drops far below the
+        // budget, the budget is stale and should be tightened rather than left
+        // as dead slack. Measured 2026-08-20 on the M4 Max: worst ratio 0.32 —
+        // an absolute error of 2.70e-6 on an oracle depth of 9.98, i.e. 37x
+        // INSIDE the flat 1e-4 that `plane_depth_flat_slab_exact` allows, which
+        // is the gap §10d item 1 exists to close.
+        assert!(
+            worst_ratio > 0.02,
+            "worst ratio {worst_ratio:.4} is implausibly small — the fixture \
+             probably degenerated (e.g. every denominator landed well away from \
+             the cutoff) and stopped testing the grazing regime"
+        );
+    }
+
+    /// **§10d item 1, second half.** Both sides of the validity cutoff, on the
+    /// reference's own construction.
+    ///
+    /// Ported from `test_plane_depth_uses_the_documented_degenerate_cutoff`:
+    /// `fx = fy = 1`, `cx = cy = 0`, so pixel `(u, 0)` subtends the ray
+    /// `(u + 0.5, 0.5, 1)`. Choosing `n = (1, 0, denom − (u + 0.5))` makes
+    /// `n·ray` equal `denom` and `offset = 2·denom` makes the depth exactly 2 —
+    /// the same trick the reference uses, so a divergence between the two
+    /// suites is a real disagreement and not a fixture difference.
+    ///
+    /// Half the cutoff must be rejected; twice it must be accepted AND give the
+    /// right depth. Rejecting both would pass a naive "grazing rays are invalid"
+    /// test while making the whole plane path dead.
+    #[tokio::test]
+    async fn plane_depth_pins_both_sides_of_the_denominator_cutoff() {
+        let device = device().await;
+
+        let below = MIN_DENOM / 2.0;
+        let above = MIN_DENOM * 2.0;
+        let data = vec![
+            // (0, 0): ray (0.5, 0.5, 1), n·ray = below -> rejected.
+            1.0,
+            0.0,
+            below - 0.5,
+            2.0 * below,
+            1.0,
+            // (1, 0): ray (1.5, 0.5, 1), n·ray = above -> accepted, depth 2.
+            1.0,
+            0.0,
+            above - 1.5,
+            2.0 * above,
+            1.0,
+        ];
+
+        let (depth, valid) = run(data, (1, 2), (1.0, 1.0, 0.0, 0.0), &device).await;
+
+        assert_eq!(
+            valid[0], 0.0,
+            "|denom| = {below} is half the {MIN_DENOM} cutoff and must be rejected"
+        );
+        assert_eq!(depth[0], 0.0, "a rejected pixel must emit exactly 0");
+        assert_eq!(
+            valid[1], 1.0,
+            "|denom| = {above} is twice the {MIN_DENOM} cutoff and must be accepted"
+        );
+        // `n_z` is formed as `above - 1.5` and the kernel re-adds 1.5, so the
+        // recovered denominator carries one ulp of 1.5 (~1.2e-7) of absolute
+        // error, i.e. ~1.2e-6 relative at |denom| = 0.1. 1e-4 on a depth of 2 is
+        // ~40x that; it is a bound on the FIXTURE's arithmetic, not a licence
+        // for the solve to be sloppy — the tight statement lives in the
+        // grazing property test above.
+        assert!(
+            (depth[1] - 2.0).abs() < 1e-4,
+            "depth just above the cutoff = {}, want 2.0",
+            depth[1]
+        );
+    }
+
+    /// The cutoff comparison is INCLUSIVE: `|denom| == min_denom` is valid.
+    ///
+    /// `denom_ok` is written as `!(|denom| < min_denom)`, so the boundary itself
+    /// passes. Flipping it to `>` would silently shave the outermost grazing
+    /// pixels off every plane in every frame — a change no forward-parity test
+    /// would notice. Pinned on the one construction where f32 can hit the
+    /// boundary EXACTLY: `cx = cy = 0.5, fx = fy = 1` makes pixel (0, 0)'s ray
+    /// exactly `(0, 0, 1)`, so `denom = 0·0 + 0·0 + n_z` reproduces `n_z`
+    /// bit-for-bit with no rounding to argue about.
+    #[tokio::test]
+    async fn plane_depth_cutoff_comparison_is_inclusive() {
+        let device = device().await;
+
+        let data = vec![0.0, 0.0, MIN_DENOM, 2.0 * MIN_DENOM, 1.0];
+        let (depth, valid) = run(data, (1, 1), (1.0, 1.0, 0.5, 0.5), &device).await;
+
+        assert_eq!(
+            valid[0], 1.0,
+            "|denom| exactly at the {MIN_DENOM} cutoff must be VALID \
+             (the test is `!(|denom| < min_denom)`)"
+        );
+        // 2·MIN_DENOM / MIN_DENOM: doubling is exact in binary floating point,
+        // so this quotient is exactly 2 with no tolerance needed.
+        assert_eq!(depth[0], 2.0);
+    }
+
+    /// **§10d item 3.** A plane BEHIND the camera is invalid, emits exactly 0,
+    /// and stays finite — on the reference's literal construction.
+    ///
+    /// The reference writes it as `n = (0, 0, 1)`, `offset = −2`. Our sign
+    /// convention is the opposite (`splat_normals` faces the normal AT the
+    /// camera, so a visible plane has `n_z < 0` and a negative offset), and
+    /// `plane_depth_invalid_pixels_are_zero_and_nan_free` above already covers
+    /// OUR spelling of it at pixel (4, 0): `n = (0, 0, −1)`, `offset = +3`.
+    /// Both give a negative quotient; this test pins the reference's spelling
+    /// too, so the two suites cannot silently disagree about which sign pair
+    /// means "behind me".
+    ///
+    /// `min_depth > 0` is the whole mechanism: an `|z| < max_depth` range test
+    /// would happily accept z = −2, and every downstream consumer would then
+    /// supervise a mirrored surface.
+    #[tokio::test]
+    async fn plane_depth_rejects_the_reference_behind_camera_plane() {
+        let device = device().await;
+
+        // fx = fy = 1, cx = cy = 0.5 -> the single pixel's ray is (0, 0, 1),
+        // so denom = n_z = +1 and depth = offset = -2.
+        for (n_z, offset, label) in [
+            (1.0f32, -2.0f32, "reference convention (n = +z, d < 0)"),
+            (-1.0, 2.0, "our convention (n = -z, d > 0)"),
+        ] {
+            let data = vec![0.0, 0.0, n_z, offset, 1.0];
+            let (depth, valid) = run(data, (1, 1), (1.0, 1.0, 0.5, 0.5), &device).await;
+
+            assert_eq!(
+                valid[0], 0.0,
+                "{label}: a plane behind the camera is invalid"
+            );
+            assert_eq!(depth[0], 0.0, "{label}: depth must be exactly 0");
+            assert!(depth[0].is_finite(), "{label}: depth must be finite");
+        }
+    }
+}
+
+/// Masked-mean semantics and the contradiction gate, ported from the reference
+/// suite (`gauss-surf`, Apache-2.0, Pablo Vela: `tests/test_gaussurf_losses.py`).
+///
+/// Everything here is about pixels that are supposed to contribute NOTHING —
+/// the reference pins that as a bit-identity property rather than an
+/// approximate one, and it is worth having because "outside the mask" is
+/// exactly where garbage lives: uncovered background, priors the writer marked
+/// absent, and the amplified noise of `raw / alpha.clamp_min(1e-10)`.
+#[cfg(all(test, not(target_family = "wasm")))]
+mod masked_mean_and_gate_tests {
+    use super::*;
+    use brush_render::burn_glue::lift_to_autodiff;
+    use burn::tensor::TensorData;
+
+    async fn device() -> burn::tensor::Device {
+        brush_cube::test_helpers::test_device().await.into()
+    }
+
+    async fn autodiff_device() -> burn::tensor::Device {
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff()
+    }
+
+    async fn read<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+        t.into_data_async()
+            .await
+            .expect("tensor readback")
+            .to_vec::<f32>()
+            .expect("f32 tensor")
+    }
+
+    fn img3(data: Vec<f32>, device: &burn::tensor::Device) -> Tensor<3> {
+        let n = data.len() / 3;
+        Tensor::<3>::from_data(TensorData::new(data, [1, n, 3]), device)
+    }
+
+    fn img1(data: Vec<f32>, device: &burn::tensor::Device) -> Tensor<3> {
+        let n = data.len();
+        Tensor::<3>::from_data(TensorData::new(data, [1, n, 1]), device)
+    }
+
+    fn img2(data: Vec<f32>, device: &burn::tensor::Device) -> Tensor<2> {
+        let n = data.len();
+        Tensor::<2>::from_data(TensorData::new(data, [1, n]), device)
+    }
+
+    /// **§10d item 4.** A pixel outside a loss's validity mask has NO numerical
+    /// effect on that loss — not "a negligible one", none: the results must be
+    /// bit-identical.
+    ///
+    /// Ported from `test_masked_mean_is_bit_identical_after_outside_mask_perturbations`.
+    /// This is the property that makes a masked mean a mean over the mask rather
+    /// than a mean over the frame that happens to be dominated by the mask, and
+    /// it is the one that catches a denominator counting the wrong pixels: if
+    /// the divisor were the pixel count instead of the valid count, the value
+    /// would still be stable here, but a masked-out pixel leaking into the
+    /// NUMERATOR (a missing `* valid`, a `+` where a `*` belongs, an off-by-one
+    /// slice) changes the result the moment that pixel stops being ordinary.
+    ///
+    /// ±1e6 is deliberately far outside the range any of these signals can
+    /// legitimately take, so a leak cannot hide inside a tolerance. The
+    /// non-finite half of the reference's contract is a separate test.
+    ///
+    /// # Mutation-checked, 2026-08-20
+    ///
+    /// Replacing `* valid` with `* valid.add_scalar(1e-9)` in `normal_loss` —
+    /// a leak nine orders of magnitude below anything a tolerance-based test
+    /// would notice — **fails** this test on the `normal_loss` arm. The ±1e6
+    /// perturbation is what converts that invisible floor into a visible one.
+    #[tokio::test]
+    async fn losses_ignore_finite_perturbations_outside_the_mask() {
+        let device = device().await;
+        const WILD: f32 = 1.0e6;
+
+        // --- normal_loss: validity comes from the PRIOR, so the prediction at
+        // an absent-prior pixel is what gets perturbed.
+        let gt_n = img3(
+            vec![
+                0.0, 0.0, -1.0, // valid prior
+                0.0, 0.0, -1.0, // valid prior
+                0.0, 0.0, 0.0, // (0,0,0) = "no prior here"
+                0.0, 0.0, 0.0, // ditto
+            ],
+            &device,
+        );
+        let tame = vec![
+            0.0, 0.2, -1.0, //
+            0.1, 0.0, -1.0, //
+            0.0, 0.0, -1.0, //
+            0.3, -0.4, -1.0, //
+        ];
+        let mut wild = tame.clone();
+        wild[6..9].copy_from_slice(&[WILD, -WILD, WILD]);
+        wild[9..12].copy_from_slice(&[-WILD, WILD, -WILD]);
+
+        let base = read(normal_loss(img3(tame, &device), gt_n.clone(), None)).await[0];
+        let perturbed = read(normal_loss(img3(wild, &device), gt_n, None)).await[0];
+        assert_eq!(
+            base, perturbed,
+            "normal_loss changed when pixels with NO prior were perturbed"
+        );
+        assert!(base > 0.0, "the fixture must produce a nonzero loss");
+
+        // --- depth_loss: validity is `gt > 0`.
+        let gt_d = img2(vec![2.0, 3.0, 0.0, 0.0], &device);
+        let tame = vec![1.9, 3.2, 1.0, 5.0];
+        let wild = vec![1.9, 3.2, WILD, 1.0 / WILD];
+
+        let base = read(depth_loss(img2(tame, &device), gt_d.clone(), None)).await[0];
+        let perturbed = read(depth_loss(img2(wild, &device), gt_d, None)).await[0];
+        assert_eq!(
+            base, perturbed,
+            "depth_loss changed when pixels with no GT depth were perturbed"
+        );
+        assert!(base > 0.0, "the fixture must produce a nonzero loss");
+
+        // --- depth_normal_loss: validity is `alpha > 0.5`, so the perturbation
+        // goes into the two uncovered pixels' normals.
+        let alpha = img1(vec![1.0, 1.0, 0.0, 0.0], &device);
+        let n_from_depth = img3(
+            vec![
+                0.0, 0.0, -1.0, //
+                0.0, 0.0, -1.0, //
+                0.0, 0.0, -1.0, //
+                0.0, 0.0, -1.0, //
+            ],
+            &device,
+        );
+        let tame = vec![
+            0.0, 0.0, -1.0, //
+            1.0, 0.0, 0.0, //
+            0.0, 0.0, -1.0, //
+            0.0, 1.0, 0.0, //
+        ];
+        let mut wild = tame.clone();
+        wild[6..12].copy_from_slice(&[WILD, -WILD, WILD, -WILD, WILD, -WILD]);
+
+        let base = read(depth_normal_loss(
+            n_from_depth.clone(),
+            img3(tame, &device),
+            alpha.clone(),
+        ))
+        .await[0];
+        let perturbed = read(depth_normal_loss(n_from_depth, img3(wild, &device), alpha)).await[0];
+        assert_eq!(
+            base, perturbed,
+            "depth_normal_loss changed when UNCOVERED pixels were perturbed"
+        );
+        assert!(base > 0.0, "the fixture must produce a nonzero loss");
+    }
+
+    /// **§10d item 4, second half — CURRENTLY FAILING BY DESIGN, see the
+    /// `#[ignore]`.** A NON-FINITE value outside the mask must contribute exact
+    /// zero, forward and backward.
+    ///
+    /// Ported from `test_masked_out_nonfinite_values_do_not_poison_loss_or_gradients`.
+    /// This is the contract that forbids implementing a masked mean as
+    /// `value * mask`: `0.0 * inf` is `NaN`, so one non-finite value in a region
+    /// the loss is supposed to ignore takes down the whole frame — and the
+    /// autodiff backward reproduces the same `0 · ∞` in the VJP even when the
+    /// forward is repaired afterwards. `plane_depth_from_features` already takes
+    /// the safe route (`mask_fill` BEFORE any arithmetic — see its sanitisation
+    /// block), and the reference uses `torch.where`. The three masked-mean
+    /// losses in this file do not: they all end in `err * valid`.
+    ///
+    /// **Measured, 2026-08-20 (M4 Max, Metal): 8 of the 9 (loss x poison)
+    /// combinations violate it.**
+    ///
+    /// ```text
+    ///   normal_loss       [inf/-inf/NaN]: forward = NaN, want 0.06666667
+    ///   depth_normal_loss [inf/-inf/NaN]: forward = NaN, want 1
+    ///   depth_loss        [NaN]         : forward = NaN, want 0.026315808
+    ///   depth_loss        [NaN]         : backward = [-0.27700832, NaN]
+    /// ```
+    ///
+    /// The one survivor is `depth_loss` under ±inf, and only by accident of its
+    /// shape: `recip()` maps `+inf` to 0 and the `pred <= 0` guard catches
+    /// `-inf` before the multiply. `NaN` defeats both (every comparison against
+    /// `NaN` is false, so `mask_fill` never fires).
+    ///
+    /// Note WHERE the damage shows: for `normal_loss` the backward is finite
+    /// even though the forward is `NaN` (`d|x|/dx · valid` is an honest 0), so
+    /// the poison travels as a `NaN` SCALAR LOSS. Summed into the total it takes
+    /// the gradient of every OTHER term in the step with it, which is a worse
+    /// failure than a local one and an easy one to misattribute.
+    ///
+    /// The finite half of the contract holds everywhere — see
+    /// `losses_ignore_finite_perturbations_outside_the_mask` (±1e6, bit-identical).
+    /// This test is left `#[ignore]`d rather than deleted or weakened because
+    /// WS-T's remit is tests only: the fix is to sanitise before the multiply in
+    /// `normal_loss`, `depth_loss` and `depth_normal_loss` (the `mask_fill`
+    /// idiom `plane_depth_from_features` already uses), which is a production
+    /// change and an owner's decision.
+    ///
+    /// Reachability, so the severity is legible rather than assumed: the
+    /// rendered normal fed to `normal_loss` is
+    /// `normal_img / alpha.clamp_min(1e-10)` re-normalised, and the rendered
+    /// depth fed to `depth_loss` is `accum / alpha.clamp_min(1e-10)`. Those
+    /// divisions cannot reach `inf` from the magnitudes a rasterizer emits, so
+    /// this is a robustness contract rather than a live bug today — which is
+    /// precisely why it needs a test and not a runtime symptom. Run it with
+    /// `cargo test -p brush-loss -- --ignored` to re-measure.
+    #[tokio::test]
+    #[ignore = "known gap: the masked-mean losses multiply by the mask, so a \
+                non-finite value OUTSIDE the mask still yields 0 * inf = NaN. \
+                Tests-only workstream; the fix is a production change. See the \
+                doc comment."]
+    async fn losses_ignore_nonfinite_values_outside_the_mask() {
+        let device = autodiff_device().await;
+        let mut violations: Vec<String> = Vec::new();
+
+        for poison in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let mut check = |what: &str, got: f32, want: f32, grads: Vec<f32>| {
+                // `partial_cmp`, not `>= 1e-6`: the value under test is very
+                // often `NaN`, and every ordinary comparison against `NaN` is
+                // false — a `>=` test would silently report the exact failure
+                // this test exists to find as a pass.
+                let close =
+                    (got - want).abs().partial_cmp(&1e-6) == Some(core::cmp::Ordering::Less);
+                if !close {
+                    violations.push(format!("{what} [{poison}]: forward = {got}, want {want}"));
+                }
+                if !grads.iter().all(|x| x.is_finite()) {
+                    violations.push(format!("{what} [{poison}]: backward = {grads:?}"));
+                }
+            };
+
+            // --- normal_loss, on a prior-absent pixel.
+            let gt = img3(
+                vec![
+                    0.0, 0.0, -1.0, // valid prior
+                    0.0, 0.0, 0.0, // no prior here
+                ],
+                &device,
+            );
+            let pred =
+                lift_to_autodiff(img3(vec![0.0, 0.2, -1.0, poison, poison, poison], &device))
+                    .require_grad();
+            let loss = normal_loss(pred.clone(), gt, None);
+            let value = read(loss.clone()).await[0];
+            let grads = loss.backward();
+            let g = read(pred.grad(&grads).expect("prediction gradient")).await;
+            check("normal_loss", value, 0.2 / 3.0, g);
+
+            // --- depth_loss, on a pixel with no GT depth.
+            let gt_d = img2(vec![2.0, 0.0], &device);
+            let pred_d = lift_to_autodiff(img2(vec![1.9, poison], &device)).require_grad();
+            let loss = depth_loss(pred_d.clone(), gt_d, None);
+            let value = read(loss.clone()).await[0];
+            let grads = loss.backward();
+            let g = read(pred_d.grad(&grads).expect("depth gradient")).await;
+            check("depth_loss", value, (1.0f32 / 1.9 - 1.0 / 2.0).abs(), g);
+
+            // --- depth_normal_loss, on an UNCOVERED pixel.
+            let alpha = img1(vec![1.0, 0.0], &device);
+            let n_d = img3(vec![0.0, 0.0, -1.0, 0.0, 0.0, -1.0], &device);
+            let n_r = lift_to_autodiff(img3(vec![1.0, 0.0, 0.0, poison, poison, poison], &device))
+                .require_grad();
+            let loss = depth_normal_loss(n_d, n_r.clone(), alpha);
+            let value = read(loss.clone()).await[0];
+            let grads = loss.backward();
+            let g = read(n_r.grad(&grads).expect("rendered-normal gradient")).await;
+            check("depth_normal_loss", value, 1.0, g);
+        }
+
+        assert!(
+            violations.is_empty(),
+            "a non-finite value OUTSIDE the validity mask changed the loss or its \
+             gradient in {} of 9 (loss x poison) combinations:\n  {}",
+            violations.len(),
+            violations.join("\n  ")
+        );
+    }
+
+    /// **§10d item 5.** The contradiction gate decides WHICH pixels are
+    /// supervised; it must never become a second gradient path into the
+    /// rendered normals.
+    ///
+    /// Pinned without reaching into the implementation: gating a pixel out by
+    /// CONTRADICTION and gating the same pixel out by marking its prior ABSENT
+    /// must produce bit-identical gradients. The two routes share only the
+    /// surviving set and the denominator; if the gate carried gradient — a
+    /// softened threshold, a forgotten `detach()` on either operand — the gated
+    /// run would pick up extra terms at exactly the contradicted pixels and the
+    /// two would diverge.
+    ///
+    /// The paired assertion that the contradicted pixels receive EXACTLY zero
+    /// gradient is what stops the test passing by both paths being equally
+    /// wrong.
+    ///
+    /// # Mutation-checked, 2026-08-20 — including one mutation it does NOT catch
+    ///
+    /// - Replacing the hard threshold with a SOFT one
+    ///   (`sigmoid(5·(cos − gate_cos))`) and dropping both `detach()` calls:
+    ///   **fails**, on exactly this assertion.
+    /// - Dropping both `detach()` calls and NOTHING else: **passes**.
+    ///
+    /// The second result is worth stating rather than hiding. The `detach()`
+    /// calls in `normal_gate_mask` are documentary, not load-bearing: the
+    /// gradient is already killed by `greater_equal_elem(..).float()`, a
+    /// boolean comparison with no derivative, so removing the detaches changes
+    /// no number anywhere and no behavioural test can see it. What this test
+    /// pins is the PROPERTY (the gate is not on the tape), which is what
+    /// actually matters and which the soft-gate mutation confirms it holds. Do
+    /// not read it as pinning the `detach()` calls themselves.
+    #[tokio::test]
+    async fn normal_gate_carries_no_gradient() {
+        let device = autodiff_device().await;
+        let cos30 = 30.0_f32.to_radians().cos();
+
+        // Pixels 0,1 agree with the prior to ~16.7 deg; pixels 2,3 are exactly
+        // opposed, so a 30 deg gate drops them.
+        let pred_data = vec![
+            0.0, 0.3, -1.0, //
+            0.0, 0.3, -1.0, //
+            0.0, 0.0, 1.0, //
+            0.0, 0.0, 1.0, //
+        ];
+        let all_valid = vec![
+            0.0, 0.0, -1.0, //
+            0.0, 0.0, -1.0, //
+            0.0, 0.0, -1.0, //
+            0.0, 0.0, -1.0, //
+        ];
+        // The same frame with the contradicted pixels' priors marked absent.
+        let prior_absent = vec![
+            0.0, 0.0, -1.0, //
+            0.0, 0.0, -1.0, //
+            0.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, //
+        ];
+
+        async fn grad_of(
+            pred_data: &[f32],
+            gt_data: Vec<f32>,
+            gate: Option<f32>,
+            device: &burn::tensor::Device,
+        ) -> Vec<f32> {
+            let pred = lift_to_autodiff(img3(pred_data.to_vec(), device)).require_grad();
+            let gt = img3(gt_data, device);
+            let loss = normal_loss(pred.clone(), gt, gate);
+            let grads = loss.backward();
+            read(
+                pred.grad(&grads)
+                    .expect("the prediction must receive a gradient"),
+            )
+            .await
+        }
+
+        let gated = grad_of(&pred_data, all_valid, Some(cos30), &device).await;
+        let prior_masked = grad_of(&pred_data, prior_absent, None, &device).await;
+
+        assert_eq!(
+            gated, prior_masked,
+            "gating by contradiction and gating by an absent prior must produce \
+             identical gradients — a difference means the gate is on the tape"
+        );
+        for (i, g) in gated.iter().enumerate().skip(6) {
+            assert_eq!(
+                *g, 0.0,
+                "channel {i} of a gated-out pixel must carry exactly no gradient"
+            );
+        }
+        let live: f32 = gated[..6].iter().map(|g| g.abs()).sum();
+        assert!(
+            live > 0.0,
+            "the surviving pixels must carry a real gradient, else the equality \
+             above is satisfied by an all-zero map"
+        );
+    }
+
+    /// **§10d item 6.** The gate reduces the PRIOR term's pixel count without
+    /// touching the depth/normal consistency mask.
+    ///
+    /// The two terms are meant to disagree about a contradicted pixel on
+    /// purpose: the prior term stops trusting the external normal there, while
+    /// the consistency term — which compares two of OUR OWN renders and needs no
+    /// prior at all — must keep supervising it. Wiring the gate into both would
+    /// quietly delete supervision from precisely the pixels where the geometry
+    /// is least settled.
+    ///
+    /// Pinned by value rather than by signature: the fixture is built so that
+    /// the consistency loss reads 1.0 with all four pixels counted and would
+    /// read 0.0 if the gate's surviving set had leaked into it.
+    #[tokio::test]
+    async fn normal_gate_does_not_touch_the_depth_consistency_mask() {
+        let device = device().await;
+        let cos30 = 30.0_f32.to_radians().cos();
+
+        // Depth-derived normals: all facing the camera.
+        let n_from_depth = img3(
+            vec![
+                0.0, 0.0, -1.0, //
+                0.0, 0.0, -1.0, //
+                0.0, 0.0, -1.0, //
+                0.0, 0.0, -1.0, //
+            ],
+            &device,
+        );
+        // Rendered normals: pixels 0,1 agree; pixels 2,3 are opposed.
+        let rendered = vec![
+            0.0, 0.0, -1.0, //
+            0.0, 0.0, -1.0, //
+            0.0, 0.0, 1.0, //
+            0.0, 0.0, 1.0, //
+        ];
+        let prior = img3(
+            vec![
+                0.0, 0.0, -1.0, //
+                0.0, 0.0, -1.0, //
+                0.0, 0.0, -1.0, //
+                0.0, 0.0, -1.0, //
+            ],
+            &device,
+        );
+        let alpha = img1(vec![1.0, 1.0, 1.0, 1.0], &device);
+
+        // The gate really does bite on this frame: 2 of 4 survive.
+        let counts = read(normal_gate_counts(
+            img3(rendered.clone(), &device),
+            prior.clone(),
+            cos30,
+        ))
+        .await;
+        assert_eq!((counts[0], counts[1]), (2.0, 4.0));
+
+        // ...and the prior term's denominator follows it: |0| twice over
+        // 2 pixels x 3 channels.
+        let gated = read(normal_loss(
+            img3(rendered.clone(), &device),
+            prior,
+            Some(cos30),
+        ))
+        .await[0];
+        assert_eq!(gated, 0.0, "the surviving pixels agree exactly");
+
+        // The consistency term sees all four: (0 + 0 + 2 + 2) / 4 == 1.0.
+        // If the gate had reached it, the contradicted pair would be gone and
+        // the answer would be 0/2 == 0.
+        let consistency = read(depth_normal_loss(
+            n_from_depth,
+            img3(rendered, &device),
+            alpha,
+        ))
+        .await[0];
+        assert!(
+            (consistency - 1.0).abs() < 1e-6,
+            "depth/normal consistency = {consistency}, want 1.0 — a value of 0 \
+             would mean the contradiction gate leaked into the consistency mask"
+        );
+    }
+
+    /// **§10d item 7.** A gate that survives nothing yields an exact,
+    /// differentiable zero — and the BACKWARD still runs.
+    ///
+    /// `normal_loss_gate_none_matches_old` already pins the forward zero. The
+    /// backward is the half that catches the real failure: `sum / count` with an
+    /// unclamped zero count is `0/0 = NaN`, whose gradient is NaN everywhere and
+    /// which would then poison the total loss for every other term in the step.
+    /// Ported from `test_empty_masks_produce_finite_differentiable_zero_losses`.
+    #[tokio::test]
+    async fn normal_gate_empty_mask_yields_a_differentiable_zero() {
+        let device = autodiff_device().await;
+
+        let pred = lift_to_autodiff(img3(
+            vec![
+                0.0, 0.3, -1.0, //
+                0.0, 0.0, 1.0, //
+            ],
+            &device,
+        ))
+        .require_grad();
+        let gt = img3(
+            vec![
+                0.0, 0.0, -1.0, //
+                0.0, 0.0, -1.0, //
+            ],
+            &device,
+        );
+
+        // A gate so tight nothing can pass it.
+        let loss = normal_loss(pred.clone(), gt, Some(0.999_999));
+        let value = read(loss.clone()).await[0];
+        assert_eq!(value, 0.0, "an empty gate must give exactly 0, not NaN");
+        assert!(value.is_finite());
+
+        let grads = loss.backward();
+        let g = read(
+            pred.grad(&grads)
+                .expect("backward must still run on an empty mask"),
+        )
+        .await;
+        assert!(
+            g.iter().all(|x| x.is_finite()),
+            "empty-mask backward produced non-finite gradients: {g:?}"
+        );
+        assert!(
+            g.iter().all(|x| *x == 0.0),
+            "nothing survived the gate, so nothing may be supervised: {g:?}"
+        );
+    }
+
+    /// **§10d item 8.** The 30-degree gate admits 29 degrees and rejects 31.
+    ///
+    /// Neither suite pinned this. Both would pass today with the comparison
+    /// inverted only if the fixture happened to straddle nothing — and, more to
+    /// the point, with the threshold off by a small epsilon, or interpreted in
+    /// the wrong unit somewhere along the way. cos(29 deg) = 0.87462 and
+    /// cos(31 deg) = 0.85717 sit 0.0086 either side of cos(30 deg) = 0.86603,
+    /// which is ~7e4 f32 epsilons: nothing about float error can move a pixel
+    /// across this boundary, so a failure here is a semantic bug every time.
+    #[tokio::test]
+    async fn normal_gate_boundary_admits_29_and_rejects_31_degrees() {
+        let device = device().await;
+        let cos30 = 30.0_f32.to_radians().cos();
+
+        // Prior straight at the camera; predictions tilted by exactly 29 and 31
+        // degrees away from it, so the cosine to the prior IS cos(29) / cos(31).
+        let gt = img3(
+            vec![
+                0.0, 0.0, -1.0, //
+                0.0, 0.0, -1.0, //
+            ],
+            &device,
+        );
+        let tilt = |deg: f32| {
+            let r = deg.to_radians();
+            [r.sin(), 0.0, -r.cos()]
+        };
+        let a = tilt(29.0);
+        let b = tilt(31.0);
+        let pred = img3(vec![a[0], a[1], a[2], b[0], b[1], b[2]], &device);
+
+        let counts = read(normal_gate_counts(pred.clone(), gt.clone(), cos30)).await;
+        assert_eq!(
+            (counts[0], counts[1]),
+            (1.0, 2.0),
+            "exactly the 29-degree pixel may survive a 30-degree gate"
+        );
+
+        // And the loss agrees: only the 29-degree pixel's L1 is counted, over a
+        // denominator of 1 pixel x 3 channels.
+        let gated = read(normal_loss(pred, gt, Some(cos30))).await[0];
+        let want = (a[0].abs() + a[1].abs() + (a[2] + 1.0).abs()) / 3.0;
+        assert!(
+            (gated - want).abs() < 1e-6,
+            "gated loss = {gated}, want {want} (only the 29-degree pixel, \
+             denominator = 1 pixel x 3 channels)"
+        );
+    }
+}

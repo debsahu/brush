@@ -2201,6 +2201,23 @@ mod tests {
             .expect("gate is armed from its start iter");
         assert!((cos30 - 30.0_f32.to_radians().cos()).abs() < 1e-6);
 
+        // §10d item 8: the boundary itself, stated in the unit the flag is
+        // written in. A 30-DEGREE gate must admit 29 degrees and reject 31.
+        // The comparison above is self-referential (it recomputes the same
+        // expression), so it cannot catch a caller-visible unit slip on its
+        // own; this can. A `cos(30)` that forgot `to_radians()` is 0.154, which
+        // both of these cosines clear, so the second assertion is the one that
+        // fires. 0.0086 separates cos(29) from cos(31) — about 7e4 f32 epsilons,
+        // so no rounding argument can move a normal across this line.
+        assert!(
+            29.0_f32.to_radians().cos() >= cos30,
+            "a 30-degree gate must admit a 29-degree disagreement"
+        );
+        assert!(
+            31.0_f32.to_radians().cos() < cos30,
+            "a 30-degree gate must reject a 31-degree disagreement"
+        );
+
         // validate(): out-of-range angles are rejected.
         for bad_deg in [-1.0, 180.5, f32::NAN] {
             let mut bad = TrainConfig::default();
