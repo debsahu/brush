@@ -627,8 +627,8 @@ mod min_scale_fold_tests {
                 l, l, l, // isotropic log-scales
             ]);
         }
-        let transforms = Tensor::<2>::from_data(TensorData::new(rows, [n, 10]), device)
-            .require_grad();
+        let transforms =
+            Tensor::<2>::from_data(TensorData::new(rows, [n, 10]), device).require_grad();
         let raw_opac =
             Tensor::<1>::from_data(TensorData::new(vec![-2.2f32; n], [n]), device).require_grad();
         let f = Tensor::<1>::from_data(TensorData::new(vec![floor; n], [n]), device);
@@ -684,8 +684,7 @@ mod min_scale_fold_tests {
     /// before this fix too, and rows below must be finite after it.
     #[tokio::test]
     async fn fold_min_scale_gradient_is_finite_below_the_subnormal_cliff() {
-        let device =
-            Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let device = Device::from(brush_cube::test_helpers::test_device().await).autodiff();
 
         // A floor in the range the Mip-Splatting filter actually produces on an
         // indoor capture (0.3162 * distance / focal).
