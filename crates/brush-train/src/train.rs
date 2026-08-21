@@ -838,11 +838,34 @@ impl SplatTrainer {
                 .iter()
                 .map(|p| format!("{:.1}%", p.inlier_frac * 100.0))
                 .collect();
+            // The co-planarity assignment band is the knob that decides how much
+            // of the scene gets flattened onto these planes, and its default is
+            // derived rather than literal — so it has to appear in the log or
+            // nobody can tell an over-flattened run from a tuned one after the
+            // fact. Only printed when the term is actually on.
+            let coplanarity = if self.config.plane_coplanarity_weight > 0.0 {
+                let assign = crate::tidi::resolve_coplanarity_assign_dist(
+                    self.config.plane_coplanarity_assign_dist,
+                    ps.spacing,
+                );
+                let source = if self.config.plane_coplanarity_assign_dist > 0.0 {
+                    "explicit"
+                } else {
+                    "default, from spacing"
+                };
+                format!(
+                    ", coplanarity w {} assign-dist {:.4} ({source})",
+                    self.config.plane_coplanarity_weight, assign
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "{} planes (spacing {:.4}, band {:.4}), inliers: [{}]",
+                "{} planes (spacing {:.4}, band {:.4}){}, inliers: [{}]",
                 ps.planes.len(),
                 ps.spacing,
                 ps.threshold,
+                coplanarity,
                 fracs.join(", ")
             )
         })
@@ -1918,11 +1941,10 @@ impl SplatTrainer {
             if self.config.plane_coplanarity_weight > 0.0
                 && let Some(planes) = &self.plane_set
             {
-                let assign = if self.config.plane_coplanarity_assign_dist > 0.0 {
-                    self.config.plane_coplanarity_assign_dist
-                } else {
-                    self.config.depth_opacity_reg_margin
-                };
+                let assign = crate::tidi::resolve_coplanarity_assign_dist(
+                    self.config.plane_coplanarity_assign_dist,
+                    planes.spacing,
+                );
                 if let Some(term) = plane_coplanarity_loss(
                     splats.means(),
                     splats.rotations(),

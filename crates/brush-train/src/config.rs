@@ -1223,9 +1223,28 @@ pub struct TrainConfig {
 
     /// CO-PLANARITY assignment band: a Gaussian is assigned to a plane only when
     /// its perpendicular distance is below this (in scene 3D-distance units) AND
-    /// it projects inside the plane's bounded extent. `<= 0` (the default) means
-    /// "use `--depth-opacity-reg-margin`", so the band matches the opacity gate's
-    /// on-surface margin unless overridden.
+    /// it projects inside the plane's bounded extent.
+    ///
+    /// `<= 0` (the default) derives the band from the seed cloud's MEASURED
+    /// nearest-neighbour spacing: **2.75× spacing**, the same quantity the
+    /// RANSAC inlier band is built from. The resolved value is printed in the
+    /// `Plane priors:` line at startup — read it rather than assuming.
+    ///
+    /// THIS IS A DISTANCE THAT MUST SCALE WITH THE CLOUD, and getting it wrong
+    /// is silent. It previously defaulted to `--depth-opacity-reg-margin`
+    /// (0.15 m), a different feature's knob in absolute units: on our 7.3 mm
+    /// ARKitScenes seed that is a 20× band which assigns **68% of all splats**
+    /// to the eight room planes and flattens furniture onto the walls. The
+    /// derived 0.02 m band assigns 34% and keeps the gain — thin-axis 33.30°
+    /// with on-seed@1cm held at 61.7%, against 31.71° with on-seed@1cm
+    /// collapsing to 48.1% at the old default.
+    ///
+    /// Rule if you set it by hand: ≈2.5–3× the seed cloud's NN spacing. Check
+    /// membership with `work/arkitscenes_48018538/tools/ransac_bands.py`; over
+    /// ~40% of splats assigned means the band is too wide.
+    ///
+    /// Evidence is single-scene (ARKitScenes 48018538);
+    /// `docs/superpowers/specs/2026-08-20-pgsr-ablation-synthesis.md` §3.1, §6.
     #[arg(long, help_heading = "TIDI options", default_value = "-1.0")]
     #[serde(default = "default_plane_coplanarity_assign_dist")]
     pub plane_coplanarity_assign_dist: f32,
@@ -1850,7 +1869,10 @@ mod tests {
             (def.plane_coplanarity_weight - 0.0).abs() < 1e-9,
             "co-planarity must default off (weight 0)"
         );
-        // assign-dist sentinel <= 0 means "fall back to the opacity-reg margin".
+        // assign-dist sentinel <= 0 means "derive the band from the seed cloud's
+        // measured NN spacing" (tidi::resolve_coplanarity_assign_dist). It used
+        // to mean "fall back to --depth-opacity-reg-margin", which was a
+        // different feature's knob in absolute units — see that function.
         assert!(def.plane_coplanarity_assign_dist <= 0.0);
 
         // Unrelated flags must not switch it on.

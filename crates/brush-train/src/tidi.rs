@@ -740,6 +740,46 @@ const RANSAC_MIN_INLIER_FRAC: f32 = 0.02;
 /// parallel walls a few spacings apart are not merged.
 const RANSAC_THRESH_SPACING_MULT: f32 = 2.5;
 
+/// Default `--plane-coplanarity-assign-dist`, as a multiple of the cloud's
+/// measured nearest-neighbour spacing.
+///
+/// MEASURED, not chosen for symmetry with `RANSAC_THRESH_SPACING_MULT`. On
+/// ARKitScenes 48018538 (spacing 7.3 mm, logged by `extract_planes`) the
+/// validated band is 0.02 m = **2.74×** spacing (arm 15: thin-axis 33.30°,
+/// within-15° 24.8%, on-seed@1cm held at 61.7%). Widening it to 0.15 m (20×
+/// spacing) assigns **68% of all splats** to the eight room planes instead of
+/// 34% and flattens furniture onto the walls — arm 11 reaches a lower thin-axis
+/// (31.71°) by wrecking on-seed@1cm (64.8% → 48.1%). Membership fractions
+/// measured by a numpy re-derivation of this RANSAC, validated against the
+/// inlier fractions this module logs
+/// (`work/arkitscenes_48018538/tools/ransac_bands.py`).
+///
+/// Single-scene evidence; see
+/// `docs/superpowers/specs/2026-08-20-pgsr-ablation-synthesis.md` §3.1, §6 item 8.
+const COPLANARITY_ASSIGN_SPACING_MULT: f32 = 2.75;
+
+/// Resolve `--plane-coplanarity-assign-dist` against the cloud the planes came
+/// from: a positive configured value wins, otherwise the band is derived from
+/// the cloud's measured NN spacing.
+///
+/// WHY THIS EXISTS. The `<= 0` fallback used to resolve to
+/// `--depth-opacity-reg-margin` (default 0.15 m), which is a different quantity
+/// for a different feature and is expressed in absolute scene units. On a dense
+/// cloud that silently became a ~20× spacing band and over-flattened a third of
+/// the scene; on a sparse one it would be tighter than the RANSAC inlier band
+/// that defined the planes in the first place. Every distance knob in this
+/// family has to scale with the cloud, and `PlaneSet` already carries the
+/// spacing, so nothing new is measured here.
+pub fn resolve_coplanarity_assign_dist(configured: f32, spacing: f32) -> f32 {
+    if configured > 0.0 {
+        return configured;
+    }
+    // `spacing` is `estimate_nn_spacing(..).unwrap_or(1e-3)`, so it is finite and
+    // positive by construction; the clamp is belt-and-braces against a degenerate
+    // single-point cloud rather than an expected path.
+    (spacing * COPLANARITY_ASSIGN_SPACING_MULT).max(1e-6)
+}
+
 /// One extracted plane. The plane is `n · x = d` with `n` a unit normal; the
 /// bounded extent is stored as an in-plane orthonormal basis `(u, v)` plus the
 /// axis-aligned bounds of the inliers' `(u, v)` projections, so membership is a
@@ -2912,6 +2952,45 @@ mod tests {
             "tilted-plane normal cos-sim {cos} to ground truth (the sign bug gives ~0.14)"
         );
         assert!(d.abs() < 1e-4, "plane through origin → offset ~0, got {d}");
+    }
+
+    /// The co-planarity assignment band must be DERIVED FROM THE CLOUD when it
+    /// is not set explicitly, never inherited from `--depth-opacity-reg-margin`.
+    ///
+    /// This is a measured contract, not a style preference. The old fallback
+    /// resolved to 0.15 m regardless of cloud density; on the ARKitScenes seed
+    /// (spacing 0.0073) that band assigns 68% of all splats to room planes
+    /// against 34% at the validated 0.02 m, and it costs 13 pp of on-seed@1cm.
+    /// A regression here is invisible in the loss curve and shows up only as an
+    /// over-flattened scene, so it is pinned by value.
+    #[test]
+    fn coplanarity_assign_dist_defaults_to_a_multiple_of_cloud_spacing() {
+        // Explicit positive value always wins, whatever the cloud looks like.
+        assert_eq!(resolve_coplanarity_assign_dist(0.02, 0.0073), 0.02);
+        assert_eq!(resolve_coplanarity_assign_dist(0.15, 100.0), 0.15);
+
+        // The ARKitScenes 48018538 cloud: 7.3 mm spacing must land on the
+        // validated ~0.02 m band, NOT on depth-opacity-reg-margin's 0.15.
+        let arkit = resolve_coplanarity_assign_dist(-1.0, 0.0073);
+        assert!(
+            (arkit - 0.020_075).abs() < 1e-6,
+            "7.3 mm spacing must derive the validated ~0.02 m band, got {arkit}"
+        );
+        assert!(
+            arkit < 0.15 / 4.0,
+            "the derived band must not land anywhere near the old 0.15 m fallback"
+        );
+
+        // It scales with the cloud: a 10x sparser cloud gets a 10x wider band.
+        let sparse = resolve_coplanarity_assign_dist(0.0, 0.073);
+        assert!(
+            (sparse / arkit - 10.0).abs() < 1e-3,
+            "band must be linear in spacing, got {sparse} vs {arkit}"
+        );
+
+        // Degenerate cloud: still strictly positive, so assignment cannot match
+        // every splat via a zero-width comparison quirk.
+        assert!(resolve_coplanarity_assign_dist(-1.0, 0.0) > 0.0);
     }
 }
 
