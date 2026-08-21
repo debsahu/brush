@@ -1215,8 +1215,34 @@ pub struct TrainConfig {
     /// the centre onto the plane AND flattens it against the plane. Unlike the
     /// opacity gate this carries a real gradient on POSITION and SCALE, so it
     /// removes the geometric ambiguity on featureless walls directly. Riskier than
-    /// the gate (it moves geometry); keep it small (e.g. 0.05). Independent of
-    /// `--plane-gate`.
+    /// the gate (it moves geometry). Independent of `--plane-gate`.
+    ///
+    /// **UNITS — this is why the old suggested 0.05 was inert.** The term is a
+    /// squared distance: `(n·mu − d)²` plus a variance, so it carries **metres²**
+    /// on a metric scene. `--flatten-loss-weight` carries linear **metres**. At
+    /// the scales these terms operate on those are not comparable magnitudes — a
+    /// splat 1 cm off its plane contributes 1e-4 here against 1e-2 there, so a
+    /// weight tuned by analogy with flatten is two orders of magnitude short.
+    ///
+    /// **Measured working value on a metric indoor scene: 20.** A 1k-iteration
+    /// sweep on ARKitScenes 48018538 at w = 0.05 / 2 / 20 gives thin-axis medians
+    /// 54.90° / 52.65° / 45.58° — monotone in the weight, with 0.05 sitting at
+    /// the inert end (its PSNR is 0.028 dB from the no-coplanarity control, and
+    /// the whole 0.05 → 20 sweep spans 0.046 dB, so PSNR cannot adjudicate this).
+    /// At 7k, w = 20 with a cloud-derived assignment band is the best fork-native
+    /// configuration measured on that scene: thin-axis 33.30° against arm 6's
+    /// 36.84°, within-15° 17.5% → 24.8%, opacity p50 UP (0.068 → 0.073 — the only
+    /// orientation lever that raises it), PSNR −0.09 dB, at −40% it/min.
+    ///
+    /// **The value scales with the scene's units**, because the term does: a
+    /// scene whose units are 10× larger needs ~100× less weight for the same
+    /// pressure. 20 is calibrated for metres. Re-derive rather than copy on a
+    /// non-metric SfM scene, or use `--normalize-metric-weights` — but note that
+    /// flag also divides `--flatten-loss-weight`, which is a measured dilution on
+    /// a metric scene.
+    ///
+    /// Single-scene evidence, and it has not been tried on `playroom_0812`;
+    /// `docs/superpowers/specs/2026-08-20-pgsr-ablation-synthesis.md` §3.1, §4, §6.
     #[arg(long, help_heading = "TIDI options", default_value = "0.0")]
     #[serde(default = "default_plane_coplanarity_weight")]
     pub plane_coplanarity_weight: f32,
@@ -1935,15 +1961,18 @@ mod tests {
         assert_eq!(gated.depth_opacity_reg_start_iter, 15000);
 
         // Plane flags parse independently and do not imply any other switch.
+        // 20.0 is the measured working weight on a metric scene, not an
+        // arbitrary literal: the term is metres² where flatten is metres, so the
+        // magnitude here is the point (see the flag doc).
         let plane = TrainConfig::try_parse_from([
             "brush",
             "--plane-gate",
             "--plane-coplanarity-weight",
-            "0.05",
+            "20.0",
         ])
         .expect("--plane-gate / --plane-coplanarity-weight must parse");
         assert!(plane.plane_gate);
-        assert!((plane.plane_coplanarity_weight - 0.05).abs() < 1e-9);
+        assert!((plane.plane_coplanarity_weight - 20.0).abs() < 1e-9);
         assert!(!plane.tidi_prune, "plane flags must not imply photometric");
         assert!(
             (plane.depth_opacity_reg_weight - 0.0).abs() < 1e-9,
