@@ -10,6 +10,10 @@ pub mod scene_loader;
 
 mod formats;
 
+/// Shared golden fixtures + expected-value tables for the prior codecs (plan T18).
+#[cfg(test)]
+mod testdata;
+
 pub use formats::{DatasetLoadResult, load_dataset};
 
 use core::f32;

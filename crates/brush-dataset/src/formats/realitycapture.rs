@@ -137,11 +137,11 @@ async fn read_dataset_inner(
         // (`super::find_prior_path`). The RealityCapture csv is a fixed
         // pose/intrinsics column template with no place to name a per-image
         // sidecar, so the directory convention is the only route here.
-        let depth = find_depth_path(&vfs, &image_path)
+        let depth = find_depth_path(&vfs, &image_path)?
             .map(|p| LoadDepth::new(vfs.clone(), p.to_path_buf()));
         // Carries no scale, so -- as in colmap.rs -- it plays no part in any
         // metric-scale estimation.
-        let normal = find_normal_path(&vfs, &image_path)
+        let normal = find_normal_path(&vfs, &image_path)?
             .map(|p| LoadNormal::new(vfs.clone(), p.to_path_buf()));
 
         let image = LoadImage::new(

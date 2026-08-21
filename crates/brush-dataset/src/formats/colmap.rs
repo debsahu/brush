@@ -171,7 +171,7 @@ async fn load_dataset_inner(
         // up with the depth.
         let metric_scale = if load_args.estimate_metric_scale {
             let scale = estimate_metric_scale(&vfs, &img_info_list, &cam_model_data, &points_dir_)
-                .await
+                .await?
                 .expect("estimate metric scale failed");
             log::info!("Rescaling colmap reconstruction to metric depth (scale = {scale})");
             Some(scale)
@@ -217,12 +217,12 @@ async fn load_dataset_inner(
             let features = find_features_path(&vfs, path, &features_dir_name)
                 .map(|p| LoadFeatures::new(vfs.clone(), p.to_path_buf()));
             let depth =
-                find_depth_path(&vfs, path).map(|p| LoadDepth::new(vfs.clone(), p.to_path_buf()));
+                find_depth_path(&vfs, path)?.map(|p| LoadDepth::new(vfs.clone(), p.to_path_buf()));
             // Surface-normal prior, discovered exactly like depth. Carries no
             // scale, so it is deliberately NOT part of the metric-scale
             // estimation above.
-            let normal =
-                find_normal_path(&vfs, path).map(|p| LoadNormal::new(vfs.clone(), p.to_path_buf()));
+            let normal = find_normal_path(&vfs, path)?
+                .map(|p| LoadNormal::new(vfs.clone(), p.to_path_buf()));
 
             // Convert w2c to c2w.
             let world_to_cam = glam::Affine3A::from_rotation_translation(
@@ -433,21 +433,32 @@ async fn estimate_metric_scale(
     images: &[colmap_reader::Image],
     cameras: &HashMap<i32, ColmapCamera>,
     points_dir: &Path,
-) -> Option<f32> {
-    let any_depth = images.iter().any(|img| {
-        find_image_by_name(vfs, &img.name)
-            .and_then(|p| super::find_depth_path(vfs, p))
-            .is_some()
-    });
+) -> Result<Option<f32>, FormatError> {
+    // An ambiguous prior must surface as an error here, not as "no depth maps
+    // found" -- that would turn a stale-file mistake into a bare panic on the
+    // caller's `.expect`.
+    let mut any_depth = false;
+    for img in images {
+        if let Some(image_path) = find_image_by_name(vfs, &img.name)
+            && super::find_depth_path(vfs, image_path)?.is_some()
+        {
+            any_depth = true;
+            break;
+        }
+    }
     if !any_depth {
-        return None;
+        return Ok(None);
     }
 
-    let (points_path, is_binary) = find_points3d_path(vfs, points_dir)?;
-    let mut points_file = vfs.reader_at_path(points_path).await.ok()?;
-    let points = colmap_reader::read_points3d(&mut points_file, is_binary, false)
-        .await
-        .ok()?;
+    let Some((points_path, is_binary)) = find_points3d_path(vfs, points_dir) else {
+        return Ok(None);
+    };
+    let Ok(mut points_file) = vfs.reader_at_path(points_path).await else {
+        return Ok(None);
+    };
+    let Ok(points) = colmap_reader::read_points3d(&mut points_file, is_binary, false).await else {
+        return Ok(None);
+    };
     let point_map: HashMap<i64, glam::Vec3> = points.iter().map(|p| (p.id, p.xyz)).collect();
 
     let mut accumulated_colmap_depth = 0.0;
@@ -460,7 +471,7 @@ async fn estimate_metric_scale(
         let Some(image_path) = find_image_by_name(vfs, &img.name) else {
             continue;
         };
-        let Some(depth_path) = find_depth_path(vfs, image_path) else {
+        let Some(depth_path) = find_depth_path(vfs, image_path)? else {
             continue;
         };
         let Some(cam) = cameras.get(&img.camera_id) else {
@@ -503,7 +514,7 @@ async fn estimate_metric_scale(
     let scale = accumulated_dataset_depth / accumulated_colmap_depth;
 
     log::info!("Estimated metric scale {scale}");
-    Some(scale)
+    Ok(Some(scale))
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
