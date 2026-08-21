@@ -41,6 +41,9 @@ pub enum FormatError {
 
     #[error("Error loading image in data: {0}")]
     ImageError(#[from] ImageError),
+
+    #[error("Ambiguous geometry prior: {0}")]
+    AmbiguousPrior(String),
 }
 
 #[derive(Debug, Error)]
@@ -316,41 +319,81 @@ fn find_points3d_path<'a>(vfs: &'a BrushVfs, points_dir: &'a Path) -> Option<(&'
 /// image's full file name or its stem (so both `depth/img.png.tiff` and
 /// `depth/img.tiff` resolve for `images/img.png`).
 ///
-/// Matching is by **stem only** -- the candidate's extension is never inspected,
-/// so `depth/img.tif` is found just as `depth/img.tiff` is. The flip side is
-/// that a stray non-TIFF sibling (`depth/img.png`) is also "found" and then
-/// fails in [`crate::load_depth::LoadDepth`] at decode time, not here.
-fn find_prior_path<'a>(vfs: &'a BrushVfs, path: &'a Path, prior_dir: &str) -> Option<&'a Path> {
+/// Matching is by **stem only** -- the candidate's extension is never
+/// inspected, so `depth/img.tif` is found just as `depth/img.tiff` is, and a
+/// quantized `depth/img.png` is found just as a float32 `depth/img.tiff` is.
+/// The prior loaders dispatch on magic bytes, so one dataset may legitimately
+/// mix both wire formats frame by frame.
+///
+/// What is **not** legitimate is two candidates for the same image. That means
+/// two files claim to be the same prior -- overwhelmingly a half-finished
+/// format migration that left the stale float32 file next to the new quantized
+/// one. Picking one would mean picking by VFS iteration order, i.e.
+/// nondeterministically training on stale supervision, so this returns an error
+/// naming every candidate instead (plan D4).
+fn find_prior_path<'a>(
+    vfs: &'a BrushVfs,
+    path: &'a Path,
+    prior_dir: &str,
+) -> Result<Option<&'a Path>, FormatError> {
     let search_name = path.file_name().expect("File must have a name");
     let search_stem = path.file_stem().expect("File must have a name");
 
-    vfs.iter_files().find(|candidate| {
-        let Some(stem) = candidate.file_stem() else {
-            return false;
-        };
-        if !(stem.eq_ignore_ascii_case(search_name) || stem.eq_ignore_ascii_case(search_stem)) {
-            return false;
-        }
-        let dir_idx = candidate
-            .components()
-            .position(|c| c.as_os_str().eq_ignore_ascii_case(prior_dir));
-        dir_idx.is_some_and(|idx| {
-            let candidate_components: Vec<_> = candidate.components().collect();
-            let path_dir_components: Vec<_> = path.parent().unwrap().components().collect();
-            let prior_dir_subpath = &candidate_components[idx + 1..candidate_components.len() - 1];
-            path_dir_components.ends_with(prior_dir_subpath)
+    let mut matches: Vec<&Path> = vfs
+        .iter_files()
+        .filter(|candidate| {
+            let Some(stem) = candidate.file_stem() else {
+                return false;
+            };
+            if !(stem.eq_ignore_ascii_case(search_name) || stem.eq_ignore_ascii_case(search_stem)) {
+                return false;
+            }
+            let dir_idx = candidate
+                .components()
+                .position(|c| c.as_os_str().eq_ignore_ascii_case(prior_dir));
+            dir_idx.is_some_and(|idx| {
+                let candidate_components: Vec<_> = candidate.components().collect();
+                let path_dir_components: Vec<_> = path.parent().unwrap().components().collect();
+                let prior_dir_subpath =
+                    &candidate_components[idx + 1..candidate_components.len() - 1];
+                path_dir_components.ends_with(prior_dir_subpath)
+            })
         })
-    })
+        .collect();
+
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matches[0])),
+        _ => {
+            // Sorted so the message is stable whatever order the VFS walked in.
+            matches.sort_unstable();
+            Err(FormatError::AmbiguousPrior(format!(
+                "{} files claim to be the '{prior_dir}' prior of '{}': {}. \
+                 Exactly one is required. This usually means a prior-format \
+                 migration left a stale file behind -- delete all but the \
+                 current one rather than letting the loader guess.",
+                matches.len(),
+                path.display(),
+                matches
+                    .iter()
+                    .map(|p| format!("'{}'", p.display()))
+                    .join(", ")
+            )))
+        }
+    }
 }
 
-/// Locate a per-image depth map (`depth/<image stem>.tiff`).
-fn find_depth_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Option<&'a Path> {
+/// Locate a per-image depth map (`depth/<image stem>.{tiff,png}`).
+fn find_depth_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Result<Option<&'a Path>, FormatError> {
     find_prior_path(vfs, path, "depth")
 }
 
-/// Locate a per-image surface-normal map (`normal/<image stem>.tiff`). Same
-/// matching rules as [`find_depth_path`], different directory component.
-fn find_normal_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Option<&'a Path> {
+/// Locate a per-image surface-normal map (`normal/<image stem>.{tiff,png}`).
+/// Same matching rules as [`find_depth_path`], different directory component.
+fn find_normal_path<'a>(
+    vfs: &'a BrushVfs,
+    path: &'a Path,
+) -> Result<Option<&'a Path>, FormatError> {
     find_prior_path(vfs, path, "normal")
 }
 
@@ -407,6 +450,26 @@ pub(crate) mod prior_test_support {
         tokio::fs::write(path, encode_rgb_f32(&values, w, h))
             .await
             .expect("write normal tiff");
+    }
+
+    /// Single-channel uint16 PNG, the quantized depth wire format. Writes the
+    /// committed golden fixture verbatim so the on-disk bytes the loader sees
+    /// are exactly the ones `test_prior_io.py` reads (plan T18).
+    pub(crate) async fn write_depth_png(path: &Path) {
+        write_prior(path, crate::testdata::GOLDEN_DEPTH_U16_PNG).await;
+    }
+
+    /// 3-channel uint8 PNG, the quantized normal wire format. Same fixture
+    /// discipline as [`write_depth_png`].
+    pub(crate) async fn write_normal_png(path: &Path) {
+        write_prior(path, crate::testdata::GOLDEN_NORMAL_U8_PNG).await;
+    }
+
+    async fn write_prior(path: &Path, bytes: &[u8]) {
+        tokio::fs::create_dir_all(path.parent().expect("has parent"))
+            .await
+            .expect("create prior dir");
+        tokio::fs::write(path, bytes).await.expect("write prior");
     }
 
     pub(crate) fn test_config() -> LoadDatasetConfig {
@@ -541,7 +604,7 @@ mod tests {
             PathBuf::from("normal/img.tiff"),
         ]);
         assert_eq!(
-            find_normal_path(&vfs, Path::new("images/img.png")),
+            find_normal_path(&vfs, Path::new("images/img.png")).expect("unambiguous"),
             Some(Path::new("normal/img.tiff"))
         );
 
@@ -551,7 +614,7 @@ mod tests {
             PathBuf::from("normal/img.jpg.tiff"),
         ]);
         assert_eq!(
-            find_normal_path(&vfs, Path::new("images/img.jpg")),
+            find_normal_path(&vfs, Path::new("images/img.jpg")).expect("unambiguous"),
             Some(Path::new("normal/img.jpg.tiff"))
         );
     }
@@ -564,7 +627,7 @@ mod tests {
             PathBuf::from("normal/foo/bar/img.tiff"),
         ]);
         assert_eq!(
-            find_normal_path(&vfs, Path::new("images/foo/bar/img.png")),
+            find_normal_path(&vfs, Path::new("images/foo/bar/img.png")).expect("unambiguous"),
             Some(Path::new("normal/foo/bar/img.tiff"))
         );
 
@@ -573,7 +636,7 @@ mod tests {
             PathBuf::from("normal/foo/img.tiff"),
         ]);
         assert_eq!(
-            find_normal_path(&vfs, Path::new("images/baz/img.png")),
+            find_normal_path(&vfs, Path::new("images/baz/img.png")).expect("unambiguous"),
             None
         );
     }
@@ -585,9 +648,12 @@ mod tests {
             PathBuf::from("depth/img.tiff"),
         ]);
         // A depth-only dataset must not resolve a normal prior, and vice versa.
-        assert_eq!(find_normal_path(&vfs, Path::new("images/img.png")), None);
         assert_eq!(
-            find_depth_path(&vfs, Path::new("images/img.png")),
+            find_normal_path(&vfs, Path::new("images/img.png")).expect("unambiguous"),
+            None
+        );
+        assert_eq!(
+            find_depth_path(&vfs, Path::new("images/img.png")).expect("unambiguous"),
             Some(Path::new("depth/img.tiff"))
         );
 
@@ -595,6 +661,224 @@ mod tests {
             PathBuf::from("images/img.png"),
             PathBuf::from("normal/img.tiff"),
         ]);
-        assert_eq!(find_depth_path(&vfs, Path::new("images/img.png")), None);
+        assert_eq!(
+            find_depth_path(&vfs, Path::new("images/img.png")).expect("unambiguous"),
+            None
+        );
+    }
+}
+
+/// Cross-format prior discovery: a dataset may mix float32-TIFF and quantized
+/// PNG priors frame by frame (plan D4 "works"), but two files claiming the same
+/// prior is fatal (D4 "fails loudly").
+///
+/// These need a real on-disk dataset, so they are native-only, in the style of
+/// the per-format prior tests.
+#[cfg(all(test, not(target_family = "wasm")))]
+mod prior_format_tests {
+    use super::prior_test_support::{
+        test_config, write_depth_png, write_depth_tiff, write_normal_png, write_normal_tiff,
+    };
+    use super::{DatasetError, DatasetLoadResult, FormatError, load_dataset};
+    use crate::testdata;
+    use brush_vfs::BrushVfs;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    const IMG_W: u32 = testdata::GOLDEN_W as u32;
+    const IMG_H: u32 = testdata::GOLDEN_H as u32;
+
+    /// A nerfstudio dataset with `n` identity-posed frames, sized to match the
+    /// golden prior fixtures (no resize is ever applied to priors -- plan D8 --
+    /// so the sizes must agree exactly).
+    async fn write_dataset(dir: &Path, frames: &[&str]) {
+        let frame_json: Vec<String> = frames
+            .iter()
+            .map(|name| {
+                format!(
+                    r#"{{
+                        "file_path": "images/{name}.png",
+                        "transform_matrix": [
+                            [1.0, 0.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0, 0.0],
+                            [0.0, 0.0, 1.0, 0.0],
+                            [0.0, 0.0, 0.0, 1.0]
+                        ]
+                    }}"#
+                )
+            })
+            .collect();
+        let transforms = format!(
+            r#"{{
+                "fl_x": 4.0, "fl_y": 3.0, "cx": 2.0, "cy": 1.5,
+                "w": {IMG_W}, "h": {IMG_H},
+                "frames": [{}]
+            }}"#,
+            frame_json.join(",")
+        );
+        tokio::fs::write(dir.join("transforms.json"), transforms)
+            .await
+            .expect("write transforms.json");
+
+        let images_dir = dir.join("images");
+        tokio::fs::create_dir_all(&images_dir)
+            .await
+            .expect("create images dir");
+        for name in frames {
+            image::RgbImage::from_pixel(IMG_W, IMG_H, image::Rgb([10, 20, 30]))
+                .save(images_dir.join(format!("{name}.png")))
+                .expect("write image");
+        }
+    }
+
+    async fn try_load(dir: &Path) -> Result<DatasetLoadResult, DatasetError> {
+        let vfs = Arc::new(BrushVfs::from_path(dir).await.expect("build vfs"));
+        load_dataset(vfs, &test_config()).await
+    }
+
+    // ---- T8: one dataset, both wire formats --------------------------------
+
+    #[tokio::test]
+    async fn mixed_format_dataset_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_dataset(root, &["frame_001", "frame_002"]).await;
+
+        // Frame 1 keeps the legacy float32 TIFFs; frame 2 is migrated.
+        write_depth_tiff(&root.join("depth/frame_001.tiff"), IMG_W, IMG_H).await;
+        write_normal_tiff(&root.join("normal/frame_001.tiff"), IMG_W, IMG_H).await;
+        write_depth_png(&root.join("depth/frame_002.png")).await;
+        write_normal_png(&root.join("normal/frame_002.png")).await;
+
+        let Ok(result) = try_load(root).await else {
+            panic!("mixed-format dataset must load");
+        };
+        let mut views: Vec<_> = result.dataset.train.views.as_ref().clone();
+        views.sort_by(|a, b| a.image.path().cmp(b.image.path()));
+        assert_eq!(views.len(), 2, "both frames must survive the load");
+
+        let (h, w) = (IMG_H as usize, IMG_W as usize);
+
+        // Frame 1: float32 TIFF, unchanged behaviour.
+        let d1 = views[0]
+            .depth
+            .as_ref()
+            .expect("frame 1 depth")
+            .load_vec(h, w)
+            .await
+            .expect("tiff depth decodes");
+        assert!(
+            d1.iter().all(|&v| v == 1.5),
+            "tiff fixture is a constant 1.5 m, got {d1:?}"
+        );
+        let n1 = views[0]
+            .normal
+            .as_ref()
+            .expect("frame 1 normal")
+            .load_vec(h, w)
+            .await
+            .expect("tiff normal decodes");
+        assert_eq!(n1.len(), h * w * 3);
+
+        // Frame 2: quantized PNG, decoded through the Part B codec -- and it
+        // must land on the SAME pinned table the codec unit tests use, i.e.
+        // going through discovery + VFS changes nothing.
+        let d2 = views[1]
+            .depth
+            .as_ref()
+            .expect("frame 2 depth")
+            .load_vec(h, w)
+            .await
+            .expect("png depth decodes");
+        for (got, &want) in d2.iter().zip(testdata::GOLDEN_DEPTH_METRES_BITS.iter()) {
+            assert_eq!(got.to_bits(), want);
+        }
+        let n2 = views[1]
+            .normal
+            .as_ref()
+            .expect("frame 2 normal")
+            .load_vec(h, w)
+            .await
+            .expect("png normal decodes");
+        for (got, &want) in n2.iter().zip(testdata::GOLDEN_NORMAL_UNIT_BITS.iter()) {
+            assert_eq!(got.to_bits(), want);
+        }
+
+        // Null model: the two frames genuinely carry different data, so
+        // "both decoded" is not one buffer counted twice.
+        assert_ne!(d1, d2);
+    }
+
+    // ---- T9: two files claiming one prior is fatal -------------------------
+
+    #[tokio::test]
+    async fn ambiguous_prior_stem_is_fatal() {
+        for (dir_name, ambiguous_ext) in [("depth", "png"), ("normal", "png")] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            write_dataset(root, &["frame_001"]).await;
+
+            // Baseline: the TIFF alone loads. This is the null model -- it
+            // proves the failure below is caused by the SECOND file, not by
+            // the dataset being broken some other way.
+            write_depth_tiff(&root.join("depth/frame_001.tiff"), IMG_W, IMG_H).await;
+            write_normal_tiff(&root.join("normal/frame_001.tiff"), IMG_W, IMG_H).await;
+            assert!(
+                try_load(root).await.is_ok(),
+                "single-prior dataset must load"
+            );
+
+            // Now leave a stale sibling behind, exactly as a crashed migration
+            // would.
+            let stale = root.join(format!("{dir_name}/frame_001.{ambiguous_ext}"));
+            if dir_name == "depth" {
+                write_depth_png(&stale).await;
+            } else {
+                write_normal_png(&stale).await;
+            }
+
+            let Err(err) = try_load(root).await else {
+                panic!("two files for one prior must be fatal");
+            };
+            let DatasetError::FormatError(FormatError::AmbiguousPrior(msg)) = err else {
+                panic!("expected AmbiguousPrior, got {err:?}");
+            };
+            // The message must name EVERY candidate -- the operator has to know
+            // which file to delete.
+            assert!(
+                msg.contains(&format!("{dir_name}/frame_001.tiff")),
+                "message must name the tiff: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("{dir_name}/frame_001.{ambiguous_ext}")),
+                "message must name the png: {msg}"
+            );
+            assert!(
+                msg.contains("images/frame_001.png"),
+                "message must name the image it belongs to: {msg}"
+            );
+        }
+    }
+
+    /// Two *stale* files of the same wire format are just as fatal -- the rule
+    /// is one prior per image, not "one per extension".
+    #[tokio::test]
+    async fn ambiguous_prior_is_not_about_extensions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_dataset(root, &["frame_001"]).await;
+        write_depth_tiff(&root.join("depth/frame_001.tiff"), IMG_W, IMG_H).await;
+        write_depth_tiff(&root.join("depth/frame_001.tif"), IMG_W, IMG_H).await;
+
+        let Err(err) = try_load(root).await else {
+            panic!("two tiffs for one prior must be fatal");
+        };
+        assert!(
+            matches!(
+                err,
+                DatasetError::FormatError(FormatError::AmbiguousPrior(_))
+            ),
+            "got {err:?}"
+        );
     }
 }

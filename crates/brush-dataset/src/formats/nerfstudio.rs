@@ -220,7 +220,7 @@ async fn read_transforms_file(
                 )
                 .await
             }
-            None => find_depth_path(&vfs, &path).map(Path::to_path_buf),
+            None => find_depth_path(&vfs, &path)?.map(Path::to_path_buf),
         }
         .map(|p| LoadDepth::new(vfs.clone(), p));
 
@@ -236,7 +236,7 @@ async fn read_transforms_file(
                 )
                 .await
             }
-            None => find_normal_path(&vfs, &path).map(Path::to_path_buf),
+            None => find_normal_path(&vfs, &path)?.map(Path::to_path_buf),
         }
         .map(|p| LoadNormal::new(vfs.clone(), p));
 

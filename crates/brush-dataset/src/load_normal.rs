@@ -1,3 +1,5 @@
+use crate::load_depth::{PRIOR_MAGIC_HELP, PriorWireFormat, describe_magic, prior_wire_format};
+
 use brush_vfs::BrushVfs;
 use burn::tensor::TensorData;
 use std::{
@@ -8,14 +10,26 @@ use std::{
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 
-/// Lazily-loaded per-view surface-normal map: a 3-channel float32 TIFF stored
-/// as `[H, W, 3]` in row-major, channel-interleaved order.
+/// Lazily-loaded per-view surface-normal map, decoded to `[H, W, 3]` f32 in
+/// row-major, channel-interleaved order.
 ///
-/// Convention (must match whatever writes the priors):
+/// Two wire formats are accepted, dispatched on magic bytes (never on the file
+/// extension -- prior discovery in the `formats` module is extension-blind):
+///
+/// - **3-channel float32 TIFF** -- components stored directly.
+/// - **RGB8 PNG** -- components quantized to uint8 (see `decode_normal_u8`).
+///
+/// Convention (must match whatever writes the priors), **identical for both
+/// wire formats** -- nothing downstream can tell which one a prior came from:
 /// - normals live in the **camera frame**, `OpenCV` axes (+X right, +Y down,
 ///   +Z forward),
 /// - unit length, oriented toward the camera (`n.z <= 0`),
 /// - `(0, 0, 0)` marks an invalid / unobserved pixel.
+///
+/// Note the sign convention is *ours*, not the quantization codec's: the codec
+/// is sign-agnostic and `gauss-surf` stores away-from-camera normals. Flipping
+/// foreign bundles is an extraction-time job, never loader logic (plan D2), so
+/// this loader stays provenance-free.
 ///
 /// This mirrors [`crate::load_depth::LoadDepth`]: lazy, size-checked against
 /// the training resolution, and hard-erroring on a mismatch, because a prior
@@ -65,21 +79,96 @@ impl LoadNormal {
     }
 }
 
-/// Decode a 3-channel float32 TIFF and check it against the expected size.
-/// Split out from `load_vec` so the decode + validation path is unit-testable
-/// without a VFS.
+/// Decode a normal prior of either wire format and check it against the
+/// expected size. Split out from `load_vec` so the decode + validation path is
+/// unit-testable without a VFS.
 pub(crate) fn decode_checked(
     bytes: &[u8],
     expected_h: usize,
     expected_w: usize,
 ) -> Result<Vec<f32>, LoadNormalError> {
-    let (normal, w, h) = decode_f32_rgb_tiff(bytes)?;
+    let Some(format) = prior_wire_format(bytes) else {
+        return Err(LoadNormalError::UnsupportedFormat(format!(
+            "unsupported prior format (expected float32 TIFF or {{Luma16|RGB8}} PNG magic); \
+             leading bytes [{}] match none of {PRIOR_MAGIC_HELP}",
+            describe_magic(bytes)
+        )));
+    };
+
+    let (normal, w, h) = match format {
+        PriorWireFormat::Tiff => decode_f32_rgb_tiff(bytes)?,
+        PriorWireFormat::Png => decode_u8_normal_png(bytes)?,
+    };
+
     if w != expected_w || h != expected_h {
-        Err(LoadNormalError::ReadTiffError(format!(
-            "invalid normal size {w} x {h}, expected {expected_w} x {expected_h}"
-        )))
+        // Per-format variant so the message never claims the wrong container.
+        let msg = format!("invalid normal size {w} x {h}, expected {expected_w} x {expected_h}");
+        return Err(match format {
+            PriorWireFormat::Tiff => LoadNormalError::ReadTiffError(msg),
+            PriorWireFormat::Png => LoadNormalError::ReadPngError(msg),
+        });
+    }
+
+    Ok(normal)
+}
+
+/// Dequantize one uint8 normal component to its signed unit value.
+///
+/// Codec contract taken verbatim from `gauss-surf` (Pablo Vela, Apache-2.0),
+/// `normals_encoding.py:44, 52-53`: encode `rint((n + 1) / 2 * 255)`, decode
+/// `c / 255 * 2 - 1` **except code 128, which maps to exact 0.0**.
+///
+/// The 128 override is deliberate and load-bearing (plan D1): it is what lets
+/// the `(0, 0, 0)` invalid sentinel survive a round trip, since a symmetric
+/// inverse would put 0.0 at code 127.5 -- unrepresentable. Its price is that
+/// the two neighbours of the override are *asymmetric*: code 127 decodes to
+/// about -1/255 while code 129 decodes to about +3/255, not +/- the same step.
+///
+/// **Do not "clean this up" to `2c/255 - 1` or `(c - 127.5)/127.5`.** Either
+/// rewrite breaks the sentinel and creates a silent, permanent disagreement
+/// with every file `gauss-surf` and `prior_io.py` have written. The deviation
+/// is 2/255 ~ 0.008 on exactly two codes -- the same order as the quantization
+/// floor itself, and ~20x inside the measured prior-error budget (plan §5).
+///
+/// The operation order is pinned to numpy's (plan D7) so every code, not just
+/// the anchors, is bit-identical across the two languages.
+#[inline]
+pub(crate) fn decode_normal_u8(code: u8) -> f32 {
+    if code == 128 {
+        0.0
     } else {
-        Ok(normal)
+        f32::from(code) / 255.0 * 2.0 - 1.0
+    }
+}
+
+/// Decode a 3-channel uint8 PNG of quantized normals into `[H, W, 3]`.
+///
+/// The pixel type is matched **exactly**: an RGBA, 16-bit, grayscale, or
+/// paletted PNG is rejected rather than converted. `image`'s `to_rgb8()` would
+/// happily narrow a 16-bit map or drop an alpha channel, turning a wrong file
+/// into plausible-looking supervision -- the same class of error the
+/// float32-TIFF sample-format check exists to prevent.
+fn decode_u8_normal_png(bytes: &[u8]) -> Result<(Vec<f32>, usize, usize), LoadNormalError> {
+    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)?;
+    let color = image.color();
+
+    let image::DynamicImage::ImageRgb8(rgb) = image else {
+        return Err(LoadNormalError::ReadPngError(format!(
+            "unsupported normal PNG pixel type {color:?} (expected 8-bit 3-channel RGB8)"
+        )));
+    };
+
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    let normal: Vec<f32> = rgb.into_raw().into_iter().map(decode_normal_u8).collect();
+
+    if w * h * 3 == normal.len() {
+        Ok((normal, w, h))
+    } else {
+        Err(LoadNormalError::ReadPngError(format!(
+            "expected {} samples for {w} x {h}, got {}",
+            w * h * 3,
+            normal.len()
+        )))
     }
 }
 
@@ -114,6 +203,15 @@ pub enum LoadNormalError {
 
     #[error("Error while reading TIFF file: {0}")]
     ReadTiffError(String),
+
+    #[error("Error while loading PNG file: {0}")]
+    LoadPngError(#[from] image::ImageError),
+
+    #[error("Error while reading PNG file: {0}")]
+    ReadPngError(String),
+
+    #[error("Error reading normal map: {0}")]
+    UnsupportedFormat(String),
 }
 
 #[cfg(test)]
@@ -182,5 +280,307 @@ mod tests {
             matches!(err, LoadNormalError::ReadTiffError(_)),
             "expected a read error, got {err:?}"
         );
+    }
+
+    // ---- T2 / T18: the uint8 codec's signed anchors, bit for bit -----------
+
+    #[test]
+    fn normal_png_signed_anchors_bit_exact() {
+        use crate::testdata;
+
+        let decoded = decode_checked(
+            testdata::GOLDEN_NORMAL_U8_PNG,
+            testdata::GOLDEN_H,
+            testdata::GOLDEN_W,
+        )
+        .expect("golden uint8 normal PNG must decode");
+
+        assert_eq!(decoded.len(), testdata::GOLDEN_NORMAL_UNIT_BITS.len());
+        for (i, (&got, &want_bits)) in decoded
+            .iter()
+            .zip(testdata::GOLDEN_NORMAL_UNIT_BITS.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                got.to_bits(),
+                want_bits,
+                "component {i} (code {}): got {got} (bits {:#010x}), want {want_bits:#010x}",
+                testdata::GOLDEN_NORMAL_CODES[i],
+                got.to_bits()
+            );
+        }
+
+        // Anchors, spelled out rather than trusted to the table.
+        assert_eq!(decode_normal_u8(0).to_bits(), (-1.0f32).to_bits());
+        assert_eq!(decode_normal_u8(128).to_bits(), 0.0f32.to_bits());
+        assert_eq!(decode_normal_u8(255).to_bits(), 1.0f32.to_bits());
+
+        // THE ASYMMETRY (plan D1, and the trap flagged in the 2026-08-19 plan
+        // §10d). 128 -> exact 0 means the two neighbours are NOT +/- one step:
+        // 127 sits one 1/255 below zero, 129 sits three 1/255 above it.
+        // A "symmetric cleanup" that deletes the 128 override, or rescales by
+        // 127.5, silently disagrees with every file gauss-surf ever wrote.
+        let c127 = decode_normal_u8(127);
+        let c129 = decode_normal_u8(129);
+        assert!(
+            (c127 - (-1.0f32 / 255.0)).abs() < 1e-7,
+            "code 127 must decode to about -1/255, got {c127}"
+        );
+        assert!(
+            (c129 - (3.0f32 / 255.0)).abs() < 1e-7,
+            "code 129 must decode to about +3/255, got {c129}"
+        );
+        // Null model: had the codec been symmetric about 128, the two
+        // neighbours would be equal and opposite. They are not -- 129 is three
+        // times as far from zero as 127.
+        assert!(
+            (c129 + c127).abs() > 0.5 * c129.abs(),
+            "127/129 must NOT be symmetric about zero: {c127} / {c129}"
+        );
+        assert!(
+            ((c129 / -c127) - 3.0).abs() < 1e-4,
+            "the asymmetry ratio must be exactly 3:1, got {}",
+            c129 / -c127
+        );
+
+        // And the pinned table is not self-fulfilling: rederive it from the
+        // codes through the D7 expression.
+        for (i, &code) in testdata::GOLDEN_NORMAL_CODES.iter().enumerate() {
+            assert_eq!(decoded[i].to_bits(), decode_normal_u8(code).to_bits());
+        }
+    }
+
+    // ---- T3: all-128 pixel is the invalid sentinel -------------------------
+
+    #[test]
+    fn normal_png_all_128_is_invalid_zero_vector() {
+        use crate::testdata;
+
+        let decoded = decode_checked(
+            testdata::GOLDEN_NORMAL_U8_PNG,
+            testdata::GOLDEN_H,
+            testdata::GOLDEN_W,
+        )
+        .expect("golden uint8 normal PNG must decode");
+
+        let base = testdata::GOLDEN_NORMAL_INVALID_PIXEL * 3;
+        assert_eq!(
+            &testdata::GOLDEN_NORMAL_CODES[base..base + 3],
+            &[128u8, 128, 128]
+        );
+        let (x, y, z) = (decoded[base], decoded[base + 1], decoded[base + 2]);
+        assert_eq!((x.to_bits(), y.to_bits(), z.to_bits()), (0, 0, 0));
+
+        // brush-loss treats a prior as valid iff ||n|| > 0.5
+        // (`normal_prior_valid_mask`, brush-loss/src/lib.rs:1800-1823), so the
+        // decoded zero vector is what actually switches supervision off. Pin
+        // the property the loss will test, not just the components.
+        let norm = x.mul_add(x, y.mul_add(y, z * z)).sqrt();
+        assert!(norm <= 0.5, "invalid pixel must fail the ||n|| > 0.5 gate");
+
+        // It is also the ONLY pixel that decodes to exactly zero. Nothing else
+        // in the fixture can be mistaken for the sentinel, and no unit normal
+        // could ever encode to all-128 anyway (it would need ||n|| < 0.007).
+        let exact_zero: Vec<usize> = (0..(testdata::GOLDEN_W * testdata::GOLDEN_H))
+            .filter(|px| (0..3).all(|c| decoded[px * 3 + c].to_bits() == 0.0f32.to_bits()))
+            .collect();
+        assert_eq!(exact_zero, vec![testdata::GOLDEN_NORMAL_INVALID_PIXEL]);
+
+        // Null model: the ||n|| > 0.5 gate must be discriminating, not
+        // trivially true. Pixel 1 is (127, 128, 129) -- a deliberate probe of
+        // the codes either side of the override, NOT a physical normal, and it
+        // legitimately lands near zero. Every one of the remaining ten pixels
+        // encodes a real (non-unit-normalised but well clear of zero) vector
+        // and must pass.
+        const CODEC_PROBE_PIXEL: usize = 1;
+        let mut valid = 0;
+        for px in 0..(testdata::GOLDEN_W * testdata::GOLDEN_H) {
+            if px == testdata::GOLDEN_NORMAL_INVALID_PIXEL || px == CODEC_PROBE_PIXEL {
+                continue;
+            }
+            let (x, y, z) = (decoded[px * 3], decoded[px * 3 + 1], decoded[px * 3 + 2]);
+            let norm = x.mul_add(x, y.mul_add(y, z * z)).sqrt();
+            assert!(norm > 0.5, "pixel {px} should be valid, ||n|| = {norm}");
+            valid += 1;
+        }
+        assert_eq!(valid, testdata::GOLDEN_W * testdata::GOLDEN_H - 2);
+
+        // A single 128 component does NOT invalidate a pixel: the override is
+        // per-component. Pixel 4 is (128, 128, 0) -> (0, 0, -1), a perfectly
+        // good toward-camera normal.
+        assert_eq!(&testdata::GOLDEN_NORMAL_CODES[12..15], &[128u8, 128, 0]);
+        assert_eq!(decoded[12].to_bits(), 0.0f32.to_bits());
+        assert_eq!(decoded[14].to_bits(), (-1.0f32).to_bits());
+    }
+
+    // ---- T5: wrong PNG pixel type is a hard error, never a conversion ------
+
+    #[test]
+    fn normal_png_wrong_pixel_type_rejected() {
+        use crate::testdata;
+
+        let (w, h) = (testdata::GOLDEN_W as u32, testdata::GOLDEN_H as u32);
+        let n = (w * h) as usize;
+
+        // RGBA8: `to_rgb8()` would silently drop the alpha channel.
+        let rgba = image::DynamicImage::ImageRgba8(
+            image::RgbaImage::from_raw(w, h, vec![128u8; n * 4]).expect("rgba buffer"),
+        );
+        let err = decode_checked(&encode_png(&rgba), testdata::GOLDEN_H, testdata::GOLDEN_W)
+            .expect_err("RGBA normal PNG must be rejected");
+        assert!(
+            matches!(err, LoadNormalError::ReadPngError(_)),
+            "expected a PNG read error, got {err:?}"
+        );
+
+        // Luma16: the *depth* wire format handed to the normal loader.
+        let luma16 = image::DynamicImage::ImageLuma16(
+            image::ImageBuffer::from_raw(w, h, vec![128u16; n]).expect("luma16 buffer"),
+        );
+        let err = decode_checked(&encode_png(&luma16), testdata::GOLDEN_H, testdata::GOLDEN_W)
+            .expect_err("16-bit grayscale normal PNG must be rejected");
+        assert!(
+            matches!(err, LoadNormalError::ReadPngError(_)),
+            "expected a PNG read error, got {err:?}"
+        );
+
+        // Rgb16: right channel count, wrong depth.
+        let rgb16 = image::DynamicImage::ImageRgb16(
+            image::ImageBuffer::from_raw(w, h, vec![128u16; n * 3]).expect("rgb16 buffer"),
+        );
+        let err = decode_checked(&encode_png(&rgb16), testdata::GOLDEN_H, testdata::GOLDEN_W)
+            .expect_err("16-bit RGB normal PNG must be rejected");
+        assert!(
+            matches!(err, LoadNormalError::ReadPngError(_)),
+            "expected a PNG read error, got {err:?}"
+        );
+
+        // Luma8: single channel.
+        let luma8 = image::DynamicImage::ImageLuma8(
+            image::GrayImage::from_raw(w, h, vec![128u8; n]).expect("luma8 buffer"),
+        );
+        let err = decode_checked(&encode_png(&luma8), testdata::GOLDEN_H, testdata::GOLDEN_W)
+            .expect_err("8-bit grayscale normal PNG must be rejected");
+        assert!(
+            matches!(err, LoadNormalError::ReadPngError(_)),
+            "expected a PNG read error, got {err:?}"
+        );
+
+        // Control: the real RGB8 fixture still decodes, so the rejections above
+        // are about the pixel type and not about PNGs in general.
+        decode_checked(
+            testdata::GOLDEN_NORMAL_U8_PNG,
+            testdata::GOLDEN_H,
+            testdata::GOLDEN_W,
+        )
+        .expect("RGB8 normal PNG must decode");
+    }
+
+    fn encode_png(image: &image::DynamicImage) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        image
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("write png");
+        buf.into_inner()
+    }
+
+    // ---- T10: size mismatch stays fatal on the PNG path too ----------------
+
+    #[test]
+    fn normal_png_size_mismatch_still_fatal() {
+        use crate::testdata;
+
+        let err = decode_checked(
+            testdata::GOLDEN_NORMAL_U8_PNG,
+            testdata::GOLDEN_W,
+            testdata::GOLDEN_H,
+        )
+        .expect_err("transposed size must be rejected");
+        assert!(
+            matches!(err, LoadNormalError::ReadPngError(_)),
+            "expected a PNG read error, got {err:?}"
+        );
+    }
+
+    // ---- T7: Deflate + FloatingPoint-predictor TIFFs -----------------------
+
+    #[test]
+    fn compressed_normal_tiff_decodes_bit_identical() {
+        use crate::testdata;
+        use tiff::encoder::{Compression, DeflateLevel};
+
+        let (w, h) = (testdata::GOLDEN_W as u32, testdata::GOLDEN_H as u32);
+        let values: Vec<f32> = testdata::PREDICTOR3_NORMAL_BITS
+            .iter()
+            .map(|&b| f32::from_bits(b))
+            .collect();
+
+        // (a) Rust-written Deflate (the encoder cannot emit predictor 3).
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut buf)
+                .expect("tiff encoder")
+                .with_compression(Compression::Deflate(DeflateLevel::Balanced));
+            encoder
+                .write_image::<colortype::RGB32Float>(w, h, &values)
+                .expect("write deflate rgb f32 tiff");
+        }
+        let deflated = buf.into_inner();
+        assert!(
+            deflated != encode_rgb_f32(&values, w, h),
+            "the deflate arm must actually differ from the uncompressed one"
+        );
+        let decoded = decode_checked(&deflated, testdata::GOLDEN_H, testdata::GOLDEN_W)
+            .expect("deflate rgb f32 tiff must decode");
+        for (got, want) in decoded.iter().zip(values.iter()) {
+            assert_eq!(got.to_bits(), want.to_bits());
+        }
+
+        // (b) tifffile-written Deflate + FloatingPoint predictor (3).
+        let decoded = decode_checked(
+            testdata::PREDICTOR3_NORMAL_TIFF,
+            testdata::GOLDEN_H,
+            testdata::GOLDEN_W,
+        )
+        .expect("predictor-3 normal fixture must decode");
+        assert_eq!(decoded.len(), testdata::PREDICTOR3_NORMAL_BITS.len());
+        for (i, (&got, &want_bits)) in decoded
+            .iter()
+            .zip(testdata::PREDICTOR3_NORMAL_BITS.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                got.to_bits(),
+                want_bits,
+                "component {i}: got bits {:#010x}, want {want_bits:#010x}",
+                got.to_bits()
+            );
+        }
+
+        // Null model: the fixture really is predictor-shuffled on disk, so a
+        // decoder that skipped the predictor pass could not have passed above.
+        let raw_le: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert!(
+            !testdata::PREDICTOR3_NORMAL_TIFF
+                .windows(raw_le.len())
+                .any(|window| window == raw_le),
+            "predictor-3 fixture must not contain the plain little-endian samples"
+        );
+    }
+
+    // ---- magic-byte dispatch (plan D3) -------------------------------------
+
+    #[test]
+    fn normal_unknown_magic_is_a_hard_error() {
+        let err = decode_checked(&[0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0], 3, 4)
+            .expect_err("a JPEG must not be accepted as a normal prior");
+        let LoadNormalError::UnsupportedFormat(msg) = err else {
+            panic!("expected UnsupportedFormat, got {err:?}");
+        };
+        assert!(
+            msg.contains("ff d8 ff e0"),
+            "message must show the magic: {msg}"
+        );
+        assert!(msg.contains("PNG") && msg.contains("TIFF"), "{msg}");
     }
 }
