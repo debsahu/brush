@@ -110,23 +110,36 @@ const EDGE_MIN_VIEW_SAMPLES: u32 = 10;
 /// silently starved of supervision rather than cleaned up.
 ///
 /// **Nothing else in the pipeline can see this state**, which is what makes the
-/// guard load-bearing rather than decorative. Verified by reading
-/// `ingest/splatcam/normals_moge.py:120-166` directly:
+/// guard load-bearing rather than decorative.
 ///
-/// * That check runs at prior-GENERATION time and compares `MoGe`'s normals
-///   against normals DIFFERENTIATED FROM DEPTH — never against the trained
-///   renderer's output. It cannot observe prior-vs-geometry disagreement at all.
-/// * It reduces to a median across per-frame medians, so it is doubly robust to
-///   outliers by construction and insensitive to any single bad frame.
-/// * It only aborts when that median is ANTI-correlated past `-min_cos`; a
-///   near-zero median passes. And it writes every `.tiff` before evaluating,
-///   so "it refuses to write a bad prior" is not accurate either.
+/// CORRECTED 2026-08-21. An earlier version of this comment claimed the upstream
+/// prior-generation check "only aborts when the median is ANTI-correlated" and
+/// "writes every `.tiff` before evaluating". Both were wrong when written and
+/// are doubly wrong now — `ingest/splatcam/normals_moge.py` stages every map in
+/// `normal.staging/` and promotes into the directory Brush reads ONLY after the
+/// median clears a POSITIVE floor, and that floor was raised from 0.3 to 0.6
+/// once the chance level was measured: two *unrelated* normal fields score
+/// ~0.33 (uniform hemispheres) to 0.46–0.55 (real interiors, where normals
+/// concentrate toward the optical axis), because both fields are constrained to
+/// the camera-facing hemisphere. A failed batch is renamed
+/// `normal.rejected-<stamp>/`, which Brush never loads.
 ///
-/// So a miscalibrated threshold — or a gate armed before the renderer's normals
-/// are plausible — sails through that check untouched. And it is invisible in
-/// the trainer too: the masked-mean denominator is the GATED count, so the loss
-/// magnitude stays perfectly normal while the supervision behind it collapses.
-/// There is no loss-curve signal. This log is the only signal.
+/// **What survives the correction — and it is the whole rationale — is that the
+/// upstream check cannot see this failure mode at all**, however well
+/// calibrated it is:
+///
+/// * It runs at prior-GENERATION time and compares `MoGe`'s normals against
+///   normals DIFFERENTIATED FROM DEPTH — never against the trained renderer's
+///   output. Prior-vs-geometry disagreement is outside what it measures.
+/// * It is a median across per-frame medians, so it is a WHOLE-FRAME verdict by
+///   construction and cannot catch a gate over-masking pixels *inside* a frame
+///   that passed it.
+///
+/// So a gate armed before the renderer's normals are plausible sails through it
+/// untouched. And it is invisible in the trainer too: the masked-mean
+/// denominator is the GATED count, so the loss magnitude stays perfectly normal
+/// while the supervision behind it collapses. There is no loss-curve signal.
+/// This log is the only signal.
 const NORMAL_GATE_LOW_FRACTION: f32 = 0.20;
 
 /// Consecutive low samples before the over-masking warning fires.
