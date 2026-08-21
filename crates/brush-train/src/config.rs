@@ -35,10 +35,31 @@ pub enum DepthSource {
     /// Geometry gradients arrive exclusively through feature VALUES; the
     /// compositing weights are constants, so depth error cannot reach opacity.
     PlaneAux,
+    /// **EXPERIMENTAL — measured HARMFUL in this trainer; do not use for delivery.**
+    ///
     /// PGSR plane-intersection depth via the main rasterize kernel (approach B).
     /// Blending-weight gradients are LIVE for the plane channels, so depth error
     /// does reach opacity — by design, and the one thing `PlaneAux` cannot
     /// express.
+    ///
+    /// Measured on two scenes (`docs/superpowers/specs/2026-08-20-pgsr-ablation-synthesis.md`
+    /// §3.3): opacity p50 falls 28% on ARKitScenes 48018538 (0.0722 → 0.0519)
+    /// and 34% on `playroom_0812` (0.2118 → 0.1395), monotonically and with none
+    /// of the cap-bound recovery every other arm shows; playroom lands at
+    /// **23.918 dB, under our 24 dB delivery gate**. The apparent mechanism is
+    /// "fade rather than rotate": with the alpha VJP open, fading a splat out is
+    /// a cheaper descent direction for the plane-depth term than rotating it.
+    ///
+    /// **The technique itself is NOT known to be broken.** The `gauss-surf`
+    /// reference trainer (Pablo Vela, Apache-2.0) carries blending-weight
+    /// gradients on its default path too, and when run on our priors, our seed
+    /// and our cameras it holds opacity p50 at **0.9934** — so the collapse is a
+    /// property of THIS trainer, not of the formulation
+    /// (`work/arkitscenes_48018538/reference/README.md` §8). Cause under
+    /// investigation; the leading suspects are our disparity-space depth loss
+    /// (a 1/d² gradient makes near-camera fading cheap in a way a metric-L1 loss
+    /// does not) and our densifier. Kept selectable precisely so those
+    /// experiments can run.
     PlaneFused,
 }
 
@@ -570,6 +591,18 @@ pub struct TrainConfig {
     /// previous behaviour, byte-identical. `plane-aux` and `plane-fused` use
     /// PGSR ray-plane depth (arXiv:2406.06521) and differ from each other only
     /// in their BACKWARD contract, not their forward values; see `DepthSource`.
+    ///
+    /// `plane-aux` is SCENE-DEPENDENT: measured −3.8° thin-axis and +0.36 dB on
+    /// `playroom_0812` when combined with `--flatten-loss-weight`, but +0.7°
+    /// (worse) on ARKitScenes 48018538. Run both at 7k before committing.
+    ///
+    /// `plane-fused` is **EXPERIMENTAL and measured harmful in this trainer** —
+    /// it collapses opacity p50 by 28%/34% on those two scenes and puts playroom
+    /// under the 24 dB gate. The cause is under investigation and is believed to
+    /// be ours, not the technique's (the reference trainer's weight-path-live
+    /// renderer does not collapse on the same data). Full numbers and the
+    /// pending experiments: `docs/superpowers/specs/2026-08-20-pgsr-ablation-synthesis.md`
+    /// §3.3 and §5.2.
     #[arg(long, help_heading = "Training options", default_value = "center")]
     #[serde(default)]
     pub depth_source: DepthSource,
