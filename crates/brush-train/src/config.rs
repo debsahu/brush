@@ -43,7 +43,7 @@ pub enum DepthSource {
     /// express.
     ///
     /// Measured on two scenes (`docs/superpowers/specs/2026-08-20-pgsr-ablation-synthesis.md`
-    /// §3.3): opacity p50 falls 28% on ARKitScenes 48018538 (0.0722 → 0.0519)
+    /// §3.3): opacity p50 falls 28% on `ARKitScenes` 48018538 (0.0722 → 0.0519)
     /// and 34% on `playroom_0812` (0.2118 → 0.1395), monotonically and with none
     /// of the cap-bound recovery every other arm shows; playroom lands at
     /// **23.918 dB, under our 24 dB delivery gate**. The apparent mechanism is
@@ -594,7 +594,7 @@ pub struct TrainConfig {
     ///
     /// `plane-aux` is SCENE-DEPENDENT: measured −3.8° thin-axis and +0.36 dB on
     /// `playroom_0812` when combined with `--flatten-loss-weight`, but +0.7°
-    /// (worse) on ARKitScenes 48018538. Run both at 7k before committing.
+    /// (worse) on `ARKitScenes` 48018538. Run both at 7k before committing.
     ///
     /// `plane-fused` is **EXPERIMENTAL and measured harmful in this trainer** —
     /// it collapses opacity p50 by 28%/34% on those two scenes and puts playroom
@@ -770,24 +770,24 @@ pub struct TrainConfig {
     ///
     /// **RECOMMENDED CORE SETTING: `1.0`.** The default stays 0 only so that
     /// existing runs and recorded baselines do not change under anyone's feet —
-    /// it is NOT a recommendation. Across a 20-arm ARKitScenes matrix and a
+    /// it is NOT a recommendation. Across a 20-arm `ARKitScenes` matrix and a
     /// 9-arm `playroom_0812` matrix this is the **only** ingredient that
     /// improves splat orientation on both scenes
     /// (`docs/superpowers/specs/2026-08-20-pgsr-ablation-synthesis.md` §1, §3.1):
     ///
     ///   * thin-axis median (angle between a splat's smallest axis and the local
-    ///     surface normal): **46.61° → 37.68° (−8.9°)** on ARKitScenes 48018538,
+    ///     surface normal): **46.61° → 37.68° (−8.9°)** on `ARKitScenes` 48018538,
     ///     **39.65° → 25.37° (−14.3°)** on `playroom_0812`;
     ///   * splats within 15° of their surface: 9.8% → 16.5% and 15.0% → 30.5%;
     ///   * PSNR is essentially unchanged (−0.09 dB / +0.15 dB) — a PSNR-gated
     ///     sweep cannot see this term at all, in either direction.
     ///
-    /// Mechanism, visible in the min-axis median: 7.2 mm → 0.75 mm (ARKitScenes),
+    /// Mechanism, visible in the min-axis median: 7.2 mm → 0.75 mm (`ARKitScenes`),
     /// 3.7 mm → 0.16 mm (playroom). It trades centre accuracy for orientation, so
     /// on-seed@1cm drops 1–3 pp; that is the term working, not a regression.
     ///
     /// Costs and interactions worth knowing before turning it on:
-    ///   * −30% it/min (ARKitScenes) / −15% (playroom at matched splat count);
+    ///   * −30% it/min (`ARKitScenes`) / −15% (playroom at matched splat count);
     ///   * do NOT combine with `--normalize-metric-weights` on a metric scene —
     ///     it divides this weight by the scene scale and measurably weakens it
     ///     (+1.4° / +1.1°);
@@ -1225,7 +1225,7 @@ pub struct TrainConfig {
     /// weight tuned by analogy with flatten is two orders of magnitude short.
     ///
     /// **Measured working value on a metric indoor scene: 20.** A 1k-iteration
-    /// sweep on ARKitScenes 48018538 at w = 0.05 / 2 / 20 gives thin-axis medians
+    /// sweep on `ARKitScenes` 48018538 at w = 0.05 / 2 / 20 gives thin-axis medians
     /// 54.90° / 52.65° / 45.58° — monotone in the weight, with 0.05 sitting at
     /// the inert end (its PSNR is 0.028 dB from the no-coplanarity control, and
     /// the whole 0.05 → 20 sweep spans 0.046 dB, so PSNR cannot adjudicate this).
@@ -1237,7 +1237,7 @@ pub struct TrainConfig {
     /// **The value scales with the scene's units**, because the term does: a
     /// scene whose units are 10× larger needs ~100× less weight for the same
     /// pressure. 20 is calibrated for metres. Re-derive rather than copy on a
-    /// non-metric SfM scene, or use `--normalize-metric-weights` — but note that
+    /// non-metric `SfM` scene, or use `--normalize-metric-weights` — but note that
     /// flag also divides `--flatten-loss-weight`, which is a measured dilution on
     /// a metric scene.
     ///
@@ -1259,7 +1259,7 @@ pub struct TrainConfig {
     /// THIS IS A DISTANCE THAT MUST SCALE WITH THE CLOUD, and getting it wrong
     /// is silent. It previously defaulted to `--depth-opacity-reg-margin`
     /// (0.15 m), a different feature's knob in absolute units: on our 7.3 mm
-    /// ARKitScenes seed that is a 20× band which assigns **68% of all splats**
+    /// `ARKitScenes` seed that is a 20× band which assigns **68% of all splats**
     /// to the eight room planes and flattens furniture onto the walls. The
     /// derived 0.02 m band assigns 34% and keeps the gain — thin-axis 33.30°
     /// with on-seed@1cm held at 61.7%, against 31.71° with on-seed@1cm
@@ -1269,7 +1269,7 @@ pub struct TrainConfig {
     /// membership with `work/arkitscenes_48018538/tools/ransac_bands.py`; over
     /// ~40% of splats assigned means the band is too wide.
     ///
-    /// Evidence is single-scene (ARKitScenes 48018538);
+    /// Evidence is single-scene (`ARKitScenes` 48018538);
     /// `docs/superpowers/specs/2026-08-20-pgsr-ablation-synthesis.md` §3.1, §6.
     #[arg(long, help_heading = "TIDI options", default_value = "-1.0")]
     #[serde(default = "default_plane_coplanarity_assign_dist")]

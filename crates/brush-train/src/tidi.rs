@@ -744,7 +744,7 @@ const RANSAC_THRESH_SPACING_MULT: f32 = 2.5;
 /// measured nearest-neighbour spacing.
 ///
 /// MEASURED, not chosen for symmetry with `RANSAC_THRESH_SPACING_MULT`. On
-/// ARKitScenes 48018538 (spacing 7.3 mm, logged by `extract_planes`) the
+/// `ARKitScenes` 48018538 (spacing 7.3 mm, logged by `extract_planes`) the
 /// validated band is 0.02 m = **2.74×** spacing (arm 15: thin-axis 33.30°,
 /// within-15° 24.8%, on-seed@1cm held at 61.7%). Widening it to 0.15 m (20×
 /// spacing) assigns **68% of all splats** to the eight room planes instead of
@@ -2958,7 +2958,7 @@ mod tests {
     /// is not set explicitly, never inherited from `--depth-opacity-reg-margin`.
     ///
     /// This is a measured contract, not a style preference. The old fallback
-    /// resolved to 0.15 m regardless of cloud density; on the ARKitScenes seed
+    /// resolved to 0.15 m regardless of cloud density; on the `ARKitScenes` seed
     /// (spacing 0.0073) that band assigns 68% of all splats to room planes
     /// against 34% at the validated 0.02 m, and it costs 13 pp of on-seed@1cm.
     /// A regression here is invisible in the loss curve and shows up only as an
@@ -2969,7 +2969,7 @@ mod tests {
         assert_eq!(resolve_coplanarity_assign_dist(0.02, 0.0073), 0.02);
         assert_eq!(resolve_coplanarity_assign_dist(0.15, 100.0), 0.15);
 
-        // The ARKitScenes 48018538 cloud: 7.3 mm spacing must land on the
+        // The `ARKitScenes` 48018538 cloud: 7.3 mm spacing must land on the
         // validated ~0.02 m band, NOT on depth-opacity-reg-margin's 0.15.
         let arkit = resolve_coplanarity_assign_dist(-1.0, 0.0073);
         assert!(
