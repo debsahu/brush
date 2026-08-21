@@ -166,14 +166,40 @@ pub struct SceneBatch {
     pub view_index: usize,
 }
 
+fn host_bytes(data: &TensorData) -> u64 {
+    data.as_bytes()
+        .len()
+        .try_into()
+        .expect("shouldn't exceed ~18 Exabytes...")
+}
+
 impl SceneBatch {
     /// Host bytes the packed image occupies.
     pub fn packed_bytes(&self) -> u64 {
-        self.img_packed
-            .as_bytes()
-            .len()
-            .try_into()
-            .expect("shouldn't exceed ~18 Exabytes...")
+        host_bytes(&self.img_packed)
+    }
+
+    /// Host bytes the decoded priors occupy: the feature map, the depth map
+    /// and the normal map.
+    ///
+    /// These dwarf the image at high resolution. A 3840x2160 view packs to
+    /// 33.2 MB, but carries another 33.2 MB of f32 depth and 99.5 MB of f32
+    /// normals — so anything budgeting by [`Self::packed_bytes`] alone
+    /// under-counts a cached 4K batch by 5x.
+    pub fn prior_bytes(&self) -> u64 {
+        let features = self
+            .features
+            .as_ref()
+            .map_or(0, |(data, _)| host_bytes(data));
+        let depth = self.depth.as_ref().map_or(0, host_bytes);
+        let normal = self.normal.as_ref().map_or(0, host_bytes);
+        features + depth + normal
+    }
+
+    /// Total host bytes this batch keeps resident — image plus priors. This
+    /// is what the scene batch cache budgets against.
+    pub fn batch_bytes(&self) -> u64 {
+        self.packed_bytes() + self.prior_bytes()
     }
 
     pub fn img_size(&self) -> [usize; 2] {
