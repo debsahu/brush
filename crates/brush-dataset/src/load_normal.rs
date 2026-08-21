@@ -588,7 +588,7 @@ mod tests {
         );
 
         // Control: the real RGB8 fixture still decodes, so the rejections above
-        // are about the pixel type and not about PNGs in general.
+        // are about the pixel type and not about PNG files in general.
         decode_checked(
             testdata::GOLDEN_NORMAL_U8_PNG,
             testdata::GOLDEN_H,
