@@ -767,6 +767,39 @@ pub struct TrainConfig {
     /// 2DGS-style pressure toward surface-aligned gaussians — nothing is
     /// collapsed or re-parametrized. `PlanarGS` `L_s`; `PlanarGS` ratio suggests
     /// ~1.0. 0 disables.
+    ///
+    /// **RECOMMENDED CORE SETTING: `1.0`.** The default stays 0 only so that
+    /// existing runs and recorded baselines do not change under anyone's feet —
+    /// it is NOT a recommendation. Across a 20-arm ARKitScenes matrix and a
+    /// 9-arm `playroom_0812` matrix this is the **only** ingredient that
+    /// improves splat orientation on both scenes
+    /// (`docs/superpowers/specs/2026-08-20-pgsr-ablation-synthesis.md` §1, §3.1):
+    ///
+    ///   * thin-axis median (angle between a splat's smallest axis and the local
+    ///     surface normal): **46.61° → 37.68° (−8.9°)** on ARKitScenes 48018538,
+    ///     **39.65° → 25.37° (−14.3°)** on `playroom_0812`;
+    ///   * splats within 15° of their surface: 9.8% → 16.5% and 15.0% → 30.5%;
+    ///   * PSNR is essentially unchanged (−0.09 dB / +0.15 dB) — a PSNR-gated
+    ///     sweep cannot see this term at all, in either direction.
+    ///
+    /// Mechanism, visible in the min-axis median: 7.2 mm → 0.75 mm (ARKitScenes),
+    /// 3.7 mm → 0.16 mm (playroom). It trades centre accuracy for orientation, so
+    /// on-seed@1cm drops 1–3 pp; that is the term working, not a regression.
+    ///
+    /// Costs and interactions worth knowing before turning it on:
+    ///   * −30% it/min (ARKitScenes) / −15% (playroom at matched splat count);
+    ///   * do NOT combine with `--normalize-metric-weights` on a metric scene —
+    ///     it divides this weight by the scene scale and measurably weakens it
+    ///     (+1.4° / +1.1°);
+    ///   * it drives log-scales down, which walks splats into the region where
+    ///     the Mip-Splatting 3D-filter fold used to NaN their gradients. That
+    ///     bug is fixed in this branch, but Stage 5 `--filter-nan` stays
+    ///     mandatory regardless (SOG codebook poisoning);
+    ///   * at weights above 1.0 the first thing to break is not the trainer but
+    ///     SOG's fixed 8-bit quaternion precision (§4 "Costs").
+    ///
+    /// A cap that BINDS is part of the recipe: opacity only recovers once the
+    /// population pins at `--max-splats`.
     #[arg(long, help_heading = "Training options", default_value = "0.0")]
     #[serde(default)]
     pub flatten_loss_weight: f32,
