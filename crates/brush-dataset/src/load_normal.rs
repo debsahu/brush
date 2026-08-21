@@ -120,15 +120,25 @@ pub(crate) fn decode_checked(
 ///
 /// The 128 override is deliberate and load-bearing (plan D1): it is what lets
 /// the `(0, 0, 0)` invalid sentinel survive a round trip, since a symmetric
-/// inverse would put 0.0 at code 127.5 -- unrepresentable. Its price is that
-/// the two neighbours of the override are *asymmetric*: code 127 decodes to
-/// about -1/255 while code 129 decodes to about +3/255, not +/- the same step.
+/// inverse would put 0.0 at code 127.5 -- unrepresentable. It has two prices,
+/// both accepted:
+///
+/// 1. The two neighbours of the override are *asymmetric*: code 127 decodes to
+///    about -1/255 while code 129 decodes to about +3/255, exactly 3x as far
+///    from zero, not +/- the same step.
+/// 2. **The worst-case round-trip error is 2/255, not 1/255.** Everything that
+///    encodes to 128 -- the whole half-open interval `[0, 2/255)` -- decodes to
+///    exactly 0, so a component just under 2/255 is dragged a full step. Every
+///    other code stays within the usual 1/255. (The plan's section 5 prose says
+///    1/255; its own *measured* 0.0078 figure is the correct one, and
+///    0.007843 = 2/255. Corrected by WS-P against 480,000 random components:
+///    976 exceeded 1/255, and every one of them was code 128.) That is still
+///    ~20x inside the measured prior-error budget, so it moves the bound, not
+///    the verdict.
 ///
 /// **Do not "clean this up" to `2c/255 - 1` or `(c - 127.5)/127.5`.** Either
 /// rewrite breaks the sentinel and creates a silent, permanent disagreement
-/// with every file `gauss-surf` and `prior_io.py` have written. The deviation
-/// is 2/255 ~ 0.008 on exactly two codes -- the same order as the quantization
-/// floor itself, and ~20x inside the measured prior-error budget (plan §5).
+/// with every file `gauss-surf` and `prior_io.py` have written.
 ///
 /// The operation order is pinned to numpy's (plan D7) so every code, not just
 /// the anchors, is bit-identical across the two languages.
@@ -316,31 +326,58 @@ mod tests {
         assert_eq!(decode_normal_u8(255).to_bits(), 1.0f32.to_bits());
 
         // THE ASYMMETRY (plan D1, and the trap flagged in the 2026-08-19 plan
-        // §10d). 128 -> exact 0 means the two neighbours are NOT +/- one step:
-        // 127 sits one 1/255 below zero, 129 sits three 1/255 above it.
-        // A "symmetric cleanup" that deletes the 128 override, or rescales by
-        // 127.5, silently disagrees with every file gauss-surf ever wrote.
+        // section 10d). 128 -> exact 0 means the two neighbours are NOT +/- one
+        // step: 127 sits about one 1/255 below zero, 129 about three 1/255
+        // above it. A "symmetric cleanup" that deletes the 128 override, or
+        // rescales by 127.5, silently disagrees with every file gauss-surf ever
+        // wrote.
         let c127 = decode_normal_u8(127);
         let c129 = decode_normal_u8(129);
-        assert!(
-            (c127 - (-1.0f32 / 255.0)).abs() < 1e-7,
-            "code 127 must decode to about -1/255, got {c127}"
+
+        // ...and "about" is the point. The pinned op order does NOT produce the
+        // bits of the obvious literal, so this asserts the exact drift rather
+        // than hiding it under a tolerance that merely happens to be wider.
+        // Measured, not assumed: the trailing `- 1.0` cancels ~6 decimal digits
+        // near zero, so `assert_eq!(c129, 3.0 / 255.0)` FAILS against correct
+        // code. That is why the golden tables ship as bit patterns.
+        assert_eq!(c127.to_bits(), 0xBB80_8080, "code 127");
+        assert_ne!(
+            c127.to_bits(),
+            (-1.0f32 / 255.0).to_bits(),
+            "127 is one ulp off the naive literal; equality here means the op \
+             order changed"
         );
+        assert_eq!(c129.to_bits(), 0x3C40_C100, "code 129");
+        assert_ne!(c129.to_bits(), (3.0f32 / 255.0).to_bits(), "code 129 drift");
+        let drift = c129 - 3.0f32 / 255.0;
         assert!(
-            (c129 - (3.0f32 / 255.0)).abs() < 1e-7,
-            "code 129 must decode to about +3/255, got {c129}"
+            (5.8e-8..6.0e-8).contains(&drift),
+            "code 129 must sit 5.87e-8 above 3/255, got {drift:e}"
         );
+
         // Null model: had the codec been symmetric about 128, the two
         // neighbours would be equal and opposite. They are not -- 129 is three
-        // times as far from zero as 127.
+        // times as far from zero as 127, which no symmetric map can produce.
         assert!(
             (c129 + c127).abs() > 0.5 * c129.abs(),
             "127/129 must NOT be symmetric about zero: {c127} / {c129}"
         );
         assert!(
             ((c129 / -c127) - 3.0).abs() < 1e-4,
-            "the asymmetry ratio must be exactly 3:1, got {}",
+            "the asymmetry ratio must be 3:1, got {}",
             c129 / -c127
+        );
+
+        // The 2/255 bound from the doc comment, as a test: everything in
+        // [0, 2/255) encodes to 128 and decodes to exactly 0, so the override's
+        // worst case is a full step, not the half step the plan's prose claims.
+        assert_eq!(decode_normal_u8(128).to_bits(), 0.0f32.to_bits());
+        let just_under = 2.0f32 / 255.0 - f32::EPSILON;
+        let code = ((just_under + 1.0) / 2.0 * 255.0).round() as u8;
+        assert_eq!(code, 128, "a component just under 2/255 must encode to 128");
+        assert!(
+            (just_under - decode_normal_u8(code)).abs() > 1.0 / 255.0,
+            "the override's worst-case error must exceed 1/255"
         );
 
         // And the pinned table is not self-fulfilling: rederive it from the
@@ -386,31 +423,48 @@ mod tests {
             .collect();
         assert_eq!(exact_zero, vec![testdata::GOLDEN_NORMAL_INVALID_PIXEL]);
 
-        // Null model: the ||n|| > 0.5 gate must be discriminating, not
-        // trivially true. Pixel 1 is (127, 128, 129) -- a deliberate probe of
-        // the codes either side of the override, NOT a physical normal, and it
-        // legitimately lands near zero. Every one of the remaining ten pixels
-        // encodes a real (non-unit-normalised but well clear of zero) vector
-        // and must pass.
-        const CODEC_PROBE_PIXEL: usize = 1;
+        // Null model: the ||n|| > 0.5 gate must be discriminating, not trivially
+        // true. The fixture deliberately contains several pixels whose codes
+        // all sit in 127..=129 -- probes of the override's neighbourhood, not
+        // physical normals -- and those legitimately land near zero. Derive
+        // that set from the CODES rather than hardcoding indices, so a fixture
+        // refresh cannot silently weaken the test.
+        let near_override = |px: usize| {
+            (0..3).all(|c| (127..=129).contains(&testdata::GOLDEN_NORMAL_CODES[px * 3 + c]))
+        };
         let mut valid = 0;
+        let mut probes = 0;
         for px in 0..(testdata::GOLDEN_W * testdata::GOLDEN_H) {
-            if px == testdata::GOLDEN_NORMAL_INVALID_PIXEL || px == CODEC_PROBE_PIXEL {
-                continue;
-            }
             let (x, y, z) = (decoded[px * 3], decoded[px * 3 + 1], decoded[px * 3 + 2]);
             let norm = x.mul_add(x, y.mul_add(y, z * z)).sqrt();
-            assert!(norm > 0.5, "pixel {px} should be valid, ||n|| = {norm}");
-            valid += 1;
+            if near_override(px) {
+                assert!(norm <= 0.5, "probe pixel {px} should be near zero");
+                probes += 1;
+            } else {
+                assert!(norm > 0.5, "pixel {px} should be valid, ||n|| = {norm}");
+                valid += 1;
+            }
         }
-        assert_eq!(valid, testdata::GOLDEN_W * testdata::GOLDEN_H - 2);
+        // Both sides must be non-trivial: all-probes would make the gate
+        // assertion vacuous, no-probes would make the invalid one vacuous.
+        assert!(valid >= 8, "only {valid} pixels exercise the valid side");
+        assert!(
+            probes >= 2,
+            "only {probes} pixels exercise the invalid side"
+        );
+        assert!(near_override(testdata::GOLDEN_NORMAL_INVALID_PIXEL));
 
         // A single 128 component does NOT invalidate a pixel: the override is
-        // per-component. Pixel 4 is (128, 128, 0) -> (0, 0, -1), a perfectly
-        // good toward-camera normal.
-        assert_eq!(&testdata::GOLDEN_NORMAL_CODES[12..15], &[128u8, 128, 0]);
-        assert_eq!(decoded[12].to_bits(), 0.0f32.to_bits());
-        assert_eq!(decoded[14].to_bits(), (-1.0f32).to_bits());
+        // per-component. This one is (128, 0, 128) -> (0, -1, 0), a perfectly
+        // good toward-camera normal that passes the gate above.
+        let base = testdata::GOLDEN_NORMAL_PARTIAL_128_PIXEL * 3;
+        assert_eq!(
+            &testdata::GOLDEN_NORMAL_CODES[base..base + 3],
+            &[128u8, 0, 128]
+        );
+        assert_eq!(decoded[base].to_bits(), 0.0f32.to_bits());
+        assert_eq!(decoded[base + 1].to_bits(), (-1.0f32).to_bits());
+        assert_eq!(decoded[base + 2].to_bits(), 0.0f32.to_bits());
     }
 
     // ---- T5: wrong PNG pixel type is a hard error, never a conversion ------
