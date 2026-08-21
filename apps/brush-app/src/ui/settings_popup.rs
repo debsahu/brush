@@ -199,7 +199,13 @@ fn draw_geometry_prior_settings(ui: &mut Ui, tc: &mut TrainConfig, enabled: bool
         "Flatten weight (0 disables)",
         enabled,
         "Population mean of each gaussian's smallest activated scale — a soft push toward \
-         surface-aligned gaussians. The term is in METRES. PlanarGS suggests ~1.0.",
+         surface-aligned gaussians. The term is in METRES.\n\n\
+         RECOMMENDED: 1.0. The default of 0 exists so recorded baselines do not change under \
+         you, not as a recommendation. Across two ablation matrices this is the only term that \
+         improved splat orientation on BOTH scenes: thin-axis median −8.9° and −14.3°, splats \
+         within 15° of their surface roughly doubled. PSNR barely moves either way, so a \
+         PSNR-only sweep cannot see this term at all. Costs 15-30% it/min, and do not combine \
+         it with metric-weight normalization on a metric scene.",
     );
     slider_tip(
         ui,
@@ -454,19 +460,33 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
                          depth: the ray is intersected with each pixel's composited tangent \
                          plane instead of reading the camera-z of splat means. Geometry \
                          gradients reach means and rotations through the feature VALUES only — \
-                         depth error cannot reach opacity. Pinhole cameras only.",
+                         depth error cannot reach opacity. Pinhole cameras only.\n\n\
+                         SCENE-DEPENDENT: measured −3.8° thin-axis and +0.36 dB on one indoor \
+                         scene when combined with the flatten term, but +0.7° (worse) on \
+                         another. Try both before committing to it.",
                     );
+                // EXPERIMENTAL is in the LABEL, not only the tooltip: a tooltip
+                // is opt-in, and this option is the one that quietly lands a
+                // scene under the delivery PSNR gate.
                 ui.selectable_value(
                     &mut tc.depth_source,
                     DepthSource::PlaneFused,
-                    "Plane (fused)",
+                    "Plane (fused) — EXPERIMENTAL",
                 )
                 .on_hover_text(
-                    "PGSR ray-plane depth composited in the MAIN rasterize kernel. Same \
+                    "EXPERIMENTAL — measured HARMFUL in this trainer. Do not use for delivery.\n\n\
+                         PGSR ray-plane depth composited in the MAIN rasterize kernel. Same \
                          forward values as Plane (aux) and one pass instead of two, but the \
                          blending weights are LIVE for the plane channels, so plane error also \
                          reaches opacity, conic and screen position. This is the faithful port; \
-                         Plane (aux) is the cheaper approximation. Pinhole cameras only.",
+                         Plane (aux) is the cheaper approximation. Pinhole cameras only.\n\n\
+                         Measured on two scenes: opacity p50 collapses 28% and 34%, \
+                         monotonically and without the cap-bound recovery every other setting \
+                         shows, and one scene lands at 23.9 dB — under the 24 dB gate. The \
+                         technique itself is not known to be broken (a reference trainer with \
+                         live weight-path gradients does not collapse on the same data); the \
+                         cause is under investigation and is believed to be ours. Kept \
+                         selectable so those experiments can run.",
                 );
             });
         });
