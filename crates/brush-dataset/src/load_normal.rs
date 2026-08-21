@@ -387,6 +387,73 @@ mod tests {
         }
     }
 
+    /// Exhaustive sweep of all 256 codes, pinning the properties the golden
+    /// fixture can only sample.
+    #[test]
+    fn normal_codec_is_exhaustively_pinned() {
+        let decoded: Vec<f32> = (0..=255u8).map(decode_normal_u8).collect();
+
+        // Endpoints are exact, and 128 is the ONLY code that reaches zero.
+        assert_eq!(decoded[0].to_bits(), (-1.0f32).to_bits());
+        assert_eq!(decoded[255].to_bits(), 1.0f32.to_bits());
+        let zeros: Vec<usize> = (0..256).filter(|&c| decoded[c] == 0.0).collect();
+        assert_eq!(zeros, vec![128]);
+
+        // Monotone non-decreasing across the whole range, INCLUDING over the
+        // override: 127 -> -1/255, 128 -> 0, 129 -> +3/255 still ascends. A
+        // codec that broke ordering would put two surfaces out of sequence.
+        for c in 1..256 {
+            assert!(
+                decoded[c] > decoded[c - 1],
+                "code {c} ({}) must exceed code {} ({})",
+                decoded[c],
+                c - 1,
+                decoded[c - 1]
+            );
+        }
+
+        // Error against the ideal signed value: within 1/255 everywhere EXCEPT
+        // the override, where it reaches a full 2/255 (see decode_normal_u8's
+        // doc comment -- the plan's prose says 1/255 and is wrong).
+        let mut over_one_255 = vec![];
+        for c in 0..256u32 {
+            #[expect(clippy::cast_precision_loss, reason = "c <= 255, exact in f32")]
+            let ideal = (c as f32) / 255.0 * 2.0 - 1.0;
+            let err = (decoded[c as usize] - ideal).abs();
+            assert!(
+                err < 2.0 / 255.0,
+                "code {c} error {err} reaches a full step"
+            );
+            if err > 1.0 / 255.0 {
+                over_one_255.push(c);
+            }
+        }
+        assert_eq!(
+            over_one_255,
+            vec![128],
+            "only the override may exceed 1/255"
+        );
+
+        // The op-order sensitivity is specifically the `/ 255.0` and the
+        // literal form, NOT the multiply: `x * 2.0` is exact in binary
+        // floating point, so a fused `2.0.mul_add(c / 255.0, -1.0)` is
+        // bit-identical for every code. Recorded because a mutation that
+        // rewrote the expression that way survived the whole suite, and
+        // "the test missed it" and "there is nothing to miss" look alike
+        // until someone checks.
+        for c in 0..=255u8 {
+            if c == 128 {
+                continue;
+            }
+            let fused = 2.0f32.mul_add(f32::from(c) / 255.0, -1.0);
+            assert_eq!(
+                fused.to_bits(),
+                decoded[c as usize].to_bits(),
+                "code {c}: multiply by two must be exact"
+            );
+        }
+    }
+
     // ---- T3: all-128 pixel is the invalid sentinel -------------------------
 
     #[test]
