@@ -2,8 +2,9 @@ use brush_render::AlphaMode;
 use clap::Args;
 use serde::{Deserialize, Serialize};
 
-/// Default Cache budget for packed scene batches. 6 GB on native; less on
-/// wasm since the whole heap is bounded by browser limits.
+/// Default cache budget for scene batches — the packed image plus its
+/// decoded priors. 6 GB on native; less on wasm since the whole heap is
+/// bounded by browser limits.
 #[cfg(not(target_family = "wasm"))]
 const DEFAULT_MAX_SCENE_BATCH_CACHE_SIZE: &str = "6GiB";
 #[cfg(target_family = "wasm")]
@@ -80,7 +81,7 @@ pub struct LoadDatasetConfig {
     /// Invert mask images, so white means "ignore this pixel" instead of "keep it".
     #[arg(long, help_heading = "Dataset Options", default_value = "false")]
     pub invert_masks: bool,
-    /// Max size of the cache for frames of the dataset, larger values usually improve performance for large datasets at the cost of more memory usage, can be e.g. 6G, 6000M, 6000MiB, 6000MB
+    /// Max size of the cache for frames of the dataset. Includes decoded depth/normal/feature priors, not just the packed image — at 4K the priors are ~4x the image, so a budget admits far fewer frames than the image size alone suggests. Larger values usually improve performance for large datasets at the cost of more memory usage, can be e.g. 6G, 6000M, 6000MiB, 6000MB
     #[arg(long, help_heading = "Dataset Options", default_value = DEFAULT_MAX_SCENE_BATCH_CACHE_SIZE, value_parser = parse_size)]
     pub max_scene_batch_cache_size: u64,
     /// Name of the folder containing per-view feature maps (`<image_stem>.npy`)
