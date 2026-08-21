@@ -1033,7 +1033,7 @@ impl SplatTrainer {
     /// tracing-log bridge, so a `tracing::warn!` here would be invisible in
     /// exactly the headless runs this guard exists for.
     fn record_normal_gate_sample(&mut self, global_iter: u32, surviving: f32, valid: f32) -> bool {
-        if !(valid.is_finite() && valid > 0.0) || !surviving.is_finite() {
+        if !(valid.is_finite() && valid > 0.0 && surviving.is_finite()) {
             return false;
         }
         let fraction = surviving / valid;
