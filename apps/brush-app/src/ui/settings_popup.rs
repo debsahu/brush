@@ -461,9 +461,12 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
                          plane instead of reading the camera-z of splat means. Geometry \
                          gradients reach means and rotations through the feature VALUES only — \
                          depth error cannot reach opacity. Pinhole cameras only.\n\n\
-                         SCENE-DEPENDENT: measured −3.8° thin-axis and +0.36 dB on one indoor \
-                         scene when combined with the flatten term, but +0.7° (worse) on \
-                         another. Try both before committing to it.",
+                         SCENE-DEPENDENT, and what it buys depends on what it is stacked on. \
+                         On one indoor scene, ALONE vs baseline: −3.8° thin-axis, +0.36 dB; \
+                         stacked on the flatten term, only −0.8° and +0.03 dB. On a second \
+                         scene it is null alone and 0.7° WORSE on top of flatten. It competes \
+                         with flatten for the same smallest-axis degree of freedom, so run \
+                         flatten-alone against flatten+plane-aux before committing to it.",
                     );
                 // EXPERIMENTAL is in the LABEL, not only the tooltip: a tooltip
                 // is opt-in, and this option is the one that quietly lands a

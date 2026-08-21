@@ -592,9 +592,19 @@ pub struct TrainConfig {
     /// PGSR ray-plane depth (arXiv:2406.06521) and differ from each other only
     /// in their BACKWARD contract, not their forward values; see `DepthSource`.
     ///
-    /// `plane-aux` is SCENE-DEPENDENT: measured −3.8° thin-axis and +0.36 dB on
-    /// `playroom_0812` when combined with `--flatten-loss-weight`, but +0.7°
-    /// (worse) on `ARKitScenes` 48018538. Run both at 7k before committing.
+    /// `plane-aux` is SCENE-DEPENDENT, and its measured benefit depends on what
+    /// it is stacked on — quote each number with its comparison:
+    ///
+    ///   * `playroom_0812`, ALONE vs baseline: **−3.8° thin-axis, +0.36 dB**.
+    ///   * `playroom_0812`, ON TOP OF `--flatten-loss-weight 1.0`: **−0.8°,
+    ///     +0.03 dB** — most of what it buys alone, flatten has already bought.
+    ///   * `ARKitScenes` 48018538, ALONE: −0.3°, i.e. null.
+    ///   * `ARKitScenes` 48018538, ON TOP OF flatten: **+0.7° WORSE.**
+    ///
+    /// So it is not a free addition to the flatten recipe: it competes for the
+    /// same smallest-axis degree of freedom. Discriminator, ~7k iterations:
+    /// run flatten-alone and flatten+plane-aux side by side and keep plane-aux
+    /// only if on-seed recovers and thin-axis does not worsen.
     ///
     /// `plane-fused` is **EXPERIMENTAL and measured harmful in this trainer** —
     /// it collapses opacity p50 by 28%/34% on those two scenes and puts playroom
