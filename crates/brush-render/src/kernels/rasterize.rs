@@ -4,12 +4,20 @@
 //! single pixel. Threads cooperate to load splats into a workgroup-shared
 //! `local_batch` then iterate splats across all pixels.
 //!
-//! `bwd_info` enables: (a) writing `out_img` as 4 f32s (rgba) so the
-//! backward kernel can recover the final color/alpha; (b) marking
-//! `visible` splats; (c) shrinking `tile_offsets[tile*2+1]` to "one past
-//! the last splat any pixel actually consumed" so the backward kernel's
-//! outer loop ends early. When `bwd_info=false` the kernel writes a
-//! packed u8x4 to `out_img` and skips the backward bookkeeping.
+//! `bwd_info` enables: (a) writing `out_img` as f32 channels (rgba, plus
+//! the optional centre-depth and PGSR plane lanes) so the backward kernel
+//! can recover the final color/alpha; (b) marking `visible` splats;
+//! (c) shrinking `tile_offsets[tile*2+1]` to "one past the last splat any
+//! pixel actually consumed" so the backward kernel's outer loop ends
+//! early. When `bwd_info=false` the kernel writes a packed u8x4 to
+//! `out_img` and skips the backward bookkeeping.
+//!
+//! Channel layout of the f32 output is owned by
+//! `helpers::raster_out_channels`: `0..=3` rgba, `4` centre depth when
+//! `render_depth`, `5..=8` the PGSR plane parameters when `render_plane`
+//! (Chen et al. 2024, arXiv:2406.06521). The plane lanes are composited
+//! exactly like the depth lane — raw sums, no background term, no alpha
+//! division — because `plane_depth_from_features` consumes the raw sums.
 
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
@@ -17,17 +25,22 @@ use burn_cubecl::cubecl::prelude::*;
 use burn_cubecl::cubecl::std::FastDivmod;
 
 use super::helpers::{
-    ALPHA_CUTOFF_MID, PROJECTED_LANES, PROJECTED_LANES_USIZE, alpha_cutoff_weight, calc_sigma,
-    map_1d_to_2d,
+    ALPHA_CUTOFF_MID, PLANE_AUX_LANES, PROJECTED_LANES, PROJECTED_LANES_USIZE, alpha_cutoff_weight,
+    calc_sigma, map_1d_to_2d, plane_channel_offset, raster_out_channels,
 };
 use super::types::{RasterizeUniforms, Sym2};
 
 #[cube(launch)]
+#[allow(clippy::fn_params_excessive_bools)]
 #[allow(clippy::too_many_arguments)]
 pub fn rasterize_kernel(
     compact_gid_from_isect: &Tensor<u32>,
     tile_offsets: &mut Tensor<u32>,
     projected: &Tensor<f32>,
+    // `[N, PLANE_AUX_LANES]`, indexed by GLOBAL gid (like
+    // `rasterize_features`'s `features`). Only read when `render_plane`; a
+    // 1-element dummy is bound otherwise.
+    plane_aux: &Tensor<f32>,
     out_img_packed: &mut Tensor<u32>,
     out_img_f32: &mut Tensor<f32>,
     global_from_compact_gid: &Tensor<u32>,
@@ -39,6 +52,10 @@ pub fn rasterize_kernel(
     #[comptime] tile_width: u32,
     #[comptime] tile_height: u32,
     #[comptime] render_depth: bool,
+    // PGSR plane-auxiliary compositing. Implies `bwd_info` (the host gates it
+    // on `bwd_info`, and the per-splat lookup goes through the `bwd_info`-only
+    // `load_gid` staging).
+    #[comptime] render_plane: bool,
 ) {
     let tile_size = comptime![tile_width * tile_height];
     let global_id = ABSOLUTE_POS as u32;
@@ -82,6 +99,13 @@ pub fn rasterize_kernel(
     let mut pix_g = 0.0f32;
     let mut pix_b = 0.0f32;
     let mut pix_d = 0.0f32;
+    // PGSR plane lanes: raw composited sums (no background term, no alpha
+    // division). `plane_depth_from_features` consumes the raw sums directly
+    // because alpha cancels between numerator and denominator.
+    let mut pix_p0 = 0.0f32;
+    let mut pix_p1 = 0.0f32;
+    let mut pix_p2 = 0.0f32;
+    let mut pix_p3 = 0.0f32;
     let mut done = !inside;
     let mut last_useful_isect = range_lo;
 
@@ -155,6 +179,16 @@ pub fn rasterize_kernel(
                     if comptime![render_depth] {
                         pix_d += local_batch[dst_base + 9] * vis;
                     }
+                    if comptime![render_plane] {
+                        // Read the plane params from global memory by GLOBAL
+                        // gid, the `rasterize_features` precedent — see
+                        // PLANE_AUX_LANES for why they are not tile-staged.
+                        let aux_base = (load_gid[t as usize] * PLANE_AUX_LANES) as usize;
+                        pix_p0 += plane_aux[aux_base] * vis;
+                        pix_p1 += plane_aux[aux_base + 1] * vis;
+                        pix_p2 += plane_aux[aux_base + 2] * vis;
+                        pix_p3 += plane_aux[aux_base + 3] * vis;
+                    }
                     t_acc = next_t;
                     last_useful_isect = batch_start + t + 1u32;
                 }
@@ -173,7 +207,7 @@ pub fn rasterize_kernel(
         let final_b = pix_b + t_acc * u.bg_b;
         let final_a = 1.0f32 - t_acc;
         if comptime![bwd_info] {
-            let out_chans = comptime![if render_depth { 5u32 } else { 4u32 }];
+            let out_chans = comptime![raster_out_channels(render_depth, render_plane)];
             let base = (pix_id * out_chans) as usize;
             out_img_f32[base] = final_r;
             out_img_f32[base + 1] = final_g;
@@ -181,6 +215,13 @@ pub fn rasterize_kernel(
             out_img_f32[base + 3] = final_a;
             if comptime![render_depth] {
                 out_img_f32[base + 4] = pix_d;
+            }
+            if comptime![render_plane] {
+                let plane_base = base + comptime![plane_channel_offset(render_depth) as usize];
+                out_img_f32[plane_base] = pix_p0;
+                out_img_f32[plane_base + 1] = pix_p1;
+                out_img_f32[plane_base + 2] = pix_p2;
+                out_img_f32[plane_base + 3] = pix_p3;
             }
         } else {
             let r = clamp(final_r * 255.0f32, 0.0f32, 255.0f32) as u32;

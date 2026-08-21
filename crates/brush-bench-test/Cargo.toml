@@ -41,6 +41,11 @@ rerun = { workspace = true }
 [dev-dependencies]
 brush-async = { path = "../brush-async" }
 brush-cube = { path = "../brush-cube" }
+# Only the tests need the plane-depth reduction
+# (`brush_loss::plane_depth_from_features`): `plane_aux_grad.rs` (WS-A test 8)
+# differentiates through it and `plane_parity.rs` (WS-B test 10) reduces both
+# render paths with it. The benches and replay binaries never touch it.
+brush-loss = { path = "../brush-loss" }
 # Keep full tensor/gradient validation in tests and Divan benches. The
 # standalone checkpoint replay is a normal release binary and must not pay
 # for synchronous debug readbacks on every training step.

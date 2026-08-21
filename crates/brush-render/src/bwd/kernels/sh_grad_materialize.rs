@@ -5,7 +5,7 @@
 //! every row is written exactly once, including exact zeros for
 //! non-contributors.
 
-use super::rasterize_backwards::COMPACT_GRAD_LANES;
+use super::rasterize_backwards::{COMPACT_GRAD_LANES, RGB_LANE};
 use crate::kernels::sh::{num_sh_coeffs, sh_basis, sh_color_component};
 use crate::kernels::types::ProjectUniforms;
 use burn_cubecl::cubecl;
@@ -31,11 +31,11 @@ pub fn build_compact_sh_map_kernel(
         terminate!();
     }
 
-    // v_combined is stride COMPACT_GRAD_LANES; rgb grads live at lanes 5..=7.
+    // v_combined is stride COMPACT_GRAD_LANES; rgb grads live at RGB_LANE..=+2.
     let grad_base = (compact_gid * COMPACT_GRAD_LANES) as usize;
-    let v_color_r = v_combined[grad_base + 5];
-    let v_color_g = v_combined[grad_base + 6];
-    let v_color_b = v_combined[grad_base + 7];
+    let v_color_r = v_combined[grad_base + RGB_LANE];
+    let v_color_g = v_combined[grad_base + RGB_LANE + 1];
+    let v_color_b = v_combined[grad_base + RGB_LANE + 2];
     if v_color_r != 0.0f32 || v_color_g != 0.0f32 || v_color_b != 0.0f32 {
         let global_gid = global_from_compact_gid[compact_gid as usize];
         compact_plus_one_from_global[global_gid as usize] = compact_gid + 1u32;
@@ -86,7 +86,7 @@ pub fn materialize_sh_grad_kernel(
 
     let mut field = 0.0f32;
     // transforms is a dense [N, 10] param buffer; v_combined is the compact
-    // backward-grad buffer of stride COMPACT_GRAD_LANES (rgb at lanes 5..=7).
+    // backward-grad buffer of stride COMPACT_GRAD_LANES (rgb at RGB_LANE..=+2).
     let transform_base = (global_gid * 10u32) as usize;
     let grad_base = (compact_gid * COMPACT_GRAD_LANES) as usize;
     if lane == 0u32 {
@@ -96,11 +96,11 @@ pub fn materialize_sh_grad_kernel(
     } else if lane == 2u32 {
         field = transforms[transform_base + 2];
     } else if lane == 3u32 {
-        field = v_combined[grad_base + 5];
+        field = v_combined[grad_base + RGB_LANE];
     } else if lane == 4u32 {
-        field = v_combined[grad_base + 6];
+        field = v_combined[grad_base + RGB_LANE + 1];
     } else if lane == 5u32 {
-        field = v_combined[grad_base + 7];
+        field = v_combined[grad_base + RGB_LANE + 2];
     }
     let mean_x = plane_broadcast(field, 0u32);
     let mean_y = plane_broadcast(field, 1u32);

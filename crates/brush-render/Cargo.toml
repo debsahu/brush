@@ -39,6 +39,9 @@ raster-census = ["dep:serde_json"]
 [dev-dependencies]
 assert_approx_eq.workspace = true
 wasm-bindgen-test = "0.3"
+# Tests only: replaying `src/tests/vjp_golden_vectors.json` through the raster
+# backward. The non-test build reaches serde_json solely via `raster-census`.
+serde_json.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }

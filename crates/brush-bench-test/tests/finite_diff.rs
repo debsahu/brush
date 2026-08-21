@@ -410,17 +410,20 @@ async fn deferred_sh_bridge_preserves_other_gradients_and_aux() {
 
         assert!(deferred_splats.sh_coeffs.grad(&deferred_grads).is_none());
 
-        // Derive the expected compact-grad width from the actual buffer layout rather than
-        // hard-coding it. brush-render-bwd's rasterize_backwards indexes this sparse buffer
-        // as `base = compact_gid * 11`, i.e. a fixed [num_visible, 11] layout per visible
-        // splat: lanes 0..=1 = screen-space xy, 2..=4 = conic, 5..=7 = rgb, 8 = alpha,
-        // 9 = refine-weight, 10 = expected-depth. All 11 lanes are always allocated; the
-        // refine and depth lanes are only *written* when compute_refine_weight / render_depth
-        // are set, so the width is 11 regardless of Cargo features. (The all-features / native
-        // MSL CI job is the only config where this test compiles, which added the depth lane
-        // that made the old hard-coded 10 stale.)
-        const COMPACT_GRAD_LANES: usize = 11;
-        const DEPTH_LANE: usize = 10;
+        // brush-render's rasterize_backwards indexes this sparse buffer as
+        // `base = compact_gid * COMPACT_GRAD_LANES`, a fixed [num_visible, COMPACT_GRAD_LANES]
+        // layout per visible splat: lanes 0..=1 = screen-space xy, 2..=4 = conic, 5..=7 = rgb,
+        // 8 = alpha, 9 = refine-weight, 10 = expected-depth, 11..=14 = PGSR plane-aux values.
+        // Every lane is always allocated; the refine, depth and plane lanes are only *written*
+        // when compute_refine_weight / render_depth / render_plane are set, so the width is
+        // feature-independent.
+        //
+        // This IMPORTS the stride instead of restating it. A hard-coded literal here went
+        // stale twice (once when the depth lane was added, once when the four plane lanes
+        // were), and a stale literal makes the assertions below silently check the wrong
+        // columns rather than fail loudly.
+        const COMPACT_GRAD_LANES: usize = brush_render::bwd::COMPACT_GRAD_LANES as usize;
+        const DEPTH_LANE: usize = brush_render::bwd::DEPTH_LANE;
         let expected_rows = num_visible.max(1) as usize;
         assert_eq!(
             sparse.compact_grads.dims(),
@@ -435,18 +438,22 @@ async fn deferred_sh_bridge_preserves_other_gradients_and_aux() {
         );
 
         // The bridge must carry every lane through untouched. All lanes stay finite, and
-        // because this render uses RasterizationMode::Rgba (render_depth = false) the
-        // expected-depth lane is never written, so it must remain exactly zero for every
-        // visible splat: the bridge neither fabricates nor drops the depth column it carries.
+        // because this render uses RasterizationMode::Rgba (render_depth = false,
+        // render_plane = false) neither the expected-depth lane nor the four PGSR plane
+        // lanes are ever written, so they must remain exactly zero for every visible splat:
+        // the bridge neither fabricates nor drops the columns it carries. This is the
+        // default-inertness pin for the plane lanes.
         let compact = read_vec(sparse.compact_grads).await;
         assert_eq!(compact.len(), expected_rows * COMPACT_GRAD_LANES);
         assert!(compact.iter().all(|v| v.is_finite()));
         for row in 0..expected_rows {
-            assert_eq!(
-                compact[row * COMPACT_GRAD_LANES + DEPTH_LANE],
-                0.0,
-                "Rgba render must leave the depth lane zero (row {row})"
-            );
+            for lane in DEPTH_LANE..COMPACT_GRAD_LANES {
+                assert_eq!(
+                    compact[row * COMPACT_GRAD_LANES + lane],
+                    0.0,
+                    "Rgba render must leave lane {lane} zero (row {row})"
+                );
+            }
         }
 
         assert_close(
@@ -1941,4 +1948,406 @@ async fn forward_loss_is_deterministic() {
         l_a, l_c,
         "forward loss is nondeterministic ({l_a} vs {l_c})"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Test 9 of the PGSR plane-render plan: finite differences through the FUSED
+// plane channels (approach B).
+//
+// PGSR: Chen et al. 2024, arXiv:2406.06521.
+//
+// This is the test that validates the hand-written alpha VJP in
+// `bwd::kernels::rasterize_backwards::plane_channel_bwd`. `raw_opac` is the
+// lane that matters: approach A (the feature pass) gives it EXACTLY zero, so a
+// numerically-correct nonzero opacity gradient here is the only direct evidence
+// that the weight path is live and right. `log_scales` is the same story via the
+// conic — `plane_features` itself hands the scales nothing (detached `argmin`),
+// so any scale gradient can only have arrived through the blending weights.
+// ---------------------------------------------------------------------------
+
+/// Scene for the plane finite-diff arms.
+///
+/// Constraints beyond the usual "away from pipeline discontinuities":
+///
+/// * **Log-scales are well separated, with the minimum always on local +Z.**
+///   `plane_features` picks the thin axis with a DETACHED `argmin`; two
+///   near-equal scales sit exactly on a discontinuity that a central difference
+///   would straddle, silently comparing two different plane normals.
+/// * **Rotations stay near identity** so the camera-facing sign (also detached)
+///   is far from flipping — the thin axis points at the camera with `|cos|` well
+///   above 0.9.
+/// * **Moderate opacity** so no pixel reaches the `T <= 1e-4` early-out (another
+///   hard discontinuity) and no alpha reaches the 0.999 saturation clamp.
+fn plane_scene() -> Scene {
+    Scene {
+        means: vec![
+            0.22, -0.12, 0.00, //
+            -0.28, 0.36, 0.24, //
+            0.12, 0.30, -0.26, //
+            -0.24, -0.22, 0.12, //
+        ],
+        rots: vec![
+            0.96, 0.11, 0.06, 0.04, //
+            0.94, -0.09, 0.13, 0.07, //
+            0.95, 0.14, -0.08, 0.05, //
+            0.93, 0.07, 0.10, -0.12, //
+        ],
+        // min is always component 2, separated from the other two by >= 0.5.
+        log_scales: vec![
+            -1.0, -1.5, -2.1, //
+            -1.1, -1.6, -2.2, //
+            -0.9, -1.4, -2.0, //
+            -1.2, -1.7, -2.3, //
+        ],
+        sh_dc: vec![
+            0.45, 0.55, 0.50, //
+            0.60, 0.40, 0.30, //
+            0.35, 0.50, 0.65, //
+            0.50, 0.45, 0.55, //
+        ],
+        raw_opac: vec![1.2, 1.0, 1.1, 1.3],
+    }
+}
+
+/// Alpha floor for `plane_depth_from_features` in these tests. Deliberately far
+/// from the coverage of the masked pixels (which are all above 0.5), so a 3e-4
+/// perturbation cannot flip a pixel's validity — validity flipping IS a
+/// discontinuity and central differences must not straddle one.
+const PLANE_MIN_ALPHA: f32 = 0.1;
+
+// Channel indices, derived from the same `const fn` the kernel uses.
+const ALPHA_CH: usize =
+    brush_render::kernels::helpers::raster_out_channels(false, false) as usize - 1;
+const PLANE_LO: usize = brush_render::kernels::helpers::plane_channel_offset(true) as usize;
+const PLANE_HI: usize = PLANE_LO + brush_render::kernels::helpers::PLANE_AUX_LANES_USIZE;
+
+/// Distinct per-channel weights so no plane channel drops out of the scalar
+/// loss by cancellation (equal weights would let a sign error in one normal
+/// component hide behind another).
+const PLANE_CHANNEL_WEIGHTS: [f32; 4] = [0.7, -1.3, 0.9, 0.4];
+
+async fn plane_render(
+    scene: &Scene,
+    cam: &Camera,
+    img_size: glam::UVec2,
+    device: &burn::tensor::Device,
+) -> (Splats, Tensor<3>) {
+    let splats = build_splats(scene, device);
+    let feats = brush_train::train::plane_features(splats.transforms.val(), cam);
+    let out = brush_render::bwd::render_splats_with_pass_and_plane_aux(
+        splats.clone(),
+        cam,
+        img_size,
+        Vec3::ZERO,
+        PASS,
+        Rasterizer::Legacy,
+        RasterizationMode::RgbaDepthPlane,
+        Some(feats),
+    )
+    .await;
+    (splats, out.img)
+}
+
+/// Scalar loss over the four composited plane channels AND the ray-plane depth
+/// derived from them.
+///
+/// `depth_mask` is a FIXED `[H, W]` mask computed once from the unperturbed
+/// scene. Recomputing it per render would make the loss discontinuous wherever a
+/// pixel crosses `PLANE_MIN_ALPHA`; holding it fixed keeps the depth term smooth
+/// in the parameters.
+fn plane_loss(
+    img: Tensor<3>,
+    cam: &Camera,
+    img_size: glam::UVec2,
+    depth_mask: Tensor<2>,
+) -> Tensor<1> {
+    let device = img.device();
+    let [h, w, _] = img.dims();
+
+    // Channel layout: 0..=3 rgba, 4 centre depth, 5..=8 plane.
+    let plane = img.clone().slice(s![.., .., PLANE_LO..PLANE_HI]);
+    let weights = Tensor::<1>::from_floats(PLANE_CHANNEL_WEIGHTS, &device).reshape([1, 1, 4]);
+    let channel_term = (plane.clone() * weights).sum();
+
+    // The [H, W, 5] contract `plane_depth_from_features` expects: the four plane
+    // sums plus the ordinary coverage alpha at channel 3.
+    let feat = Tensor::cat(
+        vec![plane, img.slice(s![.., .., ALPHA_CH..ALPHA_CH + 1])],
+        2,
+    );
+    let focal = cam.focal(img_size);
+    let center = cam.center(img_size);
+    let (depth, _, _) = brush_loss::plane_depth_from_features(
+        feat,
+        focal.x,
+        focal.y,
+        center.x,
+        center.y,
+        PLANE_MIN_ALPHA,
+        0.05,
+        0.05,
+        100.0,
+    );
+    let depth_term = (depth * depth_mask).sum() / (h * w) as f32;
+
+    channel_term + depth_term * 4.0
+}
+
+/// Pixels that are comfortably valid in the unperturbed scene: coverage above
+/// 0.5 (five times `PLANE_MIN_ALPHA`) and a plane the reduction accepted.
+async fn plane_depth_mask(
+    scene: &Scene,
+    cam: &Camera,
+    img_size: glam::UVec2,
+    device: &burn::tensor::Device,
+) -> Tensor<2> {
+    let (_, img) = plane_render(scene, cam, img_size, device).await;
+    let [h, w, _] = img.dims();
+    let feat = Tensor::cat(
+        vec![
+            img.clone().slice(s![.., .., PLANE_LO..PLANE_HI]),
+            img.clone().slice(s![.., .., ALPHA_CH..ALPHA_CH + 1]),
+        ],
+        2,
+    );
+    let focal = cam.focal(img_size);
+    let center = cam.center(img_size);
+    let (_, _, valid) = brush_loss::plane_depth_from_features(
+        feat,
+        focal.x,
+        focal.y,
+        center.x,
+        center.y,
+        PLANE_MIN_ALPHA,
+        0.05,
+        0.05,
+        100.0,
+    );
+    let alpha = img
+        .slice(s![.., .., ALPHA_CH..ALPHA_CH + 1])
+        .reshape([h, w]);
+    let mask: Vec<f32> = read_vec(valid)
+        .await
+        .into_iter()
+        .zip(read_vec(alpha).await)
+        .map(|(v, a)| f32::from(v > 0.5 && a > 0.5))
+        .collect();
+    let covered = mask.iter().filter(|v| **v > 0.5).count();
+    assert!(
+        covered > 50,
+        "plane finite-diff scene covers only {covered} pixels — the depth term would be vacuous"
+    );
+    Tensor::<1>::from_floats(mask.as_slice(), device).reshape([h, w])
+}
+
+async fn plane_loss_value(
+    scene: &Scene,
+    cam: &Camera,
+    img_size: glam::UVec2,
+    device: &burn::tensor::Device,
+    depth_mask: &Tensor<2>,
+) -> f32 {
+    let (_, img) = plane_render(scene, cam, img_size, device).await;
+    plane_loss(img, cam, img_size, depth_mask.clone())
+        .into_scalar_async::<f32>()
+        .await
+        .expect("plane loss readback")
+}
+
+async fn plane_analytical_grads(
+    scene: &Scene,
+    cam: &Camera,
+    img_size: glam::UVec2,
+    device: &burn::tensor::Device,
+    depth_mask: &Tensor<2>,
+) -> (Splats, Gradients) {
+    let (splats, img) = plane_render(scene, cam, img_size, device).await;
+    let grads = plane_loss(img, cam, img_size, depth_mask.clone()).backward();
+    (splats, grads)
+}
+
+/// Test 9: analytical vs numerical gradients for the fused plane channels.
+///
+/// The `RawOpac` and `LogScale` rows are the point of the test — see the module
+/// comment above. `depth_loss_does_not_touch_opacity` (brush-train) pins the
+/// opposite property for the CENTRE-depth channel; both are correct, and the
+/// asymmetry is the design (plan section 4.5).
+///
+/// # Why finite-differencing the MIXED contract is legitimate here
+///
+/// The shipped backward is a deliberately modified gradient — the centre-depth
+/// channel's alpha term is dropped — so in general it is NOT the derivative of
+/// any scalar function and central differences would rightly disagree. That is
+/// only true when the cotangent on the dropped channel is nonzero. **This loss
+/// puts exactly zero cotangent on channel 4**: it reads channels 5..=8 (plane)
+/// and channel 3 (coverage alpha, which is the ordinary output-alpha term, not
+/// a dropped one) and never channel 4. The dropped term is linear in
+/// `v_out[4]`, so it contributes nothing and the mixed contract coincides with
+/// the true gradient on this loss. Agreement here is therefore evidence the
+/// algebra is right, not evidence the drop is missing —
+/// `plane_mode_keeps_centre_depth_detached_from_opacity` (`plane_parity.rs`) pins
+/// the drop separately with a one-hot cotangent on channel 4.
+///
+/// # Why the scene is not faint
+///
+/// `raw_opac` sits at 1.0-1.3, i.e. alpha ~0.73-0.79 before the gaussian
+/// falloff. A suffix-buffer read/write ordering slip mis-scales the alpha VJP by
+/// `alpha/(1 - alpha)`, which is ~5% at alpha = 0.05 (swallowable by FD noise)
+/// but >3x here. A version of this test on a faint scene would pass through that
+/// bug; this one does not.
+#[tokio::test]
+async fn finite_diff_plane_fused() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let cam = std_cam();
+    let img_size = glam::uvec2(32, 32);
+    let scene = plane_scene();
+
+    // Larger eps than the RGB arms (3e-4) on purpose. This loss is a SUM over
+    // ~4k pixel-channels, so |loss| ~ 1e2 while the central difference is
+    // ~1e-1·eps; at eps = 1e-4 the f32 readback granularity of the loss itself
+    // dominates (measured: `l_plus − l_minus` quantises, and several rows return
+    // bit-identical numerical derivatives at 1e-4 and 3e-4). Sweeping
+    // eps ∈ {1e-4, 3e-4, 1e-3, 3e-3} on this scene, the disagreement falls
+    // MONOTONICALLY with eps — the signature of round-off, not of truncation —
+    // reaching ≤ 0.12% for every lane at 3e-3. The scene is smooth over a 3e-3
+    // ball: log-scales are 0.5 apart, so the detached `argmin` cannot flip, and
+    // the masked pixels sit at alpha > 0.5 against a 0.1 validity floor.
+    let eps = 3e-3_f32;
+    let rel_tol = 0.01_f32;
+    let abs_tol = 1e-4_f32;
+
+    let depth_mask = plane_depth_mask(&scene, &cam, img_size, &device).await;
+    let (splats, grads) =
+        plane_analytical_grads(&scene, &cam, img_size, &device, &depth_mask).await;
+
+    let cases: &[(Lane, usize, usize)] = &[
+        (Lane::Mean, 0, 0),
+        (Lane::Mean, 0, 2),
+        (Lane::Mean, 1, 1),
+        (Lane::Mean, 3, 2),
+        (Lane::Rot, 0, 1),
+        (Lane::Rot, 1, 2),
+        (Lane::Rot, 2, 3),
+        (Lane::LogScale, 0, 0),
+        (Lane::LogScale, 1, 1),
+        (Lane::LogScale, 2, 2),
+        (Lane::RawOpac, 0, 0),
+        (Lane::RawOpac, 1, 0),
+        (Lane::RawOpac, 2, 0),
+        (Lane::RawOpac, 3, 0),
+    ];
+
+    let mut rows: Vec<(Lane, usize, usize, f32, f32)> = Vec::with_capacity(cases.len());
+    for (lane, splat, comp) in cases {
+        let mut s_plus = scene.clone();
+        perturb(&mut s_plus, *lane, *splat, *comp, eps);
+        let l_plus = plane_loss_value(&s_plus, &cam, img_size, &device, &depth_mask).await;
+
+        let mut s_minus = scene.clone();
+        perturb(&mut s_minus, *lane, *splat, *comp, -eps);
+        let l_minus = plane_loss_value(&s_minus, &cam, img_size, &device, &depth_mask).await;
+
+        let numerical = (l_plus - l_minus) / (2.0 * eps);
+        let an = analytical_at(&splats, &grads, *lane, *splat, *comp).await;
+        rows.push((*lane, *splat, *comp, numerical, an));
+    }
+
+    // Contract row 3 (plan section 4.5): the opacity gradient is nonzero BY
+    // DESIGN. Approach A gives exactly zero here; a reviewer who "fixes" this to
+    // assert zero has converted B into A and deleted the only thing the arm-4 vs
+    // arm-5 ablation measures.
+    let max_opac = rows
+        .iter()
+        .filter(|(lane, ..)| matches!(lane, Lane::RawOpac))
+        .fold(0.0f32, |m, (.., an)| m.max(an.abs()));
+    assert!(
+        max_opac > 1e-5,
+        "fused plane channels must reach opacity; max |analytic d/d raw_opac| = {max_opac:e}"
+    );
+    let max_scale = rows
+        .iter()
+        .filter(|(lane, ..)| matches!(lane, Lane::LogScale))
+        .fold(0.0f32, |m, (.., an)| m.max(an.abs()));
+    assert!(
+        max_scale > 1e-5,
+        "fused plane channels must reach the conic (log-scales); max |analytic| = {max_scale:e}"
+    );
+
+    let mut failed: Vec<String> = Vec::new();
+    for (lane, splat, comp, numerical, an) in &rows {
+        let abs_err = (numerical - an).abs();
+        let scale = numerical.abs().max(an.abs()).max(1e-8);
+        let tol = abs_tol + rel_tol * scale;
+        if abs_err > tol {
+            failed.push(format!(
+                "{}[{},{}]: numerical {numerical:.6} vs analytical {an:.6} \
+                 (|Δ|={abs_err:.3e} > tol {tol:.3e})",
+                lane_name(*lane),
+                splat,
+                comp,
+            ));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "fused-plane finite-diff vs analytical mismatch:\n  {}",
+        failed.join("\n  "),
+    );
+}
+
+/// Every model gradient stays finite when the fused plane channels are on,
+/// across randomised scenes and view geometry. The deterministic sibling of the
+/// `fuzz.rs` backward arms, kept here because it needs the plane feature
+/// construction from brush-train.
+#[tokio::test]
+async fn fuzz_plane_fused_gradients_stay_finite() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    let base = plane_scene();
+
+    for seed in 0..24u64 {
+        // Deterministic splitmix-style jitter; no rng dependency needed here.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(seed + 1);
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 40) as f32 / 16777216.0) * 2.0 - 1.0
+        };
+
+        let mut scene = base.clone();
+        for v in &mut scene.means {
+            *v += next() * 0.6;
+        }
+        for v in &mut scene.rots {
+            *v += next() * 0.3;
+        }
+        for v in &mut scene.log_scales {
+            *v += next() * 1.5;
+        }
+        for v in &mut scene.raw_opac {
+            *v += next() * 2.0;
+        }
+
+        let img_size = glam::uvec2(24 + (seed as u32 % 3) * 8, 24 + (seed as u32 % 5) * 4);
+        let (splats, img) = plane_render(&scene, &std_cam(), img_size, &device).await;
+        let grads = img.slice(s![.., .., PLANE_LO..PLANE_HI]).mean().backward();
+
+        for (name, values) in [
+            (
+                "transforms",
+                read_vec(splats.transforms.grad(&grads).expect("transforms grad")).await,
+            ),
+            (
+                "raw_opacities",
+                read_vec(splats.raw_opacities.grad(&grads).expect("opacity grad")).await,
+            ),
+        ] {
+            assert!(
+                values.iter().all(|v| v.is_finite()),
+                "seed {seed}: non-finite {name} gradient under fused plane channels"
+            );
+        }
+    }
 }

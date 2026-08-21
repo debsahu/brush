@@ -11,6 +11,58 @@ pub enum DepthWeightDecay {
     Cosine,
 }
 
+/// Where the trainer's supervised depth comes from (`--depth-source`).
+///
+/// PGSR (Chen et al. 2024, arXiv:2406.06521) observes that the alpha-composited
+/// camera-z of splat MEANS is a centre-biased surface estimate: a depth loss
+/// against it constrains only where along the ray a gaussian sits, never its
+/// orientation, so gaussians satisfy it while forming a thick shell of tilted
+/// ellipsoids around the true surface. The plane sources composite per-splat
+/// tangent-plane parameters instead and intersect the pixel ray with the
+/// composited plane, which is unbiased.
+///
+/// The three variants have deliberately DIFFERENT backward semantics; see the
+/// contract table at the dispatch site in `train.rs` before reading an ablation
+/// result. `Center` is the default and is byte-identical to the pre-PGSR
+/// trainer.
+#[derive(Default, Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DepthSource {
+    /// Alpha-composited camera-z of splat means (previous behaviour).
+    #[default]
+    Center,
+    /// PGSR plane-intersection depth via the auxiliary feature pass (approach A).
+    /// Geometry gradients arrive exclusively through feature VALUES; the
+    /// compositing weights are constants, so depth error cannot reach opacity.
+    PlaneAux,
+    /// **EXPERIMENTAL — measured HARMFUL in this trainer; do not use for delivery.**
+    ///
+    /// PGSR plane-intersection depth via the main rasterize kernel (approach B).
+    /// Blending-weight gradients are LIVE for the plane channels, so depth error
+    /// does reach opacity — by design, and the one thing `PlaneAux` cannot
+    /// express.
+    ///
+    /// Measured on two scenes (`docs/superpowers/specs/2026-08-20-pgsr-ablation-synthesis.md`
+    /// §3.3): opacity p50 falls 28% on `ARKitScenes` 48018538 (0.0722 → 0.0519)
+    /// and 34% on `playroom_0812` (0.2118 → 0.1395), monotonically and with none
+    /// of the cap-bound recovery every other arm shows; playroom lands at
+    /// **23.918 dB, under our 24 dB delivery gate**. The apparent mechanism is
+    /// "fade rather than rotate": with the alpha VJP open, fading a splat out is
+    /// a cheaper descent direction for the plane-depth term than rotating it.
+    ///
+    /// **The technique itself is NOT known to be broken.** The `gauss-surf`
+    /// reference trainer (Pablo Vela, Apache-2.0) carries blending-weight
+    /// gradients on its default path too, and when run on our priors, our seed
+    /// and our cameras it holds opacity p50 at **0.9934** — so the collapse is a
+    /// property of THIS trainer, not of the formulation
+    /// (`work/arkitscenes_48018538/reference/README.md` §8). Cause under
+    /// investigation; the leading suspects are our disparity-space depth loss
+    /// (a 1/d² gradient makes near-camera fading cheap in a way a metric-L1 loss
+    /// does not) and our densifier. Kept selectable precisely so those
+    /// experiments can run.
+    PlaneFused,
+}
+
 #[derive(Clone, Parser, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct TrainConfig {
@@ -526,6 +578,180 @@ pub struct TrainConfig {
     #[serde(default)]
     pub depth_normal_start_iter: u32,
 
+    // ------------------------------------------------------------------
+    // PGSR plane-render config surface (WS-L). Every field below defaults to
+    // an OFF sentinel that leaves the trainer byte-identical to its pre-change
+    // behaviour; the `playroom_0812` 15k baseline (opacity p50 0.2132, scale
+    // p50 0.0082, on-seed 92.2%, dark splats 1.79%) must stay reproducible
+    // with defaults.
+    // ------------------------------------------------------------------
+    /// Source of the supervised depth map.
+    ///
+    /// `center` (default) is the alpha-composited camera-z of splat means —
+    /// previous behaviour, byte-identical. `plane-aux` and `plane-fused` use
+    /// PGSR ray-plane depth (arXiv:2406.06521) and differ from each other only
+    /// in their BACKWARD contract, not their forward values; see `DepthSource`.
+    ///
+    /// `plane-aux` is SCENE-DEPENDENT, and its measured benefit depends on what
+    /// it is stacked on — quote each number with its comparison:
+    ///
+    ///   * `playroom_0812`, ALONE vs baseline: **−3.8° thin-axis, +0.36 dB**.
+    ///   * `playroom_0812`, ON TOP OF `--flatten-loss-weight 1.0`: **−0.8°,
+    ///     +0.03 dB** — most of what it buys alone, flatten has already bought.
+    ///   * `ARKitScenes` 48018538, ALONE: −0.3°, i.e. null.
+    ///   * `ARKitScenes` 48018538, ON TOP OF flatten: **+0.7° WORSE.**
+    ///
+    /// So it is not a free addition to the flatten recipe: it competes for the
+    /// same smallest-axis degree of freedom. Discriminator, ~7k iterations:
+    /// run flatten-alone and flatten+plane-aux side by side and keep plane-aux
+    /// only if on-seed recovers and thin-axis does not worsen.
+    ///
+    /// `plane-fused` is **EXPERIMENTAL and measured harmful in this trainer** —
+    /// it collapses opacity p50 by 28%/34% on those two scenes and puts playroom
+    /// under the 24 dB gate. The cause is under investigation and is believed to
+    /// be ours, not the technique's (the reference trainer's weight-path-live
+    /// renderer does not collapse on the same data). Full numbers and the
+    /// pending experiments: `docs/superpowers/specs/2026-08-20-pgsr-ablation-synthesis.md`
+    /// §3.3 and §5.2.
+    #[arg(long, help_heading = "Training options", default_value = "center")]
+    #[serde(default)]
+    pub depth_source: DepthSource,
+
+    /// Global iteration at which the normal-term ramp starts. **0 = OFF**
+    /// (full weight from step 0, previous behaviour, byte-identical).
+    ///
+    /// When set, `--normal-loss-weight` and `--depth-normal-weight` are both
+    /// multiplied by a ramp that is 0 before this iteration and climbs linearly
+    /// to 1 over `--normal-ramp-iters`. A ramp value of exactly 0 also SKIPS
+    /// the normal render pass entirely (same philosophy as
+    /// `--depth-normal-start-iter`), so the gate costs nothing rather than
+    /// rendering work that gets multiplied by zero.
+    ///
+    /// Counts GLOBAL iterations, like every other schedule knob in this fork,
+    /// so a resumed run does not restart the countdown and an LOD transition
+    /// does not re-close the gate.
+    ///
+    /// Recipe, from the `gauss-surf` PGSR trainer (rerun-io/examples-monorepo,
+    /// Apache-2.0, by Pablo Vela), which starts at step 1,400 and ramps over 875
+    /// of its 7,000 — i.e. 20% of the run, ramping over 12.5%. These are its
+    /// implementation constants, not values either paper states:
+    ///   * 15k ablation run: `--normal-ramp-start-iter 3000 --normal-ramp-iters 1875`
+    ///   * 30k default run (`--total-train-iters` defaults to 30000):
+    ///     `--normal-ramp-start-iter 6000 --normal-ramp-iters 3750`
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    #[serde(default)]
+    pub normal_ramp_start_iter: u32,
+
+    /// Length of the normal-term ramp in global iterations, after
+    /// `--normal-ramp-start-iter`. 0 = hard step to full weight at the start
+    /// iteration. Inert unless `--normal-ramp-start-iter` is nonzero (setting
+    /// it alone is rejected by `validate()` rather than silently ignored).
+    ///
+    /// Units: iterations. See `--normal-ramp-start-iter` for the recipe.
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    #[serde(default)]
+    pub normal_ramp_iters: u32,
+
+    /// Final value of `--depth-normal-weight` after the late consistency bump.
+    /// **0.0 = OFF** (constant weight, previous behaviour, byte-identical).
+    ///
+    /// The `gauss-surf` PGSR trainer (rerun-io/examples-monorepo, Apache-2.0, by
+    /// Pablo Vela) bumps its consistency weight 0.50 -> 0.55 late in training,
+    /// from step 5,500 over 500 of its 7,000 — 78.6% of the run, over 7.1%.
+    /// Another implementation constant with no counterpart in the papers.
+    /// Units: same dimensionless weight as `--depth-normal-weight`.
+    ///
+    /// Recipe: at 15k, `--depth-normal-weight-end-start-iter 11800
+    /// --depth-normal-weight-end-ramp-iters 1050`; at the 30k default,
+    /// `23600` / `2100`.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub depth_normal_weight_end: f32,
+
+    /// Global iteration at which the late consistency bump starts ramping.
+    /// Units: iterations. Inert unless `--depth-normal-weight-end` > 0.
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    #[serde(default)]
+    pub depth_normal_weight_end_start_iter: u32,
+
+    /// Length of the late consistency bump ramp, in global iterations. 0 = hard
+    /// step at `--depth-normal-weight-end-start-iter`. Inert unless
+    /// `--depth-normal-weight-end` > 0.
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    #[serde(default)]
+    pub depth_normal_weight_end_ramp_iters: u32,
+
+    /// Per-pixel normal contradiction gate, in DEGREES. **0 = OFF** (previous
+    /// behaviour, byte-identical).
+    ///
+    /// `NeuRIS`-style (arXiv:2206.13597): a prior-normal pixel whose angle to the
+    /// RENDERED normal exceeds this threshold is dropped from
+    /// `--normal-loss-weight`'s mask for that step. Both operands are detached
+    /// — it is a mask, not a gradient path. The mean is taken over the GATED
+    /// valid count, so surviving pixels keep full per-pixel magnitude instead of
+    /// the whole term silently annealing as the gate tightens.
+    ///
+    /// This is the per-pixel refinement of the whole-frame median-cosine check
+    /// `ingest/splatcam/normals_moge.py` already performs at prior-generation
+    /// time: the frame check catches sign-flipped priors, the gate drops
+    /// locally-contradicted pixels (transients, reflections, `MoGe` failures)
+    /// inside otherwise-good frames.
+    ///
+    /// Units: degrees, in `[0, 180]`. Reference value: 30.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub normal_gate_degrees: f32,
+
+    /// Global iteration at which `--normal-gate-degrees` arms. 0 = armed from
+    /// step 0 whenever the gate is on. Units: iterations. Inert unless
+    /// `--normal-gate-degrees` > 0.
+    ///
+    /// Recipe: the `gauss-surf` PGSR trainer (rerun-io/examples-monorepo,
+    /// Apache-2.0, by Pablo Vela) arms its 30 degree gate at step 2,625 of
+    /// 7,000 — 37.5% of the run, which is ~5600 at 15k and ~11250 at the 30k
+    /// default. The 30 degrees is `NeuRIS`'s; the arming step is `gauss-surf`'s.
+    #[arg(long, help_heading = "Training options", default_value = "0")]
+    #[serde(default)]
+    pub normal_gate_start_iter: u32,
+
+    /// Divide the METRIC-DIMENSIONED loss weights by the scene scale, so a
+    /// single recipe transfers between scenes of different physical size.
+    /// **Default off = byte-identical.**
+    ///
+    /// The scale is captured ONCE from the training camera poses at trainer
+    /// construction and never updated — a live, refine-updated value would make
+    /// the effective weights drift mid-run and confound the ramp schedules.
+    ///
+    /// Which weights this touches, and why, is spelled out at the consumption
+    /// site in `train.rs`; the short version is that `--depth-loss-weight` is
+    /// deliberately NOT in the list because our depth loss is disparity-space.
+    #[arg(long, help_heading = "Training options", default_value = "false")]
+    #[serde(default)]
+    pub normalize_metric_weights: bool,
+
+    /// Keep training after a non-finite (NaN / inf) total loss instead of
+    /// aborting the run.
+    ///
+    /// **This default is a DELIBERATE BEHAVIOUR CHANGE.** Before this flag
+    /// existed there was no check at all: a single NaN loss step wrote NaN
+    /// gradients through the optimizer into the parameters, and the run
+    /// continued for hours producing garbage that only surfaced at export. The
+    /// trainer now aborts instead, matching the reference trainer, which raises
+    /// `FloatingPointError` on any non-finite loss term rather than warning.
+    ///
+    /// So a run that previously "succeeded" on a poisoned scene will now STOP.
+    /// That is the point: the output of such a run was never usable. Pass this
+    /// flag only to reproduce or debug the poisoning itself — the resulting
+    /// splats are not a deliverable.
+    ///
+    /// The check is not free (it reads a scalar back from the GPU, which
+    /// synchronises), so it does not run every step. See
+    /// `NONFINITE_LOSS_CHECK_STEPS` in `train.rs` for the cadence and the
+    /// blast-radius argument for the gaps between checks.
+    #[arg(long, help_heading = "Training options", default_value = "false")]
+    #[serde(default)]
+    pub allow_nonfinite_loss: bool,
+
     /// Weight of total-variation smoothness on the rendered normal image
     /// (DN-Splatter's `L_smooth`). Needs no prior data.
     ///
@@ -551,6 +777,39 @@ pub struct TrainConfig {
     /// 2DGS-style pressure toward surface-aligned gaussians — nothing is
     /// collapsed or re-parametrized. `PlanarGS` `L_s`; `PlanarGS` ratio suggests
     /// ~1.0. 0 disables.
+    ///
+    /// **RECOMMENDED CORE SETTING: `1.0`.** The default stays 0 only so that
+    /// existing runs and recorded baselines do not change under anyone's feet —
+    /// it is NOT a recommendation. Across a 20-arm `ARKitScenes` matrix and a
+    /// 9-arm `playroom_0812` matrix this is the **only** ingredient that
+    /// improves splat orientation on both scenes
+    /// (`docs/superpowers/specs/2026-08-20-pgsr-ablation-synthesis.md` §1, §3.1):
+    ///
+    ///   * thin-axis median (angle between a splat's smallest axis and the local
+    ///     surface normal): **46.61° → 37.68° (−8.9°)** on `ARKitScenes` 48018538,
+    ///     **39.65° → 25.37° (−14.3°)** on `playroom_0812`;
+    ///   * splats within 15° of their surface: 9.8% → 16.5% and 15.0% → 30.5%;
+    ///   * PSNR is essentially unchanged (−0.09 dB / +0.15 dB) — a PSNR-gated
+    ///     sweep cannot see this term at all, in either direction.
+    ///
+    /// Mechanism, visible in the min-axis median: 7.2 mm → 0.75 mm (`ARKitScenes`),
+    /// 3.7 mm → 0.16 mm (playroom). It trades centre accuracy for orientation, so
+    /// on-seed@1cm drops 1–3 pp; that is the term working, not a regression.
+    ///
+    /// Costs and interactions worth knowing before turning it on:
+    ///   * −30% it/min (`ARKitScenes`) / −15% (playroom at matched splat count);
+    ///   * do NOT combine with `--normalize-metric-weights` on a metric scene —
+    ///     it divides this weight by the scene scale and measurably weakens it
+    ///     (+1.4° / +1.1°);
+    ///   * it drives log-scales down, which walks splats into the region where
+    ///     the Mip-Splatting 3D-filter fold used to NaN their gradients. That
+    ///     bug is fixed in this branch, but Stage 5 `--filter-nan` stays
+    ///     mandatory regardless (SOG codebook poisoning);
+    ///   * at weights above 1.0 the first thing to break is not the trainer but
+    ///     SOG's fixed 8-bit quaternion precision (§4 "Costs").
+    ///
+    /// A cap that BINDS is part of the recipe: opacity only recovers once the
+    /// population pins at `--max-splats`.
     #[arg(long, help_heading = "Training options", default_value = "0.0")]
     #[serde(default)]
     pub flatten_loss_weight: f32,
@@ -966,17 +1225,62 @@ pub struct TrainConfig {
     /// the centre onto the plane AND flattens it against the plane. Unlike the
     /// opacity gate this carries a real gradient on POSITION and SCALE, so it
     /// removes the geometric ambiguity on featureless walls directly. Riskier than
-    /// the gate (it moves geometry); keep it small (e.g. 0.05). Independent of
-    /// `--plane-gate`.
+    /// the gate (it moves geometry). Independent of `--plane-gate`.
+    ///
+    /// **UNITS — this is why the old suggested 0.05 was inert.** The term is a
+    /// squared distance: `(n·mu − d)²` plus a variance, so it carries **metres²**
+    /// on a metric scene. `--flatten-loss-weight` carries linear **metres**. At
+    /// the scales these terms operate on those are not comparable magnitudes — a
+    /// splat 1 cm off its plane contributes 1e-4 here against 1e-2 there, so a
+    /// weight tuned by analogy with flatten is two orders of magnitude short.
+    ///
+    /// **Measured working value on a metric indoor scene: 20.** A 1k-iteration
+    /// sweep on `ARKitScenes` 48018538 at w = 0.05 / 2 / 20 gives thin-axis medians
+    /// 54.90° / 52.65° / 45.58° — monotone in the weight, with 0.05 sitting at
+    /// the inert end (its PSNR is 0.028 dB from the no-coplanarity control, and
+    /// the whole 0.05 → 20 sweep spans 0.046 dB, so PSNR cannot adjudicate this).
+    /// At 7k, w = 20 with a cloud-derived assignment band is the best fork-native
+    /// configuration measured on that scene: thin-axis 33.30° against arm 6's
+    /// 36.84°, within-15° 17.5% → 24.8%, opacity p50 UP (0.068 → 0.073 — the only
+    /// orientation lever that raises it), PSNR −0.09 dB, at −40% it/min.
+    ///
+    /// **The value scales with the scene's units**, because the term does: a
+    /// scene whose units are 10× larger needs ~100× less weight for the same
+    /// pressure. 20 is calibrated for metres. Re-derive rather than copy on a
+    /// non-metric `SfM` scene, or use `--normalize-metric-weights` — but note that
+    /// flag also divides `--flatten-loss-weight`, which is a measured dilution on
+    /// a metric scene.
+    ///
+    /// Single-scene evidence, and it has not been tried on `playroom_0812`;
+    /// `docs/superpowers/specs/2026-08-20-pgsr-ablation-synthesis.md` §3.1, §4, §6.
     #[arg(long, help_heading = "TIDI options", default_value = "0.0")]
     #[serde(default = "default_plane_coplanarity_weight")]
     pub plane_coplanarity_weight: f32,
 
     /// CO-PLANARITY assignment band: a Gaussian is assigned to a plane only when
     /// its perpendicular distance is below this (in scene 3D-distance units) AND
-    /// it projects inside the plane's bounded extent. `<= 0` (the default) means
-    /// "use `--depth-opacity-reg-margin`", so the band matches the opacity gate's
-    /// on-surface margin unless overridden.
+    /// it projects inside the plane's bounded extent.
+    ///
+    /// `<= 0` (the default) derives the band from the seed cloud's MEASURED
+    /// nearest-neighbour spacing: **2.75× spacing**, the same quantity the
+    /// RANSAC inlier band is built from. The resolved value is printed in the
+    /// `Plane priors:` line at startup — read it rather than assuming.
+    ///
+    /// THIS IS A DISTANCE THAT MUST SCALE WITH THE CLOUD, and getting it wrong
+    /// is silent. It previously defaulted to `--depth-opacity-reg-margin`
+    /// (0.15 m), a different feature's knob in absolute units: on our 7.3 mm
+    /// `ARKitScenes` seed that is a 20× band which assigns **68% of all splats**
+    /// to the eight room planes and flattens furniture onto the walls. The
+    /// derived 0.02 m band assigns 34% and keeps the gain — thin-axis 33.30°
+    /// with on-seed@1cm held at 61.7%, against 31.71° with on-seed@1cm
+    /// collapsing to 48.1% at the old default.
+    ///
+    /// Rule if you set it by hand: ≈2.5–3× the seed cloud's NN spacing. Check
+    /// membership with `work/arkitscenes_48018538/tools/ransac_bands.py`; over
+    /// ~40% of splats assigned means the band is too wide.
+    ///
+    /// Evidence is single-scene (`ARKitScenes` 48018538);
+    /// `docs/superpowers/specs/2026-08-20-pgsr-ablation-synthesis.md` §3.1, §6.
     #[arg(long, help_heading = "TIDI options", default_value = "-1.0")]
     #[serde(default = "default_plane_coplanarity_assign_dist")]
     pub plane_coplanarity_assign_dist: f32,
@@ -1066,6 +1370,24 @@ impl TrainConfig {
                 "depth-grad-sigma must be positive when depth-grad-aware is set".to_owned(),
             );
         }
+        // `--normal-ramp-start-iter 0` means the ramp is OFF, so a ramp LENGTH
+        // with no start would be silently inert. Reject rather than ignore:
+        // a config that quietly does nothing is the failure mode this whole
+        // default-inertness discipline exists to make impossible.
+        if self.normal_ramp_iters != 0 && self.normal_ramp_start_iter == 0 {
+            return Err(
+                "normal-ramp-iters requires a nonzero normal-ramp-start-iter (0 = ramp OFF)"
+                    .to_owned(),
+            );
+        }
+        if self.depth_normal_weight_end < 0.0 {
+            return Err("depth-normal-weight-end must not be negative".to_owned());
+        }
+        if !(self.normal_gate_degrees.is_finite()
+            && (0.0..=180.0).contains(&self.normal_gate_degrees))
+        {
+            return Err("normal-gate-degrees must be finite and in [0, 180]".to_owned());
+        }
         Ok(())
     }
 
@@ -1094,6 +1416,51 @@ impl TrainConfig {
         }
     }
 
+    /// Multiplier applied to BOTH `--normal-loss-weight` and the effective
+    /// `--depth-normal-weight` at `global_iter`.
+    ///
+    /// `normal_ramp_start_iter == 0` disables the ramp entirely and returns an
+    /// exact `1.0`, which is what makes the default byte-identical. Counts
+    /// global iterations.
+    pub fn normal_ramp_at(&self, global_iter: u32) -> f32 {
+        if self.normal_ramp_start_iter == 0 {
+            return 1.0;
+        }
+        linear_ramp_weight(
+            global_iter,
+            self.normal_ramp_start_iter,
+            self.normal_ramp_iters,
+        )
+    }
+
+    /// Effective `--depth-normal-weight` at `global_iter`, including the late
+    /// consistency bump. `depth_normal_weight_end == 0.0` disables the bump and
+    /// returns `depth_normal_weight` unchanged.
+    ///
+    /// Does NOT include `normal_ramp_at`; the two multiply at the call site.
+    pub fn depth_normal_weight_at(&self, global_iter: u32) -> f32 {
+        let w0 = self.depth_normal_weight;
+        if self.depth_normal_weight_end <= 0.0 {
+            return w0;
+        }
+        let t = linear_ramp_weight(
+            global_iter,
+            self.depth_normal_weight_end_start_iter,
+            self.depth_normal_weight_end_ramp_iters,
+        );
+        w0 + (self.depth_normal_weight_end - w0) * t
+    }
+
+    /// Cosine threshold for the per-pixel normal contradiction gate at
+    /// `global_iter`, or `None` when the gate is off or not yet armed.
+    ///
+    /// `None` is the pre-gate code path exactly; `normal_loss` takes this
+    /// straight through.
+    pub fn normal_gate_cos_at(&self, global_iter: u32) -> Option<f32> {
+        (self.normal_gate_degrees > 0.0 && global_iter >= self.normal_gate_start_iter)
+            .then(|| self.normal_gate_degrees.to_radians().cos())
+    }
+
     pub fn total_iters(&self) -> u32 {
         self.total_train_iters + self.lod_levels * self.lod_refine_steps
     }
@@ -1101,6 +1468,34 @@ impl TrainConfig {
     pub fn appearance_enabled(&self) -> bool {
         self.bilateral_grid || self.ppisp
     }
+}
+
+/// Linear ramp primitive: `0` before `start`, then
+/// `min(1, (step - start + 1) / ramp)`.
+///
+/// Taken from the `gauss-surf` PGSR trainer (rerun-io/examples-monorepo,
+/// Apache-2.0, by Pablo Vela), NOT from the PGSR paper — neither PGSR
+/// (arXiv:2406.06521) nor `NeuRIS` (arXiv:2206.13597) specifies a ramp shape at
+/// all, let alone this one. Credited here so a reader who wants to question the
+/// formula knows where to go and look.
+///
+/// **The `+ 1` is load-bearing and deliberate.** The ramp is NONZERO at the
+/// start step (it is `1/ramp`, not `0`) and saturates at `start + ramp - 1`,
+/// which is why `gauss-surf`'s saturation for `start=1400, ramp=875` is
+/// step 2274 rather than 2275. An off-by-one here is silent: the run trains
+/// fine, one step out of phase, and never exactly reproduces the reference.
+///
+/// `ramp == 0` degenerates to a hard step to `1.0` at `start`.
+pub fn linear_ramp_weight(step: u32, start: u32, ramp: u32) -> f32 {
+    if step < start {
+        return 0.0;
+    }
+    if ramp == 0 {
+        return 1.0;
+    }
+    // `step >= start`, so this cannot underflow.
+    let progressed = (step - start) as f32 + 1.0;
+    (progressed / ramp as f32).min(1.0)
 }
 
 fn parse_learning_rate(value: &str) -> Result<f64, String> {
@@ -1510,7 +1905,10 @@ mod tests {
             (def.plane_coplanarity_weight - 0.0).abs() < 1e-9,
             "co-planarity must default off (weight 0)"
         );
-        // assign-dist sentinel <= 0 means "fall back to the opacity-reg margin".
+        // assign-dist sentinel <= 0 means "derive the band from the seed cloud's
+        // measured NN spacing" (tidi::resolve_coplanarity_assign_dist). It used
+        // to mean "fall back to --depth-opacity-reg-margin", which was a
+        // different feature's knob in absolute units — see that function.
         assert!(def.plane_coplanarity_assign_dist <= 0.0);
 
         // Unrelated flags must not switch it on.
@@ -1573,15 +1971,18 @@ mod tests {
         assert_eq!(gated.depth_opacity_reg_start_iter, 15000);
 
         // Plane flags parse independently and do not imply any other switch.
+        // 20.0 is the measured working weight on a metric scene, not an
+        // arbitrary literal: the term is metres² where flatten is metres, so the
+        // magnitude here is the point (see the flag doc).
         let plane = TrainConfig::try_parse_from([
             "brush",
             "--plane-gate",
             "--plane-coplanarity-weight",
-            "0.05",
+            "20.0",
         ])
         .expect("--plane-gate / --plane-coplanarity-weight must parse");
         assert!(plane.plane_gate);
-        assert!((plane.plane_coplanarity_weight - 0.05).abs() < 1e-9);
+        assert!((plane.plane_coplanarity_weight - 20.0).abs() < 1e-9);
         assert!(!plane.tidi_prune, "plane flags must not imply photometric");
         assert!(
             (plane.depth_opacity_reg_weight - 0.0).abs() < 1e-9,
@@ -1748,5 +2149,292 @@ mod tests {
         lin_nz.depth_weight_end = 0.25;
         assert!((lin_nz.depth_weight_at(100) - 1.0).abs() < 1e-6);
         assert!((lin_nz.depth_weight_at(300) - 0.25).abs() < 1e-6);
+    }
+
+    // ------------------------------------------------------------------
+    // PGSR plane-render config surface (WS-L). Every one of these pins the
+    // DEFAULT to a value that leaves the trainer byte-identical to its
+    // pre-change behaviour; the parse half proves the flag is reachable.
+    // ------------------------------------------------------------------
+
+    /// `--depth-source` defaults to `center` (the alpha-composited camera-z of
+    /// splat means, i.e. exactly what the trainer did before the plane paths
+    /// existed) and round-trips all three values.
+    #[test]
+    fn depth_source_defaults_to_center_and_parses() {
+        let def = TrainConfig::default();
+        assert_eq!(def.depth_source, DepthSource::Center);
+
+        // An unrelated flag must not disturb it.
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert_eq!(other.depth_source, DepthSource::Center);
+
+        for (arg, want) in [
+            ("center", DepthSource::Center),
+            ("plane-aux", DepthSource::PlaneAux),
+            ("plane-fused", DepthSource::PlaneFused),
+        ] {
+            let cfg = TrainConfig::try_parse_from(["brush", "--depth-source", arg])
+                .unwrap_or_else(|e| panic!("--depth-source {arg} must parse: {e}"));
+            assert_eq!(cfg.depth_source, want);
+        }
+
+        assert!(TrainConfig::try_parse_from(["brush", "--depth-source", "plane"]).is_err());
+    }
+
+    /// The raw ramp primitive, pinned on its own because of the `+ 1`. The
+    /// reference's ramp is `min(1, (step - start + 1) / ramp)`, which is
+    /// NONZERO at the start step. An off-by-one here is silent: the run still
+    /// trains, it just supervises on a schedule that is one step out of phase
+    /// and never exactly reproduces the reference.
+    #[test]
+    fn linear_ramp_weight_is_nonzero_at_the_start_step() {
+        // Before the start: hard zero.
+        assert_eq!(linear_ramp_weight(1399, 1400, 875), 0.0);
+        // AT the start: 1/875, not 0.
+        assert!((linear_ramp_weight(1400, 1400, 875) - 1.0 / 875.0).abs() < 1e-9);
+        // Saturates at start + ramp - 1 = 2274 (the reference's stated value).
+        assert!((linear_ramp_weight(2273, 1400, 875) - 874.0 / 875.0).abs() < 1e-6);
+        assert_eq!(linear_ramp_weight(2274, 1400, 875), 1.0);
+        assert_eq!(linear_ramp_weight(u32::MAX, 1400, 875), 1.0);
+        // ramp == 0 is a hard step at `start`.
+        assert_eq!(linear_ramp_weight(99, 100, 0), 0.0);
+        assert_eq!(linear_ramp_weight(100, 100, 0), 1.0);
+    }
+
+    /// L1 ramp: default-inert, unrelated flags leave it, all five flags parse,
+    /// and `validate()` rejects the two nonsense combos.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn normal_ramp_defaults_noop_and_parse() {
+        let def = TrainConfig::default();
+        assert_eq!(def.normal_ramp_start_iter, 0);
+        assert_eq!(def.normal_ramp_iters, 0);
+        assert_eq!(def.depth_normal_weight_end, 0.0);
+        assert_eq!(def.depth_normal_weight_end_start_iter, 0);
+        assert_eq!(def.depth_normal_weight_end_ramp_iters, 0);
+
+        // Defaults: the ramp is EXACTLY 1.0 everywhere, so the two normal
+        // weights are multiplied by an exact identity.
+        for i in [0u32, 15_000, 30_000, u32::MAX] {
+            assert_eq!(def.normal_ramp_at(i), 1.0);
+        }
+
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert_eq!(other.normal_ramp_start_iter, 0);
+        assert_eq!(other.normal_ramp_iters, 0);
+        assert_eq!(other.depth_normal_weight_end, 0.0);
+        for i in [0u32, 15_000, u32::MAX] {
+            assert_eq!(other.normal_ramp_at(i), 1.0);
+        }
+
+        let on = TrainConfig::try_parse_from([
+            "brush",
+            "--normal-ramp-start-iter",
+            "3000",
+            "--normal-ramp-iters",
+            "1875",
+            "--depth-normal-weight-end",
+            "0.055",
+            "--depth-normal-weight-end-start-iter",
+            "11800",
+            "--depth-normal-weight-end-ramp-iters",
+            "1050",
+        ])
+        .expect("normal-ramp flags must parse");
+        assert_eq!(on.normal_ramp_start_iter, 3000);
+        assert_eq!(on.normal_ramp_iters, 1875);
+        assert!((on.depth_normal_weight_end - 0.055).abs() < 1e-9);
+        assert_eq!(on.depth_normal_weight_end_start_iter, 11800);
+        assert_eq!(on.depth_normal_weight_end_ramp_iters, 1050);
+
+        // validate(): a ramp length with no start is the silent-no-op trap.
+        let mut orphan = TrainConfig::default();
+        orphan.normal_ramp_iters = 1875;
+        assert!(orphan.validate().is_err());
+
+        // validate(): a negative end weight is rejected.
+        let mut neg = TrainConfig::default();
+        neg.depth_normal_weight_end = -0.1;
+        assert!(neg.validate().is_err());
+    }
+
+    /// `normal_ramp_at` schedule pins at the documented 15k recipe
+    /// (`--normal-ramp-start-iter 3000 --normal-ramp-iters 1875`).
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn normal_ramp_schedule_pins() {
+        let mut cfg = TrainConfig::default();
+        cfg.normal_ramp_start_iter = 3000;
+        cfg.normal_ramp_iters = 1875;
+
+        assert_eq!(cfg.normal_ramp_at(0), 0.0);
+        assert_eq!(cfg.normal_ramp_at(2999), 0.0);
+        // Nonzero AT the start step: (3000 - 3000 + 1) / 1875.
+        assert!((cfg.normal_ramp_at(3000) - 1.0 / 1875.0).abs() < 1e-9);
+        // Midpoint: (3937 - 3000 + 1) / 1875 = 938/1875.
+        assert!((cfg.normal_ramp_at(3937) - 938.0 / 1875.0).abs() < 1e-6);
+        // Saturates at start + ramp - 1.
+        assert_eq!(cfg.normal_ramp_at(3000 + 1875 - 1), 1.0);
+        assert_eq!(cfg.normal_ramp_at(15_000), 1.0);
+
+        // ramp 0 = hard step at start.
+        let mut step = TrainConfig::default();
+        step.normal_ramp_start_iter = 3000;
+        assert_eq!(step.normal_ramp_at(2999), 0.0);
+        assert_eq!(step.normal_ramp_at(3000), 1.0);
+    }
+
+    /// `depth_normal_weight_at`: identity at defaults, and the reference's
+    /// late consistency bump (0.50 -> 0.55 from 5500 over 500) when armed.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn depth_normal_weight_schedule_pins() {
+        let def = TrainConfig::default();
+        for i in [0u32, 15_000, u32::MAX] {
+            assert_eq!(def.depth_normal_weight_at(i), def.depth_normal_weight);
+        }
+
+        // Even with a base weight set, end == 0.0 means OFF -> constant.
+        let mut base_only = TrainConfig::default();
+        base_only.depth_normal_weight = 0.05;
+        for i in [0u32, 5_500, u32::MAX] {
+            assert_eq!(base_only.depth_normal_weight_at(i), 0.05);
+        }
+
+        // The reference bump, verbatim.
+        let mut bump = TrainConfig::default();
+        bump.depth_normal_weight = 0.50;
+        bump.depth_normal_weight_end = 0.55;
+        bump.depth_normal_weight_end_start_iter = 5500;
+        bump.depth_normal_weight_end_ramp_iters = 500;
+        assert!((bump.depth_normal_weight_at(5499) - 0.50).abs() < 1e-6);
+        // (5500 - 5500 + 1)/500 = 0.002 -> 0.50 + 0.05*0.002
+        assert!((bump.depth_normal_weight_at(5500) - (0.50 + 0.05 * 0.002)).abs() < 1e-6);
+        // Saturates at 5999 per the reference.
+        assert!((bump.depth_normal_weight_at(5999) - 0.55).abs() < 1e-6);
+        assert!((bump.depth_normal_weight_at(15_000) - 0.55).abs() < 1e-6);
+    }
+
+    /// L2 gate: default-inert and parses; `validate()` bounds the angle.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn normal_gate_defaults_noop_and_parse() {
+        let def = TrainConfig::default();
+        assert_eq!(def.normal_gate_degrees, 0.0);
+        assert_eq!(def.normal_gate_start_iter, 0);
+        // 0 degrees = OFF -> no cosine threshold is ever produced.
+        for i in [0u32, 15_000, u32::MAX] {
+            assert_eq!(def.normal_gate_cos_at(i), None);
+        }
+
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert_eq!(other.normal_gate_degrees, 0.0);
+        assert_eq!(other.normal_gate_start_iter, 0);
+
+        let on = TrainConfig::try_parse_from([
+            "brush",
+            "--normal-gate-degrees",
+            "30",
+            "--normal-gate-start-iter",
+            "5600",
+        ])
+        .expect("normal-gate flags must parse");
+        assert!((on.normal_gate_degrees - 30.0).abs() < 1e-9);
+        assert_eq!(on.normal_gate_start_iter, 5600);
+        assert_eq!(on.normal_gate_cos_at(5599), None);
+        let cos30 = on
+            .normal_gate_cos_at(5600)
+            .expect("gate is armed from its start iter");
+        assert!((cos30 - 30.0_f32.to_radians().cos()).abs() < 1e-6);
+
+        // §10d item 8: the boundary itself, stated in the unit the flag is
+        // written in. A 30-DEGREE gate must admit 29 degrees and reject 31.
+        // The comparison above is self-referential (it recomputes the same
+        // expression), so it cannot catch a caller-visible unit slip on its
+        // own; this can. A `cos(30)` that forgot `to_radians()` is 0.154, which
+        // both of these cosines clear, so the second assertion is the one that
+        // fires. 0.0086 separates cos(29) from cos(31) — about 7e4 f32 epsilons,
+        // so no rounding argument can move a normal across this line.
+        assert!(
+            29.0_f32.to_radians().cos() >= cos30,
+            "a 30-degree gate must admit a 29-degree disagreement"
+        );
+        assert!(
+            31.0_f32.to_radians().cos() < cos30,
+            "a 30-degree gate must reject a 31-degree disagreement"
+        );
+
+        // validate(): out-of-range angles are rejected.
+        for bad_deg in [-1.0, 180.5, f32::NAN] {
+            let mut bad = TrainConfig::default();
+            bad.normal_gate_degrees = bad_deg;
+            assert!(
+                bad.validate().is_err(),
+                "accepted normal-gate-degrees {bad_deg}"
+            );
+        }
+    }
+
+    /// L3 metric-weight normalization: default OFF and parses.
+    #[test]
+    fn normalize_metric_weights_defaults_off_and_parse() {
+        let def = TrainConfig::default();
+        assert!(!def.normalize_metric_weights);
+
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert!(!other.normalize_metric_weights);
+
+        let on = TrainConfig::try_parse_from(["brush", "--normalize-metric-weights"])
+            .expect("--normalize-metric-weights must parse");
+        assert!(on.normalize_metric_weights);
+    }
+
+    /// `--allow-nonfinite-loss` defaults OFF, i.e. a non-finite loss ABORTS.
+    ///
+    /// Note this is the one flag in this file whose inert default is not the
+    /// pre-change behaviour: before the guard existed, a NaN loss was silently
+    /// trained through. The default pinned here is the new, strict behaviour;
+    /// the flag exists to restore the old one deliberately rather than by
+    /// accident. See the field's doc comment.
+    #[test]
+    fn allow_nonfinite_loss_defaults_off_and_parse() {
+        let def = TrainConfig::default();
+        assert!(
+            !def.allow_nonfinite_loss,
+            "a non-finite loss must abort by default"
+        );
+
+        let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
+            .expect("unrelated flags must parse");
+        assert!(!other.allow_nonfinite_loss);
+
+        let on = TrainConfig::try_parse_from(["brush", "--allow-nonfinite-loss"])
+            .expect("--allow-nonfinite-loss must parse");
+        assert!(on.allow_nonfinite_loss);
+
+        // Serde default: a config file written before this flag existed still
+        // loads, and loads as the strict setting. Built by round-tripping a
+        // default config with the key REMOVED, which is exactly what an older
+        // file looks like — `TrainConfig` is not fully serde-defaulted, so a
+        // bare `{}` would fail on unrelated required fields and prove nothing.
+        let mut value =
+            serde_json::to_value(TrainConfig::default()).expect("config must serialize");
+        let removed = value
+            .as_object_mut()
+            .expect("config serializes to a JSON object")
+            .remove("allow-nonfinite-loss");
+        assert!(
+            removed.is_some(),
+            "the field must serialize under this key, or the removal below is a no-op \
+             and this test would pass vacuously"
+        );
+        let from_json: TrainConfig =
+            serde_json::from_value(value).expect("a config without the key must deserialize");
+        assert!(!from_json.allow_nonfinite_loss);
     }
 }

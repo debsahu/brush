@@ -1,5 +1,18 @@
 use burn::tensor::Tensor;
 
+/// Whether this build promotes NaN/Inf found in a validated tensor to a hard
+/// panic, rather than only logging.
+///
+/// Compiled from THIS crate's cfg, so a dependent crate reads the state
+/// `brush-render` was actually built with — which is not the same as its own.
+/// A workspace build unifies features, so `brush-render/debug-validation`
+/// requested by ONE crate's dev-dependencies (brush-bench-test does) is on for
+/// every crate in that build, while `cargo test -p <other>` alone has it off.
+/// Tests that deliberately feed non-finite tensors through the renderer must
+/// consult this rather than their own `cfg!(feature = ...)`, which would report
+/// the wrong answer in both directions.
+pub const HARD_FAILS_ON_NON_FINITE: bool = cfg!(any(test, feature = "debug-validation"));
+
 /// Scan a tensor for NaN / Inf and out-of-range values. Logs range
 /// violations; under `cfg(test)` / `debug-validation` NaN and Inf are
 /// promoted to hard panics so CI surfaces them.

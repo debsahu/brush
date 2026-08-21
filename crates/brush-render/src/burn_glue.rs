@@ -268,6 +268,45 @@ impl SplatRasterizerOps for Fusion<MainBackendBase> {
         pass: crate::gaussian_splats::RasterPass,
         rasterizer: Rasterizer,
     ) -> RenderOutput<Self> {
+        render_fusion_with_plane_aux(
+            camera,
+            img_size,
+            transforms,
+            sh_coeffs,
+            raw_opacities,
+            None,
+            render_mode,
+            raster_mode,
+            background,
+            pass,
+            rasterizer,
+        )
+        .await
+    }
+}
+
+/// Fusion-layer render with the optional PGSR plane-auxiliary input.
+///
+/// Body of [`SplatRasterizerOps::render_with_rasterizer`] for
+/// `Fusion<MainBackendBase>`; the trait method delegates with `plane_aux = None`
+/// so pre-existing callers are byte-identical. See
+/// [`crate::render::render_base_with_plane_aux`] for why this is a free function
+/// rather than a widened trait method.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn render_fusion_with_plane_aux(
+    camera: &Camera,
+    img_size: glam::UVec2,
+    transforms: FloatTensor<Fusion<MainBackendBase>>,
+    sh_coeffs: FloatTensor<Fusion<MainBackendBase>>,
+    raw_opacities: FloatTensor<Fusion<MainBackendBase>>,
+    plane_aux: Option<FloatTensor<Fusion<MainBackendBase>>>,
+    render_mode: SplatRenderMode,
+    raster_mode: RasterizationMode,
+    background: Vec3,
+    pass: crate::gaussian_splats::RasterPass,
+    rasterizer: Rasterizer,
+) -> RenderOutput<Fusion<MainBackendBase>> {
+    {
         let client = transforms.client.clone();
 
         // Resolve fusion inputs to MainBackendBase tensors. This
@@ -281,16 +320,19 @@ impl SplatRasterizerOps for Fusion<MainBackendBase> {
         let base_raw_opac = client
             .clone()
             .resolve_tensor_float::<MainBackendBase>(raw_opacities);
+        let base_plane_aux =
+            plane_aux.map(|t| client.clone().resolve_tensor_float::<MainBackendBase>(t));
 
         // Run the full pipeline on MainBackendBase. `render_with_rasterizer`
         // takes no `refine_weight`: the refine statistic is produced by the
         // rasterize backward, not the forward.
-        let out = <MainBackendBase as SplatRasterizerOps>::render_with_rasterizer(
+        let out = crate::render::render_base_with_plane_aux(
             camera,
             img_size,
             base_transforms,
             base_sh_coeffs,
             base_raw_opac,
+            base_plane_aux,
             render_mode,
             raster_mode,
             background,

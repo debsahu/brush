@@ -1,8 +1,11 @@
-use super::{DatasetFileIndex, DatasetLoadResult, FormatError, opengl_c2w_to_pose};
+use super::{
+    DatasetFileIndex, DatasetLoadResult, FormatError, find_depth_path, find_normal_path,
+    opengl_c2w_to_pose,
+};
 use crate::{
     Dataset,
     config::LoadDatasetConfig,
-    scene::{LoadImage, SceneView},
+    scene::{LoadDepth, LoadImage, LoadNormal, SceneView},
 };
 use brush_render::camera::fov_to_focal;
 use brush_render::camera::{Camera, focal_to_fov};
@@ -100,6 +103,20 @@ struct FrameData {
 
     transform_matrix: Vec<Vec<f32>>,
     file_path: String,
+
+    /// Optional per-frame depth prior, nerfstudio's own key. Path is relative
+    /// to the transforms file, exactly like `file_path`. Contents must be a
+    /// single-channel float32 TIFF in metres with `0` = invalid — see
+    /// [`crate::load_depth::LoadDepth`]; the loader does **not** resize it, so
+    /// it has to match the resolution the image is loaded at.
+    depth_file_path: Option<String>,
+
+    /// Optional per-frame surface-normal prior. Not part of the nerfstudio
+    /// spec, but the natural sibling of `depth_file_path` and the same key the
+    /// COLMAP-side `normal/` convention resolves to. 3-channel float32 TIFF,
+    /// camera-frame `OpenCV` unit normals, `(0, 0, 0)` = invalid — see
+    /// [`crate::load_normal::LoadNormal`]. Also never resized.
+    normal_file_path: Option<String>,
 }
 
 /// Build a `CameraModel` from a nerfstudio `camera_model` string and the
@@ -115,7 +132,12 @@ fn resolve_camera_model(
 ) -> Result<CameraModel, FormatError> {
     let f = |o: Option<f64>| o.unwrap_or(0.0) as f32;
     match model_name {
-        None | Some("PERSPECTIVE" | "perspective") => Ok(Pinhole),
+        // `PINHOLE` is COLMAP's name for the same zero-distortion model, and it
+        // turns up in transforms.json routinely (SplatCam writes it; the LFS
+        // recipes push people toward PINHOLE everywhere). Genuinely unsupported
+        // model names still hard-error below -- a silently substituted camera
+        // model is worse than a failed load.
+        None | Some("PERSPECTIVE" | "perspective" | "PINHOLE" | "pinhole") => Ok(Pinhole),
         Some("OPENCV" | "opencv") => Ok(RadialTangential8(RadialTangential8Params {
             k1: f(k1),
             k2: f(k2),
@@ -177,6 +199,47 @@ async fn read_transforms_file(
         };
 
         let mask_path = file_index.find_mask_path(&path).map(Path::to_path_buf);
+
+        // Geometry priors. An explicit `depth_file_path` / `normal_file_path`
+        // in the json wins; otherwise fall back to the same `depth/<stem>` /
+        // `normal/<stem>` directory convention the COLMAP loader uses
+        // (`super::find_prior_path`), so one on-disk layout feeds either
+        // loader. Before this, both were hardcoded `None` here and the depth
+        // and normal supervision silently no-opped on every nerfstudio
+        // dataset — which is why `ingest/splatcam/splatcam_to_brush.py`
+        // transcodes to COLMAP format instead.
+        let depth = match frame.depth_file_path.as_deref() {
+            Some(declared) => {
+                resolve_declared_prior_path(
+                    &vfs,
+                    transforms_path,
+                    declared,
+                    &frame.file_path,
+                    "depth",
+                    warnings,
+                )
+                .await
+            }
+            None => find_depth_path(&vfs, &path).map(Path::to_path_buf),
+        }
+        .map(|p| LoadDepth::new(vfs.clone(), p));
+
+        let normal = match frame.normal_file_path.as_deref() {
+            Some(declared) => {
+                resolve_declared_prior_path(
+                    &vfs,
+                    transforms_path,
+                    declared,
+                    &frame.file_path,
+                    "normal",
+                    warnings,
+                )
+                .await
+            }
+            None => find_normal_path(&vfs, &path).map(Path::to_path_buf),
+        }
+        .map(|p| LoadNormal::new(vfs.clone(), p));
+
         let image = LoadImage::new(
             vfs.clone(),
             path,
@@ -258,12 +321,43 @@ async fn read_transforms_file(
             image,
             camera,
             features: None,
-            depth: None,
-            normal: None,
+            depth,
+            normal,
         };
         results.push(view);
     }
     Ok(results)
+}
+
+/// Resolve a prior path explicitly declared by a frame (`depth_file_path` /
+/// `normal_file_path`). Interpreted relative to the transforms file, exactly
+/// like `file_path`, and no extension guessing — priors are written with a
+/// real extension by every generator we have.
+///
+/// A key that names a file the VFS does not hold produces a **warning** rather
+/// than a silent `None`: an ignored prior is invisible in the loss curves, so
+/// it must be loud at load time.
+async fn resolve_declared_prior_path(
+    vfs: &BrushVfs,
+    transforms_path: &Path,
+    declared: &str,
+    frame_path: &str,
+    kind: &str,
+    warnings: &mut Vec<String>,
+) -> Option<std::path::PathBuf> {
+    let path = transforms_path
+        .parent()
+        .expect("Transforms path must be a filename")
+        .join(declared);
+
+    if vfs.reader_at_path(&path).await.is_ok() {
+        Some(path)
+    } else {
+        warnings.push(format!(
+            "Frame '{frame_path}': {kind} prior '{declared}' not found, ignoring it"
+        ));
+        None
+    }
 }
 
 async fn resolve_frame_image_path(
@@ -436,6 +530,218 @@ mod tests {
         assert_eq!(
             resolve_frame_image_path(&vfs, Path::new("transforms.json"), "images/frame_001").await,
             Some(PathBuf::from("images/frame_001.png"))
+        );
+    }
+}
+
+/// Prior discovery needs a real on-disk dataset (tempfile + fs), so these live
+/// in a native-only module, in the style of the COLMAP loader's tests.
+#[cfg(all(test, not(target_family = "wasm")))]
+mod prior_tests {
+    use crate::formats::prior_test_support::{test_config, write_depth_tiff, write_normal_tiff};
+    use crate::formats::{DatasetError, DatasetLoadResult, FormatError, load_dataset};
+    use brush_render::kernels::camera_model::CameraModel;
+    use brush_vfs::BrushVfs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    const IMG_W: u32 = 4;
+    const IMG_H: u32 = 3;
+
+    /// `transforms.json` with a single frame, plus that frame's PNG. Extra
+    /// scene-level and per-frame keys are spliced in as raw json so each test
+    /// can declare exactly what it means to exercise.
+    async fn write_dataset(dir: &Path, extra_scene_keys: &str, extra_frame_keys: &str) {
+        let transforms = format!(
+            r#"{{
+                "fl_x": 4.0, "fl_y": 3.0, "cx": 2.0, "cy": 1.5,
+                "w": {IMG_W}, "h": {IMG_H}{extra_scene_keys},
+                "frames": [
+                    {{
+                        "file_path": "images/frame_001.png",
+                        "transform_matrix": [
+                            [1.0, 0.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0, 0.0],
+                            [0.0, 0.0, 1.0, 0.0],
+                            [0.0, 0.0, 0.0, 1.0]
+                        ]{extra_frame_keys}
+                    }}
+                ]
+            }}"#
+        );
+        tokio::fs::write(dir.join("transforms.json"), transforms)
+            .await
+            .expect("write transforms.json");
+
+        let images_dir = dir.join("images");
+        tokio::fs::create_dir_all(&images_dir)
+            .await
+            .expect("create images dir");
+        image::RgbImage::from_pixel(IMG_W, IMG_H, image::Rgb([10, 20, 30]))
+            .save(images_dir.join("frame_001.png"))
+            .expect("write png");
+    }
+
+    async fn load(dir: &Path) -> DatasetLoadResult {
+        try_load(dir).await.expect("load")
+    }
+
+    async fn try_load(dir: &Path) -> Result<DatasetLoadResult, DatasetError> {
+        let vfs = Arc::new(BrushVfs::from_path(dir).await.expect("build vfs"));
+        load_dataset(vfs, &test_config()).await
+    }
+
+    /// The COLMAP-side `depth/<stem>.tiff` + `normal/<stem>.tiff` layout must
+    /// resolve here too -- that is the whole point of mirroring the convention.
+    #[tokio::test]
+    async fn discovers_priors_by_directory_convention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_dataset(dir.path(), "", "").await;
+        write_depth_tiff(&dir.path().join("depth/frame_001.tiff"), IMG_W, IMG_H).await;
+        write_normal_tiff(&dir.path().join("normal/frame_001.tiff"), IMG_W, IMG_H).await;
+
+        let result = load(dir.path()).await;
+        let view = &result.dataset.train.views[0];
+
+        assert_eq!(
+            view.depth.as_ref().map(|d| d.path().to_path_buf()),
+            Some(PathBuf::from("depth/frame_001.tiff")),
+        );
+        assert_eq!(
+            view.normal.as_ref().map(|n| n.path().to_path_buf()),
+            Some(PathBuf::from("normal/frame_001.tiff")),
+        );
+
+        // Loading actually decodes at the image's own resolution: this is the
+        // no-resize contract, and a wrong-sized prior is an error, not a warp.
+        let depth = view
+            .depth
+            .as_ref()
+            .expect("depth prior")
+            .load(IMG_H as usize, IMG_W as usize)
+            .await
+            .expect("depth must decode at the image resolution");
+        assert_eq!(depth.shape, vec![IMG_H as usize, IMG_W as usize].into());
+
+        let normal = view
+            .normal
+            .as_ref()
+            .expect("normal prior")
+            .load(IMG_H as usize, IMG_W as usize)
+            .await
+            .expect("normal must decode at the image resolution");
+        assert_eq!(normal.shape, vec![IMG_H as usize, IMG_W as usize, 3].into());
+    }
+
+    /// Explicit per-frame keys win, and may point anywhere relative to the
+    /// transforms file -- not just at the conventional directories.
+    #[tokio::test]
+    async fn declared_frame_keys_resolve() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_dataset(
+            dir.path(),
+            "",
+            ",\n \"depth_file_path\": \"priors/d/frame_001.tiff\",\n \
+             \"normal_file_path\": \"priors/n/frame_001.tiff\"",
+        )
+        .await;
+        write_depth_tiff(&dir.path().join("priors/d/frame_001.tiff"), IMG_W, IMG_H).await;
+        write_normal_tiff(&dir.path().join("priors/n/frame_001.tiff"), IMG_W, IMG_H).await;
+
+        let result = load(dir.path()).await;
+        let view = &result.dataset.train.views[0];
+
+        assert_eq!(
+            view.depth.as_ref().map(|d| d.path().to_path_buf()),
+            Some(PathBuf::from("priors/d/frame_001.tiff")),
+        );
+        assert_eq!(
+            view.normal.as_ref().map(|n| n.path().to_path_buf()),
+            Some(PathBuf::from("priors/n/frame_001.tiff")),
+        );
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    /// Default-inertness pin: a dataset with no priors loads exactly as before,
+    /// with no warnings and no priors invented.
+    #[tokio::test]
+    async fn dataset_without_priors_is_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_dataset(dir.path(), "", "").await;
+
+        let result = load(dir.path()).await;
+        let views = &result.dataset.train.views;
+        assert_eq!(views.len(), 1);
+        assert!(views[0].depth.is_none());
+        assert!(views[0].normal.is_none());
+        assert!(views[0].features.is_none());
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    /// A declared prior that is not on disk must be loud. A silent `None` here
+    /// is exactly the failure this loader is being fixed for.
+    #[tokio::test]
+    async fn declared_prior_that_is_missing_warns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_dataset(
+            dir.path(),
+            "",
+            ",\n \"normal_file_path\": \"normal/nope.tiff\"",
+        )
+        .await;
+
+        let result = load(dir.path()).await;
+        assert!(result.dataset.train.views[0].normal.is_none());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("normal") && w.contains("nope.tiff")),
+            "expected a warning naming the missing prior, got {:?}",
+            result.warnings
+        );
+    }
+
+    /// `PINHOLE` is COLMAP's spelling of the zero-distortion model and shows up
+    /// in real transforms.json files (`SplatCam` writes it). It used to fail the
+    /// whole load.
+    #[tokio::test]
+    async fn accepts_pinhole_camera_model() {
+        for spelling in ["PINHOLE", "pinhole", "PERSPECTIVE", "perspective"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_dataset(
+                dir.path(),
+                &format!(", \"camera_model\": \"{spelling}\""),
+                "",
+            )
+            .await;
+
+            let result = load(dir.path()).await;
+            let cam = &result.dataset.train.views[0].camera;
+            assert!(
+                matches!(cam.camera_model, CameraModel::Pinhole),
+                "`{spelling}` must resolve to a pinhole camera",
+            );
+        }
+    }
+
+    /// ...but an unknown model still hard-errors. A silently substituted camera
+    /// model would train a wrong scene without ever saying so.
+    #[tokio::test]
+    async fn rejects_an_unknown_camera_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_dataset(dir.path(), ", \"camera_model\": \"EQUIRECTANGULAR\"", "").await;
+
+        // `DatasetLoadResult` isn't `Debug`, so unwrap the Err arm by hand.
+        let Err(err) = try_load(dir.path()).await else {
+            panic!("an unsupported camera model must fail the load");
+        };
+        assert!(
+            matches!(
+                err,
+                DatasetError::FormatError(FormatError::InvalidCamera(_))
+            ),
+            "expected an InvalidCamera error, got {err:?}"
         );
     }
 }

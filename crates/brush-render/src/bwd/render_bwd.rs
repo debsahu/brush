@@ -94,6 +94,8 @@ fn rasterize_bwd_impl(
     projected_splats: FloatTensor<MainBackendBase>,
     compact_gid_from_isect: IntTensor<MainBackendBase>,
     tile_offsets: IntTensor<MainBackendBase>,
+    plane_aux: Option<FloatTensor<MainBackendBase>>,
+    global_from_compact_gid: IntTensor<MainBackendBase>,
     background: Vec3,
     img_size: glam::UVec2,
     v_output: FloatTensor<MainBackendBase>,
@@ -101,6 +103,7 @@ fn rasterize_bwd_impl(
     smooth_cutoff: bool,
     compute_refine_weight: bool,
     render_depth: bool,
+    render_plane: bool,
     trusted_forward: bool,
 ) -> RasterizeGrads<MainBackendBase> {
     let _span = tracing::trace_span!("rasterize_bwd").entered();
@@ -110,11 +113,46 @@ fn rasterize_bwd_impl(
     let num_visible = projected_splats.shape()[0].max(1);
     let client = projected_splats.client.clone();
 
+    assert!(
+        !render_plane || plane_aux.is_some(),
+        "plane-mode raster backward requires the [N, PLANE_AUX_LANES] forward input"
+    );
+    // Bound unconditionally; every access is comptime-removed when
+    // `render_plane` is false. Matches the forward's placeholder binding.
+    //
+    // The row count is validated in the forward (`render_base_with_plane_aux`)
+    // against the splat count, and the backward reuses that exact tensor
+    // handle. This entry point is also reachable directly from the in-crate
+    // gradient tests with a hand-built buffer, so re-check what is checkable
+    // here: `num_visible` is not the splat count, so the rows cannot be pinned,
+    // but the rank and lane count can — and those are what make
+    // `plane_aux[global_gid * PLANE_AUX_LANES + 3]` addressable under
+    // `launch_unchecked`.
+    let plane_aux = plane_aux.map_or_else(
+        || MainBackendBase::float_zeros([1].into(), &device, FloatDType::F32),
+        |plane_aux| {
+            let shape = plane_aux.shape();
+            assert_eq!(
+                shape.rank(),
+                2,
+                "plane_aux must be rank 2 [total_splats, PLANE_AUX_LANES]"
+            );
+            assert_eq!(
+                shape[1],
+                crate::kernels::helpers::PLANE_AUX_LANES_USIZE,
+                "plane_aux must have PLANE_AUX_LANES columns",
+            );
+            into_contiguous(plane_aux)
+        },
+    );
+
     // Sparse [num_visible, COMPACT_GRAD_LANES] indexed by compact_gid. Lane 10
-    // is the expected-depth gradient (zero/unused when render_depth is false).
-    // The stride is owned by kernels::rasterize_backwards::COMPACT_GRAD_LANES so
-    // this allocation, the rasterize/project readers, and the coalesced SH-grad
-    // materializer can never disagree on the lane count.
+    // is the expected-depth gradient (zero/unused when render_depth is false);
+    // lanes 11..=14 are the PGSR plane-aux value gradients (likewise zero unless
+    // render_plane). The stride is owned by
+    // kernels::rasterize_backwards::COMPACT_GRAD_LANES so this allocation, the
+    // rasterize/project readers, the coalesced SH-grad materializer and the
+    // sparse SH-Adam consumer can never disagree on the lane count.
     let v_combined = MainBackendBase::float_zeros(
         [
             num_visible,
@@ -182,6 +220,8 @@ fn rasterize_bwd_impl(
                     compact_gid_from_isect.into_tensor_arg(),
                     tile_offsets.into_tensor_arg(),
                     projected_splats.into_tensor_arg(),
+                    plane_aux.into_tensor_arg(),
+                    global_from_compact_gid.into_tensor_arg(),
                     out_img.into_tensor_arg(),
                     v_output.into_tensor_arg(),
                     v_combined.clone().into_tensor_arg(),
@@ -191,6 +231,7 @@ fn rasterize_bwd_impl(
                     tile_width,
                     tile_height,
                     render_depth,
+                    render_plane,
                 );
             }
         } else if hard_floats {
@@ -201,6 +242,8 @@ fn rasterize_bwd_impl(
                 compact_gid_from_isect.into_tensor_arg(),
                 tile_offsets.into_tensor_arg(),
                 projected_splats.into_tensor_arg(),
+                plane_aux.into_tensor_arg(),
+                global_from_compact_gid.into_tensor_arg(),
                 out_img.into_tensor_arg(),
                 v_output.into_tensor_arg(),
                 v_combined.clone().into_tensor_arg(),
@@ -210,6 +253,7 @@ fn rasterize_bwd_impl(
                 tile_width,
                 tile_height,
                 render_depth,
+                render_plane,
             );
         } else {
             // Keep bounds checks for the CAS fallback: its weak-CAS retry loop does not meet
@@ -221,6 +265,8 @@ fn rasterize_bwd_impl(
                 compact_gid_from_isect.into_tensor_arg(),
                 tile_offsets.into_tensor_arg(),
                 projected_splats.into_tensor_arg(),
+                plane_aux.into_tensor_arg(),
+                global_from_compact_gid.into_tensor_arg(),
                 out_img.into_tensor_arg(),
                 v_output.into_tensor_arg(),
                 v_combined.clone().into_tensor_arg(),
@@ -230,6 +276,7 @@ fn rasterize_bwd_impl(
                 tile_width,
                 tile_height,
                 render_depth,
+                render_plane,
             );
         }
     });
@@ -244,17 +291,22 @@ impl SplatBwdOps for MainBackendBase {
         projected_splats: FloatTensor<Self>,
         compact_gid_from_isect: IntTensor<Self>,
         tile_offsets: IntTensor<Self>,
+        plane_aux: Option<FloatTensor<Self>>,
+        global_from_compact_gid: IntTensor<Self>,
         background: Vec3,
         img_size: glam::UVec2,
         v_output: FloatTensor<Self>,
         smooth_cutoff: bool,
         render_depth: bool,
+        render_plane: bool,
     ) -> RasterizeGrads<Self> {
         rasterize_bwd_impl(
             out_img,
             projected_splats,
             compact_gid_from_isect,
             tile_offsets,
+            plane_aux,
+            global_from_compact_gid,
             background,
             img_size,
             v_output,
@@ -262,6 +314,7 @@ impl SplatBwdOps for MainBackendBase {
             smooth_cutoff,
             true,
             render_depth,
+            render_plane,
             false,
         )
     }
@@ -272,18 +325,23 @@ impl SplatBwdOps for MainBackendBase {
         projected_splats: FloatTensor<Self>,
         compact_gid_from_isect: IntTensor<Self>,
         tile_offsets: IntTensor<Self>,
+        plane_aux: Option<FloatTensor<Self>>,
+        global_from_compact_gid: IntTensor<Self>,
         background: Vec3,
         img_size: glam::UVec2,
         v_output: FloatTensor<Self>,
         smooth_cutoff: bool,
         compute_refine_weight: bool,
         render_depth: bool,
+        render_plane: bool,
     ) -> RasterizeGrads<Self> {
         rasterize_bwd_impl(
             out_img,
             projected_splats,
             compact_gid_from_isect,
             tile_offsets,
+            plane_aux,
+            global_from_compact_gid,
             background,
             img_size,
             v_output,
@@ -291,6 +349,7 @@ impl SplatBwdOps for MainBackendBase {
             smooth_cutoff,
             compute_refine_weight,
             render_depth,
+            render_plane,
             false,
         )
     }
@@ -511,6 +570,8 @@ impl InternalSplatBwdOps for MainBackendBase {
             projected_splats,
             compact_gid_from_isect,
             tile_offsets,
+            plane_aux,
+            global_from_compact_gid,
             background,
             img_size,
             v_output,
@@ -518,12 +579,15 @@ impl InternalSplatBwdOps for MainBackendBase {
             smooth_cutoff,
             compute_refine_weight,
             render_depth,
+            render_plane,
         ) = input.into_parts();
         rasterize_bwd_impl(
             out_img,
             projected_splats,
             compact_gid_from_isect,
             tile_offsets,
+            plane_aux,
+            global_from_compact_gid,
             background,
             img_size,
             v_output,
@@ -531,6 +595,7 @@ impl InternalSplatBwdOps for MainBackendBase {
             smooth_cutoff,
             compute_refine_weight,
             render_depth,
+            render_plane,
             true,
         )
     }

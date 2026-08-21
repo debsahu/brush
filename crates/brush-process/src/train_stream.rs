@@ -204,6 +204,12 @@ pub(crate) async fn train_stream(
         process_config.seed,
     );
     trainer.set_view_cams(view_cams.clone());
+    // Fixed scene scale for `--normalize-metric-weights`, captured ONCE here
+    // from the full training pose set. Deliberately not re-supplied at the LOD
+    // boundaries below (the setter is one-shot anyway): a moving scale would
+    // drift the effective metric weights mid-run. A no-op without the flag.
+    let train_cameras: Vec<_> = dataset.train.views.iter().map(|view| view.camera).collect();
+    trainer.set_init_scene_scale(&train_cameras);
 
     // Depth-coupled opacity regularizer: build the static distance-to-cloud grid
     // ONCE from the seed point cloud (the measured surface the run is seeded
@@ -420,6 +426,12 @@ pub(crate) async fn train_stream(
                         .replace(".ply", &format!("_lod{current_lod}.ply"));
                     (lod_name, lod_refine_steps, lod_refine_steps)
                 };
+                // Never write a non-finite splat to disk. See the sweep before
+                // the periodic export below for the full rationale.
+                let (swept, _) = trainer
+                    .prune_non_finite_splats(iter, splats, "pre-export (LOD boundary)")
+                    .await;
+                splats = swept;
                 let res = export_checkpoint(
                     splats.clone(),
                     &export_path,
@@ -544,10 +556,15 @@ pub(crate) async fn train_stream(
 
         let refine_start = Instant::now();
         let stop_refine_iter = train_stream_config.train_config.stop_refine_iter;
+        // Named once, and consumed twice: by the refine gate itself and by the
+        // non-finite sweep further down, which only needs to run in the window
+        // where refinement is NO LONGER pruning. De Morgan of the two clauses
+        // that used to sit inline in the condition below — same gate, one name.
+        let refinement_stopped =
+            phase_progress > 0.95 || (stop_refine_iter != 0 && iter >= stop_refine_iter);
         let refine = if phase_iter > 0
             && phase_iter.is_multiple_of(train_stream_config.train_config.refine_every)
-            && phase_progress <= 0.95
-            && (stop_refine_iter == 0 || iter < stop_refine_iter)
+            && !refinement_stopped
         {
             let (new_splats, refine_stats) = trainer
                 .refine_for_phase(iter, phase_iter, phase_total, splats)
@@ -585,6 +602,32 @@ pub(crate) async fn train_stream(
 
         let step_dur = step_time.elapsed();
         train_duration += step_dur;
+
+        // --- Non-finite splat sweep, on the eval cadence, once refinement has
+        // stopped ---
+        //
+        // The prune inside `refine_for_phase` covers the whole refining phase,
+        // so the only unguarded window is the tail after refinement stops —
+        // which is also the longest stretch and the one immediately before the
+        // final export. Measured consequence of leaving it unguarded: 14-25
+        // non-finite splats in every exported ARKitScenes ply.
+        //
+        // Ride the eval cadence rather than a new one: eval already
+        // synchronises heavily, so the sweep's count readback is not a new
+        // stall. Deliberately NOT gated on an eval scene existing — a run
+        // without holdout views needs the sweep just as much.
+        //
+        // Byte-identity: `prune_non_finite_splats` returns before touching any
+        // state when the count is zero, so a clean run is unchanged.
+        if current_lod == 0
+            && refinement_stopped
+            && (iter % process_config.eval_every == 0 || iter == training_steps)
+        {
+            let (swept, _) = trainer
+                .prune_non_finite_splats(iter, splats, "eval cadence")
+                .await;
+            splats = swept;
+        }
 
         // Do evals. We skip this for LODs as it'd be confusing for rerun, but, could
         // revisit this.
@@ -647,6 +690,19 @@ pub(crate) async fn train_stream(
                 // `export_checkpoint`'s own substitution below becomes a no-op.
                 let digits = ((exp_total as f64).log10().floor() as usize) + 1;
                 let name = name.replace("{iter}", &format!("{exp_iter:0digits$}"));
+
+                // Unconditional sweep immediately before the file is written.
+                // This is the backstop: the cadenced sweeps above can still be
+                // outrun by a splat that goes non-finite on the very last step,
+                // and a non-finite value in an exported ply is not a
+                // three-splat problem — it poisons an entire SOG codebook at
+                // Stage 7, taking the whole scene down. `prune_non_finite_splats`
+                // reindexes the DiG table in lockstep, so the sidecar exported
+                // just below still matches the ply row for row.
+                let (swept, _) = trainer
+                    .prune_non_finite_splats(iter, splats, "pre-export")
+                    .await;
+                splats = swept;
 
                 let res = export_checkpoint(
                     splats.clone(),

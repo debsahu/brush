@@ -12,7 +12,10 @@ use crate::{
 };
 use brush_cube::{MainBackendBase, Runtime};
 use burn::{
-    backend::{TensorMetadata, ops::FloatTensorOps},
+    backend::{
+        TensorMetadata,
+        ops::{FloatTensorOps, IntTensorOps},
+    },
     tensor::{DType, TensorData},
 };
 use burn_wgpu::{CubeTensor, WgpuDevice, WgpuRuntime};
@@ -29,8 +32,19 @@ use wasm_bindgen_test::wasm_bindgen_test;
 // The RGBA forward composite below uses lanes 0..=8 only; the depth lane (9) is
 // carried in the buffer but not blended into the color output.
 const PROJECTED_LANES: usize = crate::kernels::helpers::PROJECTED_LANES as usize;
+/// Lanes per splat in the PGSR plane-auxiliary buffer. Sourced from the same
+/// shared constant the kernels use — see the note above; this file was itself a
+/// casualty of a re-literalized stride once already.
+const PLANE_AUX_LANES: usize = crate::kernels::helpers::PLANE_AUX_LANES_USIZE;
 const ALPHA_CUTOFF_MID: f32 = 1.0 / 255.0;
 const ALPHA_CUTOFF_BAND: f32 = 1.0e-3;
+
+/// Channels the backward-enabled rendered image carries for a given mode.
+/// Derived, never restated — same constant the forward kernel, the backward's
+/// `pix_state`, and the host `out_dim` allocation all use.
+fn out_channels(render_depth: bool, render_plane: bool) -> usize {
+    crate::kernels::helpers::raster_out_channels(render_depth, render_plane) as usize
+}
 
 #[cfg(target_family = "wasm")]
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
@@ -52,17 +66,48 @@ fn rasterize_reference(
     background: Vec3,
     smooth_cutoff: bool,
 ) -> Vec<f32> {
-    assert_eq!(projected.len() % PROJECTED_LANES, 0);
+    rasterize_reference_full(projected, None, false, img_size, background, smooth_cutoff)
+}
 
-    let mut image = vec![0.0; img_size.x as usize * img_size.y as usize * 4];
+/// As [`rasterize_reference`], but also compositing the centre-depth lane and
+/// the four PGSR plane-auxiliary lanes.
+///
+/// `plane_compact` is `[num_splats * PLANE_AUX_LANES]` in the SAME order as
+/// `projected` (i.e. compact / depth-sorted), so the caller does the
+/// compact -> global permutation the kernel does with
+/// `global_from_compact_gid`. Keeping the permutation on the caller's side is
+/// deliberate: the oracle then reproduces the composite from first principles
+/// and an indexing bug in the kernel's own lookup cannot hide in both.
+///
+/// Depth and the plane lanes have NO background term (matching the kernel) and
+/// are raw composited sums with no alpha division.
+pub(super) fn rasterize_reference_full(
+    projected: &[f32],
+    plane_compact: Option<&[f32]>,
+    render_depth: bool,
+    img_size: UVec2,
+    background: Vec3,
+    smooth_cutoff: bool,
+) -> Vec<f32> {
+    assert_eq!(projected.len() % PROJECTED_LANES, 0);
+    let num_splats = projected.len() / PROJECTED_LANES;
+    if let Some(plane) = plane_compact {
+        assert_eq!(plane.len(), num_splats * PLANE_AUX_LANES);
+    }
+
+    let chans = out_channels(render_depth, plane_compact.is_some());
+    let plane_off = crate::kernels::helpers::plane_channel_offset(render_depth) as usize;
+    let mut image = vec![0.0; img_size.x as usize * img_size.y as usize * chans];
     for y in 0..img_size.y {
         for x in 0..img_size.x {
             let pixel_x = x as f32 + 0.5;
             let pixel_y = y as f32 + 0.5;
             let mut transmittance = 1.0f32;
             let mut rgb = Vec3::ZERO;
+            let mut depth = 0.0f32;
+            let mut plane = [0.0f32; PLANE_AUX_LANES];
 
-            for splat in projected.chunks_exact(PROJECTED_LANES) {
+            for (index, splat) in projected.chunks_exact(PROJECTED_LANES).enumerate() {
                 let dx = pixel_x - splat[0];
                 let dy = pixel_y - splat[1];
                 let sigma = 0.5 * (splat[2] * dx * dx + splat[4] * dy * dy) + splat[3] * dx * dy;
@@ -82,16 +127,30 @@ fn rasterize_reference(
                     rgb.x += splat[6].max(0.0) * visibility;
                     rgb.y += splat[7].max(0.0) * visibility;
                     rgb.z += splat[8].max(0.0) * visibility;
+                    if render_depth {
+                        depth += splat[9] * visibility;
+                    }
+                    if let Some(aux) = plane_compact {
+                        for (lane, value) in plane.iter_mut().enumerate() {
+                            *value += aux[index * PLANE_AUX_LANES + lane] * visibility;
+                        }
+                    }
                     transmittance = next_transmittance;
                 }
             }
 
             rgb += background * transmittance;
-            let base = ((y * img_size.x + x) * 4) as usize;
+            let base = (y as usize * img_size.x as usize + x as usize) * chans;
             image[base] = rgb.x;
             image[base + 1] = rgb.y;
             image[base + 2] = rgb.z;
             image[base + 3] = 1.0 - transmittance;
+            if render_depth {
+                image[base + 4] = depth;
+            }
+            if plane_compact.is_some() {
+                image[base + plane_off..base + plane_off + PLANE_AUX_LANES].copy_from_slice(&plane);
+            }
         }
     }
     image
@@ -181,20 +240,26 @@ async fn read_f32(tensor: CubeTensor<WgpuRuntime>) -> Vec<f32> {
     data.as_slice::<f32>().expect("f32 tensor").to_vec()
 }
 
-async fn render_test_scene(
-    rasterizer: Rasterizer,
-    pass: RasterPass,
-    img_size: UVec2,
-) -> (Vec<f32>, Vec<f32>, u32, [usize; 3]) {
-    let device = brush_cube::test_helpers::test_device().await;
-    let camera = Camera::new(
+/// Camera shared by every oracle scene.
+fn oracle_camera() -> Camera {
+    Camera::new(
         glam::vec3(0.0, 0.0, -3.0),
         glam::Quat::IDENTITY,
         0.6,
         0.6,
         glam::vec2(0.5, 0.5),
         CameraModel::Pinhole,
-    );
+    )
+}
+
+/// Flat host-side buffers for the shared oracle scene.
+struct OracleScene {
+    transforms: Vec<f32>,
+    sh: Vec<f32>,
+    raw_opacity: Vec<f32>,
+}
+
+fn oracle_scene() -> OracleScene {
     let means = [
         [0.00, 0.00, 0.00],
         [0.08, -0.04, 0.07],
@@ -230,12 +295,28 @@ async fn render_test_scene(
     ];
     let raw_opacity = [3.6, 3.1, 2.8, 3.4, 3.0, 3.8];
 
+    OracleScene {
+        transforms,
+        sh: sh.to_vec(),
+        raw_opacity: raw_opacity.to_vec(),
+    }
+}
+
+async fn render_test_scene(
+    rasterizer: Rasterizer,
+    pass: RasterPass,
+    img_size: UVec2,
+) -> (Vec<f32>, Vec<f32>, u32, [usize; 3]) {
+    let device = brush_cube::test_helpers::test_device().await;
+    let scene = oracle_scene();
+    let num_splats = scene.raw_opacity.len();
+
     let output = <MainBackendBase as crate::SplatRasterizerOps>::render_with_rasterizer(
-        &camera,
+        &oracle_camera(),
         img_size,
-        cube_tensor(&device, [means.len(), 10], &transforms),
-        cube_tensor(&device, [means.len(), 1, 3], &sh),
-        cube_tensor(&device, [means.len()], &raw_opacity),
+        cube_tensor(&device, [num_splats, 10], &scene.transforms),
+        cube_tensor(&device, [num_splats, 1, 3], &scene.sh),
+        cube_tensor(&device, [num_splats], &scene.raw_opacity),
         SplatRenderMode::Default,
         crate::gaussian_splats::RasterizationMode::Rgba,
         Vec3::new(0.13, 0.07, 0.19),
@@ -394,4 +475,121 @@ async fn selectors_match_across_tile_boundaries() {
             2.0e-5,
         );
     }
+}
+
+async fn read_u32(tensor: CubeTensor<WgpuRuntime>) -> Vec<u32> {
+    let data: TensorData = MainBackendBase::int_into_data(tensor)
+        .await
+        .expect("readback");
+    data.as_slice::<u32>().expect("u32 tensor").to_vec()
+}
+
+/// Deterministic, plausible-looking plane parameters: a unit-ish camera-frame
+/// normal plus a signed offset. The oracle only cares that the four lanes are
+/// distinct per splat and per lane, which is what makes a stride or
+/// compact->global indexing slip visible rather than self-cancelling.
+fn plane_aux_values(num_splats: usize) -> Vec<f32> {
+    (0..num_splats)
+        .flat_map(|i| {
+            let t = i as f32;
+            let n = glam::vec3(0.13 * t - 0.4, 0.21 - 0.07 * t, 1.0).normalize();
+            [n.x, n.y, n.z, 2.5 + 0.37 * t]
+        })
+        .collect()
+}
+
+/// Test 11 of the PGSR plane-render plan: the independent CPU oracle must
+/// reproduce the main kernel's plane-channel composite.
+///
+/// This exists because adding lanes to the rendered image is exactly the change
+/// that has silently broken strides in this crate before (fork commits
+/// `a79f41b9`, `5e477544`, `ae2ec651` — and `5e477544` was this very file). The
+/// oracle walks every depth-sorted splat per pixel and never consumes the GPU
+/// tile lists, so a tile-binning or stride bug cannot disappear from both sides.
+/// Both rasterizer selectors are checked, so the 16x8 native-MSL training tile
+/// layout is covered too.
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn plane_channels_match_the_independent_cpu_oracle() {
+    let img_size = glam::uvec2(23, 19);
+    let background = Vec3::new(0.13, 0.07, 0.19);
+
+    for rasterizer in [Rasterizer::Legacy, Rasterizer::Candidate] {
+        for pass in [RasterPass::Backward, RasterPass::BackwardSmoothCutoff] {
+            let (image, projected, plane_compact, chans) =
+                render_plane_test_scene(rasterizer, pass, img_size).await;
+
+            assert_eq!(
+                chans,
+                out_channels(true, true),
+                "{rasterizer:?}/{pass:?} plane render must emit rgba + depth + 4 plane channels",
+            );
+
+            let reference = rasterize_reference_full(
+                &projected,
+                Some(&plane_compact),
+                true,
+                img_size,
+                background,
+                pass.smooth_cutoff(),
+            );
+            assert_close(
+                &format!("{rasterizer:?}/{pass:?} plane oracle"),
+                &image,
+                &reference,
+                2.0e-5,
+            );
+        }
+    }
+}
+
+/// Renders the shared oracle scene with the PGSR plane channels on, and returns
+/// `(image, projected, plane_aux_in_compact_order, channels_per_pixel)`.
+async fn render_plane_test_scene(
+    rasterizer: Rasterizer,
+    pass: RasterPass,
+    img_size: UVec2,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, usize) {
+    let device = brush_cube::test_helpers::test_device().await;
+    let scene = oracle_scene();
+    let num_splats = scene.raw_opacity.len();
+    let plane_values = plane_aux_values(num_splats);
+
+    let output = crate::render::render_base_with_plane_aux(
+        &oracle_camera(),
+        img_size,
+        cube_tensor(&device, [num_splats, 10], &scene.transforms),
+        cube_tensor(&device, [num_splats, 1, 3], &scene.sh),
+        cube_tensor(&device, [num_splats], &scene.raw_opacity),
+        Some(cube_tensor(
+            &device,
+            [num_splats, PLANE_AUX_LANES],
+            &plane_values,
+        )),
+        SplatRenderMode::Default,
+        crate::gaussian_splats::RasterizationMode::RgbaDepthPlane,
+        Vec3::new(0.13, 0.07, 0.19),
+        pass,
+        rasterizer,
+    )
+    .await;
+    output.clone().validate().await;
+
+    let num_visible = output.aux.num_visible as usize;
+    let chans = output.out_img.shape()[2];
+    let image = read_f32(output.out_img).await;
+    let mut projected = read_f32(output.projected_splats).await;
+    projected.truncate(num_visible * PROJECTED_LANES);
+    let global_from_compact = read_u32(output.global_from_compact_gid).await;
+
+    // Permute the global-gid-indexed plane buffer into compact (depth-sorted)
+    // order, which is the order `projected` is in.
+    let mut plane_compact = vec![0.0f32; num_visible * PLANE_AUX_LANES];
+    for compact in 0..num_visible {
+        let global = global_from_compact[compact] as usize;
+        plane_compact[compact * PLANE_AUX_LANES..(compact + 1) * PLANE_AUX_LANES].copy_from_slice(
+            &plane_values[global * PLANE_AUX_LANES..(global + 1) * PLANE_AUX_LANES],
+        );
+    }
+
+    (image, projected, plane_compact, chans)
 }

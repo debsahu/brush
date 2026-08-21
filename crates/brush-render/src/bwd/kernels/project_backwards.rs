@@ -12,7 +12,9 @@ use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
 
-use super::rasterize_backwards::COMPACT_GRAD_LANES;
+use super::rasterize_backwards::{
+    ALPHA_LANE, COMPACT_GRAD_LANES, CONIC_LANE, DEPTH_LANE, REFINE_LANE, RGB_LANE, XY_LANE,
+};
 
 pub const WG_SIZE: u32 = 256;
 
@@ -128,17 +130,17 @@ pub fn project_backwards_kernel(
     // v_rasterize_grads at zero and (since the dense outputs are zero-
     // init) we can return without writing anything at all.
     let rg_base = (compact_gid * COMPACT_GRAD_LANES) as usize;
-    let v_mean2d_x = v_rasterize_grads[rg_base];
-    let v_mean2d_y = v_rasterize_grads[rg_base + 1];
-    let v_conics_x = v_rasterize_grads[rg_base + 2];
-    let v_conics_y = v_rasterize_grads[rg_base + 3];
-    let v_conics_z = v_rasterize_grads[rg_base + 4];
-    let v_color_r = v_rasterize_grads[rg_base + 5];
-    let v_color_g = v_rasterize_grads[rg_base + 6];
-    let v_color_b = v_rasterize_grads[rg_base + 7];
-    let v_alpha_in = v_rasterize_grads[rg_base + 8];
-    let v_refine_in = v_rasterize_grads[rg_base + 9];
-    let v_depth_in = v_rasterize_grads[rg_base + 10];
+    let v_mean2d_x = v_rasterize_grads[rg_base + XY_LANE];
+    let v_mean2d_y = v_rasterize_grads[rg_base + XY_LANE + 1];
+    let v_conics_x = v_rasterize_grads[rg_base + CONIC_LANE];
+    let v_conics_y = v_rasterize_grads[rg_base + CONIC_LANE + 1];
+    let v_conics_z = v_rasterize_grads[rg_base + CONIC_LANE + 2];
+    let v_color_r = v_rasterize_grads[rg_base + RGB_LANE];
+    let v_color_g = v_rasterize_grads[rg_base + RGB_LANE + 1];
+    let v_color_b = v_rasterize_grads[rg_base + RGB_LANE + 2];
+    let v_alpha_in = v_rasterize_grads[rg_base + ALPHA_LANE];
+    let v_refine_in = v_rasterize_grads[rg_base + REFINE_LANE];
+    let v_depth_in = v_rasterize_grads[rg_base + DEPTH_LANE];
 
     let any_grad = v_mean2d_x != 0.0f32
         || v_mean2d_y != 0.0f32

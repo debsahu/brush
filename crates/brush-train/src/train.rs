@@ -1,6 +1,6 @@
 use crate::{
     adam_scaled::{AdamScaled, AdamState},
-    config::TrainConfig,
+    config::{DepthSource, TrainConfig},
     dig::{self, DigTrainState},
     edge, error_map,
     min_scale::compute_min_scale,
@@ -18,14 +18,22 @@ use brush_appearance::{AppearanceConfig, AppearanceTrainState};
 use brush_dataset::scene::SceneBatch;
 use brush_loss::{
     ImageLossConfig, depth_loss, depth_normal_loss, image_loss, normal_loss, normal_smooth_loss,
-    normals_from_depth, rgb_grad_weight,
+    normals_from_depth, plane_depth_from_features, rgb_grad_weight,
 };
 use brush_render::camera::Camera;
 use brush_render::gaussian_splats::{RasterizationMode, Splats, fold_min_scale};
 use brush_render::kernels::camera_model::CameraModel;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 // bwd crate dissolved into brush-render/src/bwd/ (upstream #517).
-use brush_render::bwd::{DeferredShGrad, render_splat_features, render_splats_for_training};
+use brush_render::bwd::{
+    DeferredShGrad, render_splat_features, render_splats_for_training_with_plane_aux,
+};
+// The `plane_aux = None` convenience wrapper. The trainer itself always
+// goes through the `_with_plane_aux` entry point (it is the same call for
+// `None`); the test modules below use the short form.
+#[cfg(test)]
+use brush_render::bwd::render_splats_for_training;
+use brush_render::kernels::helpers::{PLANE_AUX_LANES_USIZE, plane_channel_offset};
 use burn::{
     module::{AutodiffModule, Param, ParamId},
     optim::GradientsParams,
@@ -90,6 +98,105 @@ const MIN_SCALE_FACTOR: f32 = 0.1;
 /// The trainer samples every `refine_every / this` steps so a full window
 /// contributes roughly this many views to the per-gaussian edge accumulator.
 const EDGE_MIN_VIEW_SAMPLES: u32 = 10;
+
+/// Surviving-pixel fraction below which the normal contradiction gate
+/// (`--normal-gate-degrees`) is suspected of over-masking rather than doing its
+/// job (plan §4.7).
+///
+/// What this detects: the gate is meant to drop LOCALLY contradicted pixels —
+/// transients, reflections, isolated prior-model failures — inside a frame whose
+/// prior is broadly correct. If it is instead discarding most of the frame, the
+/// prior and the render disagree systematically, and the normal loss is being
+/// silently starved of supervision rather than cleaned up.
+///
+/// **Nothing else in the pipeline can see this state**, which is what makes the
+/// guard load-bearing rather than decorative.
+///
+/// CORRECTED 2026-08-21. An earlier version of this comment claimed the upstream
+/// prior-generation check "only aborts when the median is ANTI-correlated" and
+/// "writes every `.tiff` before evaluating". Both were wrong when written and
+/// are doubly wrong now — `ingest/splatcam/normals_moge.py` stages every map in
+/// `normal.staging/` and promotes into the directory Brush reads ONLY after the
+/// median clears a POSITIVE floor, and that floor was raised from 0.3 to 0.6
+/// once the chance level was measured: two *unrelated* normal fields score
+/// ~0.33 (uniform hemispheres) to 0.46–0.55 (real interiors, where normals
+/// concentrate toward the optical axis), because both fields are constrained to
+/// the camera-facing hemisphere. A failed batch is renamed
+/// `normal.rejected-<stamp>/`, which Brush never loads.
+///
+/// **What survives the correction — and it is the whole rationale — is that the
+/// upstream check cannot see this failure mode at all**, however well
+/// calibrated it is:
+///
+/// * It runs at prior-GENERATION time and compares `MoGe`'s normals against
+///   normals DIFFERENTIATED FROM DEPTH — never against the trained renderer's
+///   output. Prior-vs-geometry disagreement is outside what it measures.
+/// * It is a median across per-frame medians, so it is a WHOLE-FRAME verdict by
+///   construction and cannot catch a gate over-masking pixels *inside* a frame
+///   that passed it.
+///
+/// So a gate armed before the renderer's normals are plausible sails through it
+/// untouched. And it is invisible in the trainer too: the masked-mean
+/// denominator is the GATED count, so the loss magnitude stays perfectly normal
+/// while the supervision behind it collapses. There is no loss-curve signal.
+/// This log is the only signal.
+const NORMAL_GATE_LOW_FRACTION: f32 = 0.20;
+
+/// Consecutive low samples before the over-masking warning fires.
+///
+/// "Sustained" per plan §4.7: a single low frame is ordinary (a close-up, a
+/// transient filling the view) and must not warn. A run of them is the
+/// systematic case. One good sample resets the counter.
+///
+/// Known transient (measured 2026-08-19, and the reason the run must be
+/// consecutive rather than cumulative): EARLY in training the splats have not
+/// yet covered the frame, so prior pixels with nothing rendered behind them
+/// score `cos ≈ 0` and the gate drops them. On a synthetic 500-step run with a
+/// correct prior this bottomed out at 12% around step 100, warned once, then
+/// climbed to 26% by step 300 and the counter reset — exactly the intended
+/// behaviour. It does not arise under the documented recipe at all, because the
+/// reference arms the gate at ~37.5% of the run (`--normal-gate-start-iter`), by
+/// which time the geometry exists. A run that arms the gate at step 0 should
+/// expect one early warning and read a LATER sustained run as the real signal.
+const NORMAL_GATE_LOW_SAMPLES_TO_WARN: u32 = 3;
+
+/// Target number of contradiction-gate diagnostic samples per refine window.
+///
+/// The sampling stride is derived from `refine_every` (same idiom as
+/// `EDGE_MIN_VIEW_SAMPLES`) rather than being a fresh absolute constant, so the
+/// diagnostic's readback rides a cadence the training loop already runs periodic
+/// device work on instead of introducing a new stall rhythm of its own. On every
+/// other step the diagnostic costs nothing at all — no tensor is built and
+/// nothing is read back.
+const NORMAL_GATE_SAMPLES_PER_WINDOW: u32 = 2;
+
+/// Steps from the start of training for which the TOTAL LOSS is checked for
+/// finiteness on EVERY iteration.
+///
+/// # Why a cadence at all
+///
+/// Reading the loss scalar forces a GPU readback, which synchronises. The
+/// trainer deliberately avoids that on the hot path — it is why the rerun and
+/// JSONL loggers gate their own reads. An unconditional per-step check would
+/// hand every run a permanent stall to protect against a rare event.
+///
+/// # Why EVERY step early, and only sampled later
+///
+/// Explosions happen early: the learning rate is at its highest, the scene is
+/// least settled, and densification is at its most aggressive. Several hundred
+/// readbacks at the very start cost a fraction of a second against a run that
+/// would otherwise spend hours training on NaN and produce nothing.
+///
+/// # Blast radius between checks
+///
+/// After the early window the check rides the refine cadence, and that is not
+/// only a cost argument — it is a containment one. While refinement is active,
+/// the non-finite parameter prune inside `refine_for_phase` runs on exactly
+/// those iterations, so any parameter that NaNs between two checks is swept at
+/// the very step the next check happens. The unbounded window is therefore only
+/// the one AFTER refinement stops, which is precisely the window
+/// `prune_non_finite_splats` was added to cover from the eval cadence.
+const NONFINITE_LOSS_CHECK_STEPS: u32 = 250;
 
 /// The three per-parameter Adam states of a [`Splats`] module, owned directly
 /// so the trainer can update LR scaling every step and surgically edit the
@@ -223,6 +330,20 @@ pub struct SplatTrainer {
     /// on. Carried across LOD boundaries; `None` (inert) when `--cloud-prune` is
     /// off or there is no seed cloud.
     cloud_prune_grid: Option<CloudDistanceGrid>,
+    /// Scene scale captured ONCE from the training camera poses, for
+    /// `--normalize-metric-weights` (see `scene_scale_from_cameras`).
+    ///
+    /// Deliberately not the live, refine-updated `bounds` — a moving scale would
+    /// make the effective metric weights drift mid-run and confound the ramp
+    /// schedules, so an ablation could not attribute a result to either.
+    /// `set_init_scene_scale` is one-shot for the same reason: LOD phases
+    /// re-supply cameras, and the scale must not move there either.
+    init_scene_scale: Option<f32>,
+    /// Consecutive contradiction-gate samples whose surviving fraction was below
+    /// `NORMAL_GATE_LOW_FRACTION`. Drives the "sustained" half of the
+    /// over-masking warning; reset by any healthy sample. Never touched unless
+    /// `--normal-gate-degrees` is set.
+    normal_gate_low_samples: u32,
     #[cfg(not(target_family = "wasm"))]
     lpips: Option<lpips::LpipsModel>,
 }
@@ -344,6 +465,120 @@ fn step_sh_coeffs(
     splats
 }
 
+/// Rodrigues rotation taking `up` (assumed unit-length) onto `+Z`.
+///
+/// Degenerate case: when `up × Z` is below the epsilon, `up` is already
+/// (anti)parallel to `+Z`. Parallel yields the identity; antiparallel is a 180°
+/// turn about an arbitrary axis perpendicular to `up`, chosen deterministically
+/// so the result does not depend on floating-point luck. (In the antiparallel
+/// case the choice of perpendicular axis does change the resulting X/Y
+/// coordinates, so a deterministic pick is what makes `scene_scale_from_cameras`
+/// reproducible.)
+fn rotation_up_to_z(up: glam::Vec3) -> glam::Mat3 {
+    let z = glam::Vec3::Z;
+    let axis = up.cross(z);
+    let axis_len = axis.length();
+    if axis_len < 1e-6 {
+        return if up.dot(z) >= 0.0 {
+            glam::Mat3::IDENTITY
+        } else {
+            let helper = if up.x.abs() < 0.9 {
+                glam::Vec3::X
+            } else {
+                glam::Vec3::Y
+            };
+            let perp = up.cross(helper).normalize();
+            glam::Mat3::from_axis_angle(perp, std::f32::consts::PI)
+        };
+    }
+    let angle = up.dot(z).clamp(-1.0, 1.0).acos();
+    glam::Mat3::from_axis_angle(axis / axis_len, angle)
+}
+
+/// Mean world-frame "up" direction of a camera set, unit-length.
+///
+/// **This is the one convention-sensitive line of `scene_scale_from_cameras`,
+/// which is why it is a separate, directly testable function.** The `gauss-surf`
+/// PGSR trainer's poses are OpenGL, where camera `+Y` is UP, so it averages the
+/// c2w `+Y` column as-is. Ours are `OpenCV`, where camera `+Y` points DOWN, so the
+/// world-frame up axis is `−(R_c2w · Ŷ)`. Getting the sign wrong yields a
+/// rotation that differs by a 180° turn about a horizontal axis, which silently
+/// changes the derived scale on any scene whose cameras are not symmetric about
+/// that axis.
+///
+/// Falls back to `+Z` when the camera up axes cancel exactly (a synthetic
+/// back-to-back pair), which skips the reorientation rather than normalizing
+/// numerical noise.
+pub fn mean_camera_up(cameras: &[Camera]) -> glam::Vec3 {
+    if cameras.is_empty() {
+        return glam::Vec3::Z;
+    }
+    let sum = cameras.iter().fold(glam::Vec3::ZERO, |acc, cam| {
+        acc - (cam.rotation * glam::Vec3::Y)
+    });
+    if sum.length() < 1e-6 {
+        glam::Vec3::Z
+    } else {
+        sum.normalize()
+    }
+}
+
+/// Scene scale in world (metric, for a metric capture) units, computed once from
+/// the training camera poses.
+///
+/// This is `scene_scale` from the `gauss-surf` PGSR trainer
+/// (rerun-io/examples-monorepo, Apache-2.0, by Pablo Vela), measured from its
+/// `train_gsplat/cache.py` — an implementation detail, not something the PGSR
+/// paper (arXiv:2406.06521) defines. Credited explicitly because the weights
+/// below are divided by this quantity, so anyone questioning a ratio needs to
+/// be able to find what the ratio was calibrated against.
+///
+/// It is deliberately NOT `BoundingBox::median_size()` or
+/// `splat_init::estimate_scene_scale()` — neither has these semantics, and
+/// `gauss-surf`'s constant ratios only transfer if the scale they divide is the
+/// same quantity. The five steps:
+///
+/// 1. `translation = mean(camera origins)`
+/// 2. `up = normalize(mean(world-frame camera up axes))`
+/// 3. Rodrigues rotation `R` taking `up` onto `+Z`
+/// 4. `oriented = R · (origin − translation)` for every camera
+/// 5. `scene_scale = max(|component|)` over every oriented origin
+///
+/// **Convention note.** `gauss-surf`'s poses are OpenGL, where camera `+Y` is
+/// UP, so it averages c2w column 1 directly. Ours are `OpenCV`, where camera `+Y`
+/// is DOWN, so the world-frame up axis is `−(R_c2w · Ŷ)`. The sign matters: a
+/// flipped `up` produces a rotation that differs by 180°, which changes the
+/// oriented coordinates and hence the maximum. `scene_scale_from_camera_ring`
+/// pins this.
+///
+/// Returns `None` for an empty camera list or a non-finite/zero result; callers
+/// fall back to 1.0 (i.e. to unnormalized weights) rather than poisoning the
+/// loss.
+pub fn scene_scale_from_cameras(cameras: &[Camera]) -> Option<f32> {
+    if cameras.is_empty() {
+        return None;
+    }
+
+    let n = cameras.len() as f32;
+    let translation = cameras
+        .iter()
+        .fold(glam::Vec3::ZERO, |acc, cam| acc + cam.position)
+        / n;
+
+    let up = mean_camera_up(cameras);
+    let rot = rotation_up_to_z(up);
+
+    let scale = cameras
+        .iter()
+        .map(|cam| {
+            let oriented = rot * (cam.position - translation);
+            oriented.x.abs().max(oriented.y.abs()).max(oriented.z.abs())
+        })
+        .fold(0.0f32, f32::max);
+
+    (scale.is_finite() && scale > 0.0).then_some(scale)
+}
+
 pub async fn get_splat_bounds(splats: Splats, percentile: f32) -> BoundingBox {
     let means: Vec<f32> = splats
         .means()
@@ -416,6 +651,8 @@ impl SplatTrainer {
             opacity_reg_grid: None,
             plane_set: None,
             cloud_prune_grid: None,
+            init_scene_scale: None,
+            normal_gate_low_samples: 0,
             #[cfg(not(target_family = "wasm"))]
             lpips,
         }
@@ -425,6 +662,53 @@ impl SplatTrainer {
     /// Mip-Splatting 3D filter.
     pub fn set_view_cams(&mut self, view_cams: Vec<(glam::Vec3, f32)>) {
         self.view_cams = view_cams;
+    }
+
+    /// Capture the fixed scene scale for `--normalize-metric-weights` from the
+    /// full set of training camera poses.
+    ///
+    /// **One-shot on purpose**: later calls (LOD phases re-supply cameras) are
+    /// ignored, so the effective metric weights never move mid-run. A no-op
+    /// unless `--normalize-metric-weights` is set, so a default run allocates
+    /// and logs nothing.
+    pub fn set_init_scene_scale(&mut self, cameras: &[Camera]) {
+        if !self.config.normalize_metric_weights || self.init_scene_scale.is_some() {
+            return;
+        }
+        // `log::`, not `tracing::` — brush-cli wires `env_logger` with no
+        // tracing-log bridge, so a `tracing::info!` here would be invisible in
+        // exactly the runs that need to record which scale was used (same note
+        // as the sparse SH Adam site above).
+        match scene_scale_from_cameras(cameras) {
+            Some(scale) => {
+                log::info!(
+                    "normalize-metric-weights: scene scale {scale} from {} camera poses \
+                     (flatten weight /= scale, scale-reg weight /= scale^2, \
+                     scale-reg threshold *= scale)",
+                    cameras.len()
+                );
+                self.init_scene_scale = Some(scale);
+            }
+            None => {
+                log::warn!(
+                    "normalize-metric-weights: could not derive a scene scale from {} camera \
+                     poses; falling back to 1.0 (weights stay unnormalized)",
+                    cameras.len()
+                );
+            }
+        }
+    }
+
+    /// Divisor applied to the METRIC-dimensioned loss weights. `1.0` (exact
+    /// identity) unless `--normalize-metric-weights` is on AND a usable scale
+    /// was captured.
+    fn metric_weight_scale(&self) -> f32 {
+        if !self.config.normalize_metric_weights {
+            return 1.0;
+        }
+        self.init_scene_scale
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(1.0)
     }
 
     /// Attach the Mip-Splatting scale floor for the trainer's active camera
@@ -567,11 +851,34 @@ impl SplatTrainer {
                 .iter()
                 .map(|p| format!("{:.1}%", p.inlier_frac * 100.0))
                 .collect();
+            // The co-planarity assignment band is the knob that decides how much
+            // of the scene gets flattened onto these planes, and its default is
+            // derived rather than literal — so it has to appear in the log or
+            // nobody can tell an over-flattened run from a tuned one after the
+            // fact. Only printed when the term is actually on.
+            let coplanarity = if self.config.plane_coplanarity_weight > 0.0 {
+                let assign = crate::tidi::resolve_coplanarity_assign_dist(
+                    self.config.plane_coplanarity_assign_dist,
+                    ps.spacing,
+                );
+                let source = if self.config.plane_coplanarity_assign_dist > 0.0 {
+                    "explicit"
+                } else {
+                    "default, from spacing"
+                };
+                format!(
+                    ", coplanarity w {} assign-dist {:.4} ({source})",
+                    self.config.plane_coplanarity_weight, assign
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "{} planes (spacing {:.4}, band {:.4}), inliers: [{}]",
+                "{} planes (spacing {:.4}, band {:.4}){}, inliers: [{}]",
                 ps.planes.len(),
                 ps.spacing,
                 ps.threshold,
+                coplanarity,
                 fracs.join(", ")
             )
         })
@@ -693,6 +1000,68 @@ impl SplatTrainer {
     /// so a refine window contributes ~`EDGE_MIN_VIEW_SAMPLES` views.
     fn edge_sample_stride(&self) -> u32 {
         (self.config.refine_every / EDGE_MIN_VIEW_SAMPLES).max(1)
+    }
+
+    /// Steps between contradiction-gate diagnostic samples, derived from the
+    /// refine window like `edge_sample_stride`.
+    fn normal_gate_sample_stride(&self) -> u32 {
+        (self.config.refine_every / NORMAL_GATE_SAMPLES_PER_WINDOW).max(1)
+    }
+
+    /// Whether this step should measure the contradiction gate's surviving
+    /// fraction (plan §4.7).
+    ///
+    /// **False for every step of a default run.** With `--normal-gate-degrees`
+    /// unset `normal_gate_cos_at` is `None`, so the caller builds no diagnostic
+    /// tensor and performs no readback — the diagnostic is as inert as the gate
+    /// it observes. Counts GLOBAL iterations, like the gate's own arming step.
+    fn should_sample_normal_gate(&self, global_iter: u32) -> bool {
+        self.config.normal_gate_cos_at(global_iter).is_some()
+            && global_iter.is_multiple_of(self.normal_gate_sample_stride())
+    }
+
+    /// Record one contradiction-gate sample: log the surviving fraction, and
+    /// warn when it has been low for `NORMAL_GATE_LOW_SAMPLES_TO_WARN`
+    /// consecutive samples. Returns whether the warning fired, for tests.
+    ///
+    /// `surviving` / `valid` are the two counts from
+    /// `brush_loss::normal_gate_counts`. A frame with `valid == 0` carried no
+    /// usable prior, which says nothing about the gate: it is neither logged nor
+    /// counted toward the sustained-low run, and it does not reset it either.
+    ///
+    /// `log::`, not `tracing::` — brush-cli wires `env_logger` with no
+    /// tracing-log bridge, so a `tracing::warn!` here would be invisible in
+    /// exactly the headless runs this guard exists for.
+    fn record_normal_gate_sample(&mut self, global_iter: u32, surviving: f32, valid: f32) -> bool {
+        if !(valid.is_finite() && valid > 0.0 && surviving.is_finite()) {
+            return false;
+        }
+        let fraction = surviving / valid;
+        log::info!(
+            "normal gate: iter {global_iter} kept {:.1}% of prior pixels ({} of {})",
+            fraction * 100.0,
+            surviving as u64,
+            valid as u64
+        );
+        if fraction < NORMAL_GATE_LOW_FRACTION {
+            self.normal_gate_low_samples += 1;
+            if self.normal_gate_low_samples >= NORMAL_GATE_LOW_SAMPLES_TO_WARN {
+                log::warn!(
+                    "normal gate: surviving fraction has been under {:.0}% for {} consecutive \
+                     samples (now {:.1}%). The gate is masking most of the prior rather than \
+                     cleaning it up, so --normal-loss-weight is being starved. Check the \
+                     normal prior's sign/frame convention for this capture, or widen \
+                     --normal-gate-degrees.",
+                    NORMAL_GATE_LOW_FRACTION * 100.0,
+                    self.normal_gate_low_samples,
+                    fraction * 100.0
+                );
+                return true;
+            }
+        } else {
+            self.normal_gate_low_samples = 0;
+        }
+        false
     }
 
     /// Accumulate this step's GT-view edge score into the refine record (MRNF
@@ -941,6 +1310,11 @@ impl SplatTrainer {
             .as_mut()
             .map(|state| state.begin_step(batch.view_index));
 
+        // Contradiction-gate diagnostic sample for this step, if one was taken.
+        // Declared out here so the loss block only ever borrows `self`
+        // immutably; the sustained-low bookkeeping runs after the block.
+        let mut normal_gate_sample: Option<(f32, f32)> = None;
+
         let (mut grads, visible, num_visible, loss_inner, deferred_sh_grad) = {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
@@ -968,26 +1342,98 @@ impl SplatTrainer {
             // Geometry-prior terms (all inert at their 0.0 defaults, gated
             // exactly like `use_depth`, so a run that does not pass the flags
             // takes the same path it always did).
-            let use_prior_normal = self.config.normal_loss_weight > 0.0 && batch.normal.is_some();
+            //
+            // The normal-term ramp (`--normal-ramp-start-iter`) multiplies BOTH
+            // normal weights. An exact 0 additionally DROPS `use_prior_normal` /
+            // `use_dn`, so the normal render pass is skipped rather than
+            // rendered and multiplied by zero — the same philosophy as
+            // `--depth-normal-start-iter` below. At the default it is an exact
+            // 1.0, so this is byte-identical.
+            let normal_ramp = self.config.normal_ramp_at(global_iter);
+            let use_prior_normal =
+                self.config.normal_loss_weight > 0.0 && batch.normal.is_some() && normal_ramp > 0.0;
             // 2DGS gates this term at 7k of 30k. Gating here rather than just
             // zeroing the weight also skips the depth channel and the normal
             // render pass entirely before the start iteration, so the gate costs
             // nothing instead of rendering work that gets multiplied by zero.
             let dn_started = self.config.depth_normal_start_iter == 0
                 || global_iter >= self.config.depth_normal_start_iter;
-            let use_dn = self.config.depth_normal_weight > 0.0 && dn_started;
+            // Gate on the EFFECTIVE weight (including the late consistency bump)
+            // rather than the base one, so a run that ramps a zero base up to a
+            // nonzero end still activates. With the bump off this is exactly
+            // `depth_normal_weight`, i.e. byte-identical.
+            let eff_dn_weight = self.config.depth_normal_weight_at(global_iter);
+            let use_dn = eff_dn_weight > 0.0 && dn_started && normal_ramp > 0.0;
             let use_smooth = self.config.normal_smooth_weight > 0.0;
             let use_normal_render = use_prior_normal || use_dn || use_smooth;
             let use_flatten = self.config.flatten_loss_weight > 0.0;
             // The depth/normal consistency term reads the rendered depth, so it
             // needs the depth channel even without any gt depth map.
             let has_depth_channel = use_depth || use_dn;
-            let raster_mode = if has_depth_channel {
+
+            // ---- PGSR depth-source gating, hoisted above the render ----
+            //
+            // `center` and `plane-aux` leave the MAIN rasterization alone, so
+            // for them this block is pure boolean arithmetic and the render
+            // below is the call it always was. `plane-fused` (approach B)
+            // composites its plane channels IN the main kernel, so the mode and
+            // the aux tensor have to be decided before the render runs — which
+            // is the only reason these three lines live up here rather than
+            // beside the consumers.
+            //
+            // `normals_from_depth` and the ray-plane grid are both pinhole-only
+            // (our fisheye split path is KB4; interior cube faces are Pinhole).
+            // Same warn-and-skip contract the consistency term already had.
+            let plane_selected = !matches!(self.config.depth_source, DepthSource::Center);
+            let is_pinhole = matches!(camera.camera_model, CameraModel::Pinhole);
+            let depth_consumer = use_depth || use_dn;
+            if plane_selected && depth_consumer && !is_pinhole {
+                warn_plane_depth_needs_pinhole();
+            }
+            let use_plane_depth = plane_selected && depth_consumer && is_pinhole;
+            // Approach B. Falls back to nothing: when the plane depth is not
+            // usable at all (non-pinhole, or no depth consumer) `plane-fused`
+            // takes exactly the path `center` takes, as `plane-aux` does.
+            let use_fused =
+                use_plane_depth && matches!(self.config.depth_source, DepthSource::PlaneFused);
+
+            let raster_mode = if use_fused {
+                RasterizationMode::RgbaDepthPlane
+            } else if has_depth_channel {
                 RasterizationMode::RgbaAndDepth
             } else {
                 RasterizationMode::Rgba
             };
-            let diff_out = render_splats_for_training(
+
+            // The SAME on-tape `[N, 4]` construction approach A rasterizes in a
+            // separate feature pass — handed to the main kernel instead. That is
+            // deliberate: it makes the A/B delta exactly {weight-path gradients,
+            // single-pass fusion} and nothing else, with no duplicated
+            // smallest-axis/quaternion math in kernel code.
+            //
+            // Built from `splats` (not `render_input`) and folded exactly as the
+            // aux path folds it, so the two approaches composite identical
+            // per-splat values and any forward disagreement is a real bug.
+            //
+            // PGSR (Chen et al. 2024, arXiv:2406.06521), plane parameterization.
+            let plane_aux = use_fused.then(|| {
+                let t_fold = match &splats.min_scale {
+                    Some(f) => {
+                        fold_min_scale(
+                            splats.transforms.val(),
+                            splats.raw_opacities.val(),
+                            f.clone(),
+                        )
+                        .0
+                    }
+                    None => splats.transforms.val(),
+                };
+                plane_features(t_fold, &camera)
+            });
+
+            // `render_splats_for_training(..)` IS this with `plane_aux = None`
+            // (a direct delegation), so `center` and `plane-aux` are unchanged.
+            let diff_out = render_splats_for_training_with_plane_aux(
                 render_input,
                 &camera,
                 img_size,
@@ -995,6 +1441,7 @@ impl SplatTrainer {
                 compute_refine_weight,
                 raster_mode,
                 defer_sh_grad,
+                plane_aux,
             )
             .instrument(trace_span!("Forward"))
             .await;
@@ -1012,10 +1459,17 @@ impl SplatTrainer {
             // bypass the correction. Split the RGBA channels off, correct
             // those, then re-attach the untouched depth so `pred_image` keeps
             // its [H, W, 5] layout for the depth-loss term below.
+            //
+            // Under `plane-fused` the same applies to the four plane channels
+            // that follow the depth one — also geometry, also not colour. The
+            // upper bound is `raster_mode.bwd_out_channels()` rather than a
+            // literal so the two cases stay one expression; at `RgbaAndDepth`
+            // it is 5, i.e. the `4..5` slice this always did.
             let pred_image = match &active_appearance {
                 Some(active) if has_depth_channel => {
+                    let geom_end = raster_mode.bwd_out_channels();
                     let rgba = diff_out.img.clone().slice(s![.., .., 0..4]);
-                    let depth = diff_out.img.slice(s![.., .., 4..5]);
+                    let depth = diff_out.img.slice(s![.., .., 4..geom_end]);
                     Tensor::cat(vec![active.apply(rgba), depth], 2)
                 }
                 Some(active) => active.apply(diff_out.img),
@@ -1184,23 +1638,260 @@ impl SplatTrainer {
                 }
             }
 
+            // ---- Geometry feature render (normals, and optionally PGSR planes) ----
+            //
+            // ONE feature rasterization serves every geometry term. It is
+            // hoisted above the depth loss because, with a plane depth source
+            // selected, the depth loss consumes its output. Only the RENDER
+            // moves; every `loss = loss + ...` accumulation below stays exactly
+            // where it was, so the summation order — and therefore the f32
+            // result — is unchanged.
+            //
+            // What gets rendered depends on `--depth-source`:
+            //
+            //   center (DEFAULT)  3 channels = `splat_normals`, WORLD frame,
+            //                     rotated to the camera frame per-pixel after
+            //                     compositing. Byte-identical to the previous
+            //                     code: the ops below are the same ops in the
+            //                     same order.
+            //   plane-aux         4 channels = `plane_features` — camera-frame
+            //                     unit normal (0..3) + signed plane offset (3).
+            //                     Same rasterization COUNT as `center` whenever
+            //                     a normal term was already on; one extra pass
+            //                     when depth is the only consumer.
+            //   plane-fused       the same 4 channels, but composited by the
+            //                     MAIN kernel (channels 5..=8, alongside rgba
+            //                     and centre depth). NO feature rasterization
+            //                     at all — the render above already carries
+            //                     them, so this block only re-slices it.
+            //
+            // Why the plane path needs no per-pixel rotation: `plane_features`
+            // rotates each splat's normal into the camera frame BEFORE
+            // compositing. A rotation is linear and orthonormal, so
+            // `Σwᵢ(R·nᵢ) = R·(Σwᵢnᵢ)` and `normalize(R·v) = R·normalize(v)` —
+            // the two orders agree analytically and differ only in f32 rounding.
+            // The `center` branch keeps the old order verbatim because that
+            // rounding is exactly what the byte-identity gate pins.
+            //
+            // PGSR (Chen et al. 2024, arXiv:2406.06521), unbiased depth
+            // rendering; construction shared with approach B via
+            // `plane_features`.
+            // `plane_selected` / `use_plane_depth` / `use_fused` and the
+            // pinhole warning are decided above the render (approach B needs
+            // them to pick the rasterization mode).
+
+            // `(n_cam, normal_alpha)` — the rendered camera-frame normal image
+            // and its DETACHED alpha, shared by every normal term below.
+            let mut normal_render: Option<(Tensor<3>, Tensor<3>)> = None;
+            // `(depth, valid)` — PGSR plane-intersection depth and its validity
+            // mask. `None` means the consumers fall back to centre depth.
+            let mut plane_depth: Option<(Tensor<2>, Tensor<2>)> = None;
+
+            if use_normal_render || use_plane_depth {
+                let render_mode = if splats.render_mip {
+                    brush_render::gaussian_splats::SplatRenderMode::Mip
+                } else {
+                    brush_render::gaussian_splats::SplatRenderMode::Default
+                };
+                // `plane-fused` re-slices the main render and rasterizes nothing
+                // here, so it needs no folded copy; `center` and `plane-aux`
+                // both run a feature pass and do. Selecting `render_mode` first
+                // is host-side only — no tensor op moved past another, so the
+                // `center` op sequence is unchanged.
+                let folded = (!use_fused).then(|| match &splats.min_scale {
+                    Some(f) => fold_min_scale(
+                        splats.transforms.val(),
+                        splats.raw_opacities.val(),
+                        f.clone(),
+                    ),
+                    None => (splats.transforms.val(), splats.raw_opacities.val()),
+                });
+
+                if use_plane_depth {
+                    // Either way the result is the [H, W, 5] `n_sum(3) +
+                    // offset_sum(1) + alpha(1)` that `plane_depth_from_features`
+                    // contracts for — approaches A and B differ in WHICH kernel
+                    // composited it, not in what it means.
+                    let feat_img = if use_fused {
+                        // Approach B: the main rasterizer already composited the
+                        // plane lanes, with the blending-weight gradient path
+                        // LIVE (plan section 4.5 row 3). Channel 3 is that
+                        // render's coverage alpha, which is the same Σw the
+                        // feature pass reports in its trailing channel.
+                        //
+                        // Offsets come from the shared const fns: re-literalizing
+                        // the stride is precisely what broke three call sites
+                        // when the depth lane was added.
+                        let plane_c = plane_channel_offset(raster_mode.render_depth()) as usize;
+                        Tensor::cat(
+                            vec![
+                                pred_image.clone().slice(s![
+                                    ..,
+                                    ..,
+                                    plane_c..plane_c + PLANE_AUX_LANES_USIZE
+                                ]),
+                                pred_image.clone().slice(s![.., .., 3..4]),
+                            ],
+                            2,
+                        )
+                    } else {
+                        // Approach A: a separate feature rasterization of the
+                        // same on-tape [N, 4] values.
+                        let (t_fold, o_fold) =
+                            folded.expect("the non-fused paths always fold min-scale");
+                        let feats = plane_features(t_fold.clone(), &camera);
+                        render_splat_features(t_fold, o_fold, feats, &camera, img_size, render_mode)
+                            .instrument(trace_span!("Plane feature forward"))
+                            .await
+                    };
+
+                    let normal_alpha = feat_img.clone().slice(s![.., .., 4..5]).detach();
+
+                    let focal = camera.focal(img_size);
+                    let center = camera.center(img_size);
+                    let (depth, _plane_normal, valid) = plane_depth_from_features(
+                        feat_img.clone(),
+                        focal.x,
+                        focal.y,
+                        center.x,
+                        center.y,
+                        PLANE_MIN_ALPHA,
+                        PLANE_MIN_DENOM,
+                        PLANE_MIN_DEPTH,
+                        PLANE_MAX_DEPTH,
+                    );
+
+                    // The returned `_plane_normal` is `normalize(n_sum)`; the
+                    // `n_cam` built here is `normalize(n_sum / α)`. Alpha is a
+                    // positive scalar per pixel, so the two are the same
+                    // direction — we keep `n_cam` so the prior-normal, TV
+                    // smoothness and consistency terms all read ONE normal
+                    // image, produced by the same expression the `center` path
+                    // produces it with. The pixels `_plane_normal` would zero
+                    // (grazing / out-of-range) are already dropped downstream:
+                    // plane depth is 0 there, so `normals_from_depth` emits
+                    // `(0,0,0)` and `depth_normal_loss`'s length gate rejects it.
+                    let n_cam = normal_alpha_normalize(
+                        feat_img.slice(s![.., .., 0..3]),
+                        normal_alpha.clone(),
+                    );
+
+                    // Free diagnostic: v1 deliberately keeps the centre depth
+                    // channel rendered (§4.2), so the centre-vs-plane residual
+                    // costs nothing but a periodic readback. WS-1 measured
+                    // centre depth ~2% biased against plane depth on a tilted
+                    // slab (≈10 cm at 5 m), so a residual near zero means the
+                    // plane path is not actually engaging.
+                    if has_depth_channel && global_iter.is_multiple_of(PLANE_RESIDUAL_LOG_EVERY) {
+                        let centre = (pred_image.clone().slice(s![.., .., 4..5])
+                            / pred_image.clone().slice(s![.., .., 3..4]).clamp_min(1e-10))
+                        .reshape([img_h, img_w]);
+                        log_plane_vs_centre_residual(
+                            depth.clone(),
+                            centre,
+                            valid.clone(),
+                            global_iter,
+                        )
+                        .await;
+                    }
+
+                    normal_render = Some((n_cam, normal_alpha));
+                    plane_depth = Some((depth, valid));
+                } else {
+                    // ---- UNCHANGED `center` path. Do not reorder. ----
+                    let (t_fold, o_fold) =
+                        folded.expect("the non-fused paths always fold min-scale");
+                    let normals = splat_normals(t_fold.clone(), camera.position);
+                    let normal_img = render_splat_features(
+                        t_fold,
+                        o_fold,
+                        normals,
+                        &camera,
+                        img_size,
+                        render_mode,
+                    )
+                    .instrument(trace_span!("Normal forward"))
+                    .await;
+
+                    // Same detached alpha normalization as the DiG and depth
+                    // paths: the normal terms must not be able to lower their
+                    // error by changing transparency.
+                    let normal_alpha = normal_img.clone().slice(s![.., .., 3..4]).detach();
+                    let n_world =
+                        normal_img.slice(s![.., .., 0..3]) / normal_alpha.clone().clamp_min(1e-10);
+                    let n_len = n_world
+                        .clone()
+                        .powi_scalar(2)
+                        .sum_dim(2)
+                        .sqrt()
+                        .clamp_min(1e-6);
+                    let n_world = n_world / n_len;
+
+                    // World -> camera. Right-multiplying row vectors by Rᵀ is
+                    // the same as left-multiplying column vectors by R.
+                    let r_t = world_to_cam_rot_t(&camera, &device);
+                    let n_cam = n_world
+                        .reshape([(img_h * img_w) as i32, 3])
+                        .matmul(r_t)
+                        .reshape([img_h, img_w, 3]);
+
+                    normal_render = Some((n_cam, normal_alpha));
+                }
+            }
+
             // Depth Disparity L1 loss on rendered expected depth
             if use_depth && let Some(depth_data) = &batch.depth {
                 let gt_depth: Tensor<2> = Tensor::from_data(depth_data.clone(), &device);
-                let accumulated_depth = pred_image.clone().slice(s![.., .., 4..5]);
-                // Detach the alpha denominator so depth loss cannot lower its
-                // error by changing transparency. A differentiable denominator
-                // lets depth error flow into opacity. This closes one of two
-                // coupling routes; the other lives in the rasterize backward,
-                // where the depth-channel gradient feeds the alpha term (see
-                // rasterize_backwards.rs, the dropped dot_rgb depth term).
-                // Together they detach the blending weights from depth, so depth
-                // supervision moves gaussian positions only. LFS does the same
-                // (detach_depth_weights), as does DN-Splatter. This mirrors the
-                // DINO feature normalization above.
-                let alpha = pred_image.clone().slice(s![.., .., 3..4]).detach();
-                let expected_depth =
-                    (accumulated_depth / alpha.clamp_min(1e-10)).reshape([img_h, img_w]);
+                // ---- DEPTH SOURCE DISPATCH — backward contracts (§4.5) ----
+                //
+                // | source      | blending weights | geometry grads via     | opacity reachable |
+                // |-------------|------------------|------------------------|-------------------|
+                // | center      | detached in-kernel (dropped dot_rgb) + detached α denominator
+                // |             |                  | lane 10 -> means z     | NO                |
+                // | plane-aux   | CONSTANTS (feature pass; features_bwd.rs tracks
+                // |             | only the feature VALUES)
+                // |             |                  | feature values -> means (via the plane
+                // |             |                  | offset) and quats (via the normal)
+                // |             |                  |                        | NO                |
+                // | plane-fused | LIVE for the plane lanes (WS-B)          | YES, by design    |
+                //
+                // SCALES get NO gradient from either plane channel: the
+                // thinnest-axis `argmin` inside `splat_normals` is detached, so
+                // the normal — and hence the plane — is a function of the
+                // quaternion and the axis CHOICE only. That is the same
+                // situation today's normal loss is in, and it is deliberate: the
+                // choice is a permutation, and differentiating through it means
+                // differentiating a discontinuity. `--flatten-loss-weight`
+                // remains the scale-side pressure. Do NOT "fix" this by
+                // un-detaching the argmin.
+                // PGSR plane-intersection depth (arXiv:2406.06521). Invalid
+                // pixels come back as exactly 0, which `depth_loss` reads as
+                // "no prediction" and scores as a FULL-magnitude disparity
+                // error against the GT, still counted in the denominator.
+                // Zeroing the GT there instead drops them from the numerator AND
+                // the denominator, which is what "no supervision here" has to
+                // mean. No alpha division: it cancels between the ray-plane
+                // numerator and denominator (see `plane_depth_from_features`).
+                let (expected_depth, gt_depth) = if let Some((depth, valid)) = &plane_depth {
+                    (depth.clone(), gt_depth * valid.clone())
+                } else {
+                    let accumulated_depth = pred_image.clone().slice(s![.., .., 4..5]);
+                    // Detach the alpha denominator so depth loss cannot lower its
+                    // error by changing transparency. A differentiable denominator
+                    // lets depth error flow into opacity. This closes one of two
+                    // coupling routes; the other lives in the rasterize backward,
+                    // where the depth-channel gradient feeds the alpha term (see
+                    // rasterize_backwards.rs, the dropped dot_rgb depth term).
+                    // Together they detach the blending weights from depth, so depth
+                    // supervision moves gaussian positions only. LFS does the same
+                    // (detach_depth_weights), as does DN-Splatter. This mirrors the
+                    // DINO feature normalization above.
+                    let alpha = pred_image.clone().slice(s![.., .., 3..4]).detach();
+                    (
+                        (accumulated_depth / alpha.clamp_min(1e-10)).reshape([img_h, img_w]),
+                        gt_depth,
+                    )
+                };
                 // DN-Splatter gradient-aware weighting: build a per-pixel weight
                 // from the GT RGB image (same source `image_loss` consumes),
                 // lifted onto the AD graph as a constant like the LPIPS path, so
@@ -1263,11 +1954,10 @@ impl SplatTrainer {
             if self.config.plane_coplanarity_weight > 0.0
                 && let Some(planes) = &self.plane_set
             {
-                let assign = if self.config.plane_coplanarity_assign_dist > 0.0 {
-                    self.config.plane_coplanarity_assign_dist
-                } else {
-                    self.config.depth_opacity_reg_margin
-                };
+                let assign = crate::tidi::resolve_coplanarity_assign_dist(
+                    self.config.plane_coplanarity_assign_dist,
+                    planes.spacing,
+                );
                 if let Some(term) = plane_coplanarity_loss(
                     splats.means(),
                     splats.rotations(),
@@ -1288,66 +1978,54 @@ impl SplatTrainer {
             // normals derived from the quaternions makes this loss rotate
             // gaussians. No new kernel is involved.
             if use_normal_render {
-                let (t_fold, o_fold) = match &splats.min_scale {
-                    Some(f) => fold_min_scale(
-                        splats.transforms.val(),
-                        splats.raw_opacities.val(),
-                        f.clone(),
-                    ),
-                    None => (splats.transforms.val(), splats.raw_opacities.val()),
-                };
-                let render_mode = if splats.render_mip {
-                    brush_render::gaussian_splats::SplatRenderMode::Mip
-                } else {
-                    brush_render::gaussian_splats::SplatRenderMode::Default
-                };
-                let normals = splat_normals(t_fold.clone(), camera.position);
-                let normal_img =
-                    render_splat_features(t_fold, o_fold, normals, &camera, img_size, render_mode)
-                        .instrument(trace_span!("Normal forward"))
-                        .await;
-
-                // Same detached alpha normalization as the DiG and depth paths:
-                // the normal terms must not be able to lower their error by
-                // changing transparency.
-                let normal_alpha = normal_img.clone().slice(s![.., .., 3..4]).detach();
-                let n_world =
-                    normal_img.slice(s![.., .., 0..3]) / normal_alpha.clone().clamp_min(1e-10);
-                let n_len = n_world
-                    .clone()
-                    .powi_scalar(2)
-                    .sum_dim(2)
-                    .sqrt()
-                    .clamp_min(1e-6);
-                let n_world = n_world / n_len;
-
-                // World -> camera. Right-multiplying row vectors by Rᵀ is the
-                // same as left-multiplying column vectors by R.
-                let rot = camera.world_to_local().matrix3;
-                let r_t: Tensor<2> = Tensor::<1>::from_floats(
-                    [
-                        rot.x_axis.x,
-                        rot.x_axis.y,
-                        rot.x_axis.z,
-                        rot.y_axis.x,
-                        rot.y_axis.y,
-                        rot.y_axis.z,
-                        rot.z_axis.x,
-                        rot.z_axis.y,
-                        rot.z_axis.z,
-                    ],
-                    &device,
-                )
-                .reshape([3, 3]);
-                let n_cam = n_world
-                    .reshape([(img_h * img_w) as i32, 3])
-                    .matmul(r_t)
-                    .reshape([img_h, img_w, 3]);
+                // The render block above runs whenever `use_normal_render ||
+                // use_plane_depth`, so this is unreachable — `expect` rather
+                // than an `if let` because a silently-skipped normal term is a
+                // regression that no test failure would announce: the run just
+                // trains without the supervision it was configured for.
+                let (n_cam, normal_alpha) = normal_render
+                    .as_ref()
+                    .expect("use_normal_render implies the feature render ran");
+                let n_cam = n_cam.clone();
+                let normal_alpha = normal_alpha.clone();
 
                 if use_prior_normal && let Some(normal_data) = &batch.normal {
                     let gt_normal: Tensor<3> = Tensor::from_data(normal_data.clone(), &device);
+                    // NeuRIS per-pixel contradiction gate (arXiv:2206.13597);
+                    // the 30 degree value and its arming step come from the
+                    // `gauss-surf` PGSR trainer (rerun-io/examples-monorepo,
+                    // Apache-2.0, by Pablo Vela). `None` at the default is
+                    // literally the pre-gate code path.
+                    let gate_cos = self.config.normal_gate_cos_at(global_iter);
+
+                    // Over-masking diagnostic (plan §4.7). Built ONLY on the
+                    // sampling stride and ONLY when the gate is on, so a default
+                    // run constructs no tensor and reads nothing back. The
+                    // readback is a real device sync, which is why it rides the
+                    // refine-derived cadence rather than firing every step; the
+                    // condition it detects is by definition not a single-step
+                    // event. Counts are stashed here and acted on after this
+                    // block, so the loss path keeps its immutable borrow of
+                    // `self`.
+                    if let Some(gate_cos) = gate_cos
+                        && self.should_sample_normal_gate(global_iter)
+                    {
+                        let counts = brush_loss::normal_gate_counts(
+                            n_cam.clone(),
+                            gt_normal.clone(),
+                            gate_cos,
+                        );
+                        if let Ok(data) = counts.inner().into_data_async().await
+                            && let Ok(v) = data.to_vec::<f32>()
+                            && v.len() == 2
+                        {
+                            normal_gate_sample = Some((v[0], v[1]));
+                        }
+                    }
+
                     loss = loss
-                        + normal_loss(n_cam.clone(), gt_normal) * self.config.normal_loss_weight;
+                        + normal_loss(n_cam.clone(), gt_normal, gate_cos)
+                            * (self.config.normal_loss_weight * normal_ramp);
                 }
 
                 // TV smoothness on the rendered normal image. Needs no prior
@@ -1363,11 +2041,22 @@ impl SplatTrainer {
                     // Unprojection is pinhole-only for now; our fisheye-split
                     // path is KB4, interior cube faces are Pinhole. Skip with a
                     // warning rather than silently supervising with wrong math.
-                    if matches!(camera.camera_model, CameraModel::Pinhole) {
-                        let accumulated_depth = pred_image.clone().slice(s![.., .., 4..5]);
-                        let alpha = pred_image.clone().slice(s![.., .., 3..4]).detach();
-                        let expected_depth =
-                            (accumulated_depth / alpha.clamp_min(1e-10)).reshape([img_h, img_w]);
+                    if is_pinhole {
+                        // Same dispatch as the depth loss above, and for the
+                        // same reason: PGSR's consistency term compares the
+                        // rendered plane normal against normals differentiated
+                        // from the PLANE depth, not from the centre depth. No
+                        // extra masking is needed — invalid plane pixels are
+                        // exactly 0, `normals_from_depth` requires all three
+                        // contributing depths to be positive, and
+                        // `depth_normal_loss` then drops the `(0,0,0)` it emits.
+                        let expected_depth = if let Some((depth, _valid)) = &plane_depth {
+                            depth.clone()
+                        } else {
+                            let accumulated_depth = pred_image.clone().slice(s![.., .., 4..5]);
+                            let alpha = pred_image.clone().slice(s![.., .., 3..4]).detach();
+                            (accumulated_depth / alpha.clamp_min(1e-10)).reshape([img_h, img_w])
+                        };
                         let focal = camera.focal(img_size);
                         let center = camera.center(img_size);
                         let n_from_depth = normals_from_depth(
@@ -1379,7 +2068,7 @@ impl SplatTrainer {
                         );
                         loss = loss
                             + depth_normal_loss(n_from_depth, n_cam, normal_alpha)
-                                * self.config.depth_normal_weight;
+                                * (eff_dn_weight * normal_ramp);
                     } else {
                         warn_depth_normal_needs_pinhole();
                     }
@@ -1392,9 +2081,34 @@ impl SplatTrainer {
             // scale so exports keep the thin axis and we do not fight the
             // anti-aliasing floor. MRNF's prune keys on `scale_max`, so there is
             // no interaction with it.
+            //
+            // ---- `--normalize-metric-weights` (default off = exact 1.0) ----
+            //
+            // These two terms are the only ones in the loss whose VALUE carries
+            // physical units, so they are the only ones whose weight has to be
+            // divided by the scene scale for a recipe to transfer between scenes
+            // of different physical size:
+            //
+            //   * flatten  = mean(min activated scale)      -> metres    -> / s
+            //   * scale-reg = mean(s² above a threshold)    -> metres²   -> / s²
+            //     and its THRESHOLD is itself a length      -> metres    -> × s
+            //
+            // **`--depth-loss-weight` is deliberately NOT in this list, and must
+            // not be "fixed" to match the reference.** The `gauss-surf` PGSR
+            // trainer (rerun-io/examples-monorepo, Apache-2.0, by Pablo Vela)
+            // divides its depth weight by the scene scale because its depth loss
+            // is a metric L1 in metres. Ours is DISPARITY-space (`1/m`,
+            // `brush-loss/src/lib.rs` `depth_loss`), so its residual scales as
+            // `1/s`, not `s` — dividing by `s` would move the effective weight
+            // the WRONG WAY by a factor of `s²`. The dimensionless weights
+            // (`--normal-loss-weight`, `--depth-normal-weight`,
+            // `--normal-smooth-weight`, `--anti-needle-weight`) need no
+            // normalization for the same reason, and get none.
+            let metric_scale = self.metric_weight_scale();
             if use_flatten {
                 let scales = splats.transforms.val().slice(s![.., 7..10]).exp();
-                loss = loss + scales.min_dim(1).mean() * self.config.flatten_loss_weight;
+                loss = loss
+                    + scales.min_dim(1).mean() * (self.config.flatten_loss_weight / metric_scale);
             }
 
             // Scale-explosion + anti-needle regularizers (Stipple, arXiv:2608.00931).
@@ -1404,8 +2118,10 @@ impl SplatTrainer {
             if self.config.scale_reg_weight > 0.0 {
                 let scales = splats.transforms.val().slice(s![.., 7..10]).exp();
                 loss = loss
-                    + crate::tidi::scale_reg_loss(scales, self.config.scale_reg_threshold)
-                        * self.config.scale_reg_weight;
+                    + crate::tidi::scale_reg_loss(
+                        scales,
+                        self.config.scale_reg_threshold * metric_scale,
+                    ) * (self.config.scale_reg_weight / (metric_scale * metric_scale));
             }
             if self.config.anti_needle_weight > 0.0 {
                 let log_scales = splats.transforms.val().slice(s![.., 7..10]);
@@ -1416,6 +2132,29 @@ impl SplatTrainer {
             // Strip the autodiff graph off the loss so consumers can read the
             // scalar later without keeping the backward pass alive.
             let loss_inner = loss.clone().inner();
+
+            // ---- Total-loss finiteness guard ----
+            //
+            // Deliberately BEFORE the backward and the optimizer step: a NaN
+            // loss produces NaN gradients, which the optimizer then writes into
+            // every parameter it touches. Checking here means the run aborts
+            // with the parameters still clean, so whatever the caller does next
+            // (checkpoint, inspect) sees the last good state rather than a
+            // scene that has already been overwritten with NaN.
+            //
+            // Cadence and its rationale: `NONFINITE_LOSS_CHECK_STEPS`.
+            if self.should_check_loss_finite(global_iter) {
+                let loss_value: f32 = loss_inner
+                    .clone()
+                    .into_scalar_async()
+                    .await
+                    .expect("total-loss readback for the finiteness guard");
+                if !loss_value.is_finite() {
+                    self.report_nonfinite_loss(loss_value, &splats, global_iter)
+                        .await;
+                }
+            }
+
             let mut grads = splats.bwd_validate(loss).await;
 
             let deferred_sh_grad = deferred_sh_grad.map(|handle| {
@@ -1512,6 +2251,13 @@ impl SplatTrainer {
                 deferred_sh_grad,
             )
         };
+
+        // Contradiction-gate over-masking diagnostic (plan §4.7). `None` on
+        // every step of a default run, and on every non-sampling step even when
+        // the gate is on.
+        if let Some((surviving, valid)) = normal_gate_sample {
+            self.record_normal_gate_sample(global_iter, surviving, valid);
+        }
 
         // The optimizer strips autodiff before stepping, so optimizer state
         // (scaling, momentum) lives on the inner device.
@@ -1748,6 +2494,143 @@ impl SplatTrainer {
         (splats, stats)
     }
 
+    /// Whether this step's total loss should be read back and checked.
+    ///
+    /// See [`NONFINITE_LOSS_CHECK_STEPS`] for why this is sampled rather than
+    /// unconditional, and why the sampled cadence is the refine cadence.
+    fn should_check_loss_finite(&self, global_iter: u32) -> bool {
+        if self.step_count <= NONFINITE_LOSS_CHECK_STEPS {
+            return true;
+        }
+        // The refine cadence is a step that ALREADY synchronises (the refine
+        // prune reads its own counts back), so the marginal cost here is one
+        // extra scalar rather than a new stall.
+        global_iter.is_multiple_of(self.config.refine_every.max(1))
+    }
+
+    /// Report — and by default ABORT on — a non-finite total loss.
+    ///
+    /// The reference trainer raises `FloatingPointError` on any non-finite loss
+    /// term rather than warning, and that is the right posture: a step whose
+    /// loss is NaN writes NaN gradients into the parameters, and every
+    /// subsequent step trains on garbage. A run that continues past this point
+    /// has no usable output, so continuing only wastes GPU hours and, worse,
+    /// produces a file that LOOKS like a deliverable.
+    ///
+    /// `--allow-nonfinite-loss` restores the old continue-anyway behaviour for
+    /// debugging the poisoning itself.
+    async fn report_nonfinite_loss(&self, loss_value: f32, splats: &Splats, global_iter: u32) {
+        // This path is already failing, so the extra readbacks below are free in
+        // any sense that matters. WHICH parameter group is non-finite is the
+        // only cheap diagnostic available — the per-TERM loss breakdown is not,
+        // because the terms are accumulated into one scalar (`loss = loss + ..`)
+        // and are not retained separately. Splat-side counts still separate the
+        // two cases that matter: parameters already poisoned before this step
+        // (counts > 0) versus a loss that went non-finite on clean parameters
+        // (counts == 0, i.e. look at the batch and the loss terms instead).
+        let counts = non_finite_splat_masks(splats).counts().await;
+        log::error!(
+            "NON-FINITE TOTAL LOSS ({loss_value}) at iter {global_iter}. {}",
+            counts.report(global_iter, "loss guard")
+        );
+
+        assert!(
+            self.config.allow_nonfinite_loss,
+            "non-finite total loss ({loss_value}) at iter {global_iter}: aborting before the \
+             backward pass writes NaN gradients into the parameters. Splat parameters \
+             non-finite at this point: {} of {} [transforms {} | sh {} | opacity {}]. \
+             Training past this point produces an export that cannot be used — one \
+             non-finite value poisons an entire SOG codebook downstream. Pass \
+             --allow-nonfinite-loss to continue anyway (for debugging the cause only; \
+             the result is not a deliverable).",
+            counts.any, counts.total, counts.transforms, counts.sh, counts.opacities
+        );
+
+        log::error!(
+            "--allow-nonfinite-loss is set: continuing to train on a non-finite loss. \
+             The resulting splats are NOT a deliverable."
+        );
+    }
+
+    /// Prune non-finite splats OUTSIDE the refine cadence.
+    ///
+    /// # The gap this closes
+    ///
+    /// The non-finite prune inside `refine_for_phase` only runs on refine
+    /// steps, so any splat that goes NaN/inf AFTER the last refinement survives
+    /// all the way to export. Measured on `ARKitScenes`: **14-25 non-finite
+    /// splats in every exported ply**. That number was only ever visible
+    /// because `analyze/splatstats/` counts them after the fact; the trainer
+    /// should own it, which is what the log line here does.
+    ///
+    /// Downstream this is not cosmetic — one non-finite value poisons an entire
+    /// SOG codebook at Stage 7, which is a whole-scene failure, not a
+    /// three-splat one.
+    ///
+    /// # Cost, and where to call it
+    ///
+    /// Counting synchronises with the GPU, so this is for cadences that already
+    /// sync (eval) or paths where a sync is free relative to what follows
+    /// (immediately before an export writes a file).
+    ///
+    /// # Byte-identity
+    ///
+    /// When nothing is non-finite this returns EARLY — before taking the
+    /// optimizer, before touching the refine record, before `prune_points`.
+    /// A clean run therefore executes exactly the sequence it did before this
+    /// method existed, and only the (value-free) count readback is added.
+    pub async fn prune_non_finite_splats(
+        &mut self,
+        iter: u32,
+        splats: Splats,
+        site: &str,
+    ) -> (Splats, u32) {
+        let masks = non_finite_splat_masks(&splats);
+        let counts = masks.counts().await;
+        if counts.any == 0 {
+            return (splats, 0);
+        }
+        log::warn!("{}", counts.report(iter, site));
+
+        // The optimizer is created lazily on the first step. Without it there
+        // is no moment state to keep in lockstep, but `prune_points` needs one
+        // to reindex; nothing has trained yet either, so leave it alone.
+        let Some(mut optim) = self.optim.take() else {
+            log::warn!(
+                "non-finite splats found at iter {iter} ({site}) before the optimizer exists; \
+                 leaving them in place"
+            );
+            return (splats, 0);
+        };
+
+        // `refine_record` is None only right after a refine consumed it; `step`
+        // recreates it on the next iteration regardless, so a fresh zeroed
+        // record loses nothing that was going to survive anyway.
+        let device = splats.device();
+        let refiner = self
+            .refine_record
+            .take()
+            .unwrap_or_else(|| RefineRecord::new(splats.num_splats(), &device));
+
+        let (splats, refiner, pruned) = prune_points(
+            splats,
+            &mut optim,
+            refiner,
+            masks.any(),
+            self.dig.as_mut(),
+            self.tidi.as_mut(),
+        )
+        .await;
+        self.optim = Some(optim);
+        self.refine_record = Some(refiner);
+
+        log::warn!(
+            "pruned {pruned} non-finite splats at iter {iter} ({site}); {} remain",
+            splats.num_splats()
+        );
+        (splats, pruned)
+    }
+
     pub async fn refine(&mut self, iter: u32, splats: Splats) -> (Splats, RefineStats) {
         self.refine_for_phase(iter, iter, self.config.total_train_iters, splats)
             .await
@@ -1859,21 +2742,17 @@ impl SplatTrainer {
                 .squeeze_dim(1)
         };
 
-        // Prune parameter that's NaN.
-        fn row_non_finite(t: &Tensor<2>) -> Tensor<1, Bool> {
-            t.clone().is_finite().bool_not().any_dim(1).squeeze_dim(1)
+        // Prune parameters that are NaN/inf. ONE definition of "non-finite
+        // splat" lives in `non_finite_splat_masks`, shared by this prune, the
+        // out-of-refine sweep (`prune_non_finite_splats`) and the loss guard's
+        // diagnostic — three callers that must agree on what they are counting.
+        let non_finite = non_finite_splat_masks(&splats);
+        let non_finite_mask = non_finite.any();
+        let non_finite_counts = non_finite.counts().await;
+        let num_pruned_non_finite = non_finite_counts.any;
+        if num_pruned_non_finite > 0 {
+            log::info!("{}", non_finite_counts.report(global_iter, "refine"));
         }
-        let transforms_bad = row_non_finite(&splats.transforms.val());
-        let sh_bad = row_non_finite(&splats.sh_coeffs.val().flatten(1, 2));
-        let opac_bad = row_non_finite(&splats.raw_opacities.val().unsqueeze_dim(1));
-        let non_finite_mask = transforms_bad.bool_or(sh_bad).bool_or(opac_bad);
-        let num_pruned_non_finite = non_finite_mask
-            .clone()
-            .int()
-            .sum()
-            .into_scalar_async::<i32>()
-            .await
-            .expect("Failed to count non-finite splats") as u32;
 
         let prune_mask = alpha_mask
             .bool_or(scale_big)
@@ -2507,6 +3386,83 @@ fn tidi_params(config: &TrainConfig) -> TidiPruneParams {
     }
 }
 
+/// Per-parameter-group "this splat has a non-finite value" masks.
+///
+/// Split by group rather than pre-`or`ed because WHICH parameter went bad is
+/// the only cheap diagnostic available when a run poisons itself, and it is
+/// what a future root-cause pass will start from. The combined mask is
+/// [`Self::any`].
+struct NonFiniteSplatMasks {
+    transforms: Tensor<1, Bool>,
+    sh: Tensor<1, Bool>,
+    opacities: Tensor<1, Bool>,
+}
+
+/// Counts behind [`NonFiniteSplatMasks`]. `any` is the number of splats with a
+/// non-finite value ANYWHERE, so it is <= the sum of the three groups (one
+/// splat can be bad in more than one).
+struct NonFiniteSplatCounts {
+    transforms: u32,
+    sh: u32,
+    opacities: u32,
+    any: u32,
+    total: u32,
+}
+
+impl NonFiniteSplatCounts {
+    /// One-line report, shared by every site that prunes or detects. Kept
+    /// identical across sites so the numbers are greppable across a whole run.
+    fn report(&self, iter: u32, site: &str) -> String {
+        format!(
+            "non-finite splats at iter {iter} ({site}): {} of {}              [transforms {} | sh {} | opacity {}]",
+            self.any, self.total, self.transforms, self.sh, self.opacities
+        )
+    }
+}
+
+impl NonFiniteSplatMasks {
+    fn any(&self) -> Tensor<1, Bool> {
+        self.transforms
+            .clone()
+            .bool_or(self.sh.clone())
+            .bool_or(self.opacities.clone())
+    }
+
+    /// Reads all four counts back from the GPU. This SYNCHRONISES — callers are
+    /// responsible for only doing it on a cadence that already syncs, or on a
+    /// path that is already failing.
+    async fn counts(&self) -> NonFiniteSplatCounts {
+        async fn count(mask: Tensor<1, Bool>) -> u32 {
+            mask.int()
+                .sum()
+                .into_scalar_async::<i32>()
+                .await
+                .expect("Failed to count non-finite splats") as u32
+        }
+        let total = self.transforms.dims()[0] as u32;
+        NonFiniteSplatCounts {
+            transforms: count(self.transforms.clone()).await,
+            sh: count(self.sh.clone()).await,
+            opacities: count(self.opacities.clone()).await,
+            any: count(self.any()).await,
+            total,
+        }
+    }
+}
+
+/// The single definition of "this splat is non-finite", used by the refine
+/// prune, the out-of-refine sweep and the loss guard's diagnostic.
+fn non_finite_splat_masks(splats: &Splats) -> NonFiniteSplatMasks {
+    fn row_non_finite(t: &Tensor<2>) -> Tensor<1, Bool> {
+        t.clone().is_finite().bool_not().any_dim(1).squeeze_dim(1)
+    }
+    NonFiniteSplatMasks {
+        transforms: row_non_finite(&splats.transforms.val()),
+        sh: row_non_finite(&splats.sh_coeffs.val().flatten(1, 2)),
+        opacities: row_non_finite(&splats.raw_opacities.val().unsqueeze_dim(1)),
+    }
+}
+
 // Prunes points based on the given mask.
 //
 // Args:
@@ -2604,6 +3560,23 @@ fn warn_depth_normal_needs_pinhole() {
     });
 }
 
+/// Warn exactly once that a plane depth source was requested on a non-pinhole
+/// camera. Both the ray-plane grid and `normals_from_depth` assume a pinhole
+/// unprojection, so the step falls back to the centre depth channel rather than
+/// supervising with wrong math. Once, because it would otherwise fire every step
+/// of every view.
+fn warn_plane_depth_needs_pinhole() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "--depth-source selects PGSR plane depth but this camera is not \
+             Pinhole; falling back to the centre-expected depth channel for \
+             non-pinhole views (ray-plane intersection for fisheye models is not \
+             implemented)."
+        );
+    });
+}
+
 /// Warn exactly once that `--depth-opacity-reg-weight` is set but no distance-to-
 /// cloud grid was built (the run has no seed point cloud — e.g. a random-init run
 /// with no COLMAP/LiDAR points). The regularizer then no-ops for the run; it never
@@ -2618,6 +3591,111 @@ fn warn_depth_opacity_reg_no_cloud() {
              (COLMAP points3D / LiDAR ply) to enable it."
         );
     });
+}
+
+/// ---- PGSR plane-depth validity thresholds (approach A call site) ----
+///
+/// Deliberately NOT config-exposed in v1 (plan §4.1): they are PGSR-paper-typical
+/// and the sweep, if one is needed, belongs to the ablation rather than the
+/// operator surface.
+///
+/// A pixel needs real coverage before its composited plane means anything. 0.5
+/// is the same coverage threshold `depth_normal_loss` already uses, so the depth
+/// and consistency terms agree about which pixels exist.
+const PLANE_MIN_ALPHA: f32 = 0.5;
+/// `|n_sum · ray|` below this is a plane seen edge-on: the intersection runs off
+/// to infinity and its gradient with it. Reject rather than clamp.
+///
+/// **The test is against the ALPHA-WEIGHTED composited sum, not the geometric
+/// `n̂ · ray`.** `n_sum` is `Σ wᵢ nᵢ`, so at coverage α the quantity compared here
+/// is `α · (n̂ · ray)` and the effective GEOMETRIC cutoff is `min_denom / α` —
+/// tighter as coverage falls (at α = 0.7, ≈ 0.071). This is the one place alpha
+/// does not cancel: it divides out of the quotient `offset_sum / (n_sum · ray)`
+/// exactly, but not out of this validity comparison. Defensible — a thinly
+/// covered pixel is a worse plane estimate as well as a more grazing one, and
+/// `PLANE_MIN_ALPHA` only bounds α from below, it does not make α equal 1 — but
+/// it is a coupling of two thresholds and it is not obvious from the call, so it
+/// is written down. Anyone building a test fixture at a chosen denominator must
+/// tilt the geometric normal to `denom/α`; `plane_depth_grazing_tests` does.
+///
+/// **0.05, where the reference uses 1e-4 — a choice, not a transcription slip.**
+/// `gauss-surf` computes in float64, where the quotient is still accurate to
+/// ~2e-7 at 1.01x a 1e-4 cutoff. We are f32 end to end, and near-grazing is
+/// ill-conditioned: `n_sum · ray` cancels from O(1) down to `O(min_denom)`, so its
+/// ~`eps·‖ray‖` absolute rounding becomes a `eps·‖ray‖/|denom|` RELATIVE error in
+/// the depth. At 1e-4 that is ~2e-3 relative — a plane pixel accurate to two
+/// digits, fed straight into the depth loss. At 0.05 it is ~4e-6, which is the
+/// accuracy `plane_depth_grazing_tests` measures and pins. The 500x gap is the
+/// price of f32; do not "restore parity" with the reference by lowering it.
+const PLANE_MIN_DENOM: f32 = 0.05;
+/// `min_depth > 0` is what rejects a plane BEHIND the camera — an `|z| < max`
+/// test alone would accept `z = -3`.
+const PLANE_MIN_DEPTH: f32 = 1e-3;
+/// Far cut for whatever survives `PLANE_MIN_DENOM`. Generous on purpose: `SfM`
+/// scenes are not metric, so this cannot be a physical distance. With
+/// `min_denom = 0.05` the intersection is already bounded by `20·|offset|`, so
+/// this only catches the residue.
+const PLANE_MAX_DEPTH: f32 = 1e4;
+/// Interval (in global iterations) for the centre-vs-plane residual readback.
+/// Sampled rather than per-step because it forces a GPU sync; zero work at all
+/// when the depth source is `center`.
+const PLANE_RESIDUAL_LOG_EVERY: u32 = 500;
+
+/// `normalize(features / α)` for a `[H, W, 3]` composited normal image —
+/// the plane path's copy of the `center` path's alpha-normalize-then-unit-norm
+/// sequence, with the same two clamps (`1e-10` on the alpha divide, `1e-6` on
+/// the length).
+///
+/// Deliberately a separate function rather than a shared one the `center` path
+/// also calls: the `center` sequence is pinned byte-identical, and hoisting it
+/// into a shared helper is exactly the kind of "harmless" refactor that would
+/// have to be re-proven. `center_normalize_matches_plane_helper` pins that the
+/// two agree.
+fn normal_alpha_normalize(features: Tensor<3>, alpha: Tensor<3>) -> Tensor<3> {
+    let n = features / alpha.clamp_min(1e-10);
+    let len = n.clone().powi_scalar(2).sum_dim(2).sqrt().clamp_min(1e-6);
+    n / len
+}
+
+/// Log the mean relative disagreement between PGSR plane depth and the
+/// centre-expected depth channel, over the pixels where the plane is valid.
+///
+/// v1 keeps the centre depth channel rendered even when a plane source is active
+/// (plan §4.2), so this residual is free apart from the readback. It is a real
+/// signal, not noise: WS-1 measured centre depth ~2% biased against plane depth
+/// on a tilted slab (mean 1.9e-2, max 2.3e-2 relative — ≈10 cm at 5 m). A
+/// residual that sits at ~0 means the plane path is not actually engaging (e.g.
+/// nearly everything invalid), which no loss curve would show.
+async fn log_plane_vs_centre_residual(
+    plane: Tensor<2>,
+    centre: Tensor<2>,
+    valid: Tensor<2>,
+    global_iter: u32,
+) {
+    let count = valid.clone().sum();
+    // `centre` can be 0 on uncovered pixels; clamp before the divide so the
+    // masked-out entries cannot produce a non-finite that the mask then
+    // multiplies to NaN (the 0·∞ lesson).
+    let rel = ((plane - centre.clone()).abs() / centre.abs().clamp_min(1e-6)) * valid;
+    let stats: Vec<f32> = Tensor::cat(vec![rel.sum().reshape([1]), count.reshape([1])], 0)
+        .into_data_async()
+        .await
+        .expect("plane residual readback")
+        .into_vec()
+        .expect("f32 plane residual stats");
+    let (sum, n) = (stats[0], stats[1]);
+    if n > 0.0 {
+        log::info!(
+            "iter {global_iter}: plane-vs-centre depth residual {:.4} relative over {n} valid px",
+            sum / n
+        );
+    } else {
+        log::warn!(
+            "iter {global_iter}: PGSR plane depth is valid at ZERO pixels — the depth \
+             and consistency terms are unsupervised this step. Check --depth-source, \
+             the camera model, and scene scale against PLANE_MIN_DEPTH/PLANE_MAX_DEPTH."
+        );
+    }
 }
 
 /// Per-splat world-space surface normal: the gaussian's thinnest local axis,
@@ -2684,6 +3762,98 @@ fn splat_normals(transforms: Tensor<2>, cam_pos: glam::Vec3) -> Tensor<2> {
         .sub_scalar(1.0);
 
     normal * sign
+}
+
+/// The world→camera rotation as a `[3, 3]` tensor laid out so that a `[.., 3]`
+/// stack of ROW vectors can be rotated with a single `matmul`.
+///
+/// `glam`'s `Mat3::x_axis` is the first COLUMN, so reading the axes out in this
+/// order builds `Rᵀ` in row-major; right-multiplying row vectors by `Rᵀ` is the
+/// same as left-multiplying column vectors by `R`. Same idiom (and same layout)
+/// as the normal-render block in `step()`.
+pub fn world_to_cam_rot_t(cam: &Camera, device: &Device) -> Tensor<2> {
+    let rot = cam.world_to_local().matrix3;
+    Tensor::<1>::from_floats(
+        [
+            rot.x_axis.x,
+            rot.x_axis.y,
+            rot.x_axis.z,
+            rot.y_axis.x,
+            rot.y_axis.y,
+            rot.y_axis.z,
+            rot.z_axis.x,
+            rot.z_axis.y,
+            rot.z_axis.z,
+        ],
+        device,
+    )
+    .reshape([3, 3])
+}
+
+/// Per-splat camera-frame tangent-PLANE parameters, `[N, 10]` -> `[N, 4]`:
+/// channels `0..3` are the camera-frame unit normal `n_cam`, channel `3` is the
+/// signed plane offset `d`, defined so every point `p` on the splat's tangent
+/// plane satisfies `n_cam · p = d` in the `OpenCV` camera frame.
+///
+/// PGSR (Chen et al. 2024, arXiv:2406.06521), plane parameterization. Rendering
+/// these four channels through the feature rasterizer and intersecting each
+/// camera ray with the composited plane
+/// ([`brush_loss::plane_depth_from_features`]) gives PGSR's unbiased surface
+/// depth, in place of the alpha-composited camera-`z` of the splat CENTRES that
+/// `project_visible.rs:86` emits.
+///
+/// # Gradient contract (this is the whole point of the function)
+///
+/// The normal is `splat_normals` verbatim — including its two deliberately
+/// DETACHED discrete choices (thinnest-axis `argmin`, camera-facing sign) — then
+/// rotated into the camera frame, which is a constant orthonormal map. So
+/// channels `0..3` carry exactly today's normal-render gradient: live into the
+/// quaternions, nothing into the means or the scales.
+///
+/// Channel 3 is where this DIFFERS from `splat_normals`, and the difference is
+/// load-bearing. `splat_normals` uses the splat position only to pick a facing
+/// sign and therefore detaches it outright. Here
+///
+/// ```text
+/// d = n_world · (mean − cam_pos)
+/// ```
+///
+/// and the MEAN ENTERS DIFFERENTIABLY. That is the gradient path from plane
+/// depth back to gaussian positions, and it is the only one the feature pass can
+/// express (the feature rasterizer treats geometry as constant and back-props
+/// into feature VALUES only). Detaching the mean here would leave a function
+/// that still renders a perfectly correct plane-depth map and still trains —
+/// just with no position supervision at all from it, i.e. silently inert rather
+/// than visibly broken. `plane_features_offset_moves_means` pins it.
+///
+/// The camera-facing sign stays detached (it flips both `n` and `d` together, so
+/// the plane is unchanged and only the parameterization's sign convention moves).
+///
+/// # Why world frame for the offset
+///
+/// `d = n_cam · mean_cam` by definition, but a rotation preserves dot products
+/// and `mean_cam = R(mean − cam_pos)`, `n_cam = R·n_world`, so
+/// `n_cam · mean_cam = n_world · (mean − cam_pos)`. Computing it in world frame
+/// uses tensors already in hand and needs no `matmul` on the means.
+///
+/// `transforms` is expected to be the min-scale-FOLDED transforms
+/// (`fold_min_scale`), matching what the current normal render feeds
+/// `splat_normals`.
+pub fn plane_features(transforms: Tensor<2>, cam: &Camera) -> Tensor<2> {
+    let device = transforms.device();
+
+    let means = transforms.clone().slice(s![.., 0..3]);
+    let n_world = splat_normals(transforms, cam.position);
+
+    // Offset: LIVE in both `n_world` and `means`. See the gradient contract.
+    let cam_pos =
+        Tensor::<1>::from_floats([cam.position.x, cam.position.y, cam.position.z], &device)
+            .reshape([1, 3]);
+    let offset = (n_world.clone() * (means - cam_pos)).sum_dim(1);
+
+    let n_cam = n_world.matmul(world_to_cam_rot_t(cam, &device));
+
+    Tensor::cat(vec![n_cam, offset], 1)
 }
 
 #[cfg(test)]
@@ -2955,6 +4125,117 @@ mod normal_prior_grad_tests {
     /// (thinnest axis, camera-facing sign). So the only live path from this loss
     /// back into the model is the quaternion, transforms columns 3..7 — not
     /// means, not scales, not opacity. That is the contract this test guards.
+    /// **The over-masking warning, observed firing on real render output.**
+    ///
+    /// A diagnostic that has never been seen to fire is not yet a diagnostic, so
+    /// this drives the whole §4.7 path end to end: render normals, build a prior
+    /// from them, feed the real `normal_gate_counts`, and hand the counts to the
+    /// real `record_normal_gate_sample`.
+    ///
+    /// The contradicted prior here is a SIGN FLIP, chosen only because it is the
+    /// cleanest way to manufacture total disagreement — the counts it produces
+    /// (0 survivors of a nonzero valid count) are the same shape a
+    /// miscalibrated threshold produces, which is the case that actually
+    /// motivates the guard. `ingest/splatcam/normals_moge.py`'s check would
+    /// likely have flagged this particular prior upstream; it could not have
+    /// flagged the miscalibrated one, because it never compares the prior
+    /// against the renderer at all (see `NORMAL_GATE_LOW_FRACTION`).
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)]
+    async fn normal_gate_warning_fires_on_a_contradicted_prior() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = tilted_plane_splats(&device, 0.0);
+        let camera = test_camera();
+
+        let n_cam = render_camera_normals(&splats, &camera).await;
+        let rendered: Vec<f32> = n_cam
+            .clone()
+            .into_data_async()
+            .await
+            .expect("normal readback")
+            .to_vec()
+            .expect("f32 normals");
+
+        // Build the prior FROM the render: exact agreement on covered pixels,
+        // `(0,0,0)` (no prior) where nothing rendered. That isolates the gate —
+        // any masking observed below is the gate's doing, not missing coverage.
+        let mut agreeing = vec![0.0f32; rendered.len()];
+        let mut covered = 0usize;
+        for (dst, src) in agreeing.chunks_exact_mut(3).zip(rendered.chunks_exact(3)) {
+            let len = (src[0] * src[0] + src[1] * src[1] + src[2] * src[2]).sqrt();
+            if len > 0.5 {
+                dst.copy_from_slice(src);
+                covered += 1;
+            }
+        }
+        assert!(
+            covered > 100,
+            "test scene must actually render normals, covered = {covered}"
+        );
+
+        let dims = [IMG.y as usize, IMG.x as usize, 3];
+        let cos30 = 30.0_f32.to_radians().cos();
+
+        let gt_ok = Tensor::<3>::from_data(TensorData::new(agreeing.clone(), dims), &device);
+        let ok: Vec<f32> = brush_loss::normal_gate_counts(n_cam.clone(), gt_ok, cos30)
+            .inner()
+            .into_data_async()
+            .await
+            .expect("counts readback")
+            .to_vec()
+            .expect("f32 counts");
+        assert!((ok[1] - covered as f32).abs() < 1e-3, "valid = {}", ok[1]);
+        assert!(
+            (ok[0] - ok[1]).abs() < 1e-3,
+            "an exactly-agreeing prior must survive the gate entirely: {} of {}",
+            ok[0],
+            ok[1]
+        );
+
+        // Now the sign-flipped prior: same valid pixels, all contradicted.
+        let flipped: Vec<f32> = agreeing.iter().map(|v| -v).collect();
+        let gt_bad = Tensor::<3>::from_data(TensorData::new(flipped, dims), &device);
+        let bad: Vec<f32> = brush_loss::normal_gate_counts(n_cam, gt_bad, cos30)
+            .inner()
+            .into_data_async()
+            .await
+            .expect("counts readback")
+            .to_vec()
+            .expect("f32 counts");
+        assert!((bad[1] - covered as f32).abs() < 1e-3, "valid = {}", bad[1]);
+        assert_eq!(bad[0], 0.0, "a sign-flipped prior must survive nothing");
+
+        // Feed both through the real bookkeeping. The healthy counts never warn;
+        // the contradicted ones warn once the run is sustained.
+        let mut cfg = TrainConfig::default();
+        cfg.normal_gate_degrees = 30.0;
+        let mut trainer = SplatTrainer::new(
+            &cfg,
+            &Default::default(),
+            BoundingBox::from_min_max(glam::Vec3::ZERO, glam::Vec3::ONE),
+        );
+        for i in 0..5 {
+            assert!(
+                !trainer.record_normal_gate_sample(i, ok[0], ok[1]),
+                "a healthy prior must never warn"
+            );
+        }
+        let mut fired = None;
+        for i in 0..NORMAL_GATE_LOW_SAMPLES_TO_WARN {
+            if trainer.record_normal_gate_sample(100 + i, bad[0], bad[1]) {
+                fired = Some(i + 1);
+                break;
+            }
+        }
+        assert_eq!(
+            fired,
+            Some(NORMAL_GATE_LOW_SAMPLES_TO_WARN),
+            "the over-masking warning must fire on the {NORMAL_GATE_LOW_SAMPLES_TO_WARN}th \
+             consecutive contradicted sample"
+        );
+    }
+
     #[tokio::test]
     async fn normal_loss_moves_rotations_only() {
         let device =
@@ -2975,7 +4256,7 @@ mod normal_prior_grad_tests {
             &device,
         );
 
-        let loss = normal_loss(n_cam, gt);
+        let loss = normal_loss(n_cam, gt, None);
         let loss_val = loss
             .clone()
             .into_data_async()
@@ -3361,6 +4642,1635 @@ mod sparse_sh_adam_autodiff_bridge_tests {
         assert!(
             splats.sh_coeffs.grad(&grads).is_some(),
             "the stepped SH parameter must still receive gradients"
+        );
+    }
+}
+
+/// WS-L config-surface tests: the scene-scale helper
+/// (`--normalize-metric-weights`) and the contradiction-gate diagnostic's
+/// decision logic. CPU-only — pure `glam` arithmetic on camera poses and pure
+/// bookkeeping; no device and no tensors.
+///
+/// **Merge note.** This module is appended at the end of `train.rs`, as is
+/// WS-1's `plane_feature_tests`. Git's line-level heuristic interleaves the two
+/// into invalid Rust, so integration treats each `#[cfg(test)] mod` as ONE
+/// opaque block. Keep this module self-contained (it takes nothing from outside
+/// `super::*`) and do not append unrelated items after it.
+#[cfg(test)]
+mod scene_scale_tests {
+    use super::*;
+    use brush_render::kernels::camera_model::CameraModel;
+
+    /// Build an upright `OpenCV` camera at `pos` looking at `target`, with the
+    /// given world up direction.
+    ///
+    /// `OpenCV` camera frame: `+X` right, `+Y` DOWN, `+Z` forward. So the c2w
+    /// columns are `[right, -up, forward]` and `mean_camera_up` must negate
+    /// column 1 to recover `up`.
+    fn cam_at(pos: glam::Vec3, target: glam::Vec3, up: glam::Vec3) -> Camera {
+        let forward = (target - pos).normalize();
+        let down = -up.normalize();
+        let right = down.cross(forward).normalize();
+        // Re-orthogonalize so a non-perpendicular (pos, target, up) triple still
+        // yields a proper rotation.
+        let down = forward.cross(right).normalize();
+        let rotation =
+            glam::Quat::from_mat3(&glam::Mat3::from_cols(right, down, forward)).normalize();
+        Camera::new(
+            pos,
+            rotation,
+            0.8,
+            0.8,
+            glam::vec2(0.5, 0.5),
+            CameraModel::Pinhole,
+        )
+    }
+
+    /// A ring of `n` cameras of radius `r`, centred on `center`, orbiting about
+    /// `up` and all looking inward at `center`.
+    fn camera_ring(n: usize, r: f32, center: glam::Vec3, up: glam::Vec3) -> Vec<Camera> {
+        let up = up.normalize();
+        // Two orthonormal in-plane axes.
+        let a = if up.x.abs() < 0.9 {
+            up.cross(glam::Vec3::X).normalize()
+        } else {
+            up.cross(glam::Vec3::Y).normalize()
+        };
+        let b = up.cross(a).normalize();
+        (0..n)
+            .map(|k| {
+                let theta = std::f32::consts::TAU * k as f32 / n as f32;
+                let pos = center + (a * theta.cos() + b * theta.sin()) * r;
+                cam_at(pos, center, up)
+            })
+            .collect()
+    }
+
+    /// The `OpenCV` column choice, pinned on its own. This is the single line the
+    /// port's convention hangs on: the reference reads c2w column 1 directly
+    /// (OpenGL, `+Y` up), we must negate it (`OpenCV`, `+Y` down).
+    #[test]
+    fn mean_camera_up_negates_the_opencv_down_column() {
+        for up in [
+            glam::Vec3::Z,
+            glam::Vec3::Y,
+            -glam::Vec3::X,
+            glam::vec3(0.0, 1.0, 1.0).normalize(),
+        ] {
+            let cams = camera_ring(6, 2.0, glam::vec3(1.0, -2.0, 3.0), up);
+            let got = mean_camera_up(&cams);
+            assert!(
+                (got - up).length() < 1e-5,
+                "mean_camera_up = {got:?}, want {up:?} \
+                 (a result of {:?} would mean the OpenCV sign flip was missed)",
+                -up
+            );
+        }
+    }
+
+    /// Empty input, and a back-to-back pair whose up axes cancel: no panic, no
+    /// NaN, deterministic fallback.
+    #[test]
+    fn mean_camera_up_degenerate_cases() {
+        assert_eq!(mean_camera_up(&[]), glam::Vec3::Z);
+        let a = cam_at(glam::Vec3::ZERO, glam::Vec3::X, glam::Vec3::Z);
+        let b = cam_at(glam::Vec3::ZERO, glam::Vec3::X, -glam::Vec3::Z);
+        assert_eq!(mean_camera_up(&[a, b]), glam::Vec3::Z);
+    }
+
+    /// `rotation_up_to_z` really lands `up` on `+Z`, including both degenerate
+    /// (anti)parallel cases.
+    #[test]
+    fn rotation_up_to_z_lands_on_z() {
+        for up in [
+            glam::Vec3::Z,
+            -glam::Vec3::Z,
+            glam::Vec3::Y,
+            glam::Vec3::X,
+            glam::vec3(0.3, -0.5, 0.8).normalize(),
+            glam::vec3(1.0, 1.0, -1.0).normalize(),
+        ] {
+            let r = rotation_up_to_z(up);
+            let landed = r * up;
+            assert!(
+                (landed - glam::Vec3::Z).length() < 1e-5,
+                "up {up:?} landed on {landed:?}"
+            );
+            // Proper rotation: determinant +1.
+            assert!((r.determinant() - 1.0).abs() < 1e-5);
+        }
+    }
+
+    /// The whole pipeline on a synthetic ring whose answer is known by
+    /// construction.
+    ///
+    /// A ring of 8 cameras of radius `R` about `up`, translated anywhere: the
+    /// mean origin is the ring centre, so centring puts the ring at the origin;
+    /// the mean up is `up`, so the Rodrigues step lays the ring flat in the
+    /// world XY plane; and with 8 evenly spaced cameras two of them land exactly
+    /// on an in-plane axis, so the largest absolute coordinate is exactly `R`.
+    #[test]
+    fn scene_scale_from_camera_ring() {
+        // Z-up ring, offset far from the origin: centring must remove the offset
+        // entirely, so the answer is the radius, not the distance to the origin.
+        let cams = camera_ring(8, 2.0, glam::vec3(0.0, 0.0, 5.0), glam::Vec3::Z);
+        let scale = scene_scale_from_cameras(&cams).expect("ring has a scale");
+        assert!((scale - 2.0).abs() < 1e-4, "z-up ring scale = {scale}");
+
+        // Y-up ring (the COLMAP/SuperSplat-style frame): identical answer, but
+        // now the Rodrigues step does real work rotating +Y onto +Z.
+        let cams = camera_ring(8, 3.0, glam::vec3(-4.0, 9.0, 2.0), glam::Vec3::Y);
+        let scale = scene_scale_from_cameras(&cams).expect("ring has a scale");
+        assert!((scale - 3.0).abs() < 1e-4, "y-up ring scale = {scale}");
+
+        // A tilted up axis is still just a ring: the reorientation flattens it.
+        let up = glam::vec3(0.0, 1.0, 1.0).normalize();
+        let cams = camera_ring(8, 1.5, glam::vec3(2.0, 2.0, 2.0), up);
+        let scale = scene_scale_from_cameras(&cams).expect("ring has a scale");
+        assert!((scale - 1.5).abs() < 1e-4, "tilted ring scale = {scale}");
+
+        // The scale is a RADIUS, not a diameter, and it scales linearly.
+        let cams = camera_ring(8, 20.0, glam::Vec3::ZERO, glam::Vec3::Z);
+        let scale = scene_scale_from_cameras(&cams).expect("ring has a scale");
+        assert!((scale - 20.0).abs() < 1e-3, "scale = {scale}");
+
+        // Empty input yields None (callers fall back to 1.0, i.e. unnormalized).
+        assert_eq!(scene_scale_from_cameras(&[]), None);
+
+        // A single camera is its own mean, so every centred origin is zero and
+        // there is no usable scale.
+        let one = camera_ring(1, 2.0, glam::Vec3::ZERO, glam::Vec3::Z);
+        assert_eq!(scene_scale_from_cameras(&one), None);
+    }
+
+    /// The gate diagnostic must be completely inert at the default.
+    ///
+    /// With `--normal-gate-degrees` unset there is no gate to observe, so the
+    /// trainer must never take a sample — which is what keeps the readback (a
+    /// real device sync) out of every default run.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn normal_gate_diagnostic_is_inert_by_default() {
+        let device = Default::default();
+        let bounds = BoundingBox::from_min_max(glam::Vec3::ZERO, glam::Vec3::ONE);
+
+        let def = SplatTrainer::new(&TrainConfig::default(), &device, bounds);
+        for i in [0u32, 1, 99, 100, 200, 5_000, 15_000, 30_000] {
+            assert!(
+                !def.should_sample_normal_gate(i),
+                "default config sampled the gate at iter {i}"
+            );
+        }
+
+        // Gate on: sampling happens, on the refine-derived stride only.
+        let mut on = TrainConfig::default();
+        on.normal_gate_degrees = 30.0;
+        let stride = on.refine_every / NORMAL_GATE_SAMPLES_PER_WINDOW;
+        assert!(stride > 1, "test assumes a nontrivial stride, got {stride}");
+        let trainer = SplatTrainer::new(&on, &device, bounds);
+        assert!(trainer.should_sample_normal_gate(0));
+        assert!(trainer.should_sample_normal_gate(stride));
+        assert!(trainer.should_sample_normal_gate(stride * 3));
+        assert!(!trainer.should_sample_normal_gate(stride + 1));
+        assert!(!trainer.should_sample_normal_gate(stride - 1));
+
+        // Gate armed later: no sampling before its start iter, even on-stride.
+        let mut late = on;
+        late.normal_gate_start_iter = stride * 4;
+        let trainer = SplatTrainer::new(&late, &device, bounds);
+        assert!(!trainer.should_sample_normal_gate(stride * 2));
+        assert!(trainer.should_sample_normal_gate(stride * 4));
+    }
+
+    /// The sustained-low warning: fires only after a RUN of low samples, resets
+    /// on a healthy one, and ignores frames that carried no prior at all.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn normal_gate_warns_only_when_sustained() {
+        let device = Default::default();
+        let bounds = BoundingBox::from_min_max(glam::Vec3::ZERO, glam::Vec3::ONE);
+        let mut cfg = TrainConfig::default();
+        cfg.normal_gate_degrees = 30.0;
+        let mut t = SplatTrainer::new(&cfg, &device, bounds);
+
+        // A healthy fraction never warns, however often it is sampled.
+        for i in 0..10 {
+            assert!(!t.record_normal_gate_sample(i, 900.0, 1000.0));
+        }
+        assert_eq!(t.normal_gate_low_samples, 0);
+
+        // Low samples accumulate; the warning fires on the Nth, not the first.
+        assert!(!t.record_normal_gate_sample(100, 50.0, 1000.0));
+        assert!(!t.record_normal_gate_sample(200, 50.0, 1000.0));
+        assert!(
+            t.record_normal_gate_sample(300, 50.0, 1000.0),
+            "warning must fire after {NORMAL_GATE_LOW_SAMPLES_TO_WARN} consecutive low samples"
+        );
+        // It keeps firing while the condition persists — it is a sustained state.
+        assert!(t.record_normal_gate_sample(400, 50.0, 1000.0));
+
+        // One healthy sample resets the run.
+        assert!(!t.record_normal_gate_sample(500, 900.0, 1000.0));
+        assert_eq!(t.normal_gate_low_samples, 0);
+        assert!(!t.record_normal_gate_sample(600, 50.0, 1000.0));
+
+        // Exactly at the threshold is NOT low (the comparison is strict).
+        let mut edge = SplatTrainer::new(&cfg, &device, bounds);
+        for i in 0..5 {
+            assert!(!edge.record_normal_gate_sample(i, NORMAL_GATE_LOW_FRACTION * 1000.0, 1000.0));
+        }
+
+        // A frame with no usable prior says nothing about the gate: it must not
+        // count toward the run, and must not reset it either.
+        let mut empty = SplatTrainer::new(&cfg, &device, bounds);
+        assert!(!empty.record_normal_gate_sample(0, 50.0, 1000.0));
+        assert!(!empty.record_normal_gate_sample(1, 0.0, 0.0));
+        assert_eq!(
+            empty.normal_gate_low_samples, 1,
+            "an empty-prior frame must neither advance nor reset the run"
+        );
+        assert!(!empty.record_normal_gate_sample(2, 50.0, 1000.0));
+        assert!(empty.record_normal_gate_sample(3, 50.0, 1000.0));
+
+        // Non-finite counts are ignored rather than propagated into the run.
+        let mut nan = SplatTrainer::new(&cfg, &device, bounds);
+        assert!(!nan.record_normal_gate_sample(0, f32::NAN, 1000.0));
+        assert!(!nan.record_normal_gate_sample(1, 50.0, f32::NAN));
+        assert_eq!(nan.normal_gate_low_samples, 0);
+    }
+
+    /// `metric_weight_scale()` is an exact 1.0 unless the flag is on AND a scale
+    /// was captured — the default-inertness guarantee for L3, at the consumption
+    /// site rather than in config.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn metric_weight_scale_is_exactly_one_by_default() {
+        let device = Default::default();
+        let bounds = BoundingBox::from_min_max(glam::Vec3::ZERO, glam::Vec3::ONE);
+        let cams = camera_ring(8, 2.0, glam::Vec3::ZERO, glam::Vec3::Z);
+
+        // Flag off: the setter is a no-op and the divisor is an exact identity.
+        let mut off = SplatTrainer::new(&TrainConfig::default(), &device, bounds);
+        off.set_init_scene_scale(&cams);
+        assert_eq!(off.init_scene_scale, None);
+        assert_eq!(off.metric_weight_scale(), 1.0);
+
+        // Flag on: captured once, and later calls with a DIFFERENT camera set
+        // (the LOD re-supply) must not move it.
+        let mut cfg = TrainConfig::default();
+        cfg.normalize_metric_weights = true;
+        let mut on = SplatTrainer::new(&cfg, &device, bounds);
+        on.set_init_scene_scale(&cams);
+        assert!((on.metric_weight_scale() - 2.0).abs() < 1e-4);
+        let bigger = camera_ring(8, 50.0, glam::Vec3::ZERO, glam::Vec3::Z);
+        on.set_init_scene_scale(&bigger);
+        assert!(
+            (on.metric_weight_scale() - 2.0).abs() < 1e-4,
+            "set_init_scene_scale must be one-shot, got {}",
+            on.metric_weight_scale()
+        );
+
+        // Flag on but no usable scale: fall back to 1.0 rather than poisoning
+        // the loss with a zero or NaN divisor.
+        let mut none = SplatTrainer::new(&cfg, &device, bounds);
+        none.set_init_scene_scale(&[]);
+        assert_eq!(none.metric_weight_scale(), 1.0);
+    }
+
+    /// **§10d item 9.** A common world translation cannot change the scene
+    /// scale.
+    ///
+    /// Ported from the reference's `test_scene_scale_is_translation_invariant`,
+    /// including its `(17, −11, 5)` offset and its `4 · eps` budget. The
+    /// existing `scene_scale_from_camera_ring` centres its rings away from the
+    /// origin, which exercises the same code — but it re-derives the expected
+    /// answer from the radius, so a centring bug that scaled the offset instead
+    /// of removing it could in principle be absorbed by the 1e-4 comparison.
+    /// This states the invariance directly: two DIFFERENT inputs, one number.
+    ///
+    /// The tolerance is a real budget, not a formality. `translation` is a mean
+    /// of the origins, so the subtraction `origin − translation` cancels the
+    /// offset to within its own rounding: with coordinates ~17 and a result
+    /// ~2.7, a few eps of `17.0` is the whole error term.
+    #[test]
+    fn scene_scale_is_translation_invariant() {
+        let offset = glam::vec3(17.0, -11.0, 5.0);
+
+        for (n, r, center, up) in [
+            (8usize, 2.0f32, glam::Vec3::ZERO, glam::Vec3::Z),
+            (8, 3.0, glam::vec3(-4.0, 9.0, 2.0), glam::Vec3::Y),
+            (
+                5,
+                1.5,
+                glam::vec3(2.0, 2.0, 2.0),
+                glam::vec3(0.0, 1.0, 1.0).normalize(),
+            ),
+        ] {
+            let here =
+                scene_scale_from_cameras(&camera_ring(n, r, center, up)).expect("ring has a scale");
+            let there = scene_scale_from_cameras(&camera_ring(n, r, center + offset, up))
+                .expect("translated ring has a scale");
+            assert!(
+                (here - there).abs() <= 4.0 * f32::EPSILON * here.max(1.0),
+                "scene scale moved under a pure translation: {here} vs {there}"
+            );
+        }
+    }
+
+    /// **§10d item 9, second half.** The reference's three-pose fixture, whose
+    /// answer is exactly `8/3`.
+    ///
+    /// From `test_training_cameras_keep_metric_centers_and_reproduce_applied_scale`.
+    /// Camera centres `(0,0,0)`, `(2,0,0)`, `(0,4,0)` with a common up axis:
+    /// the mean is `(2/3, 4/3, 0)`, so the centred origins are `(−2/3, −4/3, 0)`,
+    /// `(4/3, −4/3, 0)` and `(−2/3, 8/3, 0)`, and the largest absolute
+    /// coordinate of any of them is `8/3`. Reorienting up onto `+Z` permutes
+    /// which axis holds it but cannot change the maximum.
+    ///
+    /// Worth its own test alongside the ring fixtures because a ring is
+    /// SYMMETRIC: its answer is the radius under almost any plausible
+    /// mis-definition of "scale" (RMS, mean distance, half the extent, the
+    /// largest coordinate). This asymmetric triple separates them — an RMS would
+    /// give 1.63, a mean distance 1.80, half the bounding extent 2.0.
+    ///
+    /// The reference's poses are `OpenGL` (c2w column 1 IS up); ours are
+    /// `OpenCV` (column 1 is DOWN), so the fixture's rotation is a 180-degree
+    /// turn about `+X` — which is what makes our `mean_camera_up` recover `+Y`
+    /// from the same geometry. That difference is pinned on its own in
+    /// `mean_camera_up_negates_the_opencv_down_column`.
+    #[test]
+    fn scene_scale_matches_the_reference_three_pose_fixture() {
+        let flip_x = glam::Quat::from_rotation_x(std::f32::consts::PI);
+        let cams: Vec<Camera> = [
+            glam::vec3(0.0, 0.0, 0.0),
+            glam::vec3(2.0, 0.0, 0.0),
+            glam::vec3(0.0, 4.0, 0.0),
+        ]
+        .into_iter()
+        .map(|pos| {
+            Camera::new(
+                pos,
+                flip_x,
+                0.8,
+                0.8,
+                glam::vec2(0.5, 0.5),
+                CameraModel::Pinhole,
+            )
+        })
+        .collect();
+
+        // Sanity: these poses really are +Y-up under our OpenCV reading.
+        let up = mean_camera_up(&cams);
+        assert!(
+            (up - glam::Vec3::Y).length() < 1e-6,
+            "fixture up = {up:?}, want +Y"
+        );
+
+        // The reference asserts this at 2 eps ABSOLUTE, in float32, on its own
+        // parser path. Ours goes through a Rodrigues rotation of the centred
+        // origins, so the budget is stated relative and measured rather than
+        // copied: worst observed deviation is 0 eps (the rotation for a +Y up
+        // axis is an exact axis permutation), and 8 eps leaves headroom for a
+        // tilted-up variant without becoming meaningless — it is still five
+        // orders of magnitude tighter than the 1e-4 the ring fixtures use.
+        let want = 8.0f32 / 3.0;
+        let scale = scene_scale_from_cameras(&cams).expect("three poses have a scale");
+        assert!(
+            (scale - want).abs() <= 8.0 * f32::EPSILON * want,
+            "scene scale = {scale}, want 8/3 = {want} (the reference's pinned value); \
+             an RMS would give 1.63, a mean distance 1.80, half the extent 2.0"
+        );
+    }
+}
+
+/// WS-1 pins for the shared PGSR plane math: the gradient contract of
+/// [`plane_features`], and an end-to-end check that a real rasterized slab's
+/// composited plane features intersect back to the slab.
+///
+/// The analytic ray-plane unit tests live in brush-loss
+/// (`plane_depth_tests`); this module is where `plane_features` and the feature
+/// rasterizer are both reachable, so it is the only place the full chain
+/// splat quaternion -> plane parameters -> compositing -> ray intersection can
+/// be closed. It is the plane-path sibling of
+/// `normal_prior_grad_tests::flat_slab_agrees_with_its_own_depth`.
+#[cfg(test)]
+mod plane_feature_tests {
+    use super::*;
+    use brush_loss::plane_depth_from_features;
+    use brush_render::gaussian_splats::SplatRenderMode;
+    use brush_render::kernels::camera_model::CameraModel;
+
+    const IMG: glam::UVec2 = glam::uvec2(48, 48);
+
+    /// Camera at `-5` on the optical axis, identity rotation, so the
+    /// world→camera rotation is the identity and every sign in the chain is
+    /// readable by hand.
+    fn test_camera() -> Camera {
+        Camera::new(
+            glam::vec3(0.0, 0.0, -5.0),
+            glam::Quat::IDENTITY,
+            0.7,
+            0.7,
+            glam::vec2(0.5, 0.5),
+            CameraModel::Pinhole,
+        )
+    }
+
+    /// A slab of overlapping gaussians whose CENTRES ALL LIE ON one plane
+    /// through the world origin, tilted by `tilt` about `+Y`, each gaussian
+    /// rotated to match so its thinnest axis is the plane normal.
+    ///
+    /// The "centres lie on the plane" part is what makes the end-to-end test
+    /// exact rather than approximate: every splat then has the SAME plane offset
+    /// `d`, so the composited `Σwᵢdᵢ / Σwᵢnᵢ·ray` reduces to `d/(n·ray)` no
+    /// matter what per-pixel coverage weights the rasterizer produces. A slab
+    /// whose centres merely scatter near the plane would make the expected depth
+    /// depend on the weights, which are not knowable outside the kernel.
+    ///
+    /// This is the difference from `normal_prior_grad_tests::tilted_plane_splats`,
+    /// which rotates the gaussians but leaves the centres in the `z = 0` plane —
+    /// fine for a normal test, useless for a depth one.
+    fn planar_slab(device: &Device, tilt: f32) -> Splats {
+        let q = glam::Quat::from_rotation_y(tilt);
+        // Thinnest axis is local +Z, so the plane's in-plane spans are the
+        // rotated local X and Y axes.
+        let e1 = q * glam::vec3(1.0, 0.0, 0.0);
+        let e2 = q * glam::vec3(0.0, 1.0, 0.0);
+
+        let mut means = vec![];
+        let n_side = 9;
+        for iy in 0..n_side {
+            for ix in 0..n_side {
+                let f = |i: i32| (i as f32 / (n_side - 1) as f32) * 2.0 - 1.0;
+                let p = e1 * f(ix) + e2 * f(iy);
+                means.extend_from_slice(&[p.x, p.y, p.z]);
+            }
+        }
+        let n = means.len() / 3;
+        let rotations: Vec<f32> = (0..n).flat_map(|_| [q.w, q.x, q.y, q.z]).collect();
+        let log_scales: Vec<f32> = (0..n).flat_map(|_| [-1.6, -1.6, -2.5]).collect();
+        let sh: Vec<f32> = (0..n).flat_map(|_| [0.5, 0.5, 0.5]).collect();
+        let opac: Vec<f32> = vec![4.0; n];
+
+        Splats::from_raw(
+            means,
+            rotations,
+            log_scales,
+            sh,
+            opac,
+            SplatRenderMode::Default,
+            device,
+        )
+    }
+
+    async fn absmax(t: Tensor<2>) -> f32 {
+        t.abs()
+            .max()
+            .into_data_async()
+            .await
+            .expect("grad readback")
+            .to_vec::<f32>()
+            .expect("f32 grad")[0]
+    }
+
+    async fn read<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+        t.into_data_async()
+            .await
+            .expect("tensor readback")
+            .to_vec::<f32>()
+            .expect("f32 tensor")
+    }
+
+    /// The offset channel is the ONLY path from plane supervision back to
+    /// gaussian positions, and its gradient is not merely nonzero — it is
+    /// exactly the world normal.
+    ///
+    /// `d = n_world · (mean − cam_pos)`, so `∂(Σd)/∂mean = n_world` (the
+    /// camera-facing sign is detached, so it contributes nothing extra). Pinning
+    /// the VALUE, not just "greater than zero", is what makes this test catch the
+    /// failure the plan warns about: detaching the mean here leaves a function
+    /// that still renders a correct plane-depth map and still trains — it just
+    /// silently supervises no positions at all.
+    #[tokio::test]
+    async fn plane_features_offset_moves_means() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = planar_slab(&device, 0.5);
+        let camera = test_camera();
+
+        let feats = plane_features(splats.transforms.val(), &camera);
+        assert_eq!(feats.dims(), [splats.num_splats() as usize, 4]);
+
+        let loss = feats.slice(s![.., 3..4]).sum();
+        let grads = splats.bwd_validate(loss).await;
+        let transforms_grad = splats
+            .transforms
+            .grad(&grads)
+            .expect("the plane offset must reach the transforms");
+
+        let mean_grad = read(transforms_grad.clone().slice(s![.., 0..3])).await;
+        let want = read(splat_normals(splats.transforms.val(), camera.position)).await;
+        assert_eq!(mean_grad.len(), want.len());
+        let worst = mean_grad
+            .iter()
+            .zip(want.iter())
+            .map(|(g, n)| (g - n).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-5,
+            "d(offset)/d(mean) must equal the world normal, worst component error {worst}"
+        );
+        // Guard against the assertion above being satisfied by an all-zero
+        // gradient matching an all-zero normal.
+        let magnitude = want.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(
+            magnitude > 0.5,
+            "the fixture's normals must be nonzero, got {magnitude}"
+        );
+
+        // The offset also depends on the quaternion through `n_world`, so that
+        // path must be live too.
+        let rot_grad = absmax(transforms_grad.clone().slice(s![.., 3..7])).await;
+        assert!(
+            rot_grad > 1e-8,
+            "the plane offset must also reach the rotations, got {rot_grad}"
+        );
+
+        // The thinnest-axis choice is a detached `argmin`, so scales get nothing
+        // — the flatten term stays the scale-side pressure. Same contract as the
+        // existing normal loss.
+        let scale_grad = absmax(transforms_grad.slice(s![.., 7..10])).await;
+        assert!(
+            scale_grad < 1e-8,
+            "the detached argmin must leave scales alone, got {scale_grad}"
+        );
+
+        let opac_grad = match splats.raw_opacities.grad(&grads) {
+            None => 0.0,
+            Some(g) => absmax(g.unsqueeze_dim(1)).await,
+        };
+        assert!(
+            opac_grad < 1e-8,
+            "plane features must not push opacity, got {opac_grad}"
+        );
+    }
+
+    /// The normal channels carry the same contract `splat_normals` always had:
+    /// rotations only. Rotating into the camera frame is a constant orthonormal
+    /// map and must not open a new path.
+    #[tokio::test]
+    async fn plane_features_normal_moves_rotations_only() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = planar_slab(&device, 0.5);
+        let camera = test_camera();
+
+        let feats = plane_features(splats.transforms.val(), &camera);
+        // A weighted sum, so the three channels cannot cancel each other out.
+        let w: Tensor<2> = Tensor::<1>::from_floats([0.3f32, -0.7, 1.1], &device).reshape([1, 3]);
+        let loss = (feats.slice(s![.., 0..3]) * w).sum();
+
+        let grads = splats.bwd_validate(loss).await;
+        let transforms_grad = splats
+            .transforms
+            .grad(&grads)
+            .expect("the plane normal must reach the transforms");
+
+        let rot_grad = absmax(transforms_grad.clone().slice(s![.., 3..7])).await;
+        assert!(
+            rot_grad > 1e-8,
+            "expected a nonzero rotation gradient, got {rot_grad}"
+        );
+        let mean_grad = absmax(transforms_grad.clone().slice(s![.., 0..3])).await;
+        assert!(
+            mean_grad < 1e-8,
+            "the plane NORMAL must not move means, got {mean_grad}"
+        );
+        let scale_grad = absmax(transforms_grad.slice(s![.., 7..10])).await;
+        assert!(
+            scale_grad < 1e-8,
+            "the plane normal must not move scales, got {scale_grad}"
+        );
+    }
+
+    /// End-to-end: rasterize `plane_features` through the feature pass, feed the
+    /// `[H, W, 5]` result to `plane_depth_from_features`, and check the recovered
+    /// depth against the slab's closed-form ray-plane depth.
+    ///
+    /// Run on a fronto-parallel slab AND a slab tilted 0.5 rad about `+Y`. The
+    /// tilted arm is the one with teeth: a fronto-parallel plane has
+    /// `n_cam = (0, 0, −1)`, so the intersection collapses to `depth = −d` and
+    /// the ray grid, the intrinsics and the world→camera rotation all drop out.
+    /// Under the tilt the depth varies ~1.5x across the frame and every one of
+    /// those is live.
+    ///
+    /// Closed form for a plane through the world origin with camera-frame unit
+    /// normal `n` and offset `d = n · (0 − cam_pos)`:
+    /// `z(u, v) = d / (n · ray(u, v))`.
+    #[tokio::test]
+    async fn plane_depth_matches_a_rendered_slab() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let camera = test_camera();
+        let focal = camera.focal(IMG);
+        let center = camera.center(IMG);
+        let (w, h) = (IMG.x as usize, IMG.y as usize);
+
+        for tilt in [0.0f32, 0.5] {
+            let splats = planar_slab(&device, tilt);
+            let transforms = splats.transforms.val();
+
+            let feats = plane_features(transforms.clone(), &camera);
+            let feat_img = render_splat_features(
+                transforms,
+                splats.raw_opacities.val(),
+                feats,
+                &camera,
+                IMG,
+                SplatRenderMode::Default,
+            )
+            .await;
+            assert_eq!(feat_img.dims(), [h, w, 5]);
+
+            let (depth, normal, valid) = plane_depth_from_features(
+                feat_img, focal.x, focal.y, center.x, center.y, 0.5, 0.05, 0.05, 100.0,
+            );
+            let depth = read(depth).await;
+            let normal = read(normal).await;
+            let valid = read(valid).await;
+
+            // Expected plane, derived independently of `plane_features`: the
+            // thinnest axis is local +Z, rotated by the tilt; `splat_normals`
+            // flips it to face the camera; the camera rotation is the identity.
+            let n = {
+                let v = glam::Quat::from_rotation_y(tilt) * glam::vec3(0.0, 0.0, 1.0);
+                // Camera at -5z, plane through the origin: `n · (0 − cam)` is
+                // `+5·v.z`, which is positive, so the facing rule flips `v`.
+                -v
+            };
+            let d = n.dot(glam::Vec3::ZERO - camera.position);
+
+            let mut covered = 0usize;
+            let mut worst = 0.0f32;
+            for py in 0..h {
+                for px in 0..w {
+                    let i = py * w + px;
+                    if valid[i] == 0.0 {
+                        continue;
+                    }
+                    covered += 1;
+
+                    let ray = glam::vec3(
+                        (px as f32 + 0.5 - center.x) / focal.x,
+                        (py as f32 + 0.5 - center.y) / focal.y,
+                        1.0,
+                    );
+                    let want = d / n.dot(ray);
+                    worst = worst.max((depth[i] - want).abs() / want);
+
+                    for c in 0..3 {
+                        assert!(
+                            (normal[i * 3 + c] - n[c]).abs() < 1e-5,
+                            "tilt {tilt}: normal[{c}] at ({px},{py}) = {}, want {}",
+                            normal[i * 3 + c],
+                            n[c]
+                        );
+                    }
+                }
+            }
+
+            // The slab spans ±1 in the plane at depth ~5 with a 0.7 rad FOV, so
+            // it covers the middle of the frame, not all of it.
+            assert!(
+                covered > 400,
+                "tilt {tilt}: expected the slab to cover a real region, got {covered} valid pixels"
+            );
+            assert!(
+                worst < 1e-5,
+                "tilt {tilt}: worst relative depth error {worst} against the closed-form plane"
+            );
+        }
+    }
+
+    /// **§10d item 2.** `q` and `−q` are the same rotation, so they must give
+    /// the same plane features.
+    ///
+    /// Ported from the reference's
+    /// `test_gaussian_plane_features_face_along_camera_ray`
+    /// (`gauss-surf`, Apache-2.0, Pablo Vela), which uses this exact fixture —
+    /// two gaussians on the optical axis at z = 2 and z = 3, thin along local
+    /// +Z, quaternions `+[1,0,0,0]` and `−[1,0,0,0]`.
+    ///
+    /// **The reference pins `n = (0, 0, +1)` and offsets `(2, 3)`; we produce
+    /// `n = (0, 0, −1)` and `(−2, −3)`, and that is correct, not a port bug.**
+    /// `splat_normals` turns the normal to FACE the camera (`n·(mean − cam) < 0`
+    /// — see its sign block), the reference points it away. Every consumer on
+    /// our side agrees with our choice: `normals_from_depth` emits `n_z ≤ 0` by
+    /// construction, and the offset follows the normal's sign because
+    /// `d = n·(mean − cam)`. The depth `d/(n·ray)` is invariant to the pair
+    /// flipping together, which is why the two conventions produce identical
+    /// depth maps. Pinned by value here so that a future half-flip — normal
+    /// negated without the offset, or the other way round — cannot pass.
+    ///
+    /// Bit-identity is the right assertion for the sign half, not an
+    /// approximation: every entry of a rotation matrix built from a quaternion
+    /// is a sum of PRODUCTS OF TWO quaternion components, so negating all four
+    /// leaves each product unchanged exactly under IEEE-754, and the
+    /// normalisation divides by the same length. There is no reordering and no
+    /// atomic accumulation anywhere in this path.
+    #[tokio::test]
+    async fn plane_features_are_invariant_to_quaternion_sign() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+
+        // Camera at the origin, identity rotation: the world frame IS the
+        // camera frame, so every number below is readable by hand.
+        let camera = Camera::new(
+            glam::Vec3::ZERO,
+            glam::Quat::IDENTITY,
+            0.7,
+            0.7,
+            glam::vec2(0.5, 0.5),
+            CameraModel::Pinhole,
+        );
+
+        let means = vec![0.0, 0.0, 2.0, 0.0, 0.0, 3.0];
+        // Thinnest axis is local +Z, so the plane normal is the quaternion's
+        // third rotation column.
+        let log_scales: Vec<f32> = (0..2).flat_map(|_| [1.0, 1.0, -2.0]).collect();
+        let sh: Vec<f32> = (0..2).flat_map(|_| [0.5, 0.5, 0.5]).collect();
+        let opac = vec![4.0; 2];
+
+        let features_for = |quats: Vec<f32>| {
+            let splats = Splats::from_raw(
+                means.clone(),
+                quats,
+                log_scales.clone(),
+                sh.clone(),
+                opac.clone(),
+                SplatRenderMode::Default,
+                &device,
+            );
+            plane_features(splats.transforms.val(), &camera)
+        };
+
+        let positive = read(features_for(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])).await;
+        let negative = read(features_for(vec![-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0])).await;
+
+        assert_eq!(
+            positive, negative,
+            "q and -q are the same rotation and must give bit-identical plane features"
+        );
+
+        // The values themselves, so this cannot pass by both sides being wrong
+        // in the same way.
+        assert_eq!(
+            positive,
+            vec![0.0, 0.0, -1.0, -2.0, 0.0, 0.0, -1.0, -3.0],
+            "camera-facing normal (0,0,-1) with offsets (-2,-3); the reference's \
+             away-facing convention is the exact negation of this pair"
+        );
+    }
+}
+
+/// WS-A pins for the `--depth-source` consumer wiring: the backward contract of
+/// the plane-aux depth path (§4.5 row 2), and the two bit-identity claims the
+/// `center` default rests on.
+///
+/// The plane MATH is pinned in `plane_feature_tests` and in brush-loss'
+/// `plane_depth_tests`. What is pinned HERE is the wiring the trainer does
+/// around it: which gradients a depth loss on plane depth is allowed to reach,
+/// and that selecting `center` still runs the pre-change op sequence.
+#[cfg(test)]
+mod plane_aux_consumer_tests {
+    use super::*;
+    use brush_loss::plane_depth_from_features;
+    use brush_render::gaussian_splats::SplatRenderMode;
+    use brush_render::kernels::camera_model::CameraModel;
+
+    const IMG: glam::UVec2 = glam::uvec2(48, 48);
+
+    /// Last-bit budget, in ULPs, for two expression trees that apply the SAME
+    /// operations to the SAME inputs and are only expected to agree to the
+    /// arithmetic's own precision.
+    ///
+    /// Derived, not tuned. Two textually identical sequences are not one
+    /// program on a GPU: the shader compiler may contract a multiply-add into an
+    /// FMA in one and not the other, and may reassociate the 3-term sum inside
+    /// `sum_dim`. Each rounding costs at most half an ULP and there are a
+    /// handful of them in the divide/square/sum/sqrt/divide chain, so 4 ULP
+    /// bounds the honest disagreement with room to spare. Independently the same
+    /// number `brush-bench-test/tests/center_source_identity.rs` reached for the
+    /// same reason (`SAME_PATH_MARGIN`).
+    ///
+    /// **Do not replace this with `assert_eq!`.** That claim was made here once
+    /// and measured false — see `center_normalize_matches_plane_helper`.
+    const SAME_PATH_ULPS: f32 = 4.0;
+
+    /// A camera that is NOT axis-aligned with the world, so the world→camera
+    /// rotation is a real rotation. `plane_feature_tests` deliberately uses an
+    /// identity-rotation camera to keep its hand-derived signs readable; here the
+    /// rotation is the thing under test, so an identity would pass vacuously.
+    fn tilted_camera() -> Camera {
+        Camera::new(
+            glam::vec3(0.3, -0.4, -5.0),
+            glam::Quat::from_euler(glam::EulerRot::XYZ, 0.12, -0.21, 0.07),
+            0.7,
+            0.7,
+            glam::vec2(0.5, 0.5),
+            CameraModel::Pinhole,
+        )
+    }
+
+    /// A tilted slab of gaussians with WELL-SEPARATED log scales per splat.
+    ///
+    /// The separation is not cosmetic. `splat_normals` picks the thinnest axis
+    /// with a detached `argmin`, so two axes of nearly equal scale put the splat
+    /// on a discontinuity: an infinitesimal parameter change flips which axis is
+    /// "the" normal and the plane jumps. Every gradient assertion below (and the
+    /// finite-difference test in brush-bench-test) requires the scene to sit away
+    /// from that boundary.
+    fn slab(device: &Device) -> Splats {
+        let q = glam::Quat::from_rotation_y(0.5);
+        let e1 = q * glam::vec3(1.0, 0.0, 0.0);
+        let e2 = q * glam::vec3(0.0, 1.0, 0.0);
+
+        let mut means = vec![];
+        let n_side = 7;
+        for iy in 0..n_side {
+            for ix in 0..n_side {
+                let f = |i: i32| (i as f32 / (n_side - 1) as f32) * 2.0 - 1.0;
+                let p = e1 * f(ix) + e2 * f(iy);
+                means.extend_from_slice(&[p.x, p.y, p.z]);
+            }
+        }
+        let n = means.len() / 3;
+        let rotations: Vec<f32> = (0..n).flat_map(|_| [q.w, q.x, q.y, q.z]).collect();
+        // -1.2 / -1.6 / -3.0: every pair is > 0.4 apart in log space, so the
+        // argmin is unambiguous and stays that way under perturbation.
+        let log_scales: Vec<f32> = (0..n).flat_map(|_| [-1.2, -1.6, -3.0]).collect();
+        let sh: Vec<f32> = (0..n).flat_map(|_| [0.5, 0.5, 0.5]).collect();
+        let opac: Vec<f32> = vec![4.0; n];
+
+        Splats::from_raw(
+            means,
+            rotations,
+            log_scales,
+            sh,
+            opac,
+            SplatRenderMode::Default,
+            device,
+        )
+    }
+
+    async fn read<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+        t.into_data_async()
+            .await
+            .expect("tensor readback")
+            .to_vec::<f32>()
+            .expect("f32 tensor")
+    }
+
+    async fn absmax<const D: usize>(t: Tensor<D>) -> f32 {
+        read(t.abs().max()).await[0]
+    }
+
+    /// Render the plane feature pass exactly the way `step()` does, and take the
+    /// production depth loss on the result.
+    ///
+    /// Deliberately the SAME call sequence and the SAME thresholds as the
+    /// trainer, including zeroing the GT at invalid pixels — a pin written
+    /// against a simplified stand-in would not be pinning the shipped path.
+    async fn plane_depth_loss(splats: &Splats, camera: &Camera) -> Tensor<1> {
+        let transforms = splats.transforms.val();
+        let feats = plane_features(transforms.clone(), camera);
+        let feat_img = render_splat_features(
+            transforms,
+            splats.raw_opacities.val(),
+            feats,
+            camera,
+            IMG,
+            SplatRenderMode::Default,
+        )
+        .await;
+
+        let focal = camera.focal(IMG);
+        let center = camera.center(IMG);
+        let (depth, _normal, valid) = plane_depth_from_features(
+            feat_img,
+            focal.x,
+            focal.y,
+            center.x,
+            center.y,
+            PLANE_MIN_ALPHA,
+            PLANE_MIN_DENOM,
+            PLANE_MIN_DEPTH,
+            PLANE_MAX_DEPTH,
+        );
+
+        // A GT that is 10% nearer than the prediction everywhere, so every valid
+        // pixel carries a real, same-signed disparity error. `* valid` is the
+        // trainer's own masking of unsupervised pixels.
+        let gt = depth.clone().detach().mul_scalar(0.9) * valid;
+        depth_loss(depth, gt, None)
+    }
+
+    /// §4.5 row 2: with `plane-aux`, depth error must NOT be able to reach
+    /// opacity.
+    ///
+    /// Approach A gets this for free rather than by construction — the feature
+    /// rasterizer's backward tracks the feature VALUES only (`features_bwd.rs`
+    /// registers a single parent), so the compositing weights are constants and
+    /// there is no alpha VJP to leak through. That is exactly the property
+    /// approach B (`plane-fused`) deliberately gives up, which is why the two
+    /// arms of the ablation are comparable only if this holds here.
+    #[tokio::test]
+    async fn plane_aux_depth_does_not_touch_opacity() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = slab(&device);
+        let camera = tilted_camera();
+
+        let loss = plane_depth_loss(&splats, &camera).await;
+        // Guard against a vacuous pass: a zero loss would satisfy every
+        // assertion below without exercising anything.
+        assert!(
+            read(loss.clone()).await[0] > 1e-6,
+            "the plane depth loss must be nonzero for this pin to mean anything"
+        );
+        let grads = splats.bwd_validate(loss).await;
+
+        match splats.raw_opacities.grad(&grads) {
+            None => {}
+            Some(g) => {
+                let worst = absmax(g).await;
+                assert_eq!(
+                    worst, 0.0,
+                    "plane-aux depth error reached opacity (max |grad| {worst}); \
+                     that is the plane-FUSED contract, not this one"
+                );
+            }
+        }
+    }
+
+    /// §4.5 row 2, the positive half: geometry gradients arrive through the
+    /// feature VALUES — means via the plane offset, quaternions via the normal.
+    ///
+    /// Scales are asserted EXACTLY zero. That is not an oversight to fix later:
+    /// `splat_normals` detaches the thinnest-axis `argmin`, so the plane is a
+    /// function of the quaternion and of a discrete axis CHOICE, and
+    /// differentiating the choice means differentiating a permutation.
+    /// `--flatten-loss-weight` is the scale-side pressure in this design.
+    #[tokio::test]
+    async fn plane_aux_depth_moves_means_and_quats() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = slab(&device);
+        let camera = tilted_camera();
+
+        let loss = plane_depth_loss(&splats, &camera).await;
+        let grads = splats.bwd_validate(loss).await;
+        let g = splats
+            .transforms
+            .grad(&grads)
+            .expect("plane depth must reach the transforms at all");
+
+        let means = absmax(g.clone().slice(s![.., 0..3])).await;
+        let quats = absmax(g.clone().slice(s![.., 3..7])).await;
+        let scales = absmax(g.slice(s![.., 7..10])).await;
+
+        assert!(
+            means > 1e-8,
+            "plane depth must move gaussian MEANS (via the offset channel), got {means}"
+        );
+        assert!(
+            quats > 1e-8,
+            "plane depth must move gaussian QUATERNIONS (via the normal channels), got {quats}"
+        );
+        assert_eq!(
+            scales, 0.0,
+            "the thinnest-axis argmin is detached, so scales must get EXACTLY no \
+             gradient from the plane path; got {scales}"
+        );
+    }
+
+    /// Byte-identity pin 1: the `center` branch now builds its world→camera
+    /// rotation with [`world_to_cam_rot_t`] instead of the inline `glam` unroll
+    /// it used before. That is the ONLY edit inside the default path, so this
+    /// test asserts the two constructions agree BIT for bit — not to a
+    /// tolerance, because a tolerance would not pin byte-identity.
+    #[tokio::test]
+    async fn world_to_cam_rot_t_is_the_inline_construction() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let camera = tilted_camera();
+
+        // Verbatim copy of the pre-change inline construction.
+        let rot = camera.world_to_local().matrix3;
+        let legacy: Tensor<2> = Tensor::<1>::from_floats(
+            [
+                rot.x_axis.x,
+                rot.x_axis.y,
+                rot.x_axis.z,
+                rot.y_axis.x,
+                rot.y_axis.y,
+                rot.y_axis.z,
+                rot.z_axis.x,
+                rot.z_axis.y,
+                rot.z_axis.z,
+            ],
+            &device,
+        )
+        .reshape([3, 3]);
+
+        let got = read(world_to_cam_rot_t(&camera, &device)).await;
+        let want = read(legacy).await;
+        assert_eq!(
+            got, want,
+            "world_to_cam_rot_t must reproduce the inline construction exactly"
+        );
+    }
+
+    /// Byte-identity pin 2, and the claim §4.3 makes about the plane path's
+    /// normal channels: compositing WORLD normals and rotating the image (the
+    /// `center` order) agrees with compositing CAMERA-frame normals directly
+    /// (the `plane-aux` order, which `plane_features` enables by rotating
+    /// per-splat before the rasterizer sees them).
+    ///
+    /// `Σwᵢ(R·nᵢ) = R·(Σwᵢnᵢ)` and `normalize(R·v) = R·normalize(v)` for an
+    /// orthonormal `R`, so they agree analytically; in f32 they agree to
+    /// rounding. That is exactly why `step()` keeps BOTH orders instead of
+    /// unifying them: the `center` order is the one the byte-identity gate pins,
+    /// and swapping it for the (equally correct) plane order would perturb the
+    /// recorded `playroom_0812` baseline in the last bits.
+    #[tokio::test]
+    async fn plane_normal_channels_match_the_center_normal_render() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = slab(&device);
+        let camera = tilted_camera();
+        let transforms = splats.transforms.val();
+        let opac = splats.raw_opacities.val();
+        let (h, w) = (IMG.y as usize, IMG.x as usize);
+
+        // --- `center` order: world normals -> composite -> /a -> unit -> R ---
+        let normal_img = render_splat_features(
+            transforms.clone(),
+            opac.clone(),
+            splat_normals(transforms.clone(), camera.position),
+            &camera,
+            IMG,
+            SplatRenderMode::Default,
+        )
+        .await;
+        let a = normal_img.clone().slice(s![.., .., 3..4]).detach();
+        let n_world = normal_img.slice(s![.., .., 0..3]) / a.clone().clamp_min(1e-10);
+        let n_len = n_world
+            .clone()
+            .powi_scalar(2)
+            .sum_dim(2)
+            .sqrt()
+            .clamp_min(1e-6);
+        let n_world = n_world / n_len;
+        let center_n = (n_world.reshape([(h * w) as i32, 3]))
+            .matmul(world_to_cam_rot_t(&camera, &device))
+            .reshape([h, w, 3]);
+
+        // --- `plane-aux` order: camera normals -> composite -> /a -> unit ---
+        let feat_img = render_splat_features(
+            transforms.clone(),
+            opac,
+            plane_features(transforms, &camera),
+            &camera,
+            IMG,
+            SplatRenderMode::Default,
+        )
+        .await;
+        let plane_a = feat_img.clone().slice(s![.., .., 4..5]).detach();
+        let plane_n = normal_alpha_normalize(feat_img.slice(s![.., .., 0..3]), plane_a.clone());
+
+        // Compare only where the pixel is actually covered: the uncovered
+        // background is `0/1e-10` in both, i.e. a normalized zero vector whose
+        // direction is meaningless and whose agreement would prove nothing.
+        let cover = read(plane_a.reshape([h, w])).await;
+        let got = read(plane_n).await;
+        let want = read(center_n).await;
+
+        let mut covered = 0usize;
+        let mut worst = 0.0f32;
+        for i in 0..h * w {
+            if cover[i] < PLANE_MIN_ALPHA {
+                continue;
+            }
+            covered += 1;
+            for c in 0..3 {
+                worst = worst.max((got[i * 3 + c] - want[i * 3 + c]).abs());
+            }
+        }
+        assert!(
+            covered > 400,
+            "expected the slab to cover a real region, got {covered} covered pixels"
+        );
+        assert!(
+            worst < 1e-5,
+            "compositing order changed the rendered normal by {worst}; the two \
+             orders are the same linear map and must agree to f32 rounding"
+        );
+    }
+    /// The duplication justification on [`normal_alpha_normalize`], made
+    /// enforceable.
+    ///
+    /// The `center` branch of `step()` writes the alpha-normalize-then-unit-norm
+    /// sequence INLINE, and the plane branch calls the helper. That is deliberate
+    /// duplication — the `center` sequence is what the byte-identity gate pins, so
+    /// folding both onto one shared helper is a refactor that would have to be
+    /// re-proven rather than assumed. The cost of the duplication is that the two
+    /// copies can drift.
+    ///
+    /// This pins that they have not. The comparison covers EVERY pixel,
+    /// background included, rather than filtering to the covered region.
+    ///
+    /// # Why this is a MARGIN and not `assert_eq!` — corrected 2026-08-20
+    ///
+    /// It was written as `assert_eq!` on the raw f32s, on the reasoning that the
+    /// same ops in the same order must be bit-equal. **That reasoning is wrong
+    /// on a GPU, and it was measured wrong here**: on the M4 Max this failed 9
+    /// runs out of 9, with **340 of 6912 elements differing by exactly one ULP**
+    /// (1.19e-7 at component magnitudes of 0.48-0.88), on both the default
+    /// backend and `native-msl`. Two textually identical expression trees are
+    /// not one program: the shader compiler is free to contract a multiply-add
+    /// into an FMA in one and not the other, and to reassociate, and the
+    /// autotuner's kernel choice differs between the two dispatch shapes.
+    ///
+    /// It is the fifth member of the class commit `08f60b6f` converted for four
+    /// other assertions in this port, and this one was missed because — and this
+    /// is the part worth recording — **it evidently PASSED on the integrator's
+    /// build** (405 tests green, 60/60 stabilization runs). So the divergence is
+    /// **build-environment-dependent**, which is worse than flaky: a machine
+    /// that happens to contract the same way sees nothing at all, and the test
+    /// silently means something different on every box it runs on.
+    ///
+    /// Hence the margin is derived from FIRST PRINCIPLES, not from this
+    /// machine's measurement. The two sequences apply the same four operations
+    /// (divide, square, sum-of-3, sqrt, divide) to the same inputs, so each
+    /// output can differ by at most the accumulated last-bit error of that
+    /// chain: a handful of roundings, each at most half an ULP, plus one
+    /// FMA-contraction difference per multiply-add. [`SAME_PATH_ULPS`] = 4 is
+    /// that budget rounded up — the same constant `center_source_identity.rs`
+    /// arrived at independently for the same reason. It is NOT tuned to the
+    /// observed 1 ULP; if it were, this test would only be meaningful here.
+    ///
+    /// The thing a margin gives up is the ability to see a sub-ULP drift, and
+    /// there is no such thing: any REAL divergence between these two sequences —
+    /// a reordered normalize, a different clamp target, a wrong slice — moves
+    /// components by 1e-2 or more, i.e. five orders of magnitude above this
+    /// budget. The mutation record below is the evidence for that claim: the
+    /// reordered-normalize mutation lands at 8.4e6 ULP.
+    ///
+    /// # What this does and does NOT pin — verified by mutation, not assumed
+    ///
+    /// Checked by deliberately breaking the helper and re-running:
+    ///
+    /// - Reordering the sequence (normalize before the alpha divide instead of
+    ///   after) **fails** the test. That is the drift worth guarding, and it is
+    ///   guarded. Re-measured 2026-08-20 under the ULP margin: it still fails,
+    ///   at **8.4e6 ULP** (worst element -119.76 vs -0.479, 2162 of 6912
+    ///   elements differing) against a 4-ULP budget — six orders of magnitude
+    ///   clear, so the margin costs this test nothing.
+    /// - Changing a clamp CONSTANT (`1e-10` -> `1e-9`) **passes**, under the
+    ///   margin exactly as it did under `assert_eq!` (re-measured 2026-08-20).
+    ///   That is not a
+    ///   weakness to fix by tightening the test; it is a property of the
+    ///   expression. Wherever alpha is ~0 the composited feature numerator is ~0
+    ///   too, so the quotient is 0 for any clamp value — the clamps exist to keep
+    ///   `0/0` from being `NaN`, not to shape the output. No test on rendered data
+    ///   can distinguish their values, so do not read this test as pinning them.
+    ///
+    /// Stating that explicitly because the comment this test exists to justify
+    /// once cited a pin that had never been written; a pin whose reach is
+    /// overstated is the same failure one step further along.
+    #[tokio::test]
+    async fn center_normalize_matches_plane_helper() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let splats = slab(&device);
+        let camera = tilted_camera();
+        let transforms = splats.transforms.val();
+        let (h, w) = (IMG.y as usize, IMG.x as usize);
+
+        // A real composited `[H, W, 4]`: 3 normal channels + alpha, with genuine
+        // covered and uncovered regions rather than synthetic values.
+        let img = render_splat_features(
+            transforms.clone(),
+            splats.raw_opacities.val(),
+            splat_normals(transforms, camera.position),
+            &camera,
+            IMG,
+            SplatRenderMode::Default,
+        )
+        .await;
+        assert_eq!(img.dims(), [h, w, 4]);
+
+        let alpha = img.clone().slice(s![.., .., 3..4]).detach();
+
+        // --- Verbatim copy of the `center` branch's inline sequence. ---
+        let inline = {
+            let n = img.clone().slice(s![.., .., 0..3]) / alpha.clone().clamp_min(1e-10);
+            let len = n.clone().powi_scalar(2).sum_dim(2).sqrt().clamp_min(1e-6);
+            n / len
+        };
+
+        // --- The helper the plane branch calls. ---
+        let helper = normal_alpha_normalize(img.slice(s![.., .., 0..3]), alpha.clone());
+
+        let got = read(helper).await;
+        let want = read(inline).await;
+        assert_eq!(got.len(), want.len());
+
+        // Worst deviation, in ULPs at the larger of the two magnitudes. `ulp()`
+        // floors at `f32::MIN_POSITIVE` so a pair of exact zeros — most of the
+        // background — yields a finite, non-zero epsilon rather than 0/0.
+        let ulp = |x: f32| f32::EPSILON * x.abs().max(f32::MIN_POSITIVE);
+        let (worst_ulps, worst_at) = got
+            .iter()
+            .zip(want.iter())
+            .enumerate()
+            .map(|(i, (a, b))| ((a - b).abs() / ulp(a.abs().max(b.abs())), i))
+            .fold((0.0f32, 0usize), |acc, x| if x.0 > acc.0 { x } else { acc });
+        let differing = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+
+        assert!(
+            worst_ulps <= SAME_PATH_ULPS,
+            "normal_alpha_normalize has drifted from the center branch's inline \
+             sequence: worst deviation {worst_ulps:.2} ULP at element {worst_at} \
+             ({} vs {}), over the {SAME_PATH_ULPS}-ULP same-path budget, with \
+             {differing} of {} elements differing at all. A REAL drift (a \
+             reordered normalize, a different clamp target, a wrong slice) lands \
+             ~1e5 ULP out — see the mutation record on this test — so anything \
+             in this range is a genuine change to the expression, not FMA \
+             contraction.",
+            got[worst_at],
+            want[worst_at],
+            got.len()
+        );
+
+        // Guard against a vacuous pass: if the render produced nothing, two
+        // all-zero images would compare equal and prove nothing. Require both a
+        // real covered region (unit-length normals) and real background.
+        let cover = read(alpha.reshape([h, w])).await;
+        let covered = cover.iter().filter(|a| **a >= PLANE_MIN_ALPHA).count();
+        let background = cover.iter().filter(|a| **a < 1e-6).count();
+        assert!(
+            covered > 400,
+            "expected a real covered region, got {covered} covered pixels"
+        );
+        assert!(
+            background > 100,
+            "expected real uncovered background (where the clamps bite), got              {background} pixels"
+        );
+    }
+}
+
+/// WS-F pins for the two NaN-containment guards: the total-loss finiteness
+/// check (gap 1) and the out-of-refine non-finite splat sweep (gap 2).
+///
+/// Both are guards, so the only test that means anything is one that makes them
+/// FIRE. A guard whose trigger path is never executed is indistinguishable from
+/// a guard that was accidentally wired to a condition that can never be true —
+/// which is the same class of defect as a dispatch that silently selects the
+/// default path. So every pin here poisons real state and observes the error
+/// path, rather than asserting that clean input stays clean.
+///
+/// **Merge note.** This module is appended at the end of `train.rs`, as are
+/// `scene_scale_tests` and `plane_feature_tests`. Git's line-level 3-way
+/// heuristic interleaves fragments of such modules into invalid Rust that still
+/// looks like a plausible merge, so integration must treat each `#[cfg(test)]
+/// mod` as ONE opaque block and concatenate whole modules. Keep this module
+/// self-contained (it takes nothing from outside `super::*`) and do not append
+/// unrelated items after it.
+#[cfg(test)]
+mod nonfinite_guard_tests {
+    use super::*;
+    use brush_render::gaussian_splats::SplatRenderMode;
+    use brush_render::kernels::camera_model::CameraModel;
+
+    const IMG: glam::UVec2 = glam::uvec2(32, 32);
+    const N_SIDE: usize = 4;
+
+    fn guard_camera() -> Camera {
+        Camera::new(
+            glam::vec3(0.0, 0.0, -5.0),
+            glam::Quat::IDENTITY,
+            0.7,
+            0.7,
+            glam::vec2(0.5, 0.5),
+            CameraModel::Pinhole,
+        )
+    }
+
+    /// A small fronto-parallel slab at `z = 0`, entirely inside the frame.
+    ///
+    /// With `poison`, splat 0's SH DC term is `NaN`. SH is chosen deliberately
+    /// over the mean: a `NaN` mean projects to a `NaN` screen position and the
+    /// visibility test rejects it (every float comparison against `NaN` is
+    /// false), so the splat is CULLED and the loss stays finite — the poison
+    /// would never reach the thing under test. A `NaN` colour on a splat that
+    /// still rasterizes normally does reach it.
+    fn guard_splats(device: &Device, poison: bool) -> Splats {
+        let mut means = Vec::new();
+        for iy in 0..N_SIDE {
+            for ix in 0..N_SIDE {
+                let f = |i: usize| (i as f32 / (N_SIDE - 1) as f32) * 2.0 - 1.0;
+                means.extend_from_slice(&[f(ix), f(iy), 0.0]);
+            }
+        }
+        let n = means.len() / 3;
+        let rotations: Vec<f32> = (0..n).flat_map(|_| [1.0, 0.0, 0.0, 0.0]).collect();
+        let log_scales: Vec<f32> = (0..n).flat_map(|_| [-1.2, -1.6, -2.5]).collect();
+        let mut sh: Vec<f32> = (0..n).flat_map(|_| [0.5, 0.5, 0.5]).collect();
+        if poison {
+            sh[0] = f32::NAN;
+        }
+        let opac: Vec<f32> = vec![4.0; n];
+        Splats::from_raw(
+            means,
+            rotations,
+            log_scales,
+            sh,
+            opac,
+            SplatRenderMode::Default,
+            device,
+        )
+    }
+
+    fn guard_batch() -> SceneBatch {
+        let (h, w) = (IMG.y as usize, IMG.x as usize);
+        let img_packed = TensorData::new(
+            (0..h * w)
+                .map(|i| {
+                    // Deterministic opaque RGBA. Wrapping on purpose: this is a
+                    // hash, not arithmetic, and a plain multiply overflows.
+                    let rgb = (i as u32).wrapping_mul(2_654_435_761) & 0x00ff_ffff;
+                    (rgb | 0xff00_0000) as i32
+                })
+                .collect::<Vec<i32>>(),
+            [h, w],
+        );
+        SceneBatch {
+            img_packed,
+            has_alpha: false,
+            alpha_mode: AlphaMode::Transparent,
+            features: None,
+            depth: None,
+            normal: None,
+            camera: guard_camera(),
+            view_index: 0,
+        }
+    }
+
+    fn guard_trainer(allow_nonfinite_loss: bool, device: &Device) -> SplatTrainer {
+        let config = TrainConfig {
+            allow_nonfinite_loss,
+            ..Default::default()
+        };
+        SplatTrainer::new(
+            &config,
+            device,
+            BoundingBox::from_min_max(glam::Vec3::splat(-2.0), glam::Vec3::splat(2.0)),
+        )
+    }
+
+    /// The cadence: every step early, then aligned to the refine cadence.
+    ///
+    /// Pins BOTH halves. Only asserting the early window would accept a guard
+    /// that stops checking forever afterwards; only asserting the late stride
+    /// would accept one that skips the explosion-prone opening.
+    #[test]
+    fn loss_check_cadence_is_early_then_refine_aligned() {
+        let device = Default::default();
+        let mut trainer = guard_trainer(false, &device);
+        let every = trainer.config.refine_every;
+        assert!(every > 1, "test assumes a nontrivial refine cadence");
+
+        // Early window: every step, whatever the iteration number.
+        for step in [1u32, 2, 7, NONFINITE_LOSS_CHECK_STEPS] {
+            trainer.step_count = step;
+            assert!(
+                trainer.should_check_loss_finite(step),
+                "step {step} is inside the early window and must be checked"
+            );
+            // Even on an iteration that is NOT on the refine stride.
+            assert!(trainer.should_check_loss_finite(every * 3 + 1));
+        }
+
+        // After it: only on the refine stride.
+        trainer.step_count = NONFINITE_LOSS_CHECK_STEPS + 1;
+        assert!(trainer.should_check_loss_finite(every * 4));
+        assert!(!trainer.should_check_loss_finite(every * 4 + 1));
+        assert!(!trainer.should_check_loss_finite(every * 4 - 1));
+    }
+
+    /// The escape hatch is off by default, so a non-finite loss ABORTS.
+    #[tokio::test]
+    #[should_panic(expected = "non-finite total loss")]
+    async fn nonfinite_loss_aborts_by_default() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let trainer = guard_trainer(false, &device);
+        let splats = guard_splats(&device, false);
+        trainer.report_nonfinite_loss(f32::NAN, &splats, 42).await;
+    }
+
+    /// `--allow-nonfinite-loss` restores the old continue-anyway behaviour.
+    #[tokio::test]
+    async fn nonfinite_loss_escape_hatch_allows_continuing() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let trainer = guard_trainer(true, &device);
+        let splats = guard_splats(&device, false);
+        // Must return rather than panic. Both non-finite kinds, since `inf` and
+        // `NaN` reach the check by different arithmetic.
+        trainer.report_nonfinite_loss(f32::NAN, &splats, 7).await;
+        trainer
+            .report_nonfinite_loss(f32::INFINITY, &splats, 8)
+            .await;
+    }
+
+    /// **The guard must be WIRED INTO `step`, not merely defined.**
+    ///
+    /// The sibling failure to a dispatch that never selects its branch: a
+    /// perfectly correct `report_nonfinite_loss` is worth nothing if
+    /// `should_check_loss_finite` is never consulted. So poison the accumulated
+    /// total loss for real, run a real `step`, and require the abort.
+    ///
+    /// # Why the poison is a weight and not a splat
+    ///
+    /// The obvious injection — a `NaN` splat parameter — does NOT work, and
+    /// finding that out is worth more than the test itself. Measured here: a
+    /// splat whose SH DC term is `NaN` is pruned by
+    /// `prune_non_finite_splats` (the sibling test proves that) yet leaves the
+    /// step-0 loss perfectly FINITE. The rasterizer never lets the poison
+    /// through: `NaN` colours are clamped away and `NaN` geometry fails the
+    /// visibility and alpha-cutoff comparisons (every float compare against
+    /// `NaN` is false), so the splat is simply skipped.
+    ///
+    /// That is exactly why gap 2 exists as a separate problem from gap 1: a
+    /// non-finite splat is INVISIBLE to the loss, so no loss-side guard will
+    /// ever catch it, and it survives all the way to the exported ply. The two
+    /// guards are not redundant — neither one subsumes the other.
+    ///
+    /// So this pin injects on the side the loss guard actually watches: a
+    /// non-finite weight makes the accumulated total non-finite, which is the
+    /// shape a real numerical blow-up takes.
+    #[tokio::test]
+    #[should_panic(expected = "non-finite total loss")]
+    async fn nonfinite_loss_guard_is_live_in_step() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let config = TrainConfig {
+            anti_needle_weight: f32::INFINITY,
+            ..Default::default()
+        };
+        let mut trainer = SplatTrainer::new(
+            &config,
+            &device,
+            BoundingBox::from_min_max(glam::Vec3::splat(-2.0), glam::Vec3::splat(2.0)),
+        );
+        let _ = trainer
+            .step(guard_batch(), guard_splats(&device, false))
+            .await;
+    }
+
+    /// A `NaN` splat parameter does NOT reach the rendered image.
+    ///
+    /// Pinned as its own fact because the whole justification for gap 2's
+    /// separate sweep rests on it: the loss guard cannot cover non-finite
+    /// splats, because they never reach the loss. If a future rasterizer change
+    /// DID start propagating splat `NaN`s into the image, this test fails and
+    /// tells the reader that the containment argument needs revisiting — rather
+    /// than the sweep quietly looking redundant.
+    ///
+    /// Stated on the RENDER rather than on a full `step`, deliberately. A step
+    /// runs the backward, and `bwd_validate` asserts on `NaN` gradients
+    /// whenever `brush-render`'s `debug-validation` is on — which a workspace
+    /// build turns on for every crate through feature unification, even though
+    /// `cargo test -p brush-train` alone does not. A step-level version of this
+    /// test therefore passes standalone and fails under `cargo test
+    /// --workspace`. The render is also simply where the mechanism lives.
+    #[tokio::test]
+    async fn a_nonfinite_splat_never_reaches_the_image() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let poisoned = guard_splats(&device, true);
+        let counts = non_finite_splat_masks(&poisoned).counts().await;
+        assert_eq!(counts.any, 1, "fixture must actually be poisoned");
+        assert_eq!(
+            counts.sh, 1,
+            "the poison must be in the SH, as the fixture intends"
+        );
+
+        // A debug-validation build panics on the non-finite INPUT before the
+        // renderer can demonstrate anything about its output, so there is
+        // nothing here to observe. Skip rather than assert something weaker:
+        // the claim this test makes is about the DEFAULT build, which is the
+        // one that ships and the one gap 2 was measured on.
+        if brush_render::validation::HARD_FAILS_ON_NON_FINITE {
+            return;
+        }
+
+        let out = render_splats_for_training(
+            poisoned,
+            &guard_camera(),
+            IMG,
+            glam::Vec3::ZERO,
+            false,
+            RasterizationMode::Rgba,
+            false,
+        )
+        .await;
+        let img = out
+            .img
+            .into_data_async()
+            .await
+            .expect("image readback")
+            .into_vec::<f32>()
+            .expect("image as f32");
+        let bad = img.iter().filter(|v| !v.is_finite()).count();
+        assert_eq!(
+            bad,
+            0,
+            "{bad} of {} rendered values are non-finite. A non-finite splat now DOES \
+             reach the image, so the loss guard partly covers gap 2 and the sweep's \
+             rationale needs updating.",
+            img.len()
+        );
+    }
+
+    /// The complementary half: a clean step must NOT trip the guard.
+    ///
+    /// Without this, a guard hard-wired to `true` would pass the test above and
+    /// break every real run.
+    #[tokio::test]
+    async fn clean_step_does_not_trip_the_guard() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let mut trainer = guard_trainer(false, &device);
+        let splats = guard_splats(&device, false);
+        let (_next, stats) = trainer.step(guard_batch(), splats).await;
+        let loss: f32 = stats.loss.into_scalar_async().await.expect("loss readback");
+        assert!(loss.is_finite(), "a clean scene produced a non-finite loss");
+    }
+
+    /// The out-of-refine sweep removes non-finite splats, and is INERT when
+    /// there are none.
+    ///
+    /// The inert half is the byte-identity argument in test form: on a clean
+    /// scene the sweep must report zero and return the same population, having
+    /// touched neither the optimizer nor the refine record.
+    #[tokio::test]
+    async fn prune_non_finite_splats_removes_them_and_is_inert_when_clean() {
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let mut trainer = guard_trainer(false, &device);
+
+        // One clean step so the optimizer and refine record exist, which is the
+        // state the sweep has to keep in lockstep when it prunes.
+        let (stepped, _stats) = trainer
+            .step(guard_batch(), guard_splats(&device, false))
+            .await;
+        let n = stepped.num_splats();
+
+        // Inert on a clean population.
+        let (clean, pruned) = trainer
+            .prune_non_finite_splats(100, stepped, "unit test (clean)")
+            .await;
+        assert_eq!(pruned, 0, "a clean scene must prune nothing");
+        assert_eq!(
+            clean.num_splats(),
+            n,
+            "the inert path must not change the population"
+        );
+
+        // And it fires on a poisoned one. Same count as the stepped population,
+        // so the optimizer state the sweep reindexes lines up.
+        let poisoned = guard_splats(&device, true);
+        assert_eq!(
+            poisoned.num_splats(),
+            n,
+            "test fixture must match the stepped splat count"
+        );
+        let (swept, pruned) = trainer
+            .prune_non_finite_splats(101, poisoned, "unit test (poisoned)")
+            .await;
+        assert_eq!(pruned, 1, "the single poisoned splat must be pruned");
+        assert_eq!(swept.num_splats(), n - 1);
+
+        // And what survives is actually finite — the point of the exercise.
+        let counts = non_finite_splat_masks(&swept).counts().await;
+        assert_eq!(
+            counts.any, 0,
+            "the sweep left {} non-finite splats behind",
+            counts.any
         );
     }
 }

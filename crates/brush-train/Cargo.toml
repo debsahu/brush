@@ -43,6 +43,9 @@ burn-wgpu.workspace = true
 
 [dev-dependencies]
 brush-cube = { path = "../brush-cube" }
+# Config tests assert the `#[serde(default)]` behaviour of new flags, i.e. that
+# an older config file without the key still loads and loads as the default.
+serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 wasm-bindgen-test = "0.3"
 
