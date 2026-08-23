@@ -544,10 +544,22 @@ fn accumulate_grads_for_batch(
                             // is dropped on purpose so depth loss cannot lower its
                             // error by changing blending weights (opacity/shape)
                             // instead of moving. This detaches the depth blending
-                            // weights, matching LFS detach_depth_weights
-                            // (kernels_backward.cuh:529). The paired denominator
-                            // detach lives in brush-train train.rs. The state update
-                            // below stays for the front-to-back depth bookkeeping.
+                            // weights. The paired denominator detach lives in
+                            // brush-train train.rs. The state update below stays
+                            // for the front-to-back depth bookkeeping.
+                            //
+                            // PROVENANCE, corrected 2026-08-22 (this previously
+                            // read "matching LFS detach_depth_weights
+                            // (kernels_backward.cuh:529)"): that symbol does not
+                            // exist anywhere in LFS master @ 2bfd6c63, the cited
+                            // line is a tile-instance-range bounds check unrelated
+                            // to depth, and LFS's depth loss keeps a LIVE
+                            // grad_alpha (depth_loss.cu:425-426). DN-Splatter is
+                            // the real precedent; the drop is our own contract,
+                            // guarded by depth_loss_does_not_touch_opacity. Nothing
+                            // about the code changes. See
+                            // docs/superpowers/specs/2026-08-19-alpha-vjp-derivation.md
+                            // section 4, "Corrections 2026-08-22".
                             grad.depth += vis * v_o_d;
                             pix_state[s + 4] = state_d - vis * splat.depth;
                         }

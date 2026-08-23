@@ -1911,9 +1911,30 @@ impl SplatTrainer {
                     // where the depth-channel gradient feeds the alpha term (see
                     // rasterize_backwards.rs, the dropped dot_rgb depth term).
                     // Together they detach the blending weights from depth, so depth
-                    // supervision moves gaussian positions only. LFS does the same
-                    // (detach_depth_weights), as does DN-Splatter. This mirrors the
+                    // supervision moves gaussian positions only. This mirrors the
                     // DINO feature normalization above.
+                    //
+                    // PROVENANCE, corrected 2026-08-22 (this comment previously
+                    // read "LFS does the same (detach_depth_weights), as does
+                    // DN-Splatter"): DN-Splatter detaches the blending weights
+                    // from depth and is the real precedent. **LFS master does
+                    // NOT** — verified by re-reading it at `2bfd6c63`: there is no
+                    // `detach_depth_weights` symbol anywhere in that tree, its
+                    // rasterizer composites depth as a RAW weighted sum with no
+                    // `/alpha` to detach (fastgs `kernels_forward.cuh:650` ->
+                    // `:769` -> `:821`, with alpha written separately at `:820`),
+                    // and its depth loss does the `accum/alpha` normalisation
+                    // itself while keeping a deliberately LIVE alpha gradient
+                    // through it (`depth_loss.cu:425-426`,
+                    // `grad_alpha[idx] = -g * c.e / c.alpha`). So LFS is not a
+                    // precedent for this detach; it is the opposite of one.
+                    //
+                    // The detach itself is unchanged and stays: it is OUR
+                    // contract, guarded end to end by
+                    // `depth_loss_does_not_touch_opacity`. Only the citation was
+                    // wrong. Full write-up:
+                    // `docs/superpowers/specs/2026-08-19-alpha-vjp-derivation.md`
+                    // §4, "Corrections 2026-08-22".
                     let alpha = pred_image.clone().slice(s![.., .., 3..4]).detach();
                     (
                         (accumulated_depth / alpha.clamp_min(1e-10)).reshape([img_h, img_w]),
@@ -3924,8 +3945,15 @@ mod depth_loss_grad_tests {
     /// The rasterize backward also folds the depth-channel gradient into the
     /// alpha gradient, and `rasterize_backwards.rs` drops that term. With both
     /// routes closed the depth blending weights are detached, so depth
-    /// supervision moves the per-splat depth values only. This matches the
-    /// `detach_depth_weights` behavior; see the kernel comment for the citation.
+    /// supervision moves the per-splat depth values only.
+    ///
+    /// This used to cite `detach_depth_weights` as matching LFS. **Retracted
+    /// 2026-08-22**: LFS master (`2bfd6c63`) has no such symbol, no `/alpha` on
+    /// depth in its rasterizer to detach, and a deliberately LIVE `grad_alpha`
+    /// in its depth loss (`depth_loss.cu:425-426`). DN-Splatter remains the
+    /// genuine precedent; the contract is ours, and this test is what guards it.
+    /// See the dispatch-site comment in the train step and
+    /// `docs/superpowers/specs/2026-08-19-alpha-vjp-derivation.md` §4.
     /// The test renders the differentiable depth path, applies a depth-only
     /// loss, and asserts the raw opacities get no gradient while the positions do.
     #[tokio::test]
