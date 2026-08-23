@@ -1961,6 +1961,7 @@ impl SplatTrainer {
                         gt_depth,
                         pixel_weight,
                         self.config.depth_loss_space,
+                        self.config.depth_uncovered,
                     ) * eff_depth_weight;
             }
 
@@ -3934,6 +3935,7 @@ mod seeded_rng_tests {
 #[cfg(test)]
 mod depth_loss_grad_tests {
     use super::*;
+    use brush_loss::DepthUncovered;
     use brush_render::gaussian_splats::SplatRenderMode;
     use brush_render::kernels::camera_model::CameraModel;
 
@@ -4016,7 +4018,13 @@ mod depth_loss_grad_tests {
         // A positive constant target, so the disparity error and its gradient are
         // nonzero wherever a gaussian was rendered.
         let gt_depth = Tensor::<2>::ones([img_h, img_w], &device) * 3.0;
-        let loss = depth_loss(expected_depth, gt_depth, None, DepthLossSpace::Disparity);
+        let loss = depth_loss(
+            expected_depth,
+            gt_depth,
+            None,
+            DepthLossSpace::Disparity,
+            DepthUncovered::Count,
+        );
 
         let grads = splats.bwd_validate(loss).await;
 
@@ -5574,7 +5582,7 @@ mod plane_feature_tests {
 #[cfg(test)]
 mod plane_aux_consumer_tests {
     use super::*;
-    use brush_loss::plane_depth_from_features;
+    use brush_loss::{DepthUncovered, plane_depth_from_features};
     use brush_render::gaussian_splats::SplatRenderMode;
     use brush_render::kernels::camera_model::CameraModel;
 
@@ -5702,7 +5710,13 @@ mod plane_aux_consumer_tests {
         // pixel carries a real, same-signed disparity error. `* valid` is the
         // trainer's own masking of unsupervised pixels.
         let gt = depth.clone().detach().mul_scalar(0.9) * valid;
-        depth_loss(depth, gt, None, DepthLossSpace::Disparity)
+        depth_loss(
+            depth,
+            gt,
+            None,
+            DepthLossSpace::Disparity,
+            DepthUncovered::Count,
+        )
     }
 
     /// §4.5 row 2: with `plane-aux`, depth error must NOT be able to reach
