@@ -267,7 +267,10 @@ pub(crate) async fn train_stream(
     let mut splats = trainer.apply_min_scale_floor(init_splats.clone());
     debug_assert_eq!(
         splats.min_scale.as_ref().map(|floor| floor.dims()[0]),
-        Some(splats.num_splats() as usize),
+        // `--min-scale-factor 0` disables the filter outright, so `None` is a
+        // legitimate state here; anything else must be a full-length floor.
+        (train_stream_config.train_config.min_scale_factor > 0.0)
+            .then_some(splats.num_splats() as usize),
         "initial Mip-Splatting floor must be attached before publication"
     );
     slot.set(0, splats.clone());
