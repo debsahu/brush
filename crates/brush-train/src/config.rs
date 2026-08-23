@@ -262,6 +262,25 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Refine options", default_value = "0.002")]
     pub scale_decay: f32,
 
+    /// Mip-Splatting 3D-filter strength (the world-space scale floor
+    /// `f = sqrt(this) * min_v(dist(mean, cam_v) / focal_v)`). The render folds
+    /// every splat to `sqrt(s^2 + f^2)` per axis and energy-compensates opacity
+    /// by `prod_i s_i / sqrt(s_i^2 + f^2)`, in the TRAINING render as well as at
+    /// export -- so this is a training-dynamics knob, not a presentation one.
+    ///
+    /// Default 0.1 (Mip-Splatting's own constant, and this trainer's historic
+    /// hard-coded value). `0` disables the floor entirely, which is what the
+    /// gauss-surf reference does (`rasterize_mode="classic"`, no 3D filter).
+    ///
+    /// Measured on a dense indoor LiDAR seed (playroom_0821, 30k): the floor
+    /// dominates the learned geometry -- 51% of splats export a thin axis within
+    /// 1.5x of `f` -- and the opacity compensation costs a median 27% of opacity
+    /// (27% of splats pay more than half). Disabling it is an anti-aliasing
+    /// trade: the filter is what keeps renders stable across resolution and the
+    /// LOD ladder, so read masked PSNR/SSIM, not just the geometry metrics.
+    #[arg(long, help_heading = "Refine options", default_value = "0.1")]
+    pub min_scale_factor: f32,
+
     /// Prune genuinely degenerate splats whose smallest scale axis falls below
     /// `1e-10` (MRNF delta #3). ON by default (LFS `min_scale_prune` in
     /// `mrnf_defaults`): the Mip-Splatting min-scale floor already keeps

@@ -89,9 +89,11 @@ impl ExpLrScheduler {
 /// configurable `TrainConfig::bounds_percentile` (default matches this).
 pub const BOUND_PERCENTILE: f32 = 0.8;
 
-/// Mip-Splatting 3D-filter strength. This is intentionally fixed: changing it
-/// alters the learned/exported representation rather than just training speed.
-const MIN_SCALE_FACTOR: f32 = 0.1;
+/// Default Mip-Splatting 3D-filter strength, mirrored by
+/// `TrainConfig::min_scale_factor`'s clap default. Changing it alters the
+/// learned/exported representation rather than just training speed, so it is
+/// flag-gated for A/B work rather than tuned casually.
+pub const MIN_SCALE_FACTOR: f32 = 0.1;
 
 /// Target number of GT views sampled per refine window for edge guidance
 /// (MRNF port, delta #4; LFS `MRNF_EDGE_MIN_VIEW_SAMPLES = 10`, mrnf.cpp:69).
@@ -734,7 +736,7 @@ impl SplatTrainer {
     /// that change splat count must drop or select the old floor first.
     pub fn apply_min_scale_floor(&self, splats: Splats) -> Splats {
         let means = splats.means();
-        match compute_min_scale(&means, &self.view_cams, MIN_SCALE_FACTOR) {
+        match compute_min_scale(&means, &self.view_cams, self.config.min_scale_factor) {
             Some(floor) => splats.with_min_scale(floor),
             None => splats,
         }
