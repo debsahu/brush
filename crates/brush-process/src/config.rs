@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 
 /// Re-exported so UI consumers (`brush-app`) can name the enum types inside
 /// `TrainStreamConfig` without taking a direct dependency edge on `brush-train`.
-pub use brush_train::config::{DepthSource, DepthWeightDecay, TrainConfig};
+pub use brush_train::config::{
+    DepthLossSpace, DepthSource, DepthUncovered, DepthWeightDecay, TrainConfig,
+};
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

@@ -16,6 +16,13 @@ burn = { workspace = true, features = ["autodiff"] }
 burn-cubecl.workspace = true
 burn-fusion.workspace = true
 burn-ir.workspace = true
+# `DepthLossSpace` is a config-surface enum that belongs beside the loss it
+# selects, so it derives `ValueEnum` + `Serialize`/`Deserialize` here instead of
+# being duplicated in `brush-train::config`. Same arrangement as
+# `SplatRenderMode` in `brush-render` (already a dependency of this crate), so
+# neither crate is new to the build graph.
+clap.workspace = true
+serde.workspace = true
 glam.workspace = true
 tracing.workspace = true
 

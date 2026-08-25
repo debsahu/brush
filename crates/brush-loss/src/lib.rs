@@ -1693,15 +1693,254 @@ pub fn image_loss_eval(
     wrap_wgpu_float::<3>(map).permute([1, 2, 0])
 }
 
-/// L1 depth loss in disparity (inverse-depth) space
+/// Space in which the depth residual is measured (`--depth-loss-space`).
+///
+/// Both variants are an L1 masked mean over `gt > 0` with the same denominator
+/// and the same non-finite discipline; they differ only in the residual.
+///
+/// ```text
+///   Disparity : |1/pred - 1/gt|   d/d(pred) = ∓1/pred²   (default, previous behaviour)
+///   Metric    : |pred - gt|       d/d(pred) = ±1
+/// ```
+///
+/// # Why this is a knob and not a constant
+///
+/// The disparity gradient scales as `1/d²`, so a splat one metre from the
+/// camera receives a hundred times the depth gradient of one ten metres away.
+/// With the plane-fused depth source (`--depth-source plane-fused`), whose
+/// blending-weight gradients are live by design, that near-field pressure has a
+/// second outlet: *fading a splat out* lowers the depth term more cheaply than
+/// *rotating it*, which is the opacity collapse measured on both ablation
+/// scenes (plan §10e/§10f: opacity p50 −28% / −34%). A metric L1 never creates
+/// that pressure — its per-pixel gradient magnitude is a constant `1`,
+/// independent of range — and it is what the `gauss-surf` PGSR reference
+/// (rerun-io/examples-monorepo, Apache-2.0, by Pablo Vela) trains with, at
+/// `3.2 / scene_scale`, while running fused. So `Metric` is the arm that
+/// separates "the technique is harmful" from "our loss made it harmful".
+///
+/// # Scale-normalization semantics FLIP with this flag
+///
+/// `--normalize-metric-weights` divides the metric-dimensioned loss weights by
+/// the scene scale. The depth weight is deliberately EXCLUDED from that set
+/// under `Disparity` — the residual is in `1/m`, so dividing by `s` moves the
+/// effective weight the wrong way by `s²` (plan §4.8). Under `Metric` the
+/// residual is in metres like flatten's, so the depth weight JOINS the
+/// normalized set and is divided by `s`, matching the reference's
+/// `3.2 / scene_scale`. See `TrainConfig::depth_loss_space` and the divisor at
+/// the consumption site in `brush-train`'s `train.rs`.
+#[derive(
+    Default,
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum DepthLossSpace {
+    /// `|1/pred - 1/gt|`. Previous behaviour, byte-identical.
+    #[default]
+    Disparity,
+    /// `|pred - gt|`, in the GT's own units (metres for our depth priors).
+    Metric,
+}
+
+/// How pixels the render does not COVER are handled by [`depth_loss`]
+/// (`--depth-uncovered`).
+///
+/// The center depth source composites `accumulated_depth / α.clamp_min(1e-10)`,
+/// which is **exactly 0** where nothing was rendered. Such a pixel may still
+/// have a perfectly valid GT depth behind it, and the legacy mask is GT-only —
+/// so it enters the numerator as a full-magnitude residual (`|0 − 1/D_gt|`,
+/// i.e. 2.0 m⁻¹ for a 0.5 m prior) and is counted in the denominator. That is
+/// an unreducible floor in the *reported* loss plus a dilution of everything
+/// else in it, proportional to the uncovered fraction of the frame.
+///
+/// ```text
+///   Count            numerator: kept      denominator: kept    (default, legacy)
+///   ExcludeNumerator numerator: dropped   denominator: kept
+///   Exclude          numerator: dropped   denominator: dropped (LFS semantics)
+/// ```
+///
+/// # Why three modes and not two
+///
+/// `Exclude` is the semantically right answer — a pixel with no prediction
+/// carries no information about the geometry, so it belongs in neither sum, and
+/// it is what `LichtFeld Studio`'s `depth_loss.cu` does (its `pixel_active`
+/// predicate skips inactive pixels from *every* sum). But it does not merely
+/// clean up the report: dropping the pixel from the DENOMINATOR rescales every
+/// surviving pixel's gradient by a per-frame factor
+/// `N_gt-valid / N_(covered ∧ gt-valid)`, which is a real change to the
+/// effective depth-supervision weight and lands hardest exactly where coverage
+/// is lowest (early training, frame edges).
+///
+/// `ExcludeNumerator` is the same coverage test with the denominator left
+/// alone. In the DEFAULT disparity space it is **gradient-identical** to
+/// `Count` (see the caveat below), so it changes the reported number and
+/// nothing else. It exists so that any metric movement observed under
+/// `Exclude` has exactly one candidate cause — the denominator rescale — rather
+/// than two.
+///
+/// # The gradient-identity claim is SPACE-DEPENDENT — read this before using it
+///
+/// Under [`DepthLossSpace::Disparity`] the excluded terms are constants in
+/// every lane that carries a finite gradient: an uncovered pixel has
+/// `pred <= 0`, so `disp_pred` comes out of
+/// `recip().mask_fill(pred_invalid, 0.0)` whose VJP zeroes that lane, and the
+/// residual `|0 − 1/D_gt|` contributes to the value but not to the derivative
+/// of any covered pixel. Verified by
+/// `exclude_numerator_preserves_every_finite_disparity_gradient`.
+///
+/// **With one measured correction to the plan** (2026-08-22): plan §2.1 states
+/// that such a pixel "carries no gradient". It actually carries a `NaN` —
+/// `mask_fill` zeroes the gradient arriving at `recip`'s OUTPUT, but `recip`'s
+/// own backward is `-grad · (1/pred)²`, which at `pred == 0` is `0 · ∞`. It is
+/// a LATENT defect rather than a live one, and `Count` keeps it unchanged for
+/// byte-identity: an uncovered pixel is by definition one no gaussian
+/// contributed to, so the rasterize backward has nothing to scatter it into and
+/// the `NaN` dies at the image boundary of the graph — measured, not assumed,
+/// by `brush-train`'s `depth_loss_does_not_touch_opacity`, which renders 4
+/// splats on a 48x48 frame against a dense GT and passes `bwd_validate`. Both
+/// exclude modes replace it with an honest `0` as a side effect of substituting
+/// the prediction before the arithmetic.
+///
+/// Under [`DepthLossSpace::Metric`] it is **NOT**. There is no `pred <= 0`
+/// guard there by design (a non-positive prediction is a legitimate finite
+/// residual, not a singularity), so an uncovered pixel scores `|0 − D_gt|` with
+/// a live `∓1` gradient — and since the center path's prediction is
+/// `accumulated_depth / α.clamp_min(1e-10)`, the chain rule multiplies that by
+/// up to `1e10` at a pixel with no coverage. So in metric space
+/// `ExcludeNumerator` is a genuine gradient change (a large one, and in the
+/// safe direction), not a reporting-only change. This was found while
+/// implementing plan §5 and is recorded there; the plan's flat
+/// "gradient-identical" claim holds for the default space only.
+/// Pinned by `exclude_numerator_changes_metric_space_gradients`.
+///
+/// # Coverage test
+///
+/// `!(pred > 0)`, spelled as the COMPLEMENT of the positivity test rather than
+/// as `pred <= 0`, for exactly the reason the `gt_invalid = !gt_valid` comment
+/// inside [`depth_loss`] gives: every comparison against `NaN` is false, so the
+/// two spellings differ on precisely one value and only the complement form
+/// substitutes a `NaN` prediction instead of letting it ride into the
+/// arithmetic. Byte-identical for all-finite predictions.
+///
+/// The stricter LFS-style test is `alpha > 1e-3`, which additionally drops
+/// barely-covered pixels whose normalised depth is noise-dominated; it needs
+/// the (detached) alpha plumbed down to this function and is deliberately NOT
+/// taken here — plan §5.2 defers it to the near-field-floor work, which is
+/// where barely-covered pixels would first misbehave.
+///
+/// # Interaction with the plane depth sources
+///
+/// None, by construction. Both plane paths already multiply their GT by the
+/// plane-validity mask at the dispatch site in `brush-train`'s `train.rs`, so a
+/// plane-invalid pixel has `gt == 0` and leaves through `gt_valid` before this
+/// mask is consulted. The composition is a no-op there in all three modes,
+/// pinned by `pre_masked_plane_style_gt_is_mode_invariant`.
+#[derive(
+    Default,
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum DepthUncovered {
+    /// Uncovered pixels stay in BOTH sums. Previous behaviour, byte-identical.
+    #[default]
+    Count,
+    /// Uncovered pixels leave the numerator only. In disparity space this
+    /// preserves every finite gradient bit for bit (and replaces the uncovered
+    /// lanes' latent `NaN` with 0), so it is a reporting-only change there.
+    ExcludeNumerator,
+    /// Uncovered pixels leave the numerator AND the denominator (LFS
+    /// semantics). Rescales surviving gradients by `N_gt / N_covered`.
+    Exclude,
+}
+
+/// L1 depth loss, in disparity (inverse-depth) space by default or in metric
+/// space under [`DepthLossSpace::Metric`]. Masked to `gt > 0`; the mean is over
+/// the UNWEIGHTED valid count so an optional `pixel_weight` modulates the error
+/// map without moving the denominator.
+///
+/// `uncovered` selects what happens to pixels the render does not cover (the
+/// center depth source composites those as exactly 0) — see [`DepthUncovered`].
+/// The default [`DepthUncovered::Count`] constructs no extra op at all and is
+/// byte-identical to the pre-flag function.
 pub fn depth_loss(
     pred_depth: Tensor<2>,
     gt_depth: Tensor<2>,
     pixel_weight: Option<Tensor<2>>,
+    space: DepthLossSpace,
+    uncovered: DepthUncovered,
 ) -> Tensor<1> {
     let gt_valid = gt_depth.clone().greater_elem(0.0);
-    let gt_invalid = gt_depth.clone().lower_equal_elem(0.0);
-    let gt_invalid_w = gt_invalid.clone();
+    // `!(gt > 0)`, NOT `gt <= 0` — and the difference is exactly one value.
+    // Every comparison against `NaN` is false, so a `NaN` GT is neither
+    // `> 0` (not supervised) nor `<= 0` (not substituted): under the old
+    // spelling it fell through BOTH tests, reached the arithmetic intact and
+    // met `* valid` as `NaN · 0 = NaN`, poisoning the frame — the same
+    // `0 · ∞` shape the discipline below exists to prevent, entered from the
+    // GT side instead of the prediction side. Complementing the validity mask
+    // closes it by construction: whatever is not supervised is substituted.
+    //
+    // **Byte-identical for all-finite GT** (for which `!(x > 0)` and `x <= 0`
+    // agree elementwise), so the recorded identity hashes are unaffected. This
+    // repairs the DISPARITY path too, which had the same hole and no test that
+    // poisoned a GT pixel to find it — the pre-existing poison test perturbs
+    // the prediction and the per-pixel weight only.
+    //
+    // Note `+inf` is deliberately NOT covered here: `inf > 0` is true, so an
+    // infinite GT depth is a SUPERVISED pixel under this function's stated
+    // contract, not a masked-out one. Rejecting it belongs to the loader.
+    let gt_invalid = gt_valid.clone().bool_not();
+
+    // ---- COVERAGE (`--depth-uncovered`) ----------------------------------
+    //
+    // A pixel the render does not cover carries no information about the
+    // geometry, but the mask above is GT-only, so under `Count` it scores a
+    // full-magnitude residual against the prior and is counted in the mean.
+    // See [`DepthUncovered`] for the full argument, including why
+    // `ExcludeNumerator` preserves every finite gradient in DISPARITY space but
+    // not in metric space, and why the uncovered lanes' `Count`-mode VJP is a
+    // `NaN` rather than the 0 the plan predicted.
+    //
+    // Spelled `!(pred > 0)` and not `pred <= 0` for the same one-value reason
+    // as `gt_invalid` above: `NaN` fails both comparisons, so only the
+    // complement form substitutes it. Byte-identical for finite predictions.
+    //
+    // `Count` takes the `None` arm and constructs NO tensor op, so the default
+    // path is the pre-flag graph node for node.
+    let uncovered_mask = match uncovered {
+        DepthUncovered::Count => None,
+        DepthUncovered::ExcludeNumerator | DepthUncovered::Exclude => {
+            Some(pred_depth.clone().greater_elem(0.0).bool_not())
+        }
+    };
+
+    // The substitution mask for the NUMERATOR. Everything downstream that used
+    // to substitute on `gt_invalid` now substitutes on this instead, which is
+    // the same object under `Count`.
+    //
+    // Folding coverage in HERE rather than adding a second `mask_fill` later is
+    // deliberate and load-bearing for the non-finite discipline below: the
+    // disparity arm's `disp_gt = gt.recip()` would otherwise be substituted on
+    // `gt_invalid` only, so an uncovered-but-GT-valid pixel would keep a live
+    // `1/D_gt` in the numerator while its `disp_pred` had been zeroed — a
+    // residual of `-1/D_gt`, i.e. exactly the term we set out to remove.
+    let num_invalid = match &uncovered_mask {
+        None => gt_invalid,
+        Some(u) => gt_invalid.bool_or(u.clone()),
+    };
+    let num_invalid_w = num_invalid.clone();
 
     // NON-FINITE DISCIPLINE — this `mask_fill` must stay BEFORE the arithmetic.
     // A masked-out pixel has to contribute exactly nothing, and `x * 0.0` does
@@ -1719,15 +1958,50 @@ pub fn depth_loss(
     // are not touched at all (`mask_fill` is a select, so their bits pass
     // through unchanged), and its VJP is an elementwise `grad * !mask` — no
     // reduction, hence no reassociation that could move a last bit.
-    let pred_depth = pred_depth.mask_fill(gt_invalid.clone(), 0.0);
+    let pred_depth = pred_depth.mask_fill(num_invalid.clone(), 0.0);
 
-    let pred_invalid = pred_depth.clone().lower_equal_elem(0.0);
-    let disp_pred = pred_depth.recip().mask_fill(pred_invalid, 0.0);
+    // The two spaces share every line above and below this match; only the
+    // residual differs. Keeping them in ONE function rather than two is
+    // deliberate — the masking, the denominator and the non-finite discipline
+    // are the parts that are easy to get subtly different, and a sibling
+    // function would have to re-derive all three.
+    let residual = match space {
+        DepthLossSpace::Disparity => {
+            let pred_invalid = pred_depth.clone().lower_equal_elem(0.0);
+            let disp_pred = pred_depth.recip().mask_fill(pred_invalid, 0.0);
 
-    let disp_gt = gt_depth.recip().mask_fill(gt_invalid, 0.0);
+            let disp_gt = gt_depth.recip().mask_fill(num_invalid, 0.0);
 
-    let valid = gt_valid.float();
-    let abs_err = (disp_pred - disp_gt).abs() * valid.clone();
+            disp_pred - disp_gt
+        }
+        DepthLossSpace::Metric => {
+            // Same NON-FINITE DISCIPLINE as the `pred_depth` line above, and it
+            // is load-bearing on THIS side too: `pred` was already substituted,
+            // but a `NaN`/`±inf` sitting in the GT outside the mask would ride
+            // straight through the subtraction (`0 - NaN = NaN`) and then meet
+            // `* 0.0` in the multiply below, which is exactly the `0 · ∞` shape
+            // the discipline exists to avoid. The disparity arm gets this for
+            // free because it already substitutes on the `recip()` result.
+            //
+            // No `pred <= 0` guard here: in metric space a negative or zero
+            // prediction is a legitimate, finite residual rather than a
+            // singularity, and the plane depth sources already zero the GT at
+            // their invalid pixels (see the dispatch site in `train.rs`), so
+            // those pixels leave through the mask rather than through a guard.
+            pred_depth - gt_depth.mask_fill(num_invalid, 0.0)
+        }
+    };
+
+    // The DENOMINATOR. `Count` and `ExcludeNumerator` share the legacy GT-only
+    // count; only `Exclude` narrows it, and it narrows it to exactly the
+    // complement of the numerator mask — i.e. `gt_valid ∧ covered` — so the two
+    // sums are over the same pixel set, which is what makes the result an
+    // honest mean rather than a mean with a hole in it.
+    let valid = match uncovered {
+        DepthUncovered::Count | DepthUncovered::ExcludeNumerator => gt_valid.float(),
+        DepthUncovered::Exclude => num_invalid_w.clone().bool_not().float(),
+    };
+    let abs_err = residual.abs() * valid.clone();
 
     // DN-Splatter semantics: per-pixel modulation of the error map; the
     // denominator stays the UNweighted valid count, so w == 1 (and None) is
@@ -1739,7 +2013,7 @@ pub fn depth_loss(
         // so a non-finite weight outside the mask would re-poison a term that
         // was just made safe. Byte-identical for finite weights, and the
         // `None` arm — the default path — constructs no op at all.
-        Some(w) => abs_err * w.mask_fill(gt_invalid_w, 0.0),
+        Some(w) => abs_err * w.mask_fill(num_invalid_w, 0.0),
         None => abs_err,
     };
 
@@ -2980,9 +3254,74 @@ mod normal_loss_tests {
         );
         let ones = Tensor::<2>::ones([2, 3], &device);
 
-        let none = read(depth_loss(pred.clone(), gt.clone(), None)).await[0];
-        let unit = read(depth_loss(pred, gt, Some(ones))).await[0];
+        let none = read(depth_loss(
+            pred.clone(),
+            gt.clone(),
+            None,
+            DepthLossSpace::Disparity,
+            DepthUncovered::Count,
+        ))
+        .await[0];
+        let unit = read(depth_loss(
+            pred,
+            gt,
+            Some(ones),
+            DepthLossSpace::Disparity,
+            DepthUncovered::Count,
+        ))
+        .await[0];
         assert_eq!(none, unit);
+    }
+
+    /// **The `--depth-loss-space` value pin.** Hand-computed on a two-pixel map
+    /// so the two spaces cannot be confused for one another by a refactor.
+    ///
+    /// One valid pixel (`pred = 2`, `gt = 1`) and one invalid (`gt = 0`), so
+    /// the denominator is 1 and the loss IS the single residual:
+    ///
+    /// ```text
+    ///   disparity : |1/2 - 1/1| = 0.5
+    ///   metric    : |2   -   1| = 1.0
+    /// ```
+    ///
+    /// The factor of exactly 2 between them is the point: at `pred = 2` a
+    /// disparity residual is a quarter of a metric one per unit of error, and
+    /// the numbers here would coincide if either arm silently fell through to
+    /// the other. The masked-out pixel carries a large prediction (`50.0`)
+    /// against `gt = 0`, which the metric arm would score as an enormous error
+    /// if its mask were dropped — so this also pins that both arms share the
+    /// SAME validity rule, not just the same denominator.
+    #[tokio::test]
+    async fn depth_loss_metric_and_disparity_are_pinned_and_distinct() {
+        let device = device().await;
+        let pred = Tensor::<2>::from_data(TensorData::new(vec![2.0, 50.0], [1, 2]), &device);
+        let gt = Tensor::<2>::from_data(TensorData::new(vec![1.0, 0.0], [1, 2]), &device);
+
+        let disparity = read(depth_loss(
+            pred.clone(),
+            gt.clone(),
+            None,
+            DepthLossSpace::Disparity,
+            DepthUncovered::Count,
+        ))
+        .await[0];
+        let metric = read(depth_loss(
+            pred,
+            gt,
+            None,
+            DepthLossSpace::Metric,
+            DepthUncovered::Count,
+        ))
+        .await[0];
+
+        assert!(
+            (disparity - 0.5).abs() < 1e-6,
+            "disparity loss {disparity}, want 0.5"
+        );
+        assert!(
+            (metric - 1.0).abs() < 1e-6,
+            "metric loss {metric}, want 1.0"
+        );
     }
 
     /// A vertical step edge (cols 0-2 = 0.0, cols 3-5 = 1.0) gives weight
@@ -3078,8 +3417,22 @@ mod normal_loss_tests {
         let w_vals = read(weight.clone()).await;
         let sum_w: f32 = w_vals.iter().sum();
 
-        let weighted = read(depth_loss(pred.clone(), gt.clone(), Some(weight))).await[0];
-        let unweighted = read(depth_loss(pred, gt, None)).await[0];
+        let weighted = read(depth_loss(
+            pred.clone(),
+            gt.clone(),
+            Some(weight),
+            DepthLossSpace::Disparity,
+            DepthUncovered::Count,
+        ))
+        .await[0];
+        let unweighted = read(depth_loss(
+            pred,
+            gt,
+            None,
+            DepthLossSpace::Disparity,
+            DepthUncovered::Count,
+        ))
+        .await[0];
 
         // Denominator is the unweighted valid count N; err is constant.
         assert!(
@@ -3906,6 +4259,100 @@ mod masked_mean_and_gate_tests {
         Tensor::<2>::from_data(TensorData::new(data, [1, n]), device)
     }
 
+    /// **The hypothesis, in test form** (plan §10f, §11.2).
+    ///
+    /// The measured plane-fused opacity collapse is attributed to the disparity
+    /// gradient's `1/d²` scaling: a near splat receives orders of magnitude
+    /// more depth gradient than a far one, and with the blending-weight
+    /// gradients live, fading it is a cheaper descent direction than rotating
+    /// it. Metric L1 cannot create that pressure, because its per-pixel
+    /// gradient magnitude is a constant.
+    ///
+    /// Two valid pixels at very different ranges (`pred = 2 m` and
+    /// `pred = 20 m`, each 10% beyond its GT so both residuals are
+    /// same-signed), denominator 2:
+    ///
+    /// ```text
+    ///   metric    : d/d(pred) = sign(pred - gt) / 2      = +0.5   at BOTH pixels
+    ///   disparity : d/d(pred) = sign(...) / (2 · pred²)  = +0.125 and +0.00125
+    /// ```
+    ///
+    /// The SIGNS agree, and that is worth stating because an earlier draft of
+    /// this test asserted they would not: the disparity chain flips twice
+    /// (over-estimating depth UNDER-estimates disparity, and `d(1/d)/dd` is
+    /// itself negative), so both losses push an over-estimated depth down. The
+    /// two losses never disagree about direction.
+    ///
+    /// What they disagree about is MAGNITUDE, and the assertion is not merely
+    /// "the numbers differ": it is that the metric gradient is
+    /// RANGE-INDEPENDENT (both pixels bit-identical) while the disparity
+    /// gradient spans the 100x that `1/d²` predicts across a 10x range. The
+    /// ranges are 2 m and 20 m rather than 1 m and 10 m so that no cell of the
+    /// 2x2 coincides numerically with another — at 1 m the disparity and metric
+    /// gradients are both exactly 0.5, and a test in which two of the four
+    /// values happen to be equal is a test that a fallthrough could pass.
+    #[tokio::test]
+    async fn depth_loss_gradient_is_range_independent_only_in_metric_space() {
+        let device = autodiff_device().await;
+        // pred is 10% beyond gt at both pixels, at ranges 2 m and 20 m.
+        let gt = || img2(vec![2.0 / 1.1, 20.0 / 1.1], &device);
+
+        let pred_m = lift_to_autodiff(img2(vec![2.0, 20.0], &device)).require_grad();
+        let loss = depth_loss(
+            pred_m.clone(),
+            gt(),
+            None,
+            DepthLossSpace::Metric,
+            DepthUncovered::Count,
+        );
+        let grads = loss.backward();
+        let g_metric = read(pred_m.grad(&grads).expect("metric depth gradient")).await;
+
+        let pred_d = lift_to_autodiff(img2(vec![2.0, 20.0], &device)).require_grad();
+        let loss = depth_loss(
+            pred_d.clone(),
+            gt(),
+            None,
+            DepthLossSpace::Disparity,
+            DepthUncovered::Count,
+        );
+        let grads = loss.backward();
+        let g_disp = read(pred_d.grad(&grads).expect("disparity depth gradient")).await;
+
+        // Metric: +1/N at both pixels, N = 2 valid pixels.
+        for (i, g) in g_metric.iter().enumerate() {
+            assert!(
+                (g - 0.5).abs() < 1e-5,
+                "metric gradient at pixel {i} is {g}, want +0.5 (constant magnitude, \
+                 independent of range)"
+            );
+        }
+
+        // Disparity: +1/(N·pred²) -> 0.125 at 2 m, 0.00125 at 20 m.
+        assert!(
+            (g_disp[0] - 0.125).abs() < 1e-5,
+            "disparity gradient at 2 m is {}, want +0.125",
+            g_disp[0]
+        );
+        assert!(
+            (g_disp[1] - 0.00125).abs() < 1e-5,
+            "disparity gradient at 20 m is {}, want +0.00125",
+            g_disp[1]
+        );
+
+        // The headline: 100x spread across a 10x range change, vs none.
+        let metric_ratio = (g_metric[0] / g_metric[1]).abs();
+        let disp_ratio = (g_disp[0] / g_disp[1]).abs();
+        assert!(
+            (metric_ratio - 1.0).abs() < 1e-4,
+            "metric near/far gradient ratio {metric_ratio}, want 1.0"
+        );
+        assert!(
+            (disp_ratio - 100.0).abs() < 1e-2,
+            "disparity near/far gradient ratio {disp_ratio}, want 100 (1/d^2 over a 10x range)"
+        );
+    }
+
     /// **§10d item 4.** A pixel outside a loss's validity mask has NO numerical
     /// effect on that loss — not "a negligible one", none: the results must be
     /// bit-identical.
@@ -3968,8 +4415,22 @@ mod masked_mean_and_gate_tests {
         let tame = vec![1.9, 3.2, 1.0, 5.0];
         let wild = vec![1.9, 3.2, WILD, 1.0 / WILD];
 
-        let base = read(depth_loss(img2(tame, &device), gt_d.clone(), None)).await[0];
-        let perturbed = read(depth_loss(img2(wild, &device), gt_d, None)).await[0];
+        let base = read(depth_loss(
+            img2(tame, &device),
+            gt_d.clone(),
+            None,
+            DepthLossSpace::Disparity,
+            DepthUncovered::Count,
+        ))
+        .await[0];
+        let perturbed = read(depth_loss(
+            img2(wild, &device),
+            gt_d,
+            None,
+            DepthLossSpace::Disparity,
+            DepthUncovered::Count,
+        ))
+        .await[0];
         assert_eq!(
             base, perturbed,
             "depth_loss changed when pixels with no GT depth were perturbed"
@@ -4024,9 +4485,26 @@ mod masked_mean_and_gate_tests {
     /// three masked-mean losses now use too (see the `NON-FINITE DISCIPLINE`
     /// comments at each site).
     ///
-    /// Five losses x three poisons = 15 combinations: `normal_loss`,
-    /// `depth_loss` (bare and with a poisoned per-pixel weight),
-    /// `depth_normal_loss` and `normal_smooth_loss`.
+    /// 48 (loss x poison) combinations: `normal_loss`, `depth_loss`
+    /// (disparity bare, disparity with a poisoned per-pixel weight, metric with
+    /// a poisoned PREDICTION) x 3 poisons, `depth_normal_loss` and
+    /// `normal_smooth_loss` x 3, plus a poisoned GT in both spaces x the 2
+    /// poisons that fall outside the `gt > 0` mask x the 3 `--depth-uncovered`
+    /// modes, plus a poisoned PREDICTION x 3 poisons x 2 spaces x 3 modes.
+    ///
+    /// The 22 -> 48 growth is the `--depth-uncovered` sweep (plan §5.4). It is
+    /// not padding: the coverage mask is derived FROM the prediction, so a
+    /// poisoned prediction is an input to the mask that is supposed to contain
+    /// it, and `Exclude` additionally moves the DENOMINATOR, which is a second
+    /// place a `NaN` can reach the result.
+    ///
+    /// The metric and poisoned-GT combinations were added with
+    /// `--depth-loss-space` (WS-M). The metric arm has neither of the
+    /// accidental protections the disparity arm enjoys — no `recip()` to map
+    /// `+inf` to 0, no `pred <= 0` guard to catch `-inf` — so its `mask_fill`s
+    /// are the whole defence. **The poisoned-GT half found a live hole in the
+    /// shared masking** that predates this change and affected the disparity
+    /// path equally: see the `gt_invalid = !gt_valid` comment in `depth_loss`.
     ///
     /// # History — this test was red when it was written, and that was the point
     ///
@@ -4113,11 +4591,122 @@ mod masked_mean_and_gate_tests {
             // --- depth_loss, on a pixel with no GT depth.
             let gt_d = img2(vec![2.0, 0.0], &device);
             let pred_d = lift_to_autodiff(img2(vec![1.9, poison], &device)).require_grad();
-            let loss = depth_loss(pred_d.clone(), gt_d, None);
+            let loss = depth_loss(
+                pred_d.clone(),
+                gt_d,
+                None,
+                DepthLossSpace::Disparity,
+                DepthUncovered::Count,
+            );
             let value = read(loss.clone()).await[0];
             let grads = loss.backward();
             let g = read(pred_d.grad(&grads).expect("depth gradient")).await;
             check("depth_loss", value, (1.0f32 / 1.9 - 1.0 / 2.0).abs(), g);
+
+            // --- depth_loss in METRIC space, same pixel. The disparity arm
+            // survives ±inf by accident of its shape (`recip()` maps `+inf` to
+            // 0 and the `pred <= 0` guard catches `-inf`); the metric arm has
+            // neither, so its ONLY protection is the pair of `mask_fill`s, and
+            // a poisoned GT reaches the subtraction directly. That makes these
+            // two combinations the load-bearing ones for the metric branch.
+            let gt_d = img2(vec![2.0, 0.0], &device);
+            let pred_d = lift_to_autodiff(img2(vec![1.9, poison], &device)).require_grad();
+            let loss = depth_loss(
+                pred_d.clone(),
+                gt_d,
+                None,
+                DepthLossSpace::Metric,
+                DepthUncovered::Count,
+            );
+            let value = read(loss.clone()).await[0];
+            let grads = loss.backward();
+            let g = read(pred_d.grad(&grads).expect("metric depth gradient")).await;
+            check("depth_loss[metric]", value, (1.9f32 - 2.0).abs(), g);
+
+            // --- and with the GT ITSELF poisoned. This is the case the
+            // pre-existing test never covered — it perturbs predictions and
+            // weights only — and it is how the `gt_invalid = !gt_valid`
+            // spelling was found to be load-bearing: under the old
+            // `gt <= 0`, a `NaN` GT satisfied NEITHER comparison (every
+            // comparison against `NaN` is false), so it was neither supervised
+            // nor substituted, rode into the arithmetic and met `* valid` as
+            // `NaN · 0`. Both spaces were affected; the metric arm is simply
+            // where it was noticed.
+            //
+            // `+inf` is EXCLUDED, and not as a convenience: `inf > 0` is true,
+            // so an infinite GT depth is a SUPERVISED pixel under this
+            // function's contract, and demanding it be ignored would be
+            // asserting a different contract than the one the code states.
+            // `NaN` and `-inf` are both genuinely outside the mask.
+            //
+            // **Swept across all three `--depth-uncovered` modes** (plan §5.4).
+            // The poisoned pixel here is COVERED (`pred = 1.0 > 0`) but
+            // GT-invalid, so it leaves through `gt_valid` in every mode and the
+            // expected value is mode-independent — which is the point: the new
+            // coverage mask must not create a second, weaker path for a
+            // poisoned GT to survive, and `Exclude`'s narrowed denominator must
+            // still count exactly the one supervised pixel.
+            if poison != f32::INFINITY {
+                for space in [DepthLossSpace::Disparity, DepthLossSpace::Metric] {
+                    for uncovered in [
+                        DepthUncovered::Count,
+                        DepthUncovered::ExcludeNumerator,
+                        DepthUncovered::Exclude,
+                    ] {
+                        let gt_d = img2(vec![2.0, poison], &device);
+                        let pred_d = lift_to_autodiff(img2(vec![1.9, 1.0], &device)).require_grad();
+                        let loss = depth_loss(pred_d.clone(), gt_d, None, space, uncovered);
+                        let value = read(loss.clone()).await[0];
+                        let grads = loss.backward();
+                        let g = read(pred_d.grad(&grads).expect("depth gradient")).await;
+                        let want = match space {
+                            DepthLossSpace::Disparity => (1.0f32 / 1.9 - 1.0 / 2.0).abs(),
+                            DepthLossSpace::Metric => (1.9f32 - 2.0).abs(),
+                        };
+                        check(
+                            &format!("depth_loss[{space:?}, {uncovered:?}, poisoned gt]"),
+                            value,
+                            want,
+                            g,
+                        );
+                    }
+                }
+            }
+
+            // --- POISONED PREDICTION at a pixel with no GT depth, swept across
+            // all three `--depth-uncovered` modes (plan §5.4, the other half).
+            //
+            // Note what makes this non-trivial rather than a re-run of the two
+            // `depth_loss` checks above: the coverage mask is derived FROM the
+            // prediction, so a poisoned prediction is an input to the new mask
+            // itself. `!(pred > 0)` is false for `+inf` (so `+inf` is "covered"
+            // and must be caught by the GT mask, as before) and true for `NaN`
+            // and `-inf`. All three modes must survive all three poisons in
+            // both spaces regardless of which mask does the catching.
+            for space in [DepthLossSpace::Disparity, DepthLossSpace::Metric] {
+                for uncovered in [
+                    DepthUncovered::Count,
+                    DepthUncovered::ExcludeNumerator,
+                    DepthUncovered::Exclude,
+                ] {
+                    let gt_d = img2(vec![2.0, 0.0], &device);
+                    let pred_d = lift_to_autodiff(img2(vec![1.9, poison], &device)).require_grad();
+                    let loss = depth_loss(pred_d.clone(), gt_d, None, space, uncovered);
+                    let value = read(loss.clone()).await[0];
+                    let grads = loss.backward();
+                    let g = read(pred_d.grad(&grads).expect("depth gradient")).await;
+                    let want = match space {
+                        DepthLossSpace::Disparity => (1.0f32 / 1.9 - 1.0 / 2.0).abs(),
+                        DepthLossSpace::Metric => (1.9f32 - 2.0).abs(),
+                    };
+                    check(
+                        &format!("depth_loss[{space:?}, {uncovered:?}, poisoned pred]"),
+                        value,
+                        want,
+                        g,
+                    );
+                }
+            }
 
             // --- depth_normal_loss, on an UNCOVERED pixel.
             let alpha = img1(vec![1.0, 0.0], &device);
@@ -4160,7 +4749,13 @@ mod masked_mean_and_gate_tests {
             let gt_d = img2(vec![2.0, 0.0], &device);
             let pred_d = lift_to_autodiff(img2(vec![1.9, 1.0], &device)).require_grad();
             let w = img2(vec![1.0, poison], &device);
-            let loss = depth_loss(pred_d.clone(), gt_d, Some(w));
+            let loss = depth_loss(
+                pred_d.clone(),
+                gt_d,
+                Some(w),
+                DepthLossSpace::Disparity,
+                DepthUncovered::Count,
+            );
             let value = read(loss.clone()).await[0];
             let grads = loss.backward();
             let g = read(pred_d.grad(&grads).expect("weighted depth gradient")).await;
@@ -4175,7 +4770,7 @@ mod masked_mean_and_gate_tests {
         assert!(
             violations.is_empty(),
             "a non-finite value OUTSIDE the validity mask changed the loss or its \
-             gradient in {} of 15 (loss x poison) combinations:\n  {}",
+             gradient in {} of 48 (loss x poison) combinations:\n  {}",
             violations.len(),
             violations.join("\n  ")
         );
@@ -4456,5 +5051,418 @@ mod masked_mean_and_gate_tests {
             "gated loss = {gated}, want {want} (only the 29-degree pixel, \
              denominator = 1 pixel x 3 channels)"
         );
+    }
+}
+
+/// **`--depth-uncovered` — plan §5.4.** Coverage handling in [`depth_loss`].
+///
+/// The three modes are pinned by hand on frames small enough to compute in the
+/// head, and the two claims that make the split worth having are tested
+/// separately: that `ExcludeNumerator` moves the reported number by exactly the
+/// analytically predicted mass and nothing else, and that `Exclude` additionally
+/// rescales by the coverage factor.
+///
+/// The one place the plan's wording had to be corrected is recorded in
+/// [`DepthUncovered`]'s docs and pinned by
+/// `exclude_numerator_changes_metric_space_gradients`: "gradient-identical"
+/// holds in the DEFAULT disparity space only.
+#[cfg(all(test, not(target_family = "wasm")))]
+mod depth_uncovered_tests {
+    use super::*;
+    use brush_render::burn_glue::lift_to_autodiff;
+    use burn::tensor::TensorData;
+
+    async fn device() -> burn::tensor::Device {
+        brush_cube::test_helpers::test_device().await.into()
+    }
+
+    async fn autodiff_device() -> burn::tensor::Device {
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff()
+    }
+
+    async fn read<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+        t.into_data_async()
+            .await
+            .expect("tensor readback")
+            .to_vec::<f32>()
+            .expect("f32 tensor")
+    }
+
+    fn img2(data: Vec<f32>, device: &burn::tensor::Device) -> Tensor<2> {
+        let n = data.len();
+        Tensor::<2>::from_data(TensorData::new(data, [1, n]), device)
+    }
+
+    const MODES: [DepthUncovered; 3] = [
+        DepthUncovered::Count,
+        DepthUncovered::ExcludeNumerator,
+        DepthUncovered::Exclude,
+    ];
+
+    /// **The value pin.** A four-pixel frame with valid GT everywhere and the
+    /// render covering exactly half of it — the fixture plan §5.4 item 1 asks
+    /// for. Every number below is an exact binary fraction, so these are
+    /// equalities in spirit even though they are written with a tolerance.
+    ///
+    /// ```text
+    ///   pred = [1.0, 2.0, 0.0, 0.0]      (the last two: nothing rendered)
+    ///   gt   = [2.0, 4.0, 0.5, 1.0]
+    ///
+    ///   disparity residuals   covered: |1/1 - 1/2| = 0.5 , |1/2 - 1/4| = 0.25
+    ///                       uncovered: |0 - 1/0.5| = 2.0 , |0 - 1/1  | = 1.0
+    ///
+    ///   count             = (0.5 + 0.25 + 2.0 + 1.0) / 4 = 0.9375
+    ///   exclude-numerator = (0.5 + 0.25            ) / 4 = 0.1875
+    ///   exclude           = (0.5 + 0.25            ) / 2 = 0.375
+    /// ```
+    ///
+    /// Note the shape of the defect this pins: the uncovered pixels contribute
+    /// **four times** the covered ones' error here, and the closer the prior
+    /// the worse it gets (a 0.5 m surface scores 2.0 m⁻¹), so the reported
+    /// depth loss on a partly-covered frame is dominated by exactly the pixels
+    /// that can teach the optimiser nothing.
+    #[tokio::test]
+    async fn uncovered_modes_are_pinned_on_a_half_covered_frame() {
+        let device = device().await;
+        let pred = || img2(vec![1.0, 2.0, 0.0, 0.0], &device);
+        let gt = || img2(vec![2.0, 4.0, 0.5, 1.0], &device);
+
+        for (space, want) in [
+            (DepthLossSpace::Disparity, [0.9375f32, 0.1875, 0.375]),
+            // metric residuals: covered |1-2| = 1, |2-4| = 2; uncovered
+            // |0-0.5| = 0.5, |0-1| = 1.  count = 4.5/4, excl-num = 3/4,
+            // exclude = 3/2.
+            (DepthLossSpace::Metric, [1.125f32, 0.75, 1.5]),
+        ] {
+            for (mode, want) in MODES.into_iter().zip(want) {
+                let got = read(depth_loss(pred(), gt(), None, space, mode)).await[0];
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "depth_loss[{space:?}, {mode:?}] = {got}, want {want}"
+                );
+            }
+        }
+    }
+
+    /// **The analytic prediction from plan §5.3**, stated as its own assertion
+    /// rather than left implicit in the pinned values above: the drop from
+    /// `count` to `exclude-numerator` is exactly the excluded mass
+    /// `Σ_excluded |1/D_gt| / N_gt-valid`, and `exclude` is then
+    /// `exclude-numerator` scaled by the coverage factor
+    /// `N_gt-valid / N_covered`.
+    ///
+    /// A 3-of-5 covered frame, so the coverage factor is `5/3` and cannot be
+    /// confused with the `4/2 = 2` of the fixture above.
+    #[tokio::test]
+    async fn the_reported_drop_and_the_rescale_match_their_closed_forms() {
+        let device = device().await;
+        let pred = || img2(vec![1.0, 2.0, 4.0, 0.0, 0.0], &device);
+        let gt = || img2(vec![1.0, 1.0, 1.0, 1.0, 1.0], &device);
+
+        let space = DepthLossSpace::Disparity;
+        let count = read(depth_loss(pred(), gt(), None, space, DepthUncovered::Count)).await[0];
+        let excl_num = read(depth_loss(
+            pred(),
+            gt(),
+            None,
+            space,
+            DepthUncovered::ExcludeNumerator,
+        ))
+        .await[0];
+        let excl = read(depth_loss(
+            pred(),
+            gt(),
+            None,
+            space,
+            DepthUncovered::Exclude,
+        ))
+        .await[0];
+
+        // Excluded mass: two pixels at |0 - 1/1| = 1, over the GT-valid count 5.
+        let predicted_drop = (1.0f32 + 1.0) / 5.0;
+        assert!(
+            ((count - excl_num) - predicted_drop).abs() < 1e-6,
+            "reported drop {} != predicted {predicted_drop}",
+            count - excl_num
+        );
+
+        // Coverage rescale: 5 GT-valid pixels, 3 of them covered.
+        let factor = 5.0f32 / 3.0;
+        assert!(
+            (excl - excl_num * factor).abs() < 1e-6,
+            "exclude {excl} != exclude-numerator {excl_num} x {factor}"
+        );
+    }
+
+    /// **The separation the two-step split exists for** (plan §5.2/§8): in the
+    /// DEFAULT disparity space, `exclude-numerator` changes the reported loss
+    /// and leaves every FINITE gradient alone, bit for bit.
+    ///
+    /// Why the covered lanes are bit-identical rather than approximately so:
+    /// nothing about them changes. The numerator sum loses terms, but the
+    /// gradient never passed through those terms, and no reduction the surviving
+    /// lanes participate in is re-associated.
+    ///
+    /// # The uncovered lanes are the exception, and the plan's wording is wrong about them
+    ///
+    /// Plan §2.1 says an uncovered-but-GT-valid pixel "carries **no gradient**
+    /// (`mask_fill`'s VJP zeroes that pixel)". **Measured 2026-08-22: it carries
+    /// a `NaN`.** `mask_fill` zeroes the gradient arriving at `recip`'s OUTPUT,
+    /// but `recip`'s own backward is `-grad · (1/pred)²`, and at `pred == 0`
+    /// that is `0 · ∞ = NaN` — the same `0 · ∞` shape the file's non-finite
+    /// discipline exists to prevent, entered through a derivative instead of
+    /// through a value. It is disparity-specific: the metric arm has no
+    /// `recip()` and its uncovered lanes carry an honest finite `∓1/N`
+    /// (`exclude_numerator_changes_metric_space_gradients`).
+    ///
+    /// Why this has never shown up as a training failure, and why it is still
+    /// only a latent defect rather than a live one: an uncovered pixel is by
+    /// definition one no gaussian contributed to, so the rasterize backward has
+    /// nothing to scatter that pixel's gradient into and the `NaN` dies at the
+    /// image boundary of the graph. `brush-train`'s
+    /// `depth_loss_does_not_touch_opacity` exercises exactly this configuration
+    /// — 4 splats on a 48x48 frame, so most of it is uncovered, against a dense
+    /// `gt = 3.0` — and passes `bwd_validate`, which rejects any non-finite
+    /// parameter gradient. So the containment is measured, not assumed.
+    ///
+    /// It is therefore left alone: `count` stays byte-identical, `NaN` included
+    /// (T6), and this test pins the difference instead of papering over it. Both
+    /// exclude modes replace the `NaN` with an honest `0` as a side effect of
+    /// substituting the prediction before the arithmetic — which removes the
+    /// reliance on that containment, and is one more reason to prefer them.
+    #[tokio::test]
+    async fn exclude_numerator_preserves_every_finite_disparity_gradient() {
+        let device = autodiff_device().await;
+        let gt = || img2(vec![2.0, 4.0, 0.5, 1.0, 3.0, 0.25], &device);
+        let vals = vec![1.0, 2.0, 0.0, 0.0, 2.5, 0.3];
+        // Lanes 2 and 3 are the uncovered ones (`pred == 0`, GT still valid).
+        let uncovered_lanes = [2usize, 3];
+
+        let mut values = Vec::new();
+        let mut grads = Vec::new();
+        for mode in [DepthUncovered::Count, DepthUncovered::ExcludeNumerator] {
+            let pred = lift_to_autodiff(img2(vals.clone(), &device)).require_grad();
+            let loss = depth_loss(pred.clone(), gt(), None, DepthLossSpace::Disparity, mode);
+            values.push(read(loss.clone()).await[0]);
+            let g = loss.backward();
+            grads.push(read(pred.grad(&g).expect("depth gradient")).await);
+        }
+
+        for i in 0..vals.len() {
+            if uncovered_lanes.contains(&i) {
+                continue;
+            }
+            assert_eq!(
+                grads[0][i], grads[1][i],
+                "exclude-numerator moved the COVERED disparity gradient at lane                  {i}: count {:?} vs exclude-numerator {:?}",
+                grads[0], grads[1]
+            );
+            assert!(
+                grads[0][i].is_finite(),
+                "covered lane {i} must carry a finite gradient: {:?}",
+                grads[0]
+            );
+        }
+
+        // The documented exception, pinned in BOTH directions so neither half
+        // can rot silently: `count` emits the `NaN`, `exclude-numerator` emits 0.
+        for i in uncovered_lanes {
+            assert!(
+                grads[0][i].is_nan(),
+                "count-mode disparity gradient at uncovered lane {i} = {},                  expected NaN (see this test's doc comment — if this now reads                  0.0, something upstream fixed `recip`'s 0 · ∞ backward and the                  doc comment above is stale)",
+                grads[0][i]
+            );
+            assert_eq!(
+                grads[1][i], 0.0,
+                "exclude-numerator must replace the uncovered lane {i} NaN with 0"
+            );
+        }
+
+        assert!(
+            values[0] > values[1],
+            "the fixture must actually exclude something: count {} !> \
+             exclude-numerator {}",
+            values[0],
+            values[1]
+        );
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "both reported VALUES stay finite (only the VJP is affected): {values:?}"
+        );
+    }
+
+    /// **The correction to the plan, pinned.** Plan §5.2 calls
+    /// `exclude-numerator` "gradient-identical to `count`" without qualifying
+    /// the space. It is not, under `--depth-loss-space metric`, and the
+    /// difference is large rather than marginal.
+    ///
+    /// The metric arm deliberately has no `pred <= 0` guard — a non-positive
+    /// prediction is a legitimate finite residual there, not a singularity — so
+    /// an uncovered pixel scores `|0 - D_gt|` with a LIVE `∓1` gradient. Under
+    /// `count` that gradient is real supervision pushing an uncovered pixel's
+    /// prediction toward the prior; and since the center path's prediction is
+    /// `accumulated_depth / α.clamp_min(1e-10)`, the chain rule multiplies it
+    /// by up to `1e10` where there is no coverage. Excluding the pixel removes
+    /// that entirely.
+    ///
+    /// So in metric space the two exclude modes are BOTH gradient-affecting.
+    /// That does not weaken the attribution argument for the default space, but
+    /// it does mean the two-step sequencing of plan §8 buys nothing under
+    /// `--depth-loss-space metric` — the numerator step is already a gradient
+    /// change there — and any metric-space arm must be read accordingly.
+    #[tokio::test]
+    async fn exclude_numerator_changes_metric_space_gradients() {
+        let device = autodiff_device().await;
+        let gt = || img2(vec![2.0, 4.0, 0.5, 1.0], &device);
+        let vals = vec![1.0, 2.0, 0.0, 0.0];
+
+        let mut grads = Vec::new();
+        for mode in [DepthUncovered::Count, DepthUncovered::ExcludeNumerator] {
+            let pred = lift_to_autodiff(img2(vals.clone(), &device)).require_grad();
+            let loss = depth_loss(pred.clone(), gt(), None, DepthLossSpace::Metric, mode);
+            let g = loss.backward();
+            grads.push(read(pred.grad(&g).expect("metric depth gradient")).await);
+        }
+
+        // Covered lanes are untouched...
+        assert_eq!(
+            grads[0][0..2],
+            grads[1][0..2],
+            "covered lanes must not move: {:?} vs {:?}",
+            grads[0],
+            grads[1]
+        );
+        // ...and the uncovered lanes carry a live -1/N under `count` (N = 4
+        // GT-valid pixels, residual 0 - gt < 0 so d|r|/dpred = -1) and exactly
+        // 0 once excluded.
+        for i in 2..4 {
+            assert!(
+                (grads[0][i] - (-0.25)).abs() < 1e-6,
+                "count-mode metric gradient at uncovered lane {i} = {}, want -0.25",
+                grads[0][i]
+            );
+            assert_eq!(
+                grads[1][i], 0.0,
+                "exclude-numerator must zero the uncovered lane {i}"
+            );
+        }
+    }
+
+    /// **Trap T10 — the plane paths must be untouched.** Both plane depth
+    /// sources multiply their GT by the plane-validity mask at the dispatch site
+    /// (`train.rs`, `gt_depth * valid`), so a pixel with no plane intersection
+    /// arrives here with `gt == 0` and leaves through `gt_valid` before the
+    /// coverage mask is consulted.
+    ///
+    /// This reproduces that pre-masking exactly — GT zeroed wherever the plane
+    /// depth came back as the invalid marker `0` — and requires all three modes
+    /// to agree in both spaces. If a future change relocated the `gt * valid`
+    /// multiply, or made this mask fire on the plane paths, this is what would
+    /// catch it.
+    #[tokio::test]
+    async fn pre_masked_plane_style_gt_is_mode_invariant() {
+        let device = device().await;
+        // Plane depth: pixels 2 and 3 had no valid intersection -> exactly 0,
+        // and the dispatch site has already zeroed their GT to match.
+        let pred = || img2(vec![1.0, 2.0, 0.0, 0.0, 3.0], &device);
+        let gt = || img2(vec![2.0, 4.0, 0.0, 0.0, 1.5], &device);
+
+        for space in [DepthLossSpace::Disparity, DepthLossSpace::Metric] {
+            let mut seen = Vec::new();
+            for mode in MODES {
+                seen.push(read(depth_loss(pred(), gt(), None, space, mode)).await[0]);
+            }
+            assert_eq!(
+                seen[0], seen[1],
+                "{space:?}: exclude-numerator changed a pre-masked plane frame"
+            );
+            assert_eq!(
+                seen[0], seen[2],
+                "{space:?}: exclude changed a pre-masked plane frame"
+            );
+            assert!(
+                seen[0] > 0.0,
+                "{space:?}: the fixture must produce a nonzero loss"
+            );
+        }
+    }
+
+    /// A frame the render covers COMPLETELY must be mode-invariant too — the
+    /// coverage mask has to be inert when there is nothing to exclude, which is
+    /// what makes `count` the safe default rather than merely the legacy one.
+    /// Includes an invalid-GT pixel so the two masks are exercised together.
+    #[tokio::test]
+    async fn fully_covered_frames_are_mode_invariant() {
+        let device = device().await;
+        let pred = || img2(vec![1.0, 2.0, 4.0, 7.0], &device);
+        let gt = || img2(vec![2.0, 4.0, 0.0, 1.0], &device);
+
+        for space in [DepthLossSpace::Disparity, DepthLossSpace::Metric] {
+            let mut seen = Vec::new();
+            for mode in MODES {
+                seen.push(read(depth_loss(pred(), gt(), None, space, mode)).await[0]);
+            }
+            assert_eq!(
+                seen[0], seen[1],
+                "{space:?}: excl-num moved a covered frame"
+            );
+            assert_eq!(seen[0], seen[2], "{space:?}: exclude moved a covered frame");
+        }
+    }
+
+    /// An all-uncovered frame must yield exactly 0 under `exclude` rather than
+    /// `NaN`: the denominator's `clamp_min(1.0)` is what stands between an
+    /// empty coverage set and a divide by zero, and `exclude` is the first mode
+    /// that can empty it while GT pixels still exist. (`count` cannot: its
+    /// denominator is the GT count.)
+    #[tokio::test]
+    async fn exclude_survives_a_frame_with_no_coverage_at_all() {
+        let device = device().await;
+        let pred = || img2(vec![0.0, 0.0, 0.0], &device);
+        let gt = || img2(vec![2.0, 4.0, 1.0], &device);
+
+        for space in [DepthLossSpace::Disparity, DepthLossSpace::Metric] {
+            let got = read(depth_loss(
+                pred(),
+                gt(),
+                None,
+                space,
+                DepthUncovered::Exclude,
+            ))
+            .await[0];
+            assert_eq!(got, 0.0, "{space:?}: all-uncovered frame must score 0");
+        }
+    }
+
+    /// The optional per-pixel weight composes with the coverage mask the same
+    /// way it composes with the GT mask: it modulates the numerator and never
+    /// the denominator. Under `exclude` the denominator is the COVERED count,
+    /// so a unit weight must still reproduce the `None` path exactly.
+    #[tokio::test]
+    async fn pixel_weight_still_leaves_the_denominator_alone_under_exclude() {
+        let device = device().await;
+        let pred = || img2(vec![1.0, 2.0, 0.0, 0.0], &device);
+        let gt = || img2(vec![2.0, 4.0, 0.5, 1.0], &device);
+        let ones = || Tensor::<2>::ones([1, 4], &device);
+
+        for mode in MODES {
+            let none = read(depth_loss(
+                pred(),
+                gt(),
+                None,
+                DepthLossSpace::Disparity,
+                mode,
+            ))
+            .await[0];
+            let unit = read(depth_loss(
+                pred(),
+                gt(),
+                Some(ones()),
+                DepthLossSpace::Disparity,
+                mode,
+            ))
+            .await[0];
+            assert_eq!(none, unit, "{mode:?}: unit weight must be the identity");
+        }
     }
 }

@@ -59,7 +59,12 @@ pub fn ppisp_fwd_kernel(
     #[comptime] with_vignetting: bool,
     #[comptime] with_crf: bool,
 ) {
-    let idx = CUBE_POS_X * BLOCK_SIZE + UNIT_POS_X;
+    // Flat pixel index from a possibly 2D-tiled grid (see
+    // `calc_cube_count_1d`): a flat `h*w/BLOCK_SIZE` dispatch exceeds the
+    // 65535-per-dimension limit above a ~2896px square face. When the grid
+    // still fits in one dimension `CUBE_POS_Y == 0`, so this is identical to
+    // the old `CUBE_POS_X * BLOCK_SIZE + UNIT_POS_X`.
+    let idx = (CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * BLOCK_SIZE + UNIT_POS_X;
     if idx >= img_h * img_w {
         terminate!();
     }
@@ -184,6 +189,7 @@ pub fn ppisp_fwd_kernel(
 #[allow(
     clippy::too_many_arguments,
     clippy::manual_range_contains,
+    clippy::manual_div_ceil,
     clippy::fn_params_excessive_bools
 )]
 pub fn ppisp_bwd_kernel(
@@ -205,7 +211,10 @@ pub fn ppisp_bwd_kernel(
     #[comptime] with_vignetting: bool,
     #[comptime] with_crf: bool,
 ) {
-    let idx = CUBE_POS_X * BLOCK_SIZE + UNIT_POS_X;
+    // Same 2D-tiled flat index as the forward. `cube_flat` also indexes the
+    // `partials` row this cube owns.
+    let cube_flat = CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X;
+    let idx = cube_flat * BLOCK_SIZE + UNIT_POS_X;
 
     let mut pg = Array::<f32>::new(NUM_PARAM_GRADS as usize);
     #[unroll]
@@ -450,7 +459,13 @@ pub fn ppisp_bwd_kernel(
         }
     }
     sync_cube();
-    if UNIT_POS_X < NUM_PARAM_GRADS {
+    // `partials` has exactly `ceil(h*w / BLOCK_SIZE)` rows, but a 2D-tiled
+    // grid rounds the cube count up (e.g. 339x340 = 115260 cubes for the
+    // 115200 a 3840px face needs), so the tail cubes have no row to write.
+    // They contribute nothing anyway: every one of their threads has
+    // `idx >= img_h * img_w`, so `pg` is all zeros.
+    let num_cubes = (img_h * img_w + BLOCK_SIZE - 1u32) / BLOCK_SIZE;
+    if UNIT_POS_X < NUM_PARAM_GRADS && cube_flat < num_cubes {
         let num_subgroups = BLOCK_SIZE / PLANE_DIM;
         let mut tot = 0.0f32;
         let mut i = 0u32;
@@ -458,6 +473,6 @@ pub fn ppisp_bwd_kernel(
             tot += sg_partials[(i * NUM_PARAM_GRADS + UNIT_POS_X) as usize];
             i += 1u32;
         }
-        partials[(CUBE_POS_X * NUM_PARAM_GRADS + UNIT_POS_X) as usize] = tot;
+        partials[(cube_flat * NUM_PARAM_GRADS + UNIT_POS_X) as usize] = tot;
     }
 }

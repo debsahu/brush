@@ -1,3 +1,7 @@
+// Re-exported so `brush_train::config::DepthLossSpace` resolves for CLI/GUI
+// consumers, the same way `DepthSource` and `DepthWeightDecay` below do. The
+// enum itself lives beside the loss it selects (`brush-loss`).
+pub use brush_loss::{DepthLossSpace, DepthUncovered};
 use brush_render::gaussian_splats::SplatRenderMode;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -496,9 +500,73 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options", default_value = "0.01")]
     pub dino_nn_reg_weight: f32,
 
-    /// Weight of l1 loss on depth (disparity-space)
+    /// Weight of l1 loss on depth. The residual is disparity-space by default;
+    /// see `--depth-loss-space` to switch it to metric, which also changes how
+    /// `--normalize-metric-weights` treats THIS weight.
     #[arg(long, help_heading = "Training options", default_value = "0.0")]
     pub depth_loss_weight: f32,
+
+    /// Space the depth residual is measured in.
+    ///
+    /// `disparity` (default, byte-identical) scores `|1/pred - 1/gt|`;
+    /// `metric` scores `|pred - gt|` in the prior's own units. Masking,
+    /// denominator and the optional gradient-aware pixel weight are identical
+    /// either way — only the residual changes.
+    ///
+    /// The two differ in how the per-pixel gradient scales with range:
+    /// disparity's is `1/d²` (a near splat gets orders of magnitude more depth
+    /// gradient than a far one), metric's is a constant `1`. That matters most
+    /// with `--depth-source plane-fused`, where the blending-weight gradients
+    /// are live and the optimizer can answer a large near-field depth gradient
+    /// by FADING the splat rather than rotating it — the opacity collapse
+    /// measured on both ablation scenes. The `gauss-surf` PGSR reference
+    /// (rerun-io/examples-monorepo, Apache-2.0, by Pablo Vela) runs fused with
+    /// a metric L1 at weight `3.2 / scene_scale` and does not see that collapse.
+    ///
+    /// **Scale-normalization flips with this flag.** Under `disparity` the
+    /// depth weight is excluded from `--normalize-metric-weights` (dividing a
+    /// `1/m` residual's weight by a length moves it the wrong way by `s²`);
+    /// under `metric` the residual is in metres, so the depth weight joins the
+    /// normalized set and is divided by the scene scale, reproducing the
+    /// reference's `3.2 / scene_scale` from a scene-independent `3.2`.
+    #[arg(long, help_heading = "Training options", default_value = "disparity")]
+    #[serde(default)]
+    pub depth_loss_space: DepthLossSpace,
+
+    /// What the depth loss does with pixels the render does not COVER.
+    ///
+    /// The center depth source composites `accum / α.clamp_min(1e-10)`, which
+    /// is exactly 0 where nothing was rendered. Such a pixel can still have a
+    /// valid GT depth, and the legacy mask is GT-only — so it scores a
+    /// full-magnitude residual (`|0 − 1/D_gt|`: 2.0 m⁻¹ against a 0.5 m prior)
+    /// and is counted in the mean. That is a floor in the REPORTED loss plus a
+    /// dilution of everything else in it, proportional to the uncovered
+    /// fraction of the frame.
+    ///
+    /// * `count` — default, byte-identical: uncovered pixels stay in both sums.
+    /// * `exclude-numerator` — they leave the numerator only. In the default
+    ///   disparity space this is GRADIENT-IDENTICAL to `count` (the removed
+    ///   terms sit behind a `mask_fill` whose VJP zeroes them), so it corrects
+    ///   the reported number and nothing else. **Not** gradient-identical under
+    ///   `--depth-loss-space metric`, which has no `pred <= 0` guard and so
+    ///   carries a live `∓1` there — see `DepthUncovered`'s docs.
+    /// * `exclude` — `LichtFeld Studio` semantics (`depth_loss.cu`'s
+    ///   `pixel_active` skips inactive pixels from every sum): they leave the
+    ///   numerator AND the denominator. This rescales every surviving pixel's
+    ///   gradient by `N_gt-valid / N_(covered ∧ gt-valid)`, so it is a real
+    ///   change in effective depth-supervision weight, largest where coverage
+    ///   is lowest (early training, frame edges).
+    ///
+    /// The two exclude modes are separate flag values on purpose: it is what
+    /// lets a metric movement under `exclude` be attributed to the denominator
+    /// rescale rather than to the numerator change.
+    ///
+    /// No effect with `--depth-source plane-aux`/`plane-fused`: those already
+    /// zero the GT at plane-invalid pixels, so uncovered pixels have left
+    /// through the `gt > 0` mask before this one is consulted.
+    #[arg(long, help_heading = "Training options", default_value = "count")]
+    #[serde(default)]
+    pub depth_uncovered: DepthUncovered,
 
     /// Global iter at which the depth-loss weight starts decaying. Full
     /// `--depth-loss-weight` before it. Only meaningful with
@@ -2049,6 +2117,127 @@ mod tests {
             config.validate(),
             Err("total training and LOD iterations exceed u32::MAX".to_owned())
         );
+    }
+
+    /// `--depth-loss-space`: default-inert and round-trips.
+    ///
+    /// The default MUST be `Disparity`. It is not a style preference: every
+    /// recorded figure in the fork's ablations — the playroom 15k baseline, the
+    /// `ARKitScenes` matrix, the `center` step-0 identity hash — was measured
+    /// with a disparity residual, and flipping the default would silently
+    /// reinterpret `--depth-loss-weight` by a factor of `d²` in every existing
+    /// recipe.
+    #[test]
+    fn depth_loss_space_defaults_to_disparity_and_parses() {
+        assert_eq!(
+            TrainConfig::default().depth_loss_space,
+            DepthLossSpace::Disparity
+        );
+        assert_eq!(DepthLossSpace::default(), DepthLossSpace::Disparity);
+
+        // An unrelated flag must not disturb it — including one that touches
+        // the same weight the space reinterprets.
+        let other = TrainConfig::try_parse_from(["brush", "--depth-loss-weight", "1.2"])
+            .expect("unrelated flags must parse");
+        assert_eq!(other.depth_loss_space, DepthLossSpace::Disparity);
+
+        for (arg, want) in [
+            ("disparity", DepthLossSpace::Disparity),
+            ("metric", DepthLossSpace::Metric),
+        ] {
+            let cfg = TrainConfig::try_parse_from(["brush", "--depth-loss-space", arg])
+                .expect("--depth-loss-space must parse");
+            assert_eq!(cfg.depth_loss_space, want, "--depth-loss-space {arg}");
+            // serde round-trip, in the kebab-case spelling the CLI uses.
+            let json = serde_json::to_string(&cfg.depth_loss_space).expect("serialize");
+            assert_eq!(json, format!("\"{arg}\""));
+            let back: DepthLossSpace = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, want);
+        }
+
+        // Serde default: a config file written before this flag existed still
+        // loads, and loads as disparity. Built by round-tripping a default
+        // config with the key REMOVED, which is what an older file looks like —
+        // `TrainConfig` is not fully serde-defaulted, so a bare `{}` would fail
+        // on unrelated required fields and prove nothing.
+        let mut value =
+            serde_json::to_value(TrainConfig::default()).expect("config must serialize");
+        let removed = value
+            .as_object_mut()
+            .expect("config serializes to a JSON object")
+            .remove("depth-loss-space");
+        assert!(
+            removed.is_some(),
+            "the field must serialize under this key, or the removal below is a no-op \
+             and this test would pass vacuously"
+        );
+        let from_json: TrainConfig =
+            serde_json::from_value(value).expect("a config without the key must deserialize");
+        assert_eq!(from_json.depth_loss_space, DepthLossSpace::Disparity);
+    }
+
+    /// **`--depth-uncovered` default-inertness + round-trip** (plan §5, T6).
+    ///
+    /// `count` must stay the default for the same reason `disparity` does: every
+    /// recorded ablation figure — the playroom 15k baseline, the `ARKitScenes`
+    /// matrix, the `center` step-0 identity hash — was measured with uncovered
+    /// pixels counted in both sums, and any other default would silently move
+    /// the reported depth loss (and, under `exclude`, the effective depth weight)
+    /// in every existing recipe.
+    #[test]
+    fn depth_uncovered_defaults_to_count_and_parses() {
+        assert_eq!(
+            TrainConfig::default().depth_uncovered,
+            DepthUncovered::Count
+        );
+        assert_eq!(DepthUncovered::default(), DepthUncovered::Count);
+
+        // An unrelated flag must not disturb it — including the two it composes
+        // with most closely.
+        let other = TrainConfig::try_parse_from([
+            "brush",
+            "--depth-loss-weight",
+            "1.2",
+            "--depth-loss-space",
+            "metric",
+        ])
+        .expect("unrelated flags must parse");
+        assert_eq!(other.depth_uncovered, DepthUncovered::Count);
+
+        for (arg, want) in [
+            ("count", DepthUncovered::Count),
+            ("exclude-numerator", DepthUncovered::ExcludeNumerator),
+            ("exclude", DepthUncovered::Exclude),
+        ] {
+            let cfg = TrainConfig::try_parse_from(["brush", "--depth-uncovered", arg])
+                .expect("--depth-uncovered must parse");
+            assert_eq!(cfg.depth_uncovered, want, "--depth-uncovered {arg}");
+            // serde round-trip, in the kebab-case spelling the CLI uses.
+            let json = serde_json::to_string(&cfg.depth_uncovered).expect("serialize");
+            assert_eq!(json, format!("\"{arg}\""));
+            let back: DepthUncovered = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, want);
+        }
+
+        // Serde default: a config file written before this flag existed still
+        // loads, and loads as `count`. Same construction as the
+        // `--depth-loss-space` test above — round-trip a default config with the
+        // key REMOVED, since a bare `{}` would fail on unrelated required fields
+        // and prove nothing.
+        let mut value =
+            serde_json::to_value(TrainConfig::default()).expect("config must serialize");
+        let removed = value
+            .as_object_mut()
+            .expect("config serializes to a JSON object")
+            .remove("depth-uncovered");
+        assert!(
+            removed.is_some(),
+            "the field must serialize under this key, or the removal below is a no-op \
+             and this test would pass vacuously"
+        );
+        let from_json: TrainConfig =
+            serde_json::from_value(value).expect("a config without the key must deserialize");
+        assert_eq!(from_json.depth_uncovered, DepthUncovered::Count);
     }
 
     /// Depth-anneal + grad-aware flags: default-inert (byte-identical to the

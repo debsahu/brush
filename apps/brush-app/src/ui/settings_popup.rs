@@ -1,7 +1,9 @@
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
-use brush_process::config::{DepthSource, TrainConfig, TrainStreamConfig};
+use brush_process::config::{
+    DepthLossSpace, DepthSource, DepthUncovered, TrainConfig, TrainStreamConfig,
+};
 use brush_render::AlphaMode;
 use brush_render::gaussian_splats::SplatRenderMode;
 use egui::{Align2, Slider, Ui};
@@ -436,6 +438,72 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
             false,
             enabled,
         );
+
+        // Which SPACE the depth residual is measured in. Sits directly under
+        // the weight it reinterprets, because the two only make sense read
+        // together: the same numeric weight means different things either side
+        // of this control.
+        ui.label("Depth loss space");
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(
+                    &mut tc.depth_loss_space,
+                    DepthLossSpace::Disparity,
+                    "Disparity",
+                )
+                .on_hover_text(
+                    "|1/pred - 1/gt|. Previous behaviour, and the default. The per-pixel \
+                     gradient scales as 1/d², so near-camera splats receive far more depth \
+                     gradient than distant ones. NOT scaled by 'Normalize metric weights' \
+                     below — a 1/m residual's weight would move the wrong way by s².",
+                );
+                ui.selectable_value(&mut tc.depth_loss_space, DepthLossSpace::Metric, "Metric")
+                    .on_hover_text(
+                        "|pred - gt|, in the depth prior's own units (metres). Constant \
+                         per-pixel gradient magnitude, independent of range — which is what \
+                         the gauss-surf PGSR reference trains with (weight 3.2 / scene_scale) \
+                         while running Plane (fused). IS scaled by 'Normalize metric weights': \
+                         with it on, enter the reference's scene-independent 3.2 directly.",
+                    );
+            });
+        });
+
+        // What the depth loss does with pixels the render does not COVER. Sits
+        // next to the space control because both are statements about what the
+        // same weight actually measures, and because the reported depth loss is
+        // not comparable across either of them.
+        ui.label("Uncovered pixels");
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut tc.depth_uncovered, DepthUncovered::Count, "Count")
+                    .on_hover_text(
+                        "Previous behaviour, and the default. A pixel the render does not cover \
+                         composites to depth 0, so if it has a valid depth prior it scores a \
+                         FULL-magnitude residual (2.0 1/m against a 0.5 m prior) and is counted \
+                         in the mean — a floor in the reported loss plus a dilution of \
+                         everything else in it.",
+                    );
+                ui.selectable_value(
+                    &mut tc.depth_uncovered,
+                    DepthUncovered::ExcludeNumerator,
+                    "Exclude (numerator)",
+                )
+                .on_hover_text(
+                    "Drop uncovered pixels from the numerator only. In Disparity space this \
+                     leaves every gradient bit-identical, so it corrects the REPORTED number \
+                     and nothing else. Not gradient-neutral in Metric space, which has no \
+                     pred <= 0 guard.",
+                );
+                ui.selectable_value(&mut tc.depth_uncovered, DepthUncovered::Exclude, "Exclude")
+                    .on_hover_text(
+                        "Drop uncovered pixels from the numerator AND the denominator \
+                         (LichtFeld Studio semantics). This rescales every surviving pixel's \
+                         gradient by N_gt / N_covered, so it is a real change in effective \
+                         depth-supervision weight — largest early in training and at frame \
+                         edges, where coverage is lowest.",
+                    );
+            });
+        });
 
         // Which depth the loss (and the depth/normal consistency term) is
         // supervised against. PGSR, arXiv:2406.06521.
@@ -1058,6 +1126,14 @@ mod tests {
             args.train_config.depth_source,
             def.train_config.depth_source
         );
+        assert_eq!(
+            args.train_config.depth_loss_space,
+            def.train_config.depth_loss_space
+        );
+        assert_eq!(
+            args.train_config.depth_uncovered,
+            def.train_config.depth_uncovered
+        );
         assert_eq!(args.train_config.normal_ramp_start_iter, 0);
         assert_eq!(args.train_config.normal_ramp_iters, 0);
         assert_eq!(args.train_config.depth_normal_weight_end, 0.0);
@@ -1081,6 +1157,7 @@ mod tests {
         tc.normalize_metric_weights = true;
         tc.flatten_loss_weight = 1.0;
         tc.scale_reg_weight = 0.1;
+        tc.depth_uncovered = DepthUncovered::Exclude;
         egui::__run_test_ui(|ui| {
             draw_settings(ui, &mut args, true);
             draw_geometry_prior_settings(ui, &mut args.train_config, true);
@@ -1090,6 +1167,7 @@ mod tests {
         assert_eq!(args.train_config.normal_ramp_iters, 1875);
         assert_eq!(args.train_config.normal_gate_start_iter, 5600);
         assert!(args.train_config.normalize_metric_weights);
+        assert_eq!(args.train_config.depth_uncovered, DepthUncovered::Exclude);
     }
 
     /// The orphan-ramp rule, made UNREACHABLE rather than merely rejected.
