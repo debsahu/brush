@@ -111,7 +111,7 @@ fn launch_fwd<R: CubeRuntime>(
     frame_idx: usize,
     stages: PpispStages,
 ) -> CubeTensor<R> {
-    use burn_cubecl::cubecl::prelude::{CubeCount, CubeDim};
+    use burn_cubecl::cubecl::prelude::CubeDim;
 
     let exposure = contiguous(exposure);
     let vignetting = contiguous(vignetting);
@@ -124,7 +124,10 @@ fn launch_fwd<R: CubeRuntime>(
     let client = rgb.client.clone();
     kernels::ppisp_fwd_kernel::launch::<R>(
         &client,
-        CubeCount::Static((h * w).div_ceil(kernels::BLOCK_SIZE), 1, 1),
+        // 2D-tiled: a flat `h*w/BLOCK_SIZE` grid blows the 65535-per-dimension
+        // dispatch limit above a ~2896px square face. Stays exactly
+        // `(n, 1, 1)` while it fits, so small dispatches are unchanged.
+        brush_cube::calc_cube_count_1d(h * w, kernels::BLOCK_SIZE),
         CubeDim::new_1d(kernels::BLOCK_SIZE),
         exposure.into_tensor_arg(),
         vignetting.into_tensor_arg(),
@@ -157,7 +160,7 @@ fn launch_bwd<R: CubeRuntime>(
     frame_idx: usize,
     stages: PpispStages,
 ) -> (CubeTensor<R>, CubeTensor<R>) {
-    use burn_cubecl::cubecl::prelude::{CubeCount, CubeDim};
+    use burn_cubecl::cubecl::prelude::CubeDim;
 
     let exposure = contiguous(exposure);
     let vignetting = contiguous(vignetting);
@@ -177,7 +180,9 @@ fn launch_bwd<R: CubeRuntime>(
     let client = rgb.client.clone();
     kernels::ppisp_bwd_kernel::launch::<R>(
         &client,
-        CubeCount::Static(num_cubes, 1, 1),
+        // Same 2D tiling as the forward. `partials` keeps exactly `num_cubes`
+        // rows; the tail cubes the tiling adds skip the write (see kernel).
+        brush_cube::calc_cube_count_1d(h * w, kernels::BLOCK_SIZE),
         CubeDim::new_1d(kernels::BLOCK_SIZE),
         exposure.into_tensor_arg(),
         vignetting.into_tensor_arg(),

@@ -86,7 +86,7 @@ fn launch_slice_fwd<R: CubeRuntime>(
     rgb: CubeTensor<R>,
     view_idx: usize,
 ) -> CubeTensor<R> {
-    use burn_cubecl::cubecl::prelude::{CubeCount, CubeDim};
+    use burn_cubecl::cubecl::prelude::CubeDim;
 
     let grids = contiguous(grids);
     let rgb = contiguous(rgb);
@@ -98,7 +98,7 @@ fn launch_slice_fwd<R: CubeRuntime>(
     let client = rgb.client.clone();
     kernels::bilagrid_slice_fwd_kernel::launch::<R>(
         &client,
-        CubeCount::Static((h * w).div_ceil(kernels::BLOCK_SIZE), 1, 1),
+        brush_cube::calc_cube_count_1d(h * w, kernels::BLOCK_SIZE),
         CubeDim::new_1d(kernels::BLOCK_SIZE),
         grids.into_tensor_arg(),
         rgb.into_tensor_arg(),
@@ -121,7 +121,7 @@ fn launch_slice_bwd<R: CubeRuntime>(
     v_out: CubeTensor<R>,
     view_idx: usize,
 ) -> (CubeTensor<R>, CubeTensor<R>) {
-    use burn_cubecl::cubecl::prelude::{CubeCount, CubeDim};
+    use burn_cubecl::cubecl::prelude::CubeDim;
 
     let grids = contiguous(grids);
     let rgb = contiguous(rgb);
@@ -134,7 +134,7 @@ fn launch_slice_bwd<R: CubeRuntime>(
     let grad_rgb = alloc_zeros(&rgb, rgb.shape(), DType::F32);
     let client = rgb.client.clone();
 
-    let cube_count = CubeCount::Static((h * w).div_ceil(kernels::BLOCK_SIZE), 1, 1);
+    let cube_count = brush_cube::calc_cube_count_1d(h * w, kernels::BLOCK_SIZE);
     let cube_dim = CubeDim::new_1d(kernels::BLOCK_SIZE);
     let grid_offset = view_idx as u32 * 12 * gl * gh * gw;
     if brush_cube::supports_float_atomics::<R>(&client) {
