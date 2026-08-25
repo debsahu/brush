@@ -78,7 +78,8 @@ async fn run_case(label: &str, size: usize) {
     let rgb = Tensor::<1>::from_floats(rgb_data.as_slice(), &device)
         .reshape([size, size, 3])
         .require_grad();
-    let weights = Tensor::<1>::from_floats(weight_data.as_slice(), &device).reshape([size, size, 3]);
+    let weights =
+        Tensor::<1>::from_floats(weight_data.as_slice(), &device).reshape([size, size, 3]);
 
     let out = ppisp_apply(
         exposure.clone(),
@@ -114,7 +115,10 @@ async fn run_case(label: &str, size: usize) {
             source * gain
         );
         worst = worst.max(error);
-        assert!(got.is_finite(), "{label}: non-finite forward value at {index}");
+        assert!(
+            got.is_finite(),
+            "{label}: non-finite forward value at {index}"
+        );
     }
 
     // dL/drgb is the incoming weight scaled by the exposure gain.

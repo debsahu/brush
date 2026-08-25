@@ -12,3 +12,7 @@ mis = "mis"
 iy = "iy"
 # Tensor-library function name (numpy/torch/burn arange), not "arrange".
 arange = "arange"
+# Product name (LichtFeld Studio), not a misspelling of "Field". typos splits the camelCase
+# identifier, so the word it actually checks is "Feld".
+LichtFeld = "LichtFeld"
+Feld = "Feld"
