@@ -646,6 +646,25 @@ pub struct TrainConfig {
     #[serde(default)]
     pub depth_normal_start_iter: u32,
 
+    /// Train masked-out pixels as EMPTY SPACE instead of ignoring them
+    /// (spirula-studio's `apply_loss_for_mask` × `alpha_loss_weight`, folded
+    /// into one weight; spirula's default weight is 0.1). Adds
+    /// `weight * mean-over-DROPPED-pixels(rendered alpha)` to the loss, and
+    /// removes the same pixels from the depth-prior, normal-prior and
+    /// depth/normal-consistency terms so no geometry term anchors what the
+    /// alpha term is clearing. A DROPPED pixel is one with `gt.a < 0.5` on a
+    /// view whose alpha mode is `Masked` — sidecar `masks/` (255=DROP, pass
+    /// `--invert-masks`) or alpha-baked RGBA with `--alpha-mode masked`.
+    /// 0 disables: masked pixels are ignored, the pre-flag behaviour.
+    ///
+    /// The geometry half is deliberately NOT a separate flag: masking the
+    /// photometric alpha while the depth prior still pulls splats onto the
+    /// masked surface is a self-defeating combination, and a second flag
+    /// would let a recipe ask for it.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    #[serde(default)]
+    pub mask_clear_weight: f32,
+
     // ------------------------------------------------------------------
     // PGSR plane-render config surface (WS-L). Every field below defaults to
     // an OFF sentinel that leaves the trainer byte-identical to its pre-change
@@ -1456,6 +1475,11 @@ impl TrainConfig {
         {
             return Err("normal-gate-degrees must be finite and in [0, 180]".to_owned());
         }
+        // A NaN weight would sail past a bare `< 0.0` check and then poison
+        // every subsequent loss value; `is_finite()` is what rejects it.
+        if !(self.mask_clear_weight.is_finite() && self.mask_clear_weight >= 0.0) {
+            return Err("mask-clear-weight must be finite and >= 0".to_owned());
+        }
         Ok(())
     }
 
@@ -1795,6 +1819,12 @@ mod tests {
         // above and just as invisible.
         assert_eq!(def.depth_normal_start_iter, 0);
 
+        // Belongs in this contract even though it is not itself a prior
+        // weight: a nonzero default would REMOVE pixels from all three terms
+        // above (see `--mask-clear-weight`), which is the same class of
+        // invisible change to every existing run.
+        assert_eq!(def.mask_clear_weight, 0.0);
+
         // Unrelated flags must not switch them on.
         let other = TrainConfig::try_parse_from(["brush", "--total-train-iters", "100"])
             .expect("unrelated flags must parse");
@@ -1803,6 +1833,7 @@ mod tests {
         assert_eq!(other.flatten_loss_weight, 0.0);
         assert_eq!(other.normal_smooth_weight, 0.0);
         assert_eq!(other.depth_normal_start_iter, 0);
+        assert_eq!(other.mask_clear_weight, 0.0);
 
         let on = TrainConfig::try_parse_from([
             "brush",
@@ -2448,6 +2479,32 @@ mod tests {
         let mut neg = TrainConfig::default();
         neg.depth_normal_weight_end = -0.1;
         assert!(neg.validate().is_err());
+    }
+
+    /// `--mask-clear-weight`: off by default, parses, and rejects the two
+    /// values that would otherwise fail silently. A negative weight would
+    /// REWARD alpha in the masked region (growing exactly what the flag
+    /// exists to clear), and a NaN weight propagates into the total loss and
+    /// from there into every parameter's gradient — neither errors on its own.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn mask_clear_weight_defaults_off_parses_and_validates() {
+        let def = TrainConfig::default();
+        assert_eq!(def.mask_clear_weight, 0.0);
+        assert!(def.validate().is_ok());
+
+        let on = TrainConfig::try_parse_from(["brush", "--mask-clear-weight", "0.1"])
+            .expect("mask-clear-weight must parse");
+        assert!((on.mask_clear_weight - 0.1).abs() < 1e-9);
+        assert!(on.validate().is_ok());
+
+        let mut neg = TrainConfig::default();
+        neg.mask_clear_weight = -0.1;
+        assert!(neg.validate().is_err());
+
+        let mut nan = TrainConfig::default();
+        nan.mask_clear_weight = f32::NAN;
+        assert!(nan.validate().is_err());
     }
 
     /// `normal_ramp_at` schedule pins at the documented 15k recipe
