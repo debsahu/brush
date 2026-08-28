@@ -1903,24 +1903,13 @@ impl SplatTrainer {
             // `--normalize-metric-weights` is on — see `depth_weight_divisor`).
             if use_depth && let Some(depth_data) = &batch.depth {
                 let gt_depth: Tensor<2> = Tensor::from_data(depth_data.clone(), &device);
-                // `--mask-clear-weight`: masked pixels are being cleared to
-                // empty space, so the depth prior must not go on anchoring
-                // splats onto the surface underneath them. The keep-mask is
-                // BINARY — scaling a metric depth by a fractional 0.37 would
-                // corrupt the value rather than mask it — and zeroing is the
-                // idiom `depth_loss` already understands: its `gt > 0` gate
-                // drops the pixel from the numerator AND the denominator.
-                // Applied before the depth-source dispatch so it covers the
-                // plane path's `gt_depth * valid` too.
+                // `--mask-clear-weight` (see `depth_keep_mask`): the depth
+                // prior must not go on anchoring splats onto the surface the
+                // alpha term is clearing. Applied here, BEFORE the depth-source
+                // dispatch below, so it covers the plane path's
+                // `gt_depth * valid` as well as the centre path.
                 let gt_depth = match &gt_keep {
-                    Some(gt_a) => {
-                        gt_depth
-                            * gt_a
-                                .clone()
-                                .greater_elem(0.5)
-                                .float()
-                                .reshape([img_h, img_w])
-                    }
+                    Some(gt_a) => gt_depth * depth_keep_mask(gt_a, img_h, img_w),
                     None => gt_depth,
                 };
                 // ---- DEPTH SOURCE DISPATCH — backward contracts (§4.5) ----
@@ -2100,15 +2089,13 @@ impl SplatTrainer {
 
                 if use_prior_normal && let Some(normal_data) = &batch.normal {
                     let gt_normal: Tensor<3> = Tensor::from_data(normal_data.clone(), &device);
-                    // Same reason as the depth prior above: nothing may hold
-                    // the masked region's geometry in place while the alpha
-                    // term clears it. Zeroing is again the existing idiom —
-                    // `normal_loss` reads `|gt| > 0.5` as "prior absent here",
-                    // which is exactly what a zeroed normal now means.
+                    // Same reason as the depth prior above (see
+                    // `normal_keep_mask`). Placed BEFORE `normal_gate_counts`
+                    // below so the over-masking diagnostic counts exactly the
+                    // pixels the loss counts, rather than reporting on a
+                    // supervision set that no longer exists.
                     let gt_normal = match &gt_keep {
-                        Some(gt_a) => {
-                            gt_normal * gt_a.clone().greater_elem(0.5).float().repeat_dim(2, 3)
-                        }
+                        Some(gt_a) => gt_normal * normal_keep_mask(gt_a),
                         None => gt_normal,
                     };
                     // NeuRIS per-pixel contradiction gate (arXiv:2206.13597);
@@ -2186,21 +2173,20 @@ impl SplatTrainer {
                             center.x,
                             center.y,
                         );
-                        // The consistency term is the one geometry term that
-                        // has no GT to zero — it gates on the RENDERED alpha
-                        // instead. Folding the keep-mask into that argument
-                        // pushes masked pixels below its `covered > 0.5` gate,
-                        // so they leave both the error and `valid.sum()`.
-                        // Without this it would be the term actively fighting
-                        // the clearing: it enforces self-consistency on
-                        // geometry the alpha term is trying to delete. (Once
-                        // clearing succeeds the gate self-closes anyway, since
-                        // rendered alpha there goes to 0 — this just stops the
-                        // fight during the descent.) `normal_smooth_loss` and
-                        // the `n_cam` normalisation keep the unmasked alpha:
-                        // TV has no GT pull, so there is nothing to fight.
+                        // Folding the keep-mask into the alpha argument (see
+                        // `alpha_keep_mask`) pushes masked pixels below
+                        // `depth_normal_loss`'s `covered > 0.5` gate, so they
+                        // leave both the error and `valid.sum()`. Without it
+                        // this is the term actively FIGHTING the clearing: it
+                        // enforces self-consistency on geometry the alpha term
+                        // is trying to delete. (Once clearing succeeds the gate
+                        // self-closes anyway — rendered alpha there goes to 0 —
+                        // so this only matters during the descent.)
+                        // `normal_smooth_loss` and the `n_cam` normalisation
+                        // deliberately keep the UNMASKED alpha: TV has no GT
+                        // pull, so there is nothing there to fight.
                         let dn_alpha = match &gt_keep {
-                            Some(gt_a) => normal_alpha * gt_a.clone().greater_elem(0.5).float(),
+                            Some(gt_a) => normal_alpha * alpha_keep_mask(gt_a),
                             None => normal_alpha,
                         };
                         loss = loss
@@ -2368,6 +2354,37 @@ impl SplatTrainer {
             // loss. No-op when the batch carries no depth (nerfstudio
             // `depth: None`); a run that set `--tidi-depth-prune` with no depth at
             // all warns once at prune time and stays inert.
+            //
+            // ---- NOT KEEP-MASKED under `--mask-clear-weight` (risk R2) -------
+            //
+            // This reads `batch.depth` DIRECTLY, i.e. the raw GT, deliberately
+            // bypassing the `gt_depth` local that `depth_keep_mask` is applied
+            // to above. So combining `--tidi-depth-prune` with
+            // `--mask-clear-weight` leaves TIDI seeing prior depth INSIDE the
+            // region the alpha term is clearing, and D4's "no geometry term
+            // anchors what is being cleared" does not hold for that pair.
+            //
+            // Judgement, stated plainly: INCONSISTENT rather than actively
+            // harmful, and the direction matters. TIDI's depth pass is a PRUNE
+            // signal, not a loss — it accumulates a residual counter and later
+            // deletes splats; it has no gradient and cannot pull a splat onto a
+            // masked surface the way the depth prior can. Its failure mode is
+            // the mild one: a splat sitting in the cleared region keeps looking
+            // depth-consistent against a prior we have decided to ignore, so
+            // TIDI declines to prune it — leaving the work to the alpha term,
+            // which is doing it anyway. It does not resurrect geometry and it
+            // does not fight the clearing gradient. The reverse pairing (TIDI
+            // pruning MORE inside the mask) would be the harmful one, and this
+            // is not that.
+            //
+            // NOT guarded here, and the guard is not obviously worth its cost:
+            // the natural fix is to keep-mask `depth_data` for this call too,
+            // but `accumulate_depth` takes `TensorData` (host-side) while
+            // `gt_keep` is a GPU tensor, so it would mean either a readback per
+            // step or pushing the mask down into `TidiState`. PROPOSED, not
+            // implemented — decide it against a scene that actually wants both
+            // flags. Neither is set in the mask-clearing A/B, so the measured
+            // result is unaffected either way.
             if self.config.tidi_depth_prune
                 && let Some(depth_data) = &batch.depth
             {
@@ -3698,6 +3715,59 @@ fn warn_depth_normal_needs_pinhole() {
              (unprojection for fisheye models is not implemented yet)."
         );
     });
+}
+
+// ---- `--mask-clear-weight` geometry keep-masks (D4) ---------------------
+//
+// Three shapes of the SAME decision: a pixel with `gt.a <= 0.5` on a `Masked`
+// view is being cleared to empty space, so no geometry term may go on
+// anchoring what the alpha term is deleting. Each returns the exact tensor its
+// call site multiplies in, which is why the shape adaptation lives here rather
+// than at the sites: `reshape` vs `repeat_dim` vs neither is the part that can
+// be silently wrong (a mask broadcast along the wrong axis still multiplies,
+// still trains, and zeroes the wrong pixels), and putting it behind a named
+// function is what lets `mask_clear_geometry_tests` below exercise the
+// trainer's own code instead of a copy of it.
+//
+// The threshold is BINARY, not the continuous `(1 - gt.a)` the photometric
+// clearing term uses. Scaling a METRIC DEPTH by a fractional 0.37 would
+// corrupt the value rather than mask it, and the same holds for a unit normal.
+// The cost is a one-pixel disagreement at soft mask edges — cleared
+// continuously, dropped from the priors abruptly — which mask dilation pushes
+// off the object; it is recorded in `mask_clear_loss`'s docs.
+
+/// `[H, W]` keep-mask in `{0.0, 1.0}` for a per-pixel DEPTH prior.
+///
+/// Multiplied into the GT, so a dropped pixel becomes exactly 0 — which is
+/// the sentinel `depth_loss` already reads as "not supervised here" via its
+/// `gt > 0` gate, removing the pixel from the numerator AND from
+/// `valid.sum()`. Zeroing only the numerator would silently rescale the loss.
+fn depth_keep_mask(gt_keep: &Tensor<3>, img_h: usize, img_w: usize) -> Tensor<2> {
+    gt_keep
+        .clone()
+        .greater_elem(0.5)
+        .float()
+        .reshape([img_h, img_w])
+}
+
+/// `[H, W, 3]` keep-mask in `{0.0, 1.0}` for a NORMAL prior.
+///
+/// `repeat_dim(2, 3)` broadcasts the per-PIXEL decision across the three
+/// channels; a dropped pixel becomes `(0, 0, 0)`, the "no prior" sentinel
+/// `normal_loss`'s `|gt| > 0.5` validity gate already understands.
+fn normal_keep_mask(gt_keep: &Tensor<3>) -> Tensor<3> {
+    gt_keep.clone().greater_elem(0.5).float().repeat_dim(2, 3)
+}
+
+/// `[H, W, 1]` keep-mask in `{0.0, 1.0}` for `depth_normal_loss`'s alpha
+/// argument — the one geometry term with no GT to zero, which gates on the
+/// RENDERED alpha instead.
+///
+/// Carries no gradient: it is a comparison against a constant GT, so
+/// multiplying the (already detached) `normal_alpha` by it cannot open a
+/// gradient path from the consistency term into transparency.
+fn alpha_keep_mask(gt_keep: &Tensor<3>) -> Tensor<3> {
+    gt_keep.clone().greater_elem(0.5).float()
 }
 
 /// Warn exactly once that `--mask-clear-weight` is set but the view carries no
@@ -6512,6 +6582,274 @@ mod nonfinite_guard_tests {
             counts.any, 0,
             "the sweep left {} non-finite splats behind",
             counts.any
+        );
+    }
+}
+
+/// **`--mask-clear-weight`, the geometry half (D4)** — the three keep-masks
+/// [`depth_keep_mask`], [`normal_keep_mask`] and [`alpha_keep_mask`] apply to
+/// the depth prior, the normal prior and `depth_normal_loss`'s alpha argument.
+///
+/// These are tested against the DOWNSTREAM GATE'S SEMANTICS rather than by
+/// asserting the mask's own contents, because the whole design rests on each
+/// zeroed pixel being read as "not supervised here" by a gate that already
+/// existed — `depth_loss`'s `gt > 0`, `normal_loss`'s `|gt| > 0.5`,
+/// `depth_normal_loss`'s `covered > 0.5`. A mask that is elementwise perfect
+/// and lands in a tensor the gate reads differently is exactly the failure
+/// worth catching, and it would pass any content assertion.
+///
+/// They run at the helper level and not through `train_step`, which needs a
+/// full `SceneBatch` with packed GT, depth and normal priors and per-view
+/// masks that no fixture in this crate builds. The helpers exist precisely so
+/// this level is the trainer's own code and not a re-typing of it: the
+/// shape adaptation that differs between the three sites — `reshape` vs
+/// `repeat_dim` vs neither — is inside the functions under test.
+///
+/// Each test pins THREE distinguishable numbers where it can: the unmasked
+/// loss, the correct masked loss, and the loss a numerator-only mask would
+/// give. Two would not be enough — dropping a pixel from the numerator while
+/// leaving it in the denominator silently rescales the term, and that is the
+/// bug these are here for.
+#[cfg(test)]
+mod mask_clear_geometry_tests {
+    use super::*;
+    use brush_loss::{DepthUncovered, depth_loss};
+    use burn::tensor::TensorData;
+
+    async fn device() -> Device {
+        brush_cube::test_helpers::test_device().await.into()
+    }
+
+    async fn autodiff_device() -> Device {
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff()
+    }
+
+    async fn read<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+        t.into_data_async()
+            .await
+            .expect("tensor readback")
+            .to_vec::<f32>()
+            .expect("f32 tensor")
+    }
+
+    /// A `[1, n, 1]` GT-alpha strip, the shape `unpack_gt_alpha` produces.
+    fn keep(data: Vec<f32>, device: &Device) -> Tensor<3> {
+        let n = data.len();
+        Tensor::<3>::from_data(TensorData::new(data, [1, n, 1]), device)
+    }
+
+    /// The DEPTH site: the mask is binary, it reshapes to the `[H, W]` the
+    /// depth tensors use, and a dropped pixel leaves the denominator too.
+    ///
+    /// GT alpha straddles the threshold at 0.4 and 0.6 so a continuous mask
+    /// (the photometric term's `1 - gt.a`) fails rather than merely scaling:
+    /// it would scale a metric depth of 4 m to 1.6 m — a plausible number the
+    /// depth loss would happily supervise against.
+    ///
+    /// Residuals are 1, 10, 10 and 3 metres at the four pixels, with the two
+    /// large ones masked out, which separates the three outcomes:
+    /// `(1+10+10+3)/4 = 6.0` unmasked, `(1+3)/2 = 2.0` correct, and
+    /// `(1+3)/4 = 1.0` if the denominator failed to shrink.
+    #[tokio::test]
+    async fn depth_keep_mask_drops_pixels_from_numerator_and_denominator() {
+        let device = device().await;
+        let (h, w) = (1usize, 4usize);
+
+        let gt_keep = keep(vec![1.0, 0.0, 0.4, 0.6], &device);
+        let gt = || {
+            Tensor::<2>::from_data(
+                TensorData::new(vec![2.0f32, 3.0, 4.0, 5.0], [h, w]),
+                &device,
+            )
+        };
+        let pred = || {
+            Tensor::<2>::from_data(
+                TensorData::new(vec![3.0f32, 13.0, 14.0, 8.0], [h, w]),
+                &device,
+            )
+        };
+
+        // The mask is BINARY: 0.4 drops, 0.6 keeps, and kept depths are
+        // untouched rather than scaled.
+        let masked_gt = gt() * depth_keep_mask(&gt_keep, h, w);
+        assert_eq!(
+            read(masked_gt.clone()).await,
+            vec![2.0, 0.0, 0.0, 5.0],
+            "expected a binary keep-mask; a continuous one would give \
+             [2.0, 0.0, 1.6, 3.0]"
+        );
+
+        let metric = |g| {
+            depth_loss(
+                pred(),
+                g,
+                None,
+                DepthLossSpace::Metric,
+                DepthUncovered::Count,
+            )
+        };
+
+        let unmasked = read(metric(gt())).await[0];
+        assert!(
+            (unmasked - 6.0).abs() < 1e-5,
+            "unmasked loss = {unmasked}, want 6.0 (all four pixels)"
+        );
+
+        let masked = read(metric(masked_gt)).await[0];
+        assert!(
+            (masked - 2.0).abs() < 1e-5,
+            "masked loss = {masked}, want 2.0 (mean over the TWO surviving \
+             pixels). 1.0 would mean the dropped pixels left the numerator but \
+             stayed in the denominator, silently rescaling the depth term."
+        );
+    }
+
+    /// The NORMAL site: `repeat_dim(2, 3)` must broadcast the per-PIXEL
+    /// decision across channels, not the other way round.
+    ///
+    /// Three pixels with pairwise-distinct normals and only the middle one
+    /// dropped. An axis mix-up cannot coincide with the right answer here: it
+    /// would zero one CHANNEL across all three pixels, which leaves the two
+    /// surviving pixels' error nonzero and the dropped pixel's still counted.
+    ///
+    /// The prediction matches the prior exactly at the two surviving pixels
+    /// and is anti-parallel at the dropped one, so the correct masked loss is
+    /// exactly 0.0 — a strictly stronger statement than "smaller".
+    #[tokio::test]
+    async fn normal_keep_mask_broadcasts_per_pixel_and_invalidates_the_prior() {
+        let device = device().await;
+
+        // Distinct axis-aligned unit normals, one per pixel.
+        #[rustfmt::skip]
+        let n = vec![
+            0.0f32, 0.0, -1.0,
+            1.0,    0.0,  0.0,
+            0.0,    1.0,  0.0,
+        ];
+        let gt = || Tensor::<3>::from_data(TensorData::new(n.clone(), [1, 3, 3]), &device);
+        // Agrees at pixels 0 and 2; anti-parallel at pixel 1.
+        #[rustfmt::skip]
+        let p = vec![
+            0.0f32, 0.0, -1.0,
+           -1.0,    0.0,  0.0,
+            0.0,    1.0,  0.0,
+        ];
+        let pred = || Tensor::<3>::from_data(TensorData::new(p.clone(), [1, 3, 3]), &device);
+
+        let gt_keep = keep(vec![1.0, 0.0, 1.0], &device);
+        let masked_gt = gt() * normal_keep_mask(&gt_keep);
+
+        // All THREE channels of pixel 1 are zeroed, and no channel of pixels 0
+        // or 2 is: that is what fixes the broadcast axis.
+        #[rustfmt::skip]
+        assert_eq!(
+            read(masked_gt.clone()).await,
+            vec![
+                0.0, 0.0, -1.0,
+                0.0, 0.0,  0.0,
+                0.0, 1.0,  0.0,
+            ],
+            "the mask must zero the dropped PIXEL across all channels, not a \
+             channel across all pixels"
+        );
+
+        let unmasked = read(normal_loss(pred(), gt(), None)).await[0];
+        assert!(
+            unmasked > 1e-6,
+            "the anti-parallel pixel must produce a real loss to begin with, \
+             got {unmasked}"
+        );
+
+        let masked = read(normal_loss(pred(), masked_gt, None)).await[0];
+        assert_eq!(
+            masked, 0.0,
+            "a zeroed normal must fail normal_loss's |gt| > 0.5 validity gate, \
+             leaving only the two exactly-agreeing pixels"
+        );
+    }
+
+    /// The DEPTH/NORMAL site: masked pixels leave `depth_normal_loss`'s
+    /// covered set, and the mask opens no gradient path.
+    ///
+    /// Three fully-covered pixels whose normals disagree by known amounts:
+    /// `1 - dot` is 0.5, 2.0 and 0.0. Masking the middle one separates
+    /// `(0.5+2.0+0)/3 = 0.8333` unmasked from `(0.5+0)/2 = 0.25` correct and
+    /// `(0.5+0)/3 = 0.1667` if the pixel left the error but stayed in
+    /// `valid.sum()`.
+    #[tokio::test]
+    async fn alpha_keep_mask_excludes_pixels_from_the_covered_set() {
+        let device = device().await;
+
+        // Unit normals; `depth_normal_loss` also gates on both lengths > 0.5.
+        #[rustfmt::skip]
+        let a = vec![
+            0.0f32, 0.0, -1.0,
+            0.0,    0.0, -1.0,
+            0.0,    0.0, -1.0,
+        ];
+        // dot = 0.5, -1.0, 1.0 against `a` => err 0.5, 2.0, 0.0.
+        let c = 0.5f32;
+        let s = (1.0f32 - c * c).sqrt();
+        #[rustfmt::skip]
+        let b = vec![
+            s,      0.0, -c,
+            0.0,    0.0,  1.0,
+            0.0,    0.0, -1.0,
+        ];
+        let n_from_depth =
+            || Tensor::<3>::from_data(TensorData::new(a.clone(), [1, 3, 3]), &device);
+        let n_cam = || Tensor::<3>::from_data(TensorData::new(b.clone(), [1, 3, 3]), &device);
+        let alpha = || Tensor::<3>::from_data(TensorData::new(vec![1.0f32; 3], [1, 3, 1]), &device);
+
+        let unmasked = read(depth_normal_loss(n_from_depth(), n_cam(), alpha())).await[0];
+        assert!(
+            (unmasked - 2.5 / 3.0).abs() < 1e-5,
+            "unmasked loss = {unmasked}, want {} (three covered pixels)",
+            2.5 / 3.0
+        );
+
+        let gt_keep = keep(vec![1.0, 0.0, 1.0], &device);
+        let dn_alpha = alpha() * alpha_keep_mask(&gt_keep);
+        let masked = read(depth_normal_loss(n_from_depth(), n_cam(), dn_alpha)).await[0];
+        assert!(
+            (masked - 0.25).abs() < 1e-5,
+            "masked loss = {masked}, want 0.25 (mean over the TWO surviving \
+             pixels). 0.1667 would mean the masked pixel left the error but \
+             stayed in valid.sum()."
+        );
+    }
+
+    /// The keep-mask must not re-attach a gradient to the alpha argument.
+    ///
+    /// `normal_alpha` reaches the call site already `.detach()`ed, deliberately:
+    /// the consistency term must not be able to lower its error by changing
+    /// transparency. The mask is a comparison against a constant GT, so the
+    /// product stays detached — this pins that, because a keep-mask that
+    /// carried a gradient would reopen exactly the coupling the detach exists
+    /// to close, and nothing else in the suite would notice.
+    #[tokio::test]
+    async fn alpha_keep_mask_stays_detached() {
+        let device = autodiff_device().await;
+
+        let alpha_leaf =
+            Tensor::<3>::from_data(TensorData::new(vec![1.0f32; 3], [1, 3, 1]), &device)
+                .require_grad();
+        assert!(
+            alpha_leaf.is_require_grad(),
+            "the fixture must start attached, or this test proves nothing"
+        );
+
+        let gt_keep = keep(vec![1.0, 0.0, 1.0], &device);
+        assert!(
+            !alpha_keep_mask(&gt_keep).is_require_grad(),
+            "the keep-mask is derived from constant GT and must carry no gradient"
+        );
+
+        // The trainer's own composition: detach first, then mask.
+        let dn_alpha = alpha_leaf.detach() * alpha_keep_mask(&gt_keep);
+        assert!(
+            !dn_alpha.is_require_grad(),
+            "masking a detached alpha must leave it detached"
         );
     }
 }
