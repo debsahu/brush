@@ -923,6 +923,30 @@ mod kernels {
         out[base + 1] = F::cast_from(g);
         out[base + 2] = F::cast_from(b);
     }
+
+    /// Decode `gt_packed`'s alpha byte to `[H, W, 1]` f32 in `[0, 1]`.
+    ///
+    /// Forward-only: GT is a constant, so no gradient exists to implement —
+    /// the `--mask-clear-weight` term's gradient flows through the RENDERED
+    /// alpha via ordinary Burn ops, never through this. No `composite`
+    /// comptime twin either: compositing is a GT-RGB operation and leaves the
+    /// alpha byte untouched.
+    #[cube(launch)]
+    pub fn unpack_gt_alpha_kernel<F: Float>(
+        gt_packed: &Tensor<u32>,
+        out: &mut Tensor<F>,
+        h: u32,
+        w: u32,
+    ) {
+        let pix_y = CUBE_POS_Y * BLOCK_Y + UNIT_POS_Y;
+        let pix_x = CUBE_POS_X * BLOCK_X + UNIT_POS_X;
+        if pix_x >= w || pix_y >= h {
+            terminate!();
+        }
+        let idx = (pix_y * w + pix_x) as usize;
+        let val = gt_packed[idx];
+        out[idx] = F::cast_from(f32::cast_from(val >> 24u32) * INV_255);
+    }
 }
 
 /// Image-loss configuration.
@@ -967,6 +991,8 @@ pub trait LossOps<B: Backend> {
     ) -> FloatTensor<B>;
 
     fn unpack_gt_rgb(gt_packed: IntTensor<B>, composite_bg: Option<Vec3>) -> FloatTensor<B>;
+
+    fn unpack_gt_alpha(gt_packed: IntTensor<B>) -> FloatTensor<B>;
 }
 
 /// Internal companion operations for the opt-in native-MSL tape. Keeping
@@ -1397,6 +1423,39 @@ fn launch_unpack_gt_rgb<R: CubeRuntime>(
     out
 }
 
+fn launch_unpack_gt_alpha<R: CubeRuntime>(gt_packed: CubeTensor<R>) -> CubeTensor<R> {
+    use burn::tensor::{DType, Shape};
+    use burn_cubecl::cubecl::prelude::{CubeCount, CubeDim};
+
+    let gt_packed = into_contiguous(gt_packed);
+    let dims = gt_packed.shape().as_slice().to_vec();
+    assert_eq!(dims.len(), 2, "unpack_gt_alpha expects [H, W] gt_packed");
+    let (h, w) = (dims[0] as u32, dims[1] as u32);
+
+    let client = gt_packed.client.clone();
+    let out = burn_cubecl::ops::numeric::zeros_client::<R>(
+        client.clone(),
+        gt_packed.device.clone(),
+        Shape::new([h as usize, w as usize, 1]),
+        DType::F32,
+    );
+    let cube_count = CubeCount::Static(
+        w.div_ceil(kernels::BLOCK_X),
+        h.div_ceil(kernels::BLOCK_Y),
+        1,
+    );
+    kernels::unpack_gt_alpha_kernel::launch::<f32, R>(
+        &client,
+        cube_count,
+        CubeDim::new_2d(kernels::BLOCK_X, kernels::BLOCK_Y),
+        gt_packed.into_tensor_arg(),
+        out.clone().into_tensor_arg(),
+        h,
+        w,
+    );
+    out
+}
+
 impl LossOps<Self> for MainBackendBase {
     fn image_loss_forward(
         pred: FloatTensor<Self>,
@@ -1417,6 +1476,10 @@ impl LossOps<Self> for MainBackendBase {
 
     fn unpack_gt_rgb(gt_packed: IntTensor<Self>, composite_bg: Option<Vec3>) -> FloatTensor<Self> {
         launch_unpack_gt_rgb(gt_packed, composite_bg)
+    }
+
+    fn unpack_gt_alpha(gt_packed: IntTensor<Self>) -> FloatTensor<Self> {
+        launch_unpack_gt_alpha(gt_packed)
     }
 }
 
@@ -1502,6 +1565,23 @@ impl LossOps<Self> for Fusion<MainBackendBase> {
                 let res = MainBackendBase::unpack_gt_rgb(
                     h.get_int_tensor::<MainBackendBase>(gt_packed),
                     composite_bg,
+                );
+                h.register_float_tensor::<MainBackendBase>(&out.id, res);
+            },
+        )
+    }
+
+    fn unpack_gt_alpha(gt_packed: IntTensor<Self>) -> FloatTensor<Self> {
+        let [gh, gw] = gt_packed.shape().dims();
+        dispatch_custom(
+            "unpack_gt_alpha",
+            [gt_packed],
+            Shape::new([gh, gw, 1]),
+            DType::F32,
+            move |desc, h| {
+                let ([gt_packed], [out]) = desc.as_fixed();
+                let res = MainBackendBase::unpack_gt_alpha(
+                    h.get_int_tensor::<MainBackendBase>(gt_packed),
                 );
                 h.register_float_tensor::<MainBackendBase>(&out.id, res);
             },
@@ -2464,6 +2544,45 @@ pub fn depth_normal_loss(
     err.sum() / valid.sum().clamp_min(1.0)
 }
 
+/// Spirula-parity mask clearing (`--mask-clear-weight`): the mean RENDERED
+/// alpha over the DROPPED pixels of a `Masked` view,
+/// `Σ (1 - gt_a)·pred_a / max(1, Σ (1 - gt_a))`. Both tensors are `[H, W, 1]`.
+///
+/// This is what makes a mask mean "empty space" rather than "ignore me".
+/// Brush's masked photometric loss only zeroes the error there, so a splat
+/// that drifts into the masked region pays nothing and survives; measured on
+/// the operator's playroom capture, the monopod region carried 2,504 splats
+/// under ignore-masking against 222 under clearing, from a 42-point seed.
+///
+/// `pred_alpha` must arrive UNDETACHED — the gradient through the rasteriser
+/// into per-splat opacity/position/scale is the entire mechanism, and this is
+/// the deliberate opposite of `depth_loss`'s and `depth_normal_loss`'s
+/// detached alpha, which exist to stop those terms buying error reductions
+/// with transparency. Here transparency IS the objective. `gt_alpha` is a
+/// constant: it is the LABEL (keep-ness), never the supervised quantity.
+///
+/// Since `pred_a ∈ [0, 1]`, this is exactly an L1 pull to zero. The
+/// denominator is the dropped-pixel count rather than H·W, following the
+/// geometry terms' convention here (`depth_loss`, `normal_loss`,
+/// `depth_normal_loss` all divide by their own valid count), so the weight
+/// means the same thing whether a mask covers 2% or 40% of a frame.
+///
+/// `(1 - gt_a)` is kept CONTINUOUS so the soft edges a resized mask produces
+/// clear softly, matching the photometric mask, which is also continuous.
+/// Note this is one place the flag's two halves differ: the geometry
+/// keep-mask in the trainer is binary at 0.5, because scaling a metric depth
+/// by a fractional 0.37 would corrupt the value rather than mask it. A
+/// one-pixel band can therefore be alpha-cleared while still depth-supervised;
+/// mask dilation pushes that band off the object, which is why the mask
+/// tooling dilates.
+///
+/// A frame with no dropped pixels returns exactly 0: the numerator is
+/// identically 0 and the clamped denominator keeps the division finite.
+pub fn mask_clear_loss(pred_alpha: Tensor<3>, gt_alpha: Tensor<3>) -> Tensor<1> {
+    let drop = gt_alpha.neg().add_scalar(1.0);
+    (drop.clone() * pred_alpha).sum() / drop.sum().clamp_min(1.0)
+}
+
 /// Total-variation smoothness on a rendered camera-frame normal image,
 /// `[H, W, 3]` (DN-Splatter's `L_smooth`).
 ///
@@ -2550,6 +2669,21 @@ pub fn normal_smooth_loss(normal: Tensor<3>, alpha: Tensor<3>) -> Tensor<1> {
 pub fn unpack_gt_rgb(gt_packed: Tensor<2, Int>, composite_bg: Option<Vec3>) -> Tensor<3> {
     let gt_p = unwrap_wgpu_int(gt_packed);
     let out = <MainBackend as LossOps<MainBackend>>::unpack_gt_rgb(gt_p, composite_bg);
+    wrap_wgpu_float(out)
+}
+
+/// Decode `gt_packed`'s alpha byte to a `[H, W, 1]` f32 tensor in `[0, 1]`.
+///
+/// Forward-only, on the inner (non-autodiff) backend: GT is constant, so
+/// there is no gradient to implement. Used by `--mask-clear-weight` — for
+/// the `(1 - gt.a)` drop weight of [`mask_clear_loss`] and for the binary
+/// keep-mask that flag applies to the geometry priors. Unlike
+/// [`unpack_gt_rgb`], one f32 channel is cheap enough (H·W floats, once per
+/// masked view per step) that no kernel-fused alternative is worth having,
+/// and it only runs when the flag is on.
+pub fn unpack_gt_alpha(gt_packed: Tensor<2, Int>) -> Tensor<3> {
+    let gt_p = unwrap_wgpu_int(gt_packed);
+    let out = <MainBackend as LossOps<MainBackend>>::unpack_gt_alpha(gt_p);
     wrap_wgpu_float(out)
 }
 
@@ -5464,5 +5598,177 @@ mod depth_uncovered_tests {
             .await[0];
             assert_eq!(none, unit, "{mode:?}: unit weight must be the identity");
         }
+    }
+}
+
+/// **`--mask-clear-weight`** — the GT alpha unpack and [`mask_clear_loss`].
+///
+/// The three properties worth pinning are the two silent-failure modes (a
+/// zero term when nothing is masked, so an unmasked dataset costs nothing;
+/// and a gradient that actually reaches the rendered alpha, since a
+/// zero-gradient term would train to completion and report a plausible loss
+/// while doing nothing) plus the normalisation, which is the one number the
+/// weight's meaning depends on.
+#[cfg(all(test, not(target_family = "wasm")))]
+mod mask_clear_tests {
+    use super::*;
+    use brush_render::burn_glue::lift_to_autodiff;
+    use burn::tensor::TensorData;
+
+    async fn device() -> burn::tensor::Device {
+        brush_cube::test_helpers::test_device().await.into()
+    }
+
+    async fn autodiff_device() -> burn::tensor::Device {
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff()
+    }
+
+    async fn read<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+        t.into_data_async()
+            .await
+            .expect("tensor readback")
+            .to_vec::<f32>()
+            .expect("f32 tensor")
+    }
+
+    /// `[1, N, 1]` alpha strip, the shape both arguments take.
+    fn alpha(data: Vec<f32>, device: &burn::tensor::Device) -> Tensor<3> {
+        let n = data.len();
+        Tensor::<3>::from_data(TensorData::new(data, [1, n, 1]), device)
+    }
+
+    /// The unpack reads the TOP byte, scaled by 1/255.
+    ///
+    /// The four values are chosen so no two are equal and none is symmetric
+    /// under a wrong shift: `r`, `g` and `b` are set to distinct nonzero
+    /// values that a `& 0xff`, `>> 8` or `>> 16` would return instead, so
+    /// reading the wrong channel fails rather than coincidentally passing.
+    #[tokio::test]
+    async fn unpack_gt_alpha_reads_the_alpha_byte() {
+        let device = device().await;
+        let packed: Vec<i32> = [
+            [11u8, 22, 33, 255],
+            [44, 55, 66, 0],
+            [77, 88, 99, 128],
+            [111, 122, 133, 64],
+        ]
+        .into_iter()
+        .map(i32::from_le_bytes)
+        .collect();
+
+        let gt = Tensor::<2, Int>::from_data(TensorData::new(packed, [2, 2]), &device);
+        let got = read(unpack_gt_alpha(gt)).await;
+
+        let want = [1.0, 0.0, 128.0 / 255.0, 64.0 / 255.0];
+        assert_eq!(got.len(), 4, "expected [H, W, 1] = 4 values, got {got:?}");
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!((g - w).abs() < 1e-6, "alpha[{i}] = {g}, want {w}");
+        }
+    }
+
+    /// The value contract: only dropped pixels contribute, and the
+    /// denominator is their count — not H·W. With one kept and one dropped
+    /// pixel the loss is the dropped pixel's alpha verbatim; an H·W
+    /// denominator would halve it.
+    #[tokio::test]
+    async fn only_dropped_pixels_contribute_and_normalise_by_their_count() {
+        let device = device().await;
+        let gt = alpha(vec![1.0, 0.0], &device);
+        let pred = alpha(vec![0.8, 0.6], &device);
+
+        let loss = read(mask_clear_loss(pred, gt)).await[0];
+        assert!(
+            (loss - 0.6).abs() < 1e-6,
+            "loss = {loss}, want 0.6 (the dropped pixel's alpha, denominator 1)"
+        );
+    }
+
+    /// Nothing masked ⇒ exactly zero, bit-identical, at any predicted alpha.
+    ///
+    /// This is what makes the flag safe to leave in a recipe that is then run
+    /// on an unmasked dataset: the term cannot contribute a spurious constant.
+    #[tokio::test]
+    async fn all_kept_gives_exactly_zero() {
+        let device = device().await;
+        let gt = alpha(vec![1.0, 1.0, 1.0], &device);
+        let pred = alpha(vec![0.9, 0.1, 0.5], &device);
+
+        let loss = read(mask_clear_loss(pred, gt)).await[0];
+        assert_eq!(loss, 0.0, "an all-kept frame must contribute exactly 0");
+    }
+
+    /// The mechanism: a positive gradient on the RENDERED alpha at dropped
+    /// pixels and exactly none at kept ones.
+    ///
+    /// Positive because increasing alpha increases the loss, so descent fades
+    /// the splat — the sign is the whole point, and a flipped one would GROW
+    /// the masked region while still reporting a falling loss on every other
+    /// term. Magnitude `1/n_dropped` pins that the clamped denominator does
+    /// not leak into the gradient when it is inactive.
+    #[tokio::test]
+    async fn gradient_hits_dropped_pixels_only() {
+        let device = autodiff_device().await;
+        let gt = alpha(vec![1.0, 0.0, 0.0], &device);
+        let pred = lift_to_autodiff(alpha(vec![0.8, 0.6, 0.2], &device)).require_grad();
+
+        let loss = mask_clear_loss(pred.clone(), gt);
+        let grads = loss.backward();
+        let g = read(
+            pred.grad(&grads)
+                .expect("mask-clear must reach the rendered alpha"),
+        )
+        .await;
+
+        assert_eq!(
+            g[0], 0.0,
+            "kept pixel must receive no gradient, got {}",
+            g[0]
+        );
+        for i in [1, 2] {
+            assert!(
+                (g[i] - 0.5).abs() < 1e-6,
+                "dropped pixel {i} gradient = {}, want +1/2 (2 dropped pixels)",
+                g[i]
+            );
+        }
+    }
+
+    /// Soft mask edges clear softly, and the `clamp_min(1.0)` denominator is
+    /// pinned deliberately.
+    ///
+    /// A lone half-dropped pixel has `Σ(1 - gt_a) = 0.5`, below the clamp, so
+    /// the loss is `0.5 · 0.4 / 1.0 = 0.2`, NOT the `0.4` an unclamped mean
+    /// would give. The clamp exists to keep an all-kept frame's `0/0` finite;
+    /// the cost is that a frame whose total dropped mass is under one pixel is
+    /// down-weighted rather than normalised. That is the right trade — such a
+    /// frame has essentially nothing to clear — but it is a real asymmetry, so
+    /// it is asserted rather than left to be rediscovered.
+    #[tokio::test]
+    async fn soft_edges_are_continuous_and_the_clamp_is_pinned() {
+        let device = device().await;
+
+        let lone = read(mask_clear_loss(
+            alpha(vec![0.4], &device),
+            alpha(vec![0.5], &device),
+        ))
+        .await[0];
+        assert!(
+            (lone - 0.2).abs() < 1e-6,
+            "loss = {lone}, want 0.2 (0.5 x 0.4, denominator clamped to 1)"
+        );
+
+        // Above the clamp the weighting is a true soft mean: two pixels at
+        // gt_a = 0.5 give Σ(1 - gt_a) = 1.0, so the same alphas normalise
+        // properly and a half-dropped pixel counts half as much as a fully
+        // dropped one.
+        let pair = read(mask_clear_loss(
+            alpha(vec![0.4, 0.4], &device),
+            alpha(vec![0.5, 0.5], &device),
+        ))
+        .await[0];
+        assert!(
+            (pair - 0.4).abs() < 1e-6,
+            "loss = {pair}, want 0.4 (denominator 1.0, unclamped)"
+        );
     }
 }
