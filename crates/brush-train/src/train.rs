@@ -1548,6 +1548,39 @@ impl SplatTrainer {
                 loss_map.mean()
             };
 
+            // ---- `--mask-clear-weight` (spirula mask clearing) -------------
+            //
+            // The masked photometric loss above only IGNORES masked pixels, so
+            // a splat that drifts into the masked region pays nothing and
+            // survives. This term makes the mask mean EMPTY SPACE instead:
+            // pull the RENDERED alpha (channel 3 — PPISP transforms RGB and
+            // leaves alpha untouched, so the post-appearance image still
+            // carries the rasteriser's alpha on the tape) toward 0 over the
+            // dropped pixels.
+            //
+            // `gt.a` is keep-ness on a Masked view in BOTH dataset shapes: a
+            // sidecar `masks/` file is written into the pixel alpha at load
+            // (`load_image.rs`, hence `--invert-masks` for 255=DROP masks) and
+            // alpha-baked RGBA carries it natively. So one gate covers both.
+            //
+            // `gt_keep` is deliberately hoisted here rather than built at each
+            // use: the depth, normal and depth/normal terms below reuse it to
+            // drop the same pixels (see `--mask-clear-weight`'s docs), and it
+            // costs one unpack per step instead of three.
+            //
+            // Flag off => `None` => not one new tensor op on the default path.
+            let mask_clear_on = self.config.mask_clear_weight > 0.0 && masked_alpha && has_alpha;
+            let gt_keep: Option<Tensor<3>> = mask_clear_on
+                .then(|| Tensor::from_inner(brush_loss::unpack_gt_alpha(gt_packed.clone())));
+            if let Some(gt_a) = &gt_keep {
+                let pred_alpha = pred_image.clone().slice(s![.., .., 3..4]);
+                loss = loss
+                    + brush_loss::mask_clear_loss(pred_alpha, gt_a.clone())
+                        * self.config.mask_clear_weight;
+            } else if self.config.mask_clear_weight > 0.0 {
+                warn_mask_clear_needs_masks();
+            }
+
             // LPIPS still needs an f32 RGB tensor for VGG. Materialising it
             // here costs ~99 MB at 4K, only when LPIPS is enabled.
             #[cfg(not(target_family = "wasm"))]
@@ -1870,6 +1903,26 @@ impl SplatTrainer {
             // `--normalize-metric-weights` is on — see `depth_weight_divisor`).
             if use_depth && let Some(depth_data) = &batch.depth {
                 let gt_depth: Tensor<2> = Tensor::from_data(depth_data.clone(), &device);
+                // `--mask-clear-weight`: masked pixels are being cleared to
+                // empty space, so the depth prior must not go on anchoring
+                // splats onto the surface underneath them. The keep-mask is
+                // BINARY — scaling a metric depth by a fractional 0.37 would
+                // corrupt the value rather than mask it — and zeroing is the
+                // idiom `depth_loss` already understands: its `gt > 0` gate
+                // drops the pixel from the numerator AND the denominator.
+                // Applied before the depth-source dispatch so it covers the
+                // plane path's `gt_depth * valid` too.
+                let gt_depth = match &gt_keep {
+                    Some(gt_a) => {
+                        gt_depth
+                            * gt_a
+                                .clone()
+                                .greater_elem(0.5)
+                                .float()
+                                .reshape([img_h, img_w])
+                    }
+                    None => gt_depth,
+                };
                 // ---- DEPTH SOURCE DISPATCH — backward contracts (§4.5) ----
                 //
                 // | source      | blending weights | geometry grads via     | opacity reachable |
@@ -2047,6 +2100,17 @@ impl SplatTrainer {
 
                 if use_prior_normal && let Some(normal_data) = &batch.normal {
                     let gt_normal: Tensor<3> = Tensor::from_data(normal_data.clone(), &device);
+                    // Same reason as the depth prior above: nothing may hold
+                    // the masked region's geometry in place while the alpha
+                    // term clears it. Zeroing is again the existing idiom —
+                    // `normal_loss` reads `|gt| > 0.5` as "prior absent here",
+                    // which is exactly what a zeroed normal now means.
+                    let gt_normal = match &gt_keep {
+                        Some(gt_a) => {
+                            gt_normal * gt_a.clone().greater_elem(0.5).float().repeat_dim(2, 3)
+                        }
+                        None => gt_normal,
+                    };
                     // NeuRIS per-pixel contradiction gate (arXiv:2206.13597);
                     // the 30 degree value and its arming step come from the
                     // `gauss-surf` PGSR trainer (rerun-io/examples-monorepo,
@@ -2122,8 +2186,25 @@ impl SplatTrainer {
                             center.x,
                             center.y,
                         );
+                        // The consistency term is the one geometry term that
+                        // has no GT to zero — it gates on the RENDERED alpha
+                        // instead. Folding the keep-mask into that argument
+                        // pushes masked pixels below its `covered > 0.5` gate,
+                        // so they leave both the error and `valid.sum()`.
+                        // Without this it would be the term actively fighting
+                        // the clearing: it enforces self-consistency on
+                        // geometry the alpha term is trying to delete. (Once
+                        // clearing succeeds the gate self-closes anyway, since
+                        // rendered alpha there goes to 0 — this just stops the
+                        // fight during the descent.) `normal_smooth_loss` and
+                        // the `n_cam` normalisation keep the unmasked alpha:
+                        // TV has no GT pull, so there is nothing to fight.
+                        let dn_alpha = match &gt_keep {
+                            Some(gt_a) => normal_alpha * gt_a.clone().greater_elem(0.5).float(),
+                            None => normal_alpha,
+                        };
                         loss = loss
-                            + depth_normal_loss(n_from_depth, n_cam, normal_alpha)
+                            + depth_normal_loss(n_from_depth, n_cam, dn_alpha)
                                 * (eff_dn_weight * normal_ramp);
                     } else {
                         warn_depth_normal_needs_pinhole();
@@ -3615,6 +3696,22 @@ fn warn_depth_normal_needs_pinhole() {
             "--depth-normal-weight is set but this camera is not Pinhole; the \
              depth/normal consistency term is skipped for non-pinhole views \
              (unprojection for fisheye models is not implemented yet)."
+        );
+    });
+}
+
+/// Warn exactly once that `--mask-clear-weight` is set but the view carries no
+/// `Masked` alpha, so there is nothing to clear. Worth saying out loud: the
+/// term is silently inert in that case, which looks exactly like the flag
+/// working and finding nothing to remove. Once, because it would otherwise
+/// fire every step of every view.
+fn warn_mask_clear_needs_masks() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "--mask-clear-weight is set but this view has no Masked alpha \
+             (need masks/ + --invert-masks, or RGBA + --alpha-mode masked); \
+             the mask-clearing term is inert for this view."
         );
     });
 }
