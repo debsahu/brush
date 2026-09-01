@@ -1057,7 +1057,7 @@ fn features_root(path: &Path, features_dir: &str) -> Option<PathBuf> {
 ///
 /// There is real structural information to decide on, and it is *not* depth:
 /// the dataset loader has already resolved a concrete `.npy` per view
-/// ([`brush_dataset::formats`]'s `find_features_path`), so the metadata that
+/// (`brush_dataset::formats`'s `find_features_path`), so the metadata that
 /// belongs to this run is the one sitting in the features directory those files
 /// actually came from. Candidates are therefore ranked by how many training
 /// views resolved into their directory, ties broken by the smallest path -- the
