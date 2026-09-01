@@ -182,6 +182,9 @@ async fn load_dataset_inner(
         let mut views = Vec::new();
         let mut warnings = Vec::new();
         let file_index = DatasetFileIndex::new(&vfs);
+        // images.txt stores bare file names, so any name claimed by two files
+        // is resolved by a tie-break the operator never asked for. Say so.
+        warnings.extend(file_index.ambiguity_warnings());
 
         for img_info in img_info_list
             .iter()
@@ -520,6 +523,7 @@ async fn estimate_metric_scale(
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use crate::config::LoadDatasetConfig;
+    use crate::formats::prior_test_support::write_depth_png;
     use crate::formats::{DatasetLoadResult, load_dataset};
     use brush_render::camera::focal_to_fov;
     use brush_render::kernels::camera_model::CameraModel;
@@ -685,6 +689,67 @@ mod tests {
         assert_eq!(sh_coeffs.len(), 4 * 3);
         let expected_sh = rgb_to_sh(glam::vec3(1.0, 0.0, 0.0));
         assert_eq!(&sh_coeffs[0..3], expected_sh.to_array().as_slice());
+    }
+
+    /// The quantized-PNG prior format gives `depth/img0.png` the image's own
+    /// extension, and COLMAP's images.txt stores bare file names, so both files
+    /// answer to `img0.png`. Training must use the photograph.
+    ///
+    /// This loaded *successfully* before the fix -- a depth map is a perfectly
+    /// valid PNG -- and reported a spectacular PSNR against maps that are
+    /// smooth and trivial to fit, which is why nothing caught it. The dataset
+    /// below is exactly the shape that armed it.
+    #[tokio::test]
+    async fn depth_prior_is_never_loaded_as_the_image() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_dataset(dir.path()).await;
+        for name in ["img0", "img1", "img2"] {
+            write_depth_png(&dir.path().join(format!("depth/{name}.png"))).await;
+        }
+
+        let result = load_test_dataset(dir.path(), None).await;
+        let views = &result.dataset.train.views;
+        assert_eq!(views.len(), 3, "all three views must load");
+
+        // The directory a path sits in is what identifies it here.
+        fn parent_dir(path: &Path) -> String {
+            path.parent()
+                .and_then(Path::file_name)
+                .map(|d| d.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        }
+
+        for view in views.iter() {
+            let image_path = view.image.path().to_string_lossy().into_owned();
+            assert_eq!(
+                parent_dir(view.image.path()),
+                "images",
+                "trained on '{image_path}' instead of the photograph"
+            );
+
+            // Not just the path: the photograph is a flat RGB(10, 20, 30),
+            // while the depth map is 16-bit grayscale, so no depth pixel can
+            // impersonate it.
+            let decoded = view.image.load().await.expect("image decodes");
+            assert_eq!(
+                decoded.to_rgb8().get_pixel(0, 0),
+                &image::Rgb([10u8, 20, 30]),
+                "'{image_path}' does not decode to the photograph's pixels"
+            );
+
+            // And the depth prior still resolves -- from the very file that
+            // must not be the image.
+            let depth = view
+                .depth
+                .as_ref()
+                .expect("depth prior must still be discovered")
+                .path();
+            assert_eq!(parent_dir(depth), "depth", "depth prior at {depth:?}");
+        }
+
+        // No spurious ambiguity warning: only `missing.png` is reported.
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(result.warnings[0].contains("missing.png"));
     }
 
     #[tokio::test]

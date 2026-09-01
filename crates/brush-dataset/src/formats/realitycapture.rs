@@ -100,6 +100,8 @@ async fn read_dataset_inner(
     let mut warnings = Vec::new();
     let mut warned_brown4 = false;
     let file_index = DatasetFileIndex::new(&vfs);
+    // The csv's `name` column is a bare file name; see colmap.rs.
+    warnings.extend(file_index.ambiguity_warnings());
 
     for line in lines
         .step_by(load_args.subsample_frames.unwrap_or(1) as usize)

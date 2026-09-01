@@ -120,25 +120,115 @@ pub async fn load_dataset(
     })
 }
 
+/// Directory holding per-image masks.
+const MASK_DIR_NAME: &str = "masks";
+
+/// Directory holding per-image metric depth maps, as resolved by
+/// [`find_depth_path`].
+const PRIOR_DIR_DEPTH: &str = "depth";
+
+/// Directory holding per-image surface-normal maps, as resolved by
+/// [`find_normal_path`].
+const PRIOR_DIR_NORMAL: &str = "normal";
+
+/// Every directory whose contents are per-image *sidecars* rather than images.
+///
+/// This is the single source of truth: [`find_prior_path`]'s call sites and
+/// image discovery both read it, so the two can never drift into disagreeing
+/// about which files are priors. Adding a prior kind means adding it here, and
+/// image discovery follows automatically.
+const SIDECAR_DIR_NAMES: [&str; 3] = [MASK_DIR_NAME, PRIOR_DIR_DEPTH, PRIOR_DIR_NORMAL];
+
+fn is_sidecar_dir(component: &str) -> bool {
+    SIDECAR_DIR_NAMES
+        .iter()
+        .any(|name| component.eq_ignore_ascii_case(name))
+}
+
+/// True if any *directory* component of these normalized path components names
+/// a sidecar tree. The final component is the file name and is not considered:
+/// a file called `depth.png` is an ordinary image.
+fn has_sidecar_dir(components: &[String]) -> bool {
+    let Some((_file_name, directories)) = components.split_last() else {
+        return false;
+    };
+    directories.iter().any(|part| is_sidecar_dir(part))
+}
+
+/// True if `path` lives inside a sidecar tree (mask / depth / normal), i.e. it
+/// is per-image data and never a candidate image. Case-insensitive, matching
+/// [`find_prior_path`]'s own comparison.
+fn is_sidecar_path(path: &Path) -> bool {
+    has_sidecar_dir(&normalized_components(path))
+}
+
+/// The images registered under one suffix key of the file index.
+///
+/// `chosen` is the lexicographically first, which is what resolution returns.
+/// `others` is kept so an ambiguous key can be *reported* rather than silently
+/// decided -- see [`DatasetFileIndex::ambiguity_warnings`].
+#[derive(Debug)]
+struct ImageCandidates {
+    chosen: PathBuf,
+    others: Vec<PathBuf>,
+}
+
+impl ImageCandidates {
+    fn new(path: &Path) -> Self {
+        Self {
+            chosen: path.to_path_buf(),
+            others: Vec::new(),
+        }
+    }
+
+    fn insert(&mut self, path: &Path) {
+        if path < self.chosen.as_path() {
+            let previous = std::mem::replace(&mut self.chosen, path.to_path_buf());
+            self.others.push(previous);
+        } else {
+            self.others.push(path.to_path_buf());
+        }
+    }
+
+    /// Every candidate, `chosen` included, in a stable order.
+    fn all(&self) -> Vec<&Path> {
+        let mut all: Vec<&Path> = std::iter::once(self.chosen.as_path())
+            .chain(self.others.iter().map(PathBuf::as_path))
+            .collect();
+        all.sort_unstable();
+        all
+    }
+}
+
 /// Paths used by dataset formats, indexed once so resolving every camera does
 /// not repeatedly scan the entire VFS.
 struct DatasetFileIndex {
-    images_by_suffix: HashMap<String, PathBuf>,
+    images_by_suffix: HashMap<String, ImageCandidates>,
     masks_by_key: HashMap<(String, String), PathBuf>,
 }
 
 impl DatasetFileIndex {
     fn new(vfs: &BrushVfs) -> Self {
-        let mut images_by_suffix = HashMap::new();
+        let mut images_by_suffix: HashMap<String, ImageCandidates> = HashMap::new();
         let mut masks_by_key = HashMap::new();
 
         for path in vfs.iter_files() {
             let components = normalized_components(path);
-            let masks_index = components.iter().position(|part| part == "masks");
+            let masks_index = components.iter().position(|part| part == MASK_DIR_NAME);
 
-            if masks_index.is_none() {
+            // Sidecar trees -- masks and the geometry priors -- hold per-image
+            // data, never images, so they are kept out of the image index
+            // entirely. Without this a file is indexed under EVERY suffix of
+            // its path including the bare file name, and COLMAP stores bare
+            // names, so `depth/frame.png` and `images/frame.png` both claim the
+            // key `frame.png`. See `is_sidecar_path`.
+            if !has_sidecar_dir(&components) {
                 for start in 0..components.len() {
-                    insert_min_path(&mut images_by_suffix, components[start..].join("/"), path);
+                    let key = components[start..].join("/");
+                    images_by_suffix
+                        .entry(key)
+                        .and_modify(|candidates| candidates.insert(path))
+                        .or_insert_with(|| ImageCandidates::new(path));
                 }
             }
 
@@ -162,11 +252,66 @@ impl DatasetFileIndex {
         }
     }
 
-    /// Resolve a path suffix as stored by COLMAP or `RealityCapture`. Masks are
-    /// excluded so an image cannot resolve to its own mask.
+    /// Resolve a path suffix as stored by COLMAP or `RealityCapture`. Masks and
+    /// geometry priors are excluded, so an image can never resolve to its own
+    /// mask, depth map or normal map.
     fn find_image_by_name(&self, name: &str) -> Option<&Path> {
         let key = normalized_components(Path::new(name)).join("/");
-        self.images_by_suffix.get(&key).map(PathBuf::as_path)
+        self.images_by_suffix
+            .get(&key)
+            .map(|candidates| candidates.chosen.as_path())
+    }
+
+    /// Suffix keys that more than one image claims, as a single aggregated
+    /// warning for the loader to surface.
+    ///
+    /// Resolution keeps the lexicographically first candidate -- the choice
+    /// this index has always made, so every dataset that loads today keeps
+    /// loading, including the very common nerfstudio downscale pyramid
+    /// (`images/`, `images_2/`, `images_4/`, ...) where every bare name is
+    /// ambiguous by construction. That is why this is a warning and not the
+    /// hard error `find_prior_path` raises: there, two candidates mean one is
+    /// stale supervision and neither can be trusted; here they are usually the
+    /// same view at different scales, and refusing the load would reject a
+    /// large class of working datasets. The genuinely undecidable case -- an
+    /// image against a *prior* of the same name -- is not decided by this rule
+    /// at all, because priors never enter the index.
+    ///
+    /// Whatever the cause, the operator is told. A silently chosen image is
+    /// precisely the failure this index shipped with.
+    fn ambiguity_warnings(&self) -> Vec<String> {
+        let mut ambiguous: Vec<(&String, &ImageCandidates)> = self
+            .images_by_suffix
+            .iter()
+            .filter(|(_, candidates)| !candidates.others.is_empty())
+            .collect();
+        if ambiguous.is_empty() {
+            return Vec::new();
+        }
+        // Sorted so the message is stable whatever order the VFS walked in.
+        ambiguous.sort_unstable_by(|a, b| a.0.cmp(b.0));
+
+        let examples = ambiguous
+            .iter()
+            .take(3)
+            .map(|(key, candidates)| {
+                format!(
+                    "'{key}' matches {}",
+                    candidates
+                        .all()
+                        .iter()
+                        .map(|p| format!("'{}'", p.display()))
+                        .join(", ")
+                )
+            })
+            .join("; ");
+
+        vec![format!(
+            "{} image name(s) match more than one file; the lexicographically first is used \
+             for each. If that is not the file you meant to train on, remove or rename the \
+             others. {examples}",
+            ambiguous.len()
+        )]
     }
 
     fn find_mask_path(&self, path: &Path) -> Option<&Path> {
@@ -261,13 +406,15 @@ fn split_eval_every(
 }
 
 /// Resolve a bare image name (as stored by colmap / `RealityCapture`, which only
-/// record a filename) to a path in the VFS by brute-force suffix search. Masks
-/// are skipped so an image never resolves to its own mask. Used by
-/// `estimate_metric_scale`, which runs before the per-image `DatasetFileIndex`
-/// is built and is opt-in/rare enough that the linear scan is fine.
+/// record a filename) to a path in the VFS by brute-force suffix search. Sidecar
+/// trees are skipped so an image never resolves to its own mask, depth map or
+/// normal map -- the same exclusion, and the same reason, as
+/// [`DatasetFileIndex::new`]. Used by `estimate_metric_scale`, which runs before
+/// the per-image `DatasetFileIndex` is built and is opt-in/rare enough that the
+/// linear scan is fine.
 pub(crate) fn find_image_by_name<'a>(vfs: &'a BrushVfs, name: &str) -> Option<&'a Path> {
     vfs.files_ending_in(name)
-        .filter(|p| !p.iter().any(|f| f == "masks"))
+        .filter(|path| !is_sidecar_path(path))
         .min()
 }
 
@@ -385,7 +532,7 @@ fn find_prior_path<'a>(
 
 /// Locate a per-image depth map (`depth/<image stem>.{tiff,png}`).
 fn find_depth_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Result<Option<&'a Path>, FormatError> {
-    find_prior_path(vfs, path, "depth")
+    find_prior_path(vfs, path, PRIOR_DIR_DEPTH)
 }
 
 /// Locate a per-image surface-normal map (`normal/<image stem>.{tiff,png}`).
@@ -394,7 +541,7 @@ fn find_normal_path<'a>(
     vfs: &'a BrushVfs,
     path: &'a Path,
 ) -> Result<Option<&'a Path>, FormatError> {
-    find_prior_path(vfs, path, "normal")
+    find_prior_path(vfs, path, PRIOR_DIR_NORMAL)
 }
 
 /// Shared fixtures for the per-format prior-discovery tests (nerfstudio,
@@ -593,6 +740,128 @@ mod tests {
         assert_eq!(
             index.find_image_by_name("FRAME.PNG"),
             Some(Path::new("images/nested/frame.png"))
+        );
+    }
+
+    /// A geometry prior sharing the image's file name must never be returned
+    /// as the image. Reproduces the silent depth-for-image swap: COLMAP stores
+    /// bare names, `depth` sorts before `images`, so the bare-name shortcut
+    /// used to hand back the depth map.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_prior_never_outranks_image_on_bare_name() {
+        let vfs = BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/frame_0001_back.png"),
+            PathBuf::from("depth/frame_0001_back.png"),
+            PathBuf::from("normal/frame_0001_back.png"),
+        ]);
+        let index = DatasetFileIndex::new(&vfs);
+        assert_eq!(
+            index.find_image_by_name("frame_0001_back.png"),
+            Some(Path::new("images/frame_0001_back.png"))
+        );
+    }
+
+    /// The pre-index scan `estimate_metric_scale` uses must make the same
+    /// exclusion, or the metric scale is fitted against a depth map that was
+    /// read as a photograph.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_free_find_image_by_name_skips_sidecars() {
+        let vfs = BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/frame.png"),
+            PathBuf::from("depth/frame.png"),
+            PathBuf::from("normal/frame.png"),
+            PathBuf::from("masks/frame.png"),
+        ]);
+        assert_eq!(
+            find_image_by_name(&vfs, "frame.png"),
+            Some(Path::new("images/frame.png"))
+        );
+    }
+
+    /// An image against a prior of the same name is not an ambiguity to be
+    /// reported and tie-broken -- the loader knows which is which, so the
+    /// prior never enters the index. If this ever starts warning, the
+    /// exclusion has been replaced by a priority rule.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_prior_collision_is_not_an_ambiguity() {
+        let vfs = BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/frame.png"),
+            PathBuf::from("depth/frame.png"),
+            PathBuf::from("normal/frame.png"),
+        ]);
+        let index = DatasetFileIndex::new(&vfs);
+        assert_eq!(index.ambiguity_warnings(), Vec::<String>::new());
+    }
+
+    /// Two real images of one bare name (the nerfstudio downscale pyramid) is
+    /// still resolved -- deterministically, full resolution first -- but the
+    /// operator is told rather than left to guess.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_two_images_of_one_name_resolve_and_warn() {
+        let vfs = BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/frame.png"),
+            PathBuf::from("images_2/frame.png"),
+        ]);
+        let index = DatasetFileIndex::new(&vfs);
+        assert_eq!(
+            index.find_image_by_name("frame.png"),
+            Some(Path::new("images/frame.png"))
+        );
+
+        let warnings = index.ambiguity_warnings();
+        assert_eq!(warnings.len(), 1, "one aggregated message, not one per key");
+        assert!(
+            warnings[0].contains("images/frame.png") && warnings[0].contains("images_2/frame.png"),
+            "the message must name both candidates: {}",
+            warnings[0]
+        );
+
+        // A directory-prefixed name is unambiguous and must not be dragged in.
+        assert_eq!(
+            index.find_image_by_name("images_2/frame.png"),
+            Some(Path::new("images_2/frame.png"))
+        );
+    }
+
+    /// Excluding sidecars must not cost the legitimate lookups: a
+    /// directory-prefixed COLMAP name, the bare-name shortcut, and both
+    /// sidecars of that same image all still resolve.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_nested_lookups_survive_the_sidecar_exclusion() {
+        let vfs = BrushVfs::create_test_vfs(vec![
+            PathBuf::from("data/images/nested/frame.png"),
+            PathBuf::from("data/depth/nested/frame.png"),
+            PathBuf::from("data/masks/nested/frame.png"),
+        ]);
+        let index = DatasetFileIndex::new(&vfs);
+
+        assert_eq!(
+            index.find_image_by_name("images/nested/frame.png"),
+            Some(Path::new("data/images/nested/frame.png"))
+        );
+        assert_eq!(
+            index.find_image_by_name("frame.png"),
+            Some(Path::new("data/images/nested/frame.png"))
+        );
+        assert_eq!(
+            index.find_mask_path(Path::new("data/images/nested/frame.png")),
+            Some(Path::new("data/masks/nested/frame.png"))
+        );
+        assert_eq!(
+            find_depth_path(&vfs, Path::new("data/images/nested/frame.png")).expect("unambiguous"),
+            Some(Path::new("data/depth/nested/frame.png"))
+        );
+    }
+
+    /// The exclusion keys on directory components only. A photograph that
+    /// happens to be called `depth.png` is still a photograph.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_sidecar_exclusion_ignores_the_file_name() {
+        let vfs = BrushVfs::create_test_vfs(vec![PathBuf::from("images/depth.png")]);
+        let index = DatasetFileIndex::new(&vfs);
+        assert_eq!(
+            index.find_image_by_name("depth.png"),
+            Some(Path::new("images/depth.png"))
         );
     }
 
