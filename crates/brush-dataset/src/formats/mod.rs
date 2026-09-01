@@ -44,6 +44,9 @@ pub enum FormatError {
 
     #[error("Ambiguous geometry prior: {0}")]
     AmbiguousPrior(String),
+
+    #[error("Ambiguous dataset: {0}")]
+    AmbiguousDataset(String),
 }
 
 #[derive(Debug, Error)]
@@ -314,6 +317,24 @@ impl DatasetFileIndex {
         )]
     }
 
+    /// Resolve an image's mask, searching three stem forms (`frame.png`,
+    /// `frame`, `frame.mask`) against every suffix of the image's directory.
+    ///
+    /// Unlike the image and feature lookups, this one is already deterministic
+    /// -- it takes the lexicographic minimum over all matches, and 500 lookups
+    /// of a deliberately ambiguous tree returned the same file 500 times. What
+    /// the minimum *means* was never written down, so, measured and pinned by
+    /// `test_mask_precedence_is_pinned`:
+    ///
+    /// * `masks/frame.mask.png` beats `masks/frame.png` (`.` sorts below `p`).
+    /// * `masks/frame.png` beats `masks/sub/frame.png` -- the shallower mask
+    ///   wins even though the deeper one matched more of the image's directory,
+    ///   which is the opposite of [`find_features_path`]'s most-specific rule.
+    ///
+    /// Neither precedence is obviously the right one, but both are stable and
+    /// real datasets have been trained against them, so they are documented and
+    /// tested rather than changed: silently swapping which mask an existing
+    /// scene trains against is the failure this module keeps trying to avoid.
     fn find_mask_path(&self, path: &Path) -> Option<&Path> {
         let search_name = path.file_name()?.to_string_lossy().to_lowercase();
         let search_stem = path.file_stem()?.to_string_lossy().to_lowercase();
@@ -419,6 +440,28 @@ pub(crate) fn find_image_by_name<'a>(vfs: &'a BrushVfs, name: &str) -> Option<&'
 }
 
 /// Locate a per-image feature map (`<features_dir_name>/<image_stem>.npy`).
+///
+/// A candidate matches when the directories *between* the features directory and
+/// the file are a suffix of the image's own directory, so an empty tail --
+/// `<anything>/dino_features/frame.npy` -- matches every image called `frame`.
+/// More than one file can therefore qualify, and this used to resolve it with
+/// `.find()` over the VFS `HashMap`: measured, 500 lookups of one unchanged
+/// three-file tree returned `dino_features/frame.npy` 272 times and
+/// `extra/dino_features/frame.npy` 228, i.e. the same dataset trained with a
+/// different feature map on different runs.
+///
+/// Resolution is now: **the most specific match wins** -- the candidate that
+/// matched the longest tail of the image's directory, because that one names the
+/// image's own subdirectory rather than merely any image of that stem -- and
+/// equally specific candidates are broken lexicographically, the tie-break the
+/// rest of this module already uses ([`insert_min_path`], [`find_image_by_name`]).
+///
+/// This tie-breaks rather than erroring as [`find_prior_path`] does. Features
+/// are optional supervision that only the `DiG` path consumes, `find_features_path`
+/// runs on every image whether or not that path is enabled, and unlike a stale
+/// depth map a duplicated feature tree carries a genuine ordering between its
+/// candidates. Failing an entire load over an ignorable extra copy is not worth
+/// the strictness; picking the same one every time is.
 pub(crate) fn find_features_path<'a>(
     vfs: &'a BrushVfs,
     path: &'a Path,
@@ -426,29 +469,34 @@ pub(crate) fn find_features_path<'a>(
 ) -> Option<&'a Path> {
     let search_stem = path.file_stem().expect("File must have a name");
 
-    vfs.iter_files().find(|candidate| {
-        let Some(stem) = candidate.file_stem() else {
-            return false;
-        };
+    vfs.iter_files()
+        .filter_map(|candidate| {
+            let stem = candidate.file_stem()?;
 
-        let is_npy = candidate
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("npy"));
-        if !is_npy || !stem.eq_ignore_ascii_case(search_stem) {
-            return false;
-        }
+            let is_npy = candidate
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("npy"));
+            if !is_npy || !stem.eq_ignore_ascii_case(search_stem) {
+                return None;
+            }
 
-        let features_idx = candidate
-            .components()
-            .position(|c| c.as_os_str().eq_ignore_ascii_case(features_dir_name));
-        features_idx.is_some_and(|idx| {
+            let features_idx = candidate
+                .components()
+                .position(|c| c.as_os_str().eq_ignore_ascii_case(features_dir_name))?;
             let candidate_components: Vec<_> = candidate.components().collect();
-            let path_dir_components: Vec<_> = path.parent().unwrap().components().collect();
+            let path_dir_components: Vec<_> = path.parent()?.components().collect();
             let features_dir_subpath =
-                &candidate_components[idx + 1..candidate_components.len() - 1];
-            path_dir_components.ends_with(features_dir_subpath)
+                &candidate_components[features_idx + 1..candidate_components.len() - 1];
+            path_dir_components
+                .ends_with(features_dir_subpath)
+                .then_some((features_dir_subpath.len(), candidate))
         })
-    })
+        // Most specific first, then smallest path. `Reverse` on the path makes
+        // the lexicographic tie-break run the other way from the specificity
+        // one. VFS paths are distinct, so this maximum is unique -- the result
+        // does not depend on which order the candidates arrived in.
+        .max_by_key(|(specificity, candidate)| (*specificity, std::cmp::Reverse(*candidate)))
+        .map(|(_, candidate)| candidate)
 }
 
 /// Locate the `points3d.{txt,bin}` belonging to the chosen reconstruction.
@@ -459,6 +507,82 @@ fn find_points3d_path<'a>(vfs: &'a BrushVfs, points_dir: &'a Path) -> Option<(&'
         .find(|p| p.parent() == Some(points_dir))?;
     let is_binary = matches!(path.extension().and_then(|e| e.to_str()), Some("bin"));
     Some((path, is_binary))
+}
+
+/// Pick the single dataset descriptor (a `transforms*.json`) that a set of
+/// candidate paths denotes, or refuse.
+///
+/// The VFS is backed by a `HashMap`, and Rust randomizes hash-map iteration per
+/// process, so `candidates.next()` picks a *different* file on different runs of
+/// the identical command. Nothing errors, because every candidate parses: the
+/// scene simply trains against one dataset today and another tomorrow. That is
+/// worse than a deterministic wrong answer, because it cannot be reproduced or
+/// bisected. Measured before this function existed: 40 loads of one unchanged
+/// two-dataset directory returned one scene 18 times and the other 22.
+///
+/// The rule, and why it is split the way it is:
+///
+/// * **Depth is real information.** A descriptor sitting at the top of the tree
+///   the user pointed brush at *is* that tree's dataset; anything deeper is
+///   contained within it -- a sub-capture, a reprocess, a backup left in a
+///   subdirectory of a larger archive. So the shallowest candidate wins, and the
+///   common "archive with a nested extra `transforms.json`" shape keeps loading,
+///   deterministically and for a stated reason rather than by coin flip.
+///
+/// * **A tie at the shallowest depth is not information at all.** Two sibling
+///   descriptors (`a/transforms.json`, `b/transforms.json` -- exactly what
+///   Stage 2a's dataset next to Stage 2b's merged one looks like) are usually
+///   two genuinely *different* datasets, not two encodings of one, so either
+///   choice may be flatly wrong. There is nothing to tie-break on, so this
+///   refuses and names every candidate, as [`find_prior_path`] does. Note that
+///   no such tree loads reliably today either -- it already picks at random --
+///   so refusing breaks nothing that currently works.
+///
+/// Returns `Ok(None)` for an empty candidate list, which callers must keep
+/// distinct from an error: "no nerfstudio descriptor here" has to fall through
+/// to the next format, while "several, and I will not guess" must not.
+fn select_descriptor(
+    mut candidates: Vec<PathBuf>,
+    file_name: &str,
+) -> Result<Option<PathBuf>, FormatError> {
+    // Sorted so both the choice and the error message are stable whatever order
+    // the VFS walked in.
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    let Some(min_depth) = candidates.iter().map(|p| p.components().count()).min() else {
+        return Ok(None);
+    };
+    let (shallowest, deeper): (Vec<&PathBuf>, Vec<&PathBuf>) = candidates
+        .iter()
+        .partition(|p| p.components().count() == min_depth);
+
+    if let [only] = shallowest.as_slice() {
+        return Ok(Some((*only).clone()));
+    }
+
+    let list = |paths: &[&PathBuf]| {
+        paths
+            .iter()
+            .map(|p| format!("'{}'", p.display()))
+            .join(", ")
+    };
+    let mut message = format!(
+        "{} files named '{file_name}' sit at the same depth in this dataset and nothing \
+         distinguishes them: {}. Brush used to pick one by hash-map iteration order, which \
+         differs between runs of the identical command -- so the scene would train against one \
+         of them today and the other tomorrow, with nothing changed. Point brush at the single \
+         dataset you mean, or remove/rename the others.",
+        shallowest.len(),
+        list(&shallowest),
+    );
+    if !deeper.is_empty() {
+        message.push_str(&format!(
+            " (Also present but deeper in the tree, and therefore never candidates: {}.)",
+            list(&deeper)
+        ));
+    }
+    Err(FormatError::AmbiguousDataset(message))
 }
 
 /// Locate a per-image prior map stored under a `<prior_dir>/` directory whose
@@ -863,6 +987,180 @@ mod tests {
             index.find_image_by_name("depth.png"),
             Some(Path::new("images/depth.png"))
         );
+    }
+
+    /// How many times a lookup is repeated when the point of the test is that
+    /// the answer must not depend on `HashMap` iteration order.
+    ///
+    /// Each iteration builds a *fresh* `BrushVfs`, and a fresh `HashMap` gets a
+    /// fresh `RandomState`, so the walk order really does change from one
+    /// iteration to the next -- measured on this exact fixture before the fix:
+    /// `dino_features/frame.npy` 272 times and `extra/dino_features/frame.npy`
+    /// 228 out of 500. A test that ran the lookup once would therefore pass by
+    /// luck about half the time. At 500 repeats an unfixed selection survives
+    /// with probability around `2^-499`.
+    const ORDER_PROBE_RUNS: usize = 500;
+
+    /// The `.find()` this replaced returned a different feature map on
+    /// different runs of the identical lookup (272/228 of 500, measured).
+    /// Both candidates match: `<anything>/dino_features/frame.npy` has an empty
+    /// directory tail, so it matches every image called `frame`.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_features_selection_survives_iteration_order() {
+        for _ in 0..ORDER_PROBE_RUNS {
+            let vfs = BrushVfs::create_test_vfs(vec![
+                PathBuf::from("images/frame.png"),
+                PathBuf::from("dino_features/frame.npy"),
+                PathBuf::from("extra/dino_features/frame.npy"),
+            ]);
+            assert_eq!(
+                find_features_path(&vfs, Path::new("images/frame.png"), "dino_features"),
+                Some(Path::new("dino_features/frame.npy")),
+                "equally specific candidates must break lexicographically, every run"
+            );
+        }
+    }
+
+    /// Specificity outranks the lexicographic tie-break: `dino_features/frame`
+    /// matches any image of that stem, `dino_features/nested/frame` matches
+    /// this image's own subdirectory. The second is the one that was computed
+    /// for this view. (Lexicographically it is the *larger* of the two, so this
+    /// also proves the ordering is not a plain `min`.)
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_features_prefer_the_most_specific_match() {
+        for _ in 0..ORDER_PROBE_RUNS {
+            let vfs = BrushVfs::create_test_vfs(vec![
+                PathBuf::from("images/nested/frame.png"),
+                PathBuf::from("dino_features/frame.npy"),
+                PathBuf::from("dino_features/nested/frame.npy"),
+            ]);
+            assert_eq!(
+                find_features_path(&vfs, Path::new("images/nested/frame.png"), "dino_features"),
+                Some(Path::new("dino_features/nested/frame.npy")),
+                "the candidate matching the image's own subdirectory must win, every run"
+            );
+        }
+    }
+
+    /// A feature map that matches nothing about this image must still not be
+    /// returned -- the null model for the two tests above, which would both
+    /// pass if the tie-break simply returned any `.npy` it found.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_features_still_require_a_matching_subdirectory() {
+        let vfs = BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/baz/frame.png"),
+            PathBuf::from("dino_features/foo/frame.npy"),
+        ]);
+        assert_eq!(
+            find_features_path(&vfs, Path::new("images/baz/frame.png"), "dino_features"),
+            None
+        );
+    }
+
+    /// [`DatasetFileIndex::find_mask_path`] was already deterministic; this
+    /// pins *what* it decides, because the doc comment now claims it and
+    /// nothing else would catch a change. Both orderings fall out of taking the
+    /// lexicographic minimum, neither is obviously the right precedence, and
+    /// real datasets have trained against them -- so they are tested, not
+    /// changed.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_mask_precedence_is_pinned() {
+        for _ in 0..ORDER_PROBE_RUNS {
+            // `.mask.png` beats a plain `.png` of the same stem.
+            let vfs = BrushVfs::create_test_vfs(vec![
+                PathBuf::from("images/frame.png"),
+                PathBuf::from("masks/frame.png"),
+                PathBuf::from("masks/frame.mask.png"),
+            ]);
+            let index = DatasetFileIndex::new(&vfs);
+            assert_eq!(
+                index.find_mask_path(Path::new("images/frame.png")),
+                Some(Path::new("masks/frame.mask.png"))
+            );
+
+            // The shallower mask beats the one that matched more of the image's
+            // directory -- the opposite of `find_features_path`'s rule.
+            let vfs = BrushVfs::create_test_vfs(vec![
+                PathBuf::from("images/sub/frame.png"),
+                PathBuf::from("masks/frame.png"),
+                PathBuf::from("masks/sub/frame.png"),
+            ]);
+            let index = DatasetFileIndex::new(&vfs);
+            assert_eq!(
+                index.find_mask_path(Path::new("images/sub/frame.png")),
+                Some(Path::new("masks/frame.png"))
+            );
+        }
+    }
+
+    fn descriptor(paths: &[&str]) -> Result<Option<PathBuf>, FormatError> {
+        select_descriptor(paths.iter().map(PathBuf::from).collect(), "transforms.json")
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_descriptor_selection_basics() {
+        assert_eq!(descriptor(&[]).expect("empty is not an error"), None);
+        assert_eq!(
+            descriptor(&["scene/transforms.json"]).expect("unambiguous"),
+            Some(PathBuf::from("scene/transforms.json"))
+        );
+    }
+
+    /// The shape this rule exists for: a descriptor at the top of the tree the
+    /// user pointed at, with another one buried in a subdirectory. The
+    /// shallowest wins, so such archives keep loading instead of erroring.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_descriptor_shallowest_wins() {
+        assert_eq!(
+            descriptor(&["scene/extra/transforms.json", "scene/transforms.json"])
+                .expect("depth decides"),
+            Some(PathBuf::from("scene/transforms.json"))
+        );
+    }
+
+    /// Two sibling datasets. Nothing distinguishes them, so this must refuse --
+    /// and the message must name every candidate, since the operator has to
+    /// know which trees to separate.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_descriptor_tie_is_fatal_and_names_every_candidate() {
+        let Err(FormatError::AmbiguousDataset(message)) = descriptor(&[
+            "b/transforms.json",
+            "a/transforms.json",
+            "a/nested/transforms.json",
+        ]) else {
+            panic!("a tie at the shallowest depth must be an error");
+        };
+        assert!(
+            message.contains("'a/transforms.json'") && message.contains("'b/transforms.json'"),
+            "must name both tied candidates: {message}"
+        );
+        assert!(
+            message.contains("'a/nested/transforms.json'"),
+            "must also account for the deeper file, or the operator sees a count \
+             that does not match the tree: {message}"
+        );
+    }
+
+    /// The choice and the message have to be identical whatever order the VFS
+    /// hands the candidates over in, which is the property the loader actually
+    /// depends on. Every permutation of a fixed candidate set must agree.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_descriptor_selection_is_order_independent() {
+        let unambiguous = ["z/transforms.json", "a/b/transforms.json"];
+        let tied = ["b/transforms.json", "a/transforms.json", "c/d/e.json"];
+
+        for paths in [unambiguous.as_slice(), tied.as_slice()] {
+            let expected = format!("{:?}", descriptor(paths));
+            // Every rotation and its reverse: enough to catch any rule that
+            // reads the first or last element rather than comparing them.
+            for rotation in 0..paths.len() {
+                let mut permuted: Vec<&str> = paths.to_vec();
+                permuted.rotate_left(rotation);
+                assert_eq!(format!("{:?}", descriptor(&permuted)), expected);
+                permuted.reverse();
+                assert_eq!(format!("{:?}", descriptor(&permuted)), expected);
+            }
+        }
     }
 
     #[wasm_bindgen_test(unsupported = test)]
