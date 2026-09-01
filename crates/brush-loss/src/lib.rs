@@ -2249,10 +2249,37 @@ pub fn normal_gate_counts(
 ///
 /// `P(u, v) = z * ((u - cx) / fx, (v - cy) / fy, 1)` in the `OpenCV` camera frame
 /// (+X right, +Y down, +Z forward); the normal is
-/// `normalize(dP/dv × dP/du)`, whose sign is camera-facing (`n.z <= 0`) for any
-/// depth graph — no data-dependent flip is needed. Forward differences, so the
-/// LAST row and column are invalid and emit `(0, 0, 0)`, as does any pixel whose
-/// three contributing depths are not all positive.
+/// `normalize(dP/dv × dP/du)`, whose sign is camera-facing for any depth graph —
+/// no data-dependent flip is needed. Forward differences, so the LAST row and
+/// column are invalid and emit `(0, 0, 0)`, as does any pixel whose three
+/// contributing depths are not all positive.
+///
+/// **"Camera-facing" means `dot(n, r) <= 0` against THAT PIXEL'S view ray
+/// `r = ((u - cx) / fx, (v - cy) / fy, 1)`. It does NOT mean `n.z <= 0`**, which
+/// this doc comment claimed until 2026-08-31. The two coincide only on the
+/// optical axis; off-axis they differ for every normal with
+/// `|n.z| < sin(off-axis angle)`, which reaches 0.816 at the corner of a 90°
+/// square face. Measured on real 2048 px cube faces, **20.6% of valid pixels
+/// (9.8–34.1% per face) carry a correctly-oriented normal with `n.z > 0`** — so
+/// the old claim is false on a fifth of a typical frame.
+///
+/// The code was always right; only the stated reason was wrong. Substituting the
+/// forward differences gives the exact identity
+///
+/// ```text
+/// dot(dP/dv × dP/du, r) = −z(u+1, v) · z(u, v+1) / (fx · fy)
+/// ```
+///
+/// for ANY depth graph, and validity already requires both those depths
+/// positive. That — not any property of `n.z` — is what makes the cross-product
+/// order sufficient. **Do not "restore" an `n.z` flip on the strength of the old
+/// comment**: `ingest/lidar_priors/scripts/normals.py` did exactly that and
+/// silently disagreed with this function by an exact negation on up to 34% of a
+/// face until 2026-08-31. See `research/prior-generator-defect-sweep.md`, and
+/// the grazing-plane case in
+/// `ingest/lidar_priors/fixtures/normals_from_depth_slanted_plane.json`, whose
+/// camera-facing normal has `n.z = +0.3041` (this implementation reproduces it
+/// to 2.1e-6, verified 2026-08-31).
 ///
 /// Differentiable through `depth`; the intrinsics are constants.
 pub fn normals_from_depth(depth: Tensor<2>, fx: f32, fy: f32, cx: f32, cy: f32) -> Tensor<3> {

@@ -23,8 +23,22 @@ use tokio::io::AsyncReadExt;
 /// wire formats** -- nothing downstream can tell which one a prior came from:
 /// - normals live in the **camera frame**, `OpenCV` axes (+X right, +Y down,
 ///   +Z forward),
-/// - unit length, oriented toward the camera (`n.z <= 0`),
+/// - unit length, oriented **toward the camera**: `dot(n, r) <= 0` against that
+///   pixel's OWN view ray `r = ((u - cx) / fx, (v - cy) / fy, 1)`,
 /// - `(0, 0, 0)` marks an invalid / unobserved pixel.
+///
+/// **This said `n.z <= 0` until 2026-08-31. Do not restore it.** That is the ray
+/// test only on the optical axis; off-axis the two disagree for every normal with
+/// `|n_z| < sin(off-axis angle)`, which reaches 0.816 at the corner of a 90-degree
+/// cube face. Measured on a shipped prior tree
+/// (`work/osmo_playroom/priors2048_hybrid_da360/normal/f00000_front.png`),
+/// **7.05% of its 4,186,116 valid pixels have `n_z > 0`** while satisfying the ray
+/// form (measured 2026-08-31; 16.3% over that whole 276-face tree) -- so the
+/// old wording declared a correct, in-use prior to be out of contract. Stating the
+/// `n.z` form is exactly the reasoning that produced the orientation defect written
+/// up in `research/normal-orientation-gate-defect.md` and
+/// `research/prior-generator-defect-sweep.md`; the same wording was corrected in
+/// `brush-loss/src/lib.rs` and `brush-train/src/train.rs` and missed here.
 ///
 /// Note the sign convention is *ours*, not the quantization codec's: the codec
 /// is sign-agnostic and `gauss-surf` stores away-from-camera normals. Flipping

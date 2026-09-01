@@ -5670,9 +5670,22 @@ mod plane_feature_tests {
     /// `n = (0, 0, −1)` and `(−2, −3)`, and that is correct, not a port bug.**
     /// `splat_normals` turns the normal to FACE the camera (`n·(mean − cam) < 0`
     /// — see its sign block), the reference points it away. Every consumer on
-    /// our side agrees with our choice: `normals_from_depth` emits `n_z ≤ 0` by
-    /// construction, and the offset follows the normal's sign because
-    /// `d = n·(mean − cam)`. The depth `d/(n·ray)` is invariant to the pair
+    /// our side agrees with our choice: `normals_from_depth` emits
+    /// **camera-facing** normals by construction, and the offset follows the
+    /// normal's sign because `d = n·(mean − cam)`.
+    ///
+    /// This sentence read "`normals_from_depth` emits `n_z ≤ 0` by
+    /// construction" until 2026-08-31. That is FALSE — camera-facing means
+    /// `n·r ≤ 0` against the per-pixel view ray, and 20.6% of the valid pixels
+    /// of a real 2048 px cube face carry a correctly-oriented normal with
+    /// `n_z > 0`. The conclusion here survives (`n·(mean − cam) < 0` is the
+    /// ray form, and it is what `splat_normals` actually tests); only the
+    /// stated reason was wrong, and it is the exact reasoning that would
+    /// justify reintroducing an `n.z` flip. See `normals_from_depth`'s own doc
+    /// comment in `brush-loss` and
+    /// `research/prior-generator-defect-sweep.md`. The two gaussians in THIS
+    /// fixture sit on the optical axis, where the two rules coincide, which is
+    /// why the pinned values below are unaffected. The depth `d/(n·ray)` is invariant to the pair
     /// flipping together, which is why the two conventions produce identical
     /// depth maps. Pinned by value here so that a future half-flip — normal
     /// negated without the offset, or the other way round — cannot pass.
