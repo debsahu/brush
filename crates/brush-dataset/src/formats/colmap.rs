@@ -781,3 +781,109 @@ mod tests {
         assert_vec3_close(eval[1].camera.position, glam::Vec3::ZERO);
     }
 }
+
+/// Which sparse reconstruction a multi-model COLMAP tree trains against.
+///
+/// [`select_colmap_model`] was already deterministic -- it ranks by registered
+/// image count and breaks ties on the path -- but the ranking runs over
+/// `files_ending_in`, i.e. over the VFS `HashMap`, so every branch that does
+/// *not* separate the candidates by count is one hash-map iteration away from
+/// being a coin flip. Those branches are what this pins; the count branch is
+/// here as the null model that proves the fixture is wired up.
+#[cfg(all(test, not(target_family = "wasm")))]
+mod model_selection_tests {
+    use super::select_colmap_model;
+    use brush_vfs::BrushVfs;
+    use std::path::{Path, PathBuf};
+
+    /// Each iteration builds a fresh `BrushVfs`, hence a fresh `HashMap` with a
+    /// fresh `RandomState`, so the walk order genuinely differs run to run. A
+    /// single selection would pass by luck about half the time; at 40 an
+    /// order-dependent one survives with probability about `2^-39`.
+    const SELECT_RUNS: usize = 40;
+
+    /// A minimal text-format model registering `images` images.
+    async fn write_model(dir: &Path, images: usize) {
+        tokio::fs::create_dir_all(dir).await.expect("create dir");
+        tokio::fs::write(dir.join("cameras.txt"), "1 PINHOLE 4 3 4.0 3.0 2.0 1.5\n")
+            .await
+            .expect("write cameras.txt");
+        let mut body = String::new();
+        for i in 0..images {
+            body.push_str(&format!(
+                "{} 1.0 0.0 0.0 0.0 0.0 0.0 0.0 1 img{i}.png\n\n",
+                i + 1
+            ));
+        }
+        tokio::fs::write(dir.join("images.txt"), body)
+            .await
+            .expect("write images.txt");
+    }
+
+    async fn select(root: &Path) -> Option<PathBuf> {
+        let vfs = BrushVfs::from_path(root).await.expect("build vfs");
+        select_colmap_model(&vfs).await
+    }
+
+    /// Null model: with different image counts the count decides, so the
+    /// fixture really is being read and the tie-break tests below are not
+    /// passing for some unrelated reason. `sparse/1` is the lexicographically
+    /// larger path, so this cannot be the tie-break in disguise either.
+    #[tokio::test]
+    async fn the_largest_model_wins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_model(&root.join("sparse/0"), 2).await;
+        write_model(&root.join("sparse/1"), 5).await;
+
+        for _ in 0..SELECT_RUNS {
+            assert_eq!(
+                select(root).await,
+                Some(PathBuf::from("sparse/1/cameras.txt"))
+            );
+        }
+    }
+
+    /// Two disconnected reconstructions that registered the same number of
+    /// images. Nothing but the path separates them, so the smallest path has to
+    /// win every run -- otherwise the scene is a different reconstruction on
+    /// different days.
+    #[tokio::test]
+    async fn an_equal_count_tie_breaks_on_the_path_every_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_model(&root.join("sparse/0"), 3).await;
+        write_model(&root.join("sparse/1"), 3).await;
+
+        for _ in 0..SELECT_RUNS {
+            assert_eq!(
+                select(root).await,
+                Some(PathBuf::from("sparse/0/cameras.txt"))
+            );
+        }
+    }
+
+    /// Neither model can be scored (no `images.txt` to count), so the ranking
+    /// never runs at all and the fallback decides. It must still land on one
+    /// file every run, so the parse error the caller then reports names the
+    /// same model each time.
+    #[tokio::test]
+    async fn an_unreadable_pair_still_falls_back_deterministically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        for model in ["sparse/0", "sparse/1"] {
+            let dir = root.join(model);
+            tokio::fs::create_dir_all(&dir).await.expect("create dir");
+            tokio::fs::write(dir.join("cameras.txt"), "1 PINHOLE 4 3 4.0 3.0 2.0 1.5\n")
+                .await
+                .expect("write cameras.txt");
+        }
+
+        for _ in 0..SELECT_RUNS {
+            assert_eq!(
+                select(root).await,
+                Some(PathBuf::from("sparse/0/cameras.txt"))
+            );
+        }
+    }
+}

@@ -337,15 +337,11 @@ pub(crate) async fn train_stream(
     // size, PCA dim) so the artifact is self-describing.
     #[cfg(not(target_family = "wasm"))]
     let dig_extraction_meta: Option<serde_json::Value> = {
-        let features_dir = &train_stream_config.load_config.features_dir_name;
-        let meta_path = vfs
-            .files_ending_in("meta.json")
-            .find(|p| {
-                p.parent()
-                    .and_then(|d| d.file_name())
-                    .is_some_and(|d| d.eq_ignore_ascii_case(features_dir))
-            })
-            .map(Path::to_path_buf);
+        let meta_path = dig_meta_path(
+            &vfs,
+            &dataset.train,
+            &train_stream_config.load_config.features_dir_name,
+        );
         match meta_path {
             Some(path) => {
                 let mut bytes = vec![];
@@ -912,6 +908,195 @@ mod tests {
         assert_eq!(cameras[0].0, camera.position);
         assert!((cameras[0].1 - camera.focal(glam::uvec2(16, 13)).x).abs() < 1e-6);
     }
+}
+
+/// Which `meta.json` the `DiG` export is stamped with when a tree holds more
+/// than one features directory.
+///
+/// The `.find()` these replaced picked a different one on different runs of the
+/// identical command. Measured on the fixture below, before the fix: 500
+/// lookups returned `dino_features/meta.json` 265 times and
+/// `extra/dino_features/meta.json` 235.
+#[cfg(all(test, not(target_family = "wasm")))]
+mod dig_meta_tests {
+    use super::*;
+    use brush_dataset::{load_features::LoadFeatures, load_image::LoadImage, scene::SceneView};
+    use brush_render::camera::Camera;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    /// Each iteration builds a fresh `BrushVfs`, hence a fresh `HashMap` with a
+    /// fresh `RandomState`, so the walk order genuinely differs run to run --
+    /// that is what the 265/235 split was measured with. A single lookup would
+    /// pass by luck about half the time; at 500 an unfixed selection survives
+    /// with probability around `2^-499`.
+    const ORDER_PROBE_RUNS: usize = 500;
+
+    fn tree() -> Vec<PathBuf> {
+        vec![
+            PathBuf::from("images/frame.png"),
+            PathBuf::from("dino_features/frame.npy"),
+            PathBuf::from("dino_features/meta.json"),
+            PathBuf::from("extra/dino_features/frame.npy"),
+            PathBuf::from("extra/dino_features/meta.json"),
+        ]
+    }
+
+    /// One view whose feature map is `features` (or none at all).
+    fn scene_with_features(vfs: &Arc<BrushVfs>, features: Option<&str>) -> Scene {
+        let camera = Camera::new(
+            glam::Vec3::ZERO,
+            glam::Quat::IDENTITY,
+            std::f64::consts::FRAC_PI_2,
+            std::f64::consts::FRAC_PI_2,
+            glam::Vec2::splat(0.5),
+            CameraModel::Pinhole,
+        );
+        Scene::new(vec![SceneView {
+            image: LoadImage::new(
+                vfs.clone(),
+                "images/frame.png".into(),
+                None,
+                32,
+                None,
+                false,
+            ),
+            camera,
+            features: features.map(|p| LoadFeatures::new(vfs.clone(), PathBuf::from(p))),
+            depth: None,
+            normal: None,
+        }])
+    }
+
+    /// The load-bearing case. The view resolved into `extra/dino_features`, so
+    /// that directory's meta is the one describing this run's features -- even
+    /// though it is the lexicographically *larger* of the two candidates, which
+    /// is also what stops a plain `min` from passing this test.
+    #[test]
+    fn dig_meta_follows_the_features_the_views_loaded() {
+        for _ in 0..ORDER_PROBE_RUNS {
+            let vfs = Arc::new(BrushVfs::create_test_vfs(tree()));
+            let scene = scene_with_features(&vfs, Some("extra/dino_features/frame.npy"));
+            assert_eq!(
+                dig_meta_path(&vfs, &scene, "dino_features"),
+                Some(PathBuf::from("extra/dino_features/meta.json")),
+                "the meta must describe the features actually loaded, every run"
+            );
+        }
+    }
+
+    /// The mirror image, so the test above cannot pass by always returning the
+    /// deeper candidate: point the view at the other directory and the other
+    /// meta must win.
+    #[test]
+    fn dig_meta_follows_the_other_features_directory_too() {
+        for _ in 0..ORDER_PROBE_RUNS {
+            let vfs = Arc::new(BrushVfs::create_test_vfs(tree()));
+            let scene = scene_with_features(&vfs, Some("dino_features/frame.npy"));
+            assert_eq!(
+                dig_meta_path(&vfs, &scene, "dino_features"),
+                Some(PathBuf::from("dino_features/meta.json"))
+            );
+        }
+    }
+
+    /// With no features loaded at all there is nothing to anchor on, so the
+    /// rule degrades to the smallest path -- which still has to be the same
+    /// answer every run.
+    #[test]
+    fn dig_meta_without_features_is_still_deterministic() {
+        for _ in 0..ORDER_PROBE_RUNS {
+            let vfs = Arc::new(BrushVfs::create_test_vfs(tree()));
+            let scene = scene_with_features(&vfs, None);
+            assert_eq!(
+                dig_meta_path(&vfs, &scene, "dino_features"),
+                Some(PathBuf::from("dino_features/meta.json"))
+            );
+        }
+    }
+
+    /// Null model for the three above: a `meta.json` that is not inside a
+    /// features directory is never a candidate, so they are not passing merely
+    /// because some `meta.json` exists.
+    #[test]
+    fn dig_meta_ignores_files_outside_the_features_dir() {
+        let vfs = Arc::new(BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/frame.png"),
+            PathBuf::from("meta.json"),
+            PathBuf::from("other/meta.json"),
+        ]));
+        let scene = scene_with_features(&vfs, None);
+        assert_eq!(dig_meta_path(&vfs, &scene, "dino_features"), None);
+    }
+}
+
+/// The `<...>/<features_dir>` prefix of a resolved feature-map path, i.e. the
+/// features directory that file was found in. `None` if the path does not run
+/// through such a directory at all.
+#[cfg(not(target_family = "wasm"))]
+fn features_root(path: &Path, features_dir: &str) -> Option<PathBuf> {
+    let components: Vec<_> = path.components().collect();
+    let index = components
+        .iter()
+        .position(|c| c.as_os_str().eq_ignore_ascii_case(features_dir))?;
+    Some(components[..=index].iter().copied().collect())
+}
+
+/// The `DiG` feature-extraction `meta.json` describing the features this run
+/// actually trained on -- embedded in the export so the artifact is
+/// self-describing.
+///
+/// `files_ending_in` iterates the VFS `HashMap`, and Rust randomizes hash-map
+/// iteration per process, so the `.find()` this replaced returned a different
+/// file on different runs of the identical command. Measured on the
+/// two-`dino_features` fixture in the tests below: 500 lookups returned
+/// `dino_features/meta.json` 265 times and `extra/dino_features/meta.json` 235.
+/// Nothing errored either way -- both files parse -- so the only symptom was an
+/// export stamped with a model, patch size and PCA dim that need not be the
+/// ones behind its features.
+///
+/// There is real structural information to decide on, and it is *not* depth:
+/// the dataset loader has already resolved a concrete `.npy` per view
+/// ([`brush_dataset::formats`]'s `find_features_path`), so the metadata that
+/// belongs to this run is the one sitting in the features directory those files
+/// actually came from. Candidates are therefore ranked by how many training
+/// views resolved into their directory, ties broken by the smallest path -- the
+/// count-then-smallest-path shape `select_colmap_model` already uses. When no
+/// view carries features at all (`DiG` off, or nothing matched) every count is
+/// zero and the rule degrades to the smallest path, which is still the same
+/// answer every run.
+///
+/// This tie-breaks rather than erroring as `find_prior_path` does. The meta is
+/// optional metadata *about* the export, not supervision the training reads, so
+/// refusing to train because a dataset happens to carry a second copy of a
+/// features tree would be wildly out of proportion -- the same trade
+/// `find_features_path` records for the feature maps themselves.
+#[cfg(not(target_family = "wasm"))]
+fn dig_meta_path(vfs: &BrushVfs, scene: &Scene, features_dir: &str) -> Option<PathBuf> {
+    let view_roots: Vec<PathBuf> = scene
+        .views
+        .iter()
+        .filter_map(|view| features_root(view.features.as_ref()?.path(), features_dir))
+        .collect();
+
+    vfs.files_ending_in("meta.json")
+        .filter(|path| {
+            path.parent()
+                .and_then(Path::file_name)
+                .is_some_and(|dir| dir.eq_ignore_ascii_case(features_dir))
+        })
+        .max_by_key(|path| {
+            let dir = path.parent().expect("filtered on the parent just above");
+            let used = view_roots
+                .iter()
+                .filter(|root| root.as_path() == dir)
+                .count();
+            // `Reverse` makes the lexicographic tie-break run the other way
+            // from the count one. VFS paths are distinct, so this maximum is
+            // unique and does not depend on the order candidates arrived in.
+            (used, std::cmp::Reverse(*path))
+        })
+        .map(Path::to_path_buf)
 }
 
 /// Group training views by camera intrinsics (fov + principal point +

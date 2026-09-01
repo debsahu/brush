@@ -1,6 +1,6 @@
 use super::{
     DatasetFileIndex, DatasetLoadResult, FormatError, find_depth_path, find_normal_path,
-    opengl_c2w_to_pose, split_eval_every,
+    opengl_c2w_to_pose, select_descriptor, split_eval_every,
 };
 use crate::{
     Dataset,
@@ -13,7 +13,7 @@ use brush_render::kernels::camera_model::CameraModel::{Pinhole, RadialTangential
 use brush_render::kernels::camera_model::radial_tangential_8::RadialTangential8Params;
 use brush_vfs::BrushVfs;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
@@ -58,13 +58,41 @@ fn col_f64(fields: &[&str], header: &HashMap<String, usize>, name: &str) -> f64 
         .unwrap_or(0.0)
 }
 
+/// Find the `RealityCapture` camera csv this tree denotes, and load it.
+///
+/// This used to return the *first* csv whose header parsed, over
+/// `files_with_extension("csv")` -- i.e. over the VFS `HashMap`, whose
+/// iteration Rust randomizes per process. On a tree holding two
+/// `RealityCapture` exports that picked a different **dataset** on different
+/// runs of the identical command, silently, because both parse. Measured on the
+/// two-sibling fixture in `descriptor_tests` below: 200 loads of one unchanged
+/// directory returned the 2-view scene 89 times and the 3-view scene 111.
+///
+/// A `RealityCapture` camera csv *is* this format's dataset descriptor, exactly
+/// as `transforms.json` is nerfstudio's, so it gets the same rule and the same
+/// code: [`select_descriptor`] -- the shallowest candidate wins, because a
+/// descriptor at the top of the tree the user pointed brush at is that tree's
+/// dataset and anything deeper is contained within it; a tie at the shallowest
+/// depth refuses and names every candidate, because two sibling exports are two
+/// genuinely different scenes and either pick may be flatly wrong.
+///
+/// Unlike nerfstudio's, these candidates cannot be recognized by name: the
+/// column set is a user-customizable template and so is the file name, so
+/// membership is decided by parsing the header. Every csv is therefore read
+/// before the choice is made, rather than stopping at the first hit -- the
+/// contents are kept so the winner is not read twice, and only header-matching
+/// files (small pose tables) are retained.
 pub async fn read_dataset(
     vfs: Arc<BrushVfs>,
     load_args: &LoadDatasetConfig,
 ) -> Option<Result<DatasetLoadResult, FormatError>> {
-    let csv_paths: Vec<_> = vfs.files_with_extension("csv").collect();
+    // Sorted before anything reads them, so the scan order -- and any log or
+    // error it produces -- does not depend on the VFS walk.
+    let mut csv_paths: Vec<_> = vfs.files_with_extension("csv").collect();
+    csv_paths.sort();
 
-    // Find a csv whose header looks like the RealityCapture camera format.
+    // Every csv whose header is the RealityCapture camera template.
+    let mut candidates: Vec<(PathBuf, String)> = Vec::new();
     for path in csv_paths {
         let Ok(mut reader) = vfs.reader_at_path(&path).await else {
             continue;
@@ -77,12 +105,27 @@ pub async fn read_dataset(
             continue;
         };
         if parse_header(first_line).is_some() {
-            log::info!("Loading RealityCapture dataset from {path:?}");
-            return Some(read_dataset_inner(vfs, load_args, buf).await);
+            candidates.push((path, buf));
         }
     }
 
-    None
+    let chosen = match select_descriptor(
+        candidates.iter().map(|(path, _)| path.clone()).collect(),
+        "RealityCapture camera csv files",
+    ) {
+        Ok(Some(path)) => path,
+        Ok(None) => return None,
+        Err(err) => return Some(Err(err)),
+    };
+
+    let contents = candidates
+        .into_iter()
+        .find(|(path, _)| *path == chosen)
+        .map(|(_, buf)| buf)
+        .expect("the chosen csv came from the candidate list");
+
+    log::info!("Loading RealityCapture dataset from {chosen:?}");
+    Some(read_dataset_inner(vfs, load_args, contents).await)
 }
 
 async fn read_dataset_inner(
@@ -415,5 +458,158 @@ mod prior_tests {
         assert!(views[0].normal.is_none());
         assert!(views[0].features.is_none());
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+}
+
+/// Which `RealityCapture` csv a tree with more than one of them loads.
+///
+/// The selection used to be the first csv whose header parsed, over
+/// `files_with_extension("csv")` -- i.e. over a `HashMap` -- so it picked a
+/// different dataset on different runs of the identical command. Measured on
+/// the two-sibling fixture below, before the fix: 200 loads of one unchanged
+/// directory returned the 2-view scene 89 times and the 3-view scene 111.
+/// Nothing errored either way -- both csvs are valid `RealityCapture` exports --
+/// so the only symptom was a scene that trained correctly one day and
+/// incorrectly the next. Same bug, same fix and same fixture shape as
+/// `nerfstudio::descriptor_tests`.
+///
+/// These need a real on-disk tree, so they are native-only.
+#[cfg(all(test, not(target_family = "wasm")))]
+mod descriptor_tests {
+    use crate::formats::prior_test_support::test_config;
+    use crate::formats::{DatasetError, DatasetLoadResult, FormatError, load_dataset};
+    use brush_vfs::BrushVfs;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// Each iteration builds a fresh `BrushVfs`, hence a fresh `HashMap` with a
+    /// fresh `RandomState`, so the walk order genuinely differs run to run --
+    /// that is what the 89/111 split above was measured with. A single load
+    /// would pass by luck about half the time; at 40 an unfixed selection
+    /// survives with probability about `2^-39`.
+    const LOAD_RUNS: usize = 40;
+
+    /// A minimal `RealityCapture` dataset whose frame count and image names
+    /// identify which directory it came from.
+    async fn write_ds(dir: &Path, name: &str, frames: usize) {
+        tokio::fs::create_dir_all(dir).await.expect("create dir");
+        let mut csv = String::from("#name,x,y,alt,heading,pitch,roll,f\n");
+        for i in 0..frames {
+            csv.push_str(&format!("{name}_{i}.png,1,2,3,10,20,30,20.0\n"));
+        }
+        tokio::fs::write(dir.join("cameras.csv"), csv)
+            .await
+            .expect("write csv");
+
+        let images = dir.join("images");
+        tokio::fs::create_dir_all(&images)
+            .await
+            .expect("create images dir");
+        for i in 0..frames {
+            image::RgbImage::from_pixel(4, 3, image::Rgb([10, 20, 30]))
+                .save(images.join(format!("{name}_{i}.png")))
+                .expect("write image");
+        }
+    }
+
+    async fn try_load(dir: &Path) -> Result<DatasetLoadResult, DatasetError> {
+        let vfs = Arc::new(BrushVfs::from_path(dir).await.expect("build vfs"));
+        load_dataset(vfs, &test_config()).await
+    }
+
+    /// A one-line description of whichever dataset got loaded.
+    async fn load_identity(dir: &Path) -> String {
+        let result = try_load(dir).await.expect("dataset must load");
+        let mut names: Vec<String> = result
+            .dataset
+            .train
+            .views
+            .iter()
+            .map(|view| view.image.path().display().to_string())
+            .collect();
+        names.sort();
+        names.join(",")
+    }
+
+    /// Two sibling exports. Nothing distinguishes them, so the load must refuse
+    /// and name both, rather than train one of them at random.
+    #[tokio::test]
+    async fn sibling_csvs_are_fatal_and_name_every_candidate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_ds(&root.join("a"), "alpha", 2).await;
+
+        // Null model: one of the two, alone, loads fine. Without this the test
+        // below would also pass if the tree were broken for some other reason.
+        assert_eq!(
+            load_identity(root).await,
+            "a/images/alpha_0.png,a/images/alpha_1.png",
+            "a single nested dataset must still load"
+        );
+
+        write_ds(&root.join("b"), "beta", 3).await;
+
+        // The refusal, and its wording, must be the same every run -- an error
+        // chosen by iteration order would be no better than a dataset chosen
+        // that way.
+        let mut messages = std::collections::BTreeSet::new();
+        for _ in 0..LOAD_RUNS {
+            let Err(err) = try_load(root).await else {
+                panic!("two sibling RealityCapture exports must be fatal");
+            };
+            let DatasetError::FormatError(FormatError::AmbiguousDataset(message)) = err else {
+                panic!("expected AmbiguousDataset, got {err:?}");
+            };
+            messages.insert(message);
+        }
+        assert_eq!(messages.len(), 1, "the message must not vary: {messages:?}");
+
+        let message = messages.iter().next().expect("one message");
+        assert!(
+            message.contains("a/cameras.csv") && message.contains("b/cameras.csv"),
+            "the message must name every candidate: {message}"
+        );
+    }
+
+    /// An export at the root of the tree with another buried in a
+    /// subdirectory -- a reprocess, or a backup inside a larger archive. Depth
+    /// decides, so this keeps loading, and always the same one.
+    #[tokio::test]
+    async fn the_root_csv_beats_a_nested_one_every_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_ds(root, "root", 2).await;
+        write_ds(&root.join("backup"), "old", 3).await;
+
+        let mut loaded = std::collections::BTreeSet::new();
+        for _ in 0..LOAD_RUNS {
+            loaded.insert(load_identity(root).await);
+        }
+        assert_eq!(
+            loaded.into_iter().collect::<Vec<_>>(),
+            vec!["images/root_0.png,images/root_1.png".to_owned()],
+            "the shallowest export must win, every run"
+        );
+    }
+
+    /// A csv that is not a `RealityCapture` camera export is not a candidate at
+    /// all -- so a stray spreadsheet next to the real export can neither be
+    /// chosen nor make the load ambiguous. Null model for the header filter the
+    /// two tests above depend on.
+    #[tokio::test]
+    async fn a_csv_that_is_not_a_camera_export_is_never_a_candidate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_ds(root, "root", 2).await;
+        tokio::fs::write(root.join("notes.csv"), "a,b,c\n1,2,3\n")
+            .await
+            .expect("write csv");
+
+        for _ in 0..LOAD_RUNS {
+            assert_eq!(
+                load_identity(root).await,
+                "images/root_0.png,images/root_1.png"
+            );
+        }
     }
 }

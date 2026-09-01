@@ -399,14 +399,17 @@ pub async fn read_dataset(
         // `transforms_train.json` -- but an ambiguous `transforms.json` is an
         // error, never a quiet fall-through to the train file.
         let named = |name: &str| vfs.files_ending_in(name).map(Path::to_path_buf).collect();
-        let chosen = match select_descriptor(named("transforms.json"), "transforms.json") {
+        let describe = |name: &str| format!("files named '{name}'");
+        let chosen = match select_descriptor(named("transforms.json"), &describe("transforms.json"))
+        {
             Ok(Some(path)) => Some(path),
-            Ok(None) => {
-                match select_descriptor(named("transforms_train.json"), "transforms_train.json") {
-                    Ok(path) => path,
-                    Err(err) => return Some(Err(err)),
-                }
-            }
+            Ok(None) => match select_descriptor(
+                named("transforms_train.json"),
+                &describe("transforms_train.json"),
+            ) {
+                Ok(path) => path,
+                Err(err) => return Some(Err(err)),
+            },
             Err(err) => return Some(Err(err)),
         };
         chosen?
@@ -449,7 +452,7 @@ async fn read_dataset_inner(
             .filter(|path| path.ends_with(name))
             .cloned()
             .collect();
-        select_descriptor(candidates, name)
+        select_descriptor(candidates, &format!("files named '{name}'"))
     };
     let eval_trans_path = match pick("transforms_val.json")? {
         Some(path) => Some(path),

@@ -174,10 +174,7 @@ mod native {
         let vfs = BrushVfs::from_path(&args.ply)
             .await
             .with_context(|| format!("failed to mount checkpoint {}", args.ply.display()))?;
-        let path = vfs
-            .file_paths()
-            .next()
-            .context("checkpoint VFS contained no files")?;
+        let path = brush_bench_test::checkpoint::select_checkpoint_ply(&vfs)?;
         let reader = vfs
             .reader_at_path(&path)
             .await

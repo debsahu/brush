@@ -97,15 +97,9 @@ pub async fn load_dataset(
     }
 
     // If there's an initial ply file, override the init stream with that.
-    let mut ply_paths: Vec<_> = vfs.files_with_extension("ply").collect();
-    ply_paths.sort();
+    let main_ply = select_init_ply(vfs.files_with_extension("ply").collect());
 
-    let main_ply = ply_paths
-        .iter()
-        .find(|p| p.file_name().is_some_and(|n| n == "init.ply"))
-        .or_else(|| ply_paths.last());
-
-    let init_splat = if let Some(main_ply) = main_ply {
+    let init_splat = if let Some(main_ply) = main_ply.as_ref() {
         log::info!("Using ply {main_ply:?} as initial point cloud.");
         let reader = vfs
             .reader_at_path(main_ply)
@@ -499,7 +493,45 @@ pub(crate) fn find_features_path<'a>(
         .map(|(_, candidate)| candidate)
 }
 
+/// Pick the ply that overrides a loaded dataset's initial point cloud.
+///
+/// Already deterministic before this was a function -- the caller sorted first
+/// -- and extracted only so the precedence can be stated and pinned, because
+/// the seed cloud is the single largest lever on a trained result and nothing
+/// else would catch a change to which one is chosen. The rule, measured and
+/// pinned by `test_init_ply_precedence_is_pinned`:
+///
+/// * a file **named `init.ply`** wins over any other ply, at any depth, and the
+///   lexicographically smallest one wins if there are several;
+/// * failing that, the lexicographically **largest** ply of all wins -- note
+///   the direction, which is the opposite of every other tie-break in this
+///   module and falls out of the original `ply_paths.last()`.
+///
+/// Neither is obviously the right precedence, but both are stable and datasets
+/// have been trained against them, so they are documented and tested rather
+/// than changed.
+fn select_init_ply(mut ply_paths: Vec<PathBuf>) -> Option<PathBuf> {
+    // Sorted, because the VFS hands these over in hash-map order and both
+    // branches below read a specific end of the list.
+    ply_paths.sort();
+    ply_paths
+        .iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "init.ply"))
+        .or_else(|| ply_paths.last())
+        .cloned()
+}
+
 /// Locate the `points3d.{txt,bin}` belonging to the chosen reconstruction.
+///
+/// Deterministic without a tie-break, and worth recording why, since the
+/// surrounding `.find()`-over-the-VFS shape is exactly the one this module has
+/// twice had to repair. `files_ending_in` anchors on a path separator
+/// (`PathKey::from_str` prefixes the needle with `/`), so it matches only files
+/// *named* `points3d.txt` -- never `mypoints3d.txt` -- and a directory holds at
+/// most one file of a given name, so the `parent() == points_dir` filter admits
+/// at most one candidate per extension. `chain` then fixes the precedence
+/// between the two extensions: `.txt` outranks `.bin`. Pinned by
+/// `test_points3d_selection_is_deterministic`.
 fn find_points3d_path<'a>(vfs: &'a BrushVfs, points_dir: &'a Path) -> Option<(&'a Path, bool)> {
     let path = vfs
         .files_ending_in("points3d.txt")
@@ -541,9 +573,15 @@ fn find_points3d_path<'a>(vfs: &'a BrushVfs, points_dir: &'a Path) -> Option<(&'
 /// Returns `Ok(None)` for an empty candidate list, which callers must keep
 /// distinct from an error: "no nerfstudio descriptor here" has to fall through
 /// to the next format, while "several, and I will not guess" must not.
+///
+/// `description` names the candidate class in the error, as a plural noun
+/// phrase -- `"files named 'transforms.json'"`, `"RealityCapture camera csv
+/// files"`. The candidates are not always files of one name: `RealityCapture`'s
+/// csv template is user-named and is recognized by its header, so it is
+/// described by what it is rather than by what it is called.
 fn select_descriptor(
     mut candidates: Vec<PathBuf>,
-    file_name: &str,
+    description: &str,
 ) -> Result<Option<PathBuf>, FormatError> {
     // Sorted so both the choice and the error message are stable whatever order
     // the VFS walked in.
@@ -568,7 +606,7 @@ fn select_descriptor(
             .join(", ")
     };
     let mut message = format!(
-        "{} files named '{file_name}' sit at the same depth in this dataset and nothing \
+        "{} {description} sit at the same depth in this dataset and nothing \
          distinguishes them: {}. Brush used to pick one by hash-map iteration order, which \
          differs between runs of the identical command -- so the scene would train against one \
          of them today and the other tomorrow, with nothing changed. Point brush at the single \
@@ -947,6 +985,48 @@ mod tests {
         );
     }
 
+    /// [`DatasetFileIndex`] is built by walking the VFS `HashMap`, so it is the
+    /// one structure here that sees the randomized order for *every* file
+    /// rather than for one lookup. It is order-independent by construction --
+    /// both accumulators keep a minimum, and `ambiguity_warnings` sorts before
+    /// formatting -- but this is the index that resolves every training image,
+    /// and a depth map returned as the image it belongs to is what cost this
+    /// project a 3.5-hour training run, so the property is probed rather than
+    /// argued. Both the resolved image *and* the exact warning text must be
+    /// identical across fresh instances.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_index_build_is_order_independent() {
+        let mut resolved = std::collections::BTreeSet::new();
+        let mut warnings = std::collections::BTreeSet::new();
+        for _ in 0..ORDER_PROBE_RUNS {
+            let vfs = BrushVfs::create_test_vfs(vec![
+                PathBuf::from("images/frame.png"),
+                PathBuf::from("images_2/frame.png"),
+                PathBuf::from("images_4/frame.png"),
+                PathBuf::from("depth/frame.tiff"),
+                PathBuf::from("masks/frame.png"),
+                PathBuf::from("masks/sub/frame.png"),
+            ]);
+            let index = DatasetFileIndex::new(&vfs);
+            resolved.insert(format!(
+                "{:?}|{:?}",
+                index.find_image_by_name("frame.png"),
+                index.find_mask_path(Path::new("images/frame.png")),
+            ));
+            warnings.insert(index.ambiguity_warnings().join("\n"));
+        }
+        assert_eq!(
+            resolved.into_iter().collect::<Vec<_>>(),
+            vec!["Some(\"images/frame.png\")|Some(\"masks/frame.png\")".to_owned()],
+            "resolution must not depend on the VFS walk order"
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the aggregated warning must be byte-identical every run: {warnings:?}"
+        );
+    }
+
     /// Excluding sidecars must not cost the legitimate lookups: a
     /// directory-prefixed COLMAP name, the bare-name shortcut, and both
     /// sidecars of that same image all still resolve.
@@ -1093,8 +1173,113 @@ mod tests {
         }
     }
 
+    /// [`find_points3d_path`] was already deterministic; this pins *what* it
+    /// decides, because the doc comment now claims it and nothing else would
+    /// catch a change. The fixture is deliberately ambiguous in every way the
+    /// function could plausibly be confused by: a second reconstruction
+    /// directory, both extensions present in the chosen one, and a file whose
+    /// name merely *ends* with the needle.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_points3d_selection_is_deterministic() {
+        for _ in 0..ORDER_PROBE_RUNS {
+            let vfs = BrushVfs::create_test_vfs(vec![
+                PathBuf::from("sparse/0/cameras.txt"),
+                PathBuf::from("sparse/0/points3D.txt"),
+                PathBuf::from("sparse/0/points3D.bin"),
+                PathBuf::from("sparse/0/my_points3D.txt"),
+                PathBuf::from("sparse/1/cameras.txt"),
+                PathBuf::from("sparse/1/points3D.txt"),
+            ]);
+
+            // `.txt` outranks `.bin` in the chosen directory, and a file that
+            // only ends with the needle is not a match at all.
+            assert_eq!(
+                find_points3d_path(&vfs, Path::new("sparse/0")),
+                Some((Path::new("sparse/0/points3D.txt"), false))
+            );
+
+            // The other reconstruction is never reachable from this one.
+            assert_eq!(
+                find_points3d_path(&vfs, Path::new("sparse/1")),
+                Some((Path::new("sparse/1/points3D.txt"), false))
+            );
+        }
+
+        // With only the binary present, the binary is used -- the null model
+        // for the extension precedence above.
+        for _ in 0..ORDER_PROBE_RUNS {
+            let vfs = BrushVfs::create_test_vfs(vec![
+                PathBuf::from("sparse/0/cameras.bin"),
+                PathBuf::from("sparse/0/points3D.bin"),
+                PathBuf::from("sparse/1/points3D.txt"),
+            ]);
+            assert_eq!(
+                find_points3d_path(&vfs, Path::new("sparse/0")),
+                Some((Path::new("sparse/0/points3D.bin"), true))
+            );
+        }
+    }
+
+    /// [`find_image_by_name`] was already deterministic (it takes the
+    /// lexicographic minimum); this pins that, over a tree where several files
+    /// share the bare name COLMAP stores.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_find_image_by_name_is_order_independent() {
+        for _ in 0..ORDER_PROBE_RUNS {
+            let vfs = BrushVfs::create_test_vfs(vec![
+                PathBuf::from("images/frame.png"),
+                PathBuf::from("images_2/frame.png"),
+                PathBuf::from("images_4/frame.png"),
+                PathBuf::from("depth/frame.png"),
+            ]);
+            assert_eq!(
+                find_image_by_name(&vfs, "frame.png"),
+                Some(Path::new("images/frame.png")),
+                "the smallest non-sidecar path must win, every run"
+            );
+        }
+    }
+
+    /// [`select_init_ply`] was already deterministic (the caller sorted before
+    /// this was a function); this pins the precedence, which decides the seed
+    /// point cloud and so has more effect on a trained result than any flag.
+    /// Both directions fall out of the original `find(init.ply).or(last())`,
+    /// and they disagree with each other -- one takes the smallest match, the
+    /// other the largest -- so neither is safe to assume.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn test_init_ply_precedence_is_pinned() {
+        let init_wins = ["z/other.ply", "a/init.ply", "b/init.ply"];
+        let no_init = ["b/cloud.ply", "a/cloud.ply", "z/cloud.ply"];
+
+        for (paths, expected) in [
+            // A file named init.ply beats any other ply, and the smallest such
+            // file wins when there are several.
+            (init_wins.as_slice(), Some("a/init.ply")),
+            // Without one, the LARGEST ply of all wins -- the opposite
+            // direction from every other tie-break in this module.
+            (no_init.as_slice(), Some("z/cloud.ply")),
+            (&[], None),
+        ] {
+            // Every rotation and its reverse: enough to catch any rule that
+            // reads the first or last element rather than comparing them.
+            for rotation in 0..paths.len().max(1) {
+                let mut permuted: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+                permuted.rotate_left(rotation);
+                assert_eq!(
+                    select_init_ply(permuted.clone()),
+                    expected.map(PathBuf::from)
+                );
+                permuted.reverse();
+                assert_eq!(select_init_ply(permuted), expected.map(PathBuf::from));
+            }
+        }
+    }
+
     fn descriptor(paths: &[&str]) -> Result<Option<PathBuf>, FormatError> {
-        select_descriptor(paths.iter().map(PathBuf::from).collect(), "transforms.json")
+        select_descriptor(
+            paths.iter().map(PathBuf::from).collect(),
+            "files named 'transforms.json'",
+        )
     }
 
     #[wasm_bindgen_test(unsupported = test)]
