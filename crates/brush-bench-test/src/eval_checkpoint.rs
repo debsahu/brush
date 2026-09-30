@@ -152,7 +152,7 @@ mod native {
         let args = Args::parse();
         validate_args(&args)?;
 
-        let device = Device::from(brush_process::burn_init_setup().await);
+        let device = brush_process::burn_init_setup().await;
         let checkpoint = load_checkpoint(&args.ply, &device).await?;
         let splat_count = checkpoint.num_splats();
 
@@ -170,6 +170,7 @@ mod native {
             alpha_mode: Some(args.alpha_mode),
             train_on_eval: false,
             estimate_metric_scale: false,
+            units_per_meter: 1.0,
             invert_masks: false,
             // Evaluation loads each held-out view exactly once; retain the
             // conventional native budget for loader/config parity.

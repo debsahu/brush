@@ -92,7 +92,7 @@ impl ImportanceOptimizer {
             let adam = self.adam.clone();
             let state = &mut self.state;
             module.omega = module.omega.map(|t| {
-                let stepped = adam.step(lr, t.inner(), &grad, state);
+                let stepped = adam.step(lr, t.inner(), &grad, None, state);
                 Tensor::from_inner(stepped).require_grad()
             });
         }
@@ -441,14 +441,14 @@ impl TidiState {
             t.into_data_async()
                 .await
                 .expect("tidi readback")
-                .into_vec()
+                .try_into_vec()
                 .expect("f32")
         }
         async fn host2(t: Tensor<2>) -> Vec<f32> {
             t.into_data_async()
                 .await
                 .expect("tidi readback")
-                .into_vec()
+                .try_into_vec()
                 .expect("f32")
         }
 
@@ -460,7 +460,7 @@ impl TidiState {
             .into_data_async()
             .await
             .expect("tidi birth readback")
-            .into_vec()
+            .try_into_vec()
             .expect("i32");
         let age: Vec<i32> = birth.iter().map(|&b| cur_iter as i32 - b).collect();
 
@@ -1220,7 +1220,7 @@ pub async fn extract_planes_from_cloud(cloud_means: Tensor<2>, seed: u64) -> Opt
         .into_data_async()
         .await
         .ok()?
-        .into_vec()
+        .try_into_vec()
         .ok()?;
     Some(extract_planes(&host, seed))
 }
@@ -1488,7 +1488,7 @@ impl CloudDistanceGrid {
             .into_data_async()
             .await
             .ok()?
-            .into_vec()
+            .try_into_vec()
             .ok()?;
         let data = build_distance_field(&host, margin, softness, planes)?;
         let num = data.field.len();
@@ -3032,7 +3032,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("vis_accum readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
         assert_eq!(
             got,
@@ -3096,7 +3096,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("valid_accum readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
         let floating: Vec<f32> = tidi
             .float_accum
@@ -3104,7 +3104,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("float_accum readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
 
         assert_eq!(
@@ -3169,7 +3169,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("grad readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
 
         // Far-from-cloud Gaussian: penalized, so a clearly POSITIVE gradient
@@ -3230,7 +3230,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("grad readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
 
         // A floater at this opacity would get ~0.25; the surface splat's grad must
@@ -3372,7 +3372,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("grad readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
 
         // The loss must stay finite (no NaN poison) and the divergent row must be
@@ -3444,7 +3444,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("grad readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
         // G0 z-gradient positive (pull onto the plane); G1 z-gradient ~0.
         assert!(
@@ -3464,7 +3464,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("grad readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
         // The flatten term penalizes the normal-aligned (z) scale axis of the
         // assigned Gaussian — a nonzero, POSITIVE gradient there (shrinks it).
@@ -3555,7 +3555,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("loss readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
         assert!(
             lv.iter().all(|v| v.is_finite()),
@@ -3569,7 +3569,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("grad readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
         let gs: Vec<f32> = scales
             .grad(&grads)
@@ -3577,7 +3577,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("grad readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
         assert!(
             gm.iter().all(|v| v.is_finite()),
@@ -3633,7 +3633,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("distance readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
         assert!(
             dists[0] <= dist,
@@ -3678,7 +3678,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("distance readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
         assert!(
             d1[0] <= dist,
@@ -3695,7 +3695,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("distance readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
         assert!(
             d2[0] > dist,
@@ -3713,7 +3713,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("distance readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
         assert!(
             dn[0] > dist,
@@ -3770,7 +3770,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("distance readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
         assert!(
             dists.iter().all(|&d| d > dist),
@@ -3825,7 +3825,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("distance readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32");
         assert!(
             dists[0] > dist,
@@ -3854,7 +3854,7 @@ mod device_tests {
             t.into_data_async()
                 .await
                 .expect("readback")
-                .into_vec::<f32>()
+                .try_into_vec::<f32>()
                 .expect("f32")[0]
         }
         // Threshold above both scales: nothing gated, loss exactly 0.
@@ -3883,7 +3883,7 @@ mod device_tests {
             .into_data_async()
             .await
             .expect("readback")
-            .into_vec::<f32>()
+            .try_into_vec::<f32>()
             .expect("f32")[0];
         // mean of (1.0, e^3) = (1 + 20.0855)/2 = 10.5428.
         assert!(

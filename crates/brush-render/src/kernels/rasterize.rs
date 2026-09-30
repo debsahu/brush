@@ -19,10 +19,10 @@
 //! exactly like the depth lane — raw sums, no background term, no alpha
 //! division — because `plane_depth_from_features` consumes the raw sums.
 
-use burn_cubecl::cubecl;
-use burn_cubecl::cubecl::cube;
-use burn_cubecl::cubecl::prelude::*;
-use burn_cubecl::cubecl::std::FastDivmod;
+use burn::cubecl;
+use burn::cubecl::cube;
+use burn::cubecl::prelude::*;
+use burn::cubecl::std::FastDivmod;
 
 use super::helpers::{
     ALPHA_CUTOFF_MID, PLANE_AUX_LANES, PROJECTED_LANES, PROJECTED_LANES_USIZE, alpha_cutoff_weight,

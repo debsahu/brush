@@ -41,12 +41,13 @@ use crate::{
         ALPHA_CUTOFF_BAND, ALPHA_CUTOFF_MID, PLANE_AUX_LANES_USIZE, PROJECTED_LANES_USIZE,
     },
 };
-use brush_cube::{MainBackendBase, Runtime};
+use brush_cube::CubeDevice;
+use brush_cube::MainBackendBase;
 use burn::{
     backend::ops::FloatTensorOps,
     tensor::{DType, TensorData},
 };
-use burn_wgpu::{CubeTensor, WgpuDevice, WgpuRuntime};
+use burn_wgpu::CubeTensor;
 use glam::{UVec2, Vec3};
 use serde_json::Value;
 use wasm_bindgen_test::wasm_bindgen_test;
@@ -60,10 +61,10 @@ const GOLDEN_DEPTH: usize = 3;
 const GOLDEN_PLANE: usize = 4;
 
 fn cube_tensor_f32<const D: usize>(
-    device: &WgpuDevice,
+    device: &CubeDevice,
     shape: [usize; D],
     data: &[f32],
-) -> CubeTensor<WgpuRuntime> {
+) -> CubeTensor {
     let expect: usize = shape.iter().product();
     assert_eq!(
         data.len(),
@@ -71,7 +72,7 @@ fn cube_tensor_f32<const D: usize>(
         "shape {shape:?} vs {} values",
         data.len()
     );
-    let client = WgpuRuntime::client(device);
+    let client = device.client();
     let handle = client.create_from_slice(bytemuck::cast_slice(data));
     CubeTensor::new_contiguous(
         client,
@@ -83,11 +84,11 @@ fn cube_tensor_f32<const D: usize>(
 }
 
 fn cube_tensor_u32<const D: usize>(
-    device: &WgpuDevice,
+    device: &CubeDevice,
     shape: [usize; D],
     data: &[u32],
-) -> CubeTensor<WgpuRuntime> {
-    let client = WgpuRuntime::client(device);
+) -> CubeTensor {
+    let client = device.client();
     let handle = client.create_from_slice(bytemuck::cast_slice(data));
     CubeTensor::new_contiguous(
         client,
@@ -98,7 +99,7 @@ fn cube_tensor_u32<const D: usize>(
     )
 }
 
-async fn read_f32(tensor: CubeTensor<WgpuRuntime>) -> Vec<f32> {
+async fn read_f32(tensor: CubeTensor) -> Vec<f32> {
     let data: TensorData = MainBackendBase::float_into_data(tensor)
         .await
         .expect("readback");
@@ -161,7 +162,7 @@ fn check(case: &str, quantity: &str, splat: usize, actual: f64, expected: f64) -
 /// Every `__mixed_contract` golden case, replayed through `rasterize_bwd`.
 #[wasm_bindgen_test(unsupported = tokio::test)]
 async fn raster_backward_matches_the_independent_vjp_reference() {
-    let device = brush_cube::test_helpers::test_device().await;
+    let device = CubeDevice::Wgpu(brush_cube::test_helpers::test_device().await);
     let golden: Value = serde_json::from_str(include_str!("vjp_golden_vectors.json"))
         .expect("golden vectors must parse");
 

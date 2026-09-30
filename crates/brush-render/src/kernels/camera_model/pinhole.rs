@@ -1,8 +1,8 @@
 use crate::kernels::camera_model::JacobianClampLimits;
 use crate::kernels::types::ProjectUniforms;
 use brush_cube::{Mat2x3, Sym2, Sym3, Vec2, Vec3A};
-use burn_cubecl::cubecl;
-use burn_cubecl::cubecl::prelude::*;
+use burn::cubecl;
+use burn::cubecl::prelude::*;
 use bytemuck::{ByteHash, NoUninit};
 
 #[derive(CubeLaunch, CubeType, Copy, Clone, NoUninit, ByteHash, PartialEq, Debug, Default)]
@@ -16,7 +16,7 @@ pub struct PinholeParams {
 }
 
 impl PinholeParams {
-    pub fn to_launch_object<R: Runtime>(&self) -> PinholeParamsLaunch<R> {
+    pub fn to_launch_object(&self) -> PinholeParamsLaunch {
         PinholeParamsLaunch::new(self.fx, self.fy, self.cx, self.cy)
     }
 }
@@ -70,6 +70,7 @@ pub fn calculate_projection_vjp_pinhole(
         lim_pos_y,
         lim_neg_x,
         lim_neg_y,
+        ..
     } = u.jacobian_clamp_limits;
 
     let mx = mean_c.x();

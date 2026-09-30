@@ -26,23 +26,18 @@ mod ppisp_kernels;
 mod ppisp_math;
 pub mod train_state;
 
-use burn::backend::wgpu::WgpuRuntime;
 use burn::tensor::{DType, Shape};
-use burn_cubecl::{CubeRuntime, fusion::FusionCubeRuntime, tensor::CubeTensor};
+use burn_cubecl::{fusion::FusionCubeRuntime, tensor::CubeTensor};
+use burn_fusion::custom::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
 use burn_fusion::{
-    FusionHandle,
+    ExecutionError, FusionHandle,
     stream::{Operation, StreamId},
 };
-use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
 
 pub(crate) use brush_cube::{AtomicAddF32, CasAtomicAdd, HfAtomicAdd};
 
-pub(crate) fn alloc_zeros<R: CubeRuntime>(
-    template: &CubeTensor<R>,
-    shape: Shape,
-    dtype: DType,
-) -> CubeTensor<R> {
-    burn_cubecl::ops::numeric::zeros_client::<R>(
+pub(crate) fn alloc_zeros(template: &CubeTensor, shape: Shape, dtype: DType) -> CubeTensor {
+    burn_cubecl::ops::numeric::zeros_client(
         template.client.clone(),
         template.device.clone(),
         shape,
@@ -62,19 +57,23 @@ impl<F> std::fmt::Debug for ClosureOp<F> {
     }
 }
 
-impl<F> Operation<FusionCubeRuntime<WgpuRuntime>> for ClosureOp<F>
+impl<F> Operation<FusionCubeRuntime> for ClosureOp<F>
 where
-    F: Fn(&CustomOpIr, &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>)
+    F: Fn(&CustomOpIr, &mut HandleContainer<FusionHandle<FusionCubeRuntime>>)
         + Send
         + Sync
         + 'static,
 {
-    fn execute(&self, h: &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>) {
+    fn execute(
+        &self,
+        h: &mut HandleContainer<FusionHandle<FusionCubeRuntime>>,
+    ) -> Result<(), ExecutionError> {
         (self.op)(&self.desc, h);
+        Ok(())
     }
 }
 
-pub(crate) type FusionTensor = burn_fusion::FusionTensor<FusionCubeRuntime<WgpuRuntime>>;
+pub(crate) type FusionTensor = burn_fusion::FusionTensor<FusionCubeRuntime>;
 
 /// Register a custom op with `N` inputs and `M` outputs on the Fusion
 /// stream. Generalises `brush-loss`'s single-output helper: each output is
@@ -87,7 +86,7 @@ pub(crate) fn dispatch_custom<const N: usize, const M: usize, F>(
     op: F,
 ) -> [FusionTensor; M]
 where
-    F: Fn(&CustomOpIr, &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>)
+    F: Fn(&CustomOpIr, &mut HandleContainer<FusionHandle<FusionCubeRuntime>>)
         + Send
         + Sync
         + 'static,
@@ -107,7 +106,7 @@ where
 }
 
 /// Resolve a possibly-fused float tensor into a contiguous `CubeTensor`.
-pub(crate) fn contiguous<R: CubeRuntime>(t: CubeTensor<R>) -> CubeTensor<R> {
+pub(crate) fn contiguous(t: CubeTensor) -> CubeTensor {
     burn_cubecl::kernel::into_contiguous(t)
 }
 

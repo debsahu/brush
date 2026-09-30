@@ -23,7 +23,7 @@ mod native {
         train::{BOUND_PERCENTILE, SplatTrainer, get_splat_bounds},
     };
     use brush_vfs::BrushVfs;
-    use burn::{module::AutodiffModule, prelude::Device, tensor::Tensor};
+    use burn::{module::Module, prelude::Device, tensor::Tensor};
     use clap::Parser;
 
     #[derive(Debug, Parser)]
@@ -121,6 +121,7 @@ mod native {
             alpha_mode: args.alpha_mode,
             train_on_eval: false,
             estimate_metric_scale: false,
+            units_per_meter: 1.0,
             invert_masks: false,
             // The replay owns its few decoded views directly, so the scene-loader
             // cache is unused. Keep the conventional value for config parity.
@@ -242,7 +243,7 @@ mod native {
 
         // Match the CLI's command batching and GPU memory allocator, then mirror
         // its inner/lift/valid splat lifecycle in `run_steps`.
-        let device = Device::from(brush_process::burn_init_setup().await);
+        let device = brush_process::burn_init_setup().await;
         device.seed(args.seed);
 
         let (batches, view_labels) = load_batches(&args).await?;

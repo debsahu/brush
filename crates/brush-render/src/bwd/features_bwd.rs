@@ -15,29 +15,28 @@ use crate::{
 };
 use brush_cube::{MainBackend, MainBackendBase, calc_cube_count_1d};
 use burn::backend::ops::FloatTensorOps;
+use burn::cubecl::CubeDim;
+use burn::cubecl::features::AtomicUsage;
+use burn::cubecl::ir::{ElemType, FloatKind, Type};
 use burn::{
     backend::{
-        TensorMetadata,
         autodiff::{
             checkpoint::{base::Checkpointer, strategy::NoCheckpointing},
             grads::Gradients,
             ops::{Backward, Ops, OpsKind},
         },
         tensor::{FloatTensor, IntTensor},
-        wgpu::WgpuRuntime,
     },
     tensor::{DType, FloatDType, Shape, Tensor},
 };
-use burn_cubecl::cubecl::CubeDim;
-use burn_cubecl::cubecl::features::AtomicUsage;
-use burn_cubecl::cubecl::ir::{ElemType, FloatKind, Type};
 use burn_cubecl::fusion::FusionCubeRuntime;
 use burn_cubecl::kernel::into_contiguous;
 use burn_fusion::{
-    Fusion, FusionHandle,
-    stream::{Operation, StreamId},
+    ExecutionError, Fusion, FusionHandle,
+    custom::{
+        CustomOpIr, HandleContainer, Operation, OperationIr, OperationOutput, StreamId, TensorIr,
+    },
 };
-use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
 
 use crate::bwd::kernels;
 
@@ -70,7 +69,7 @@ fn rasterize_features_bwd_base(
 
     let hard_floats = client
         .properties()
-        .atomic_type_usage(Type::atomic(Type::scalar(ElemType::Float(FloatKind::F32))))
+        .atomic_type_usage(Type::atomic(Type::new(ElemType::Float(FloatKind::F32))))
         .contains(AtomicUsage::Add);
 
     let uniforms = crate::kernels::types::RasterizeUniformsLaunch::new(
@@ -91,7 +90,7 @@ fn rasterize_features_bwd_base(
         use kernels::rasterize_backwards::{CasAtomicAdd, HfAtomicAdd};
         use kernels::rasterize_features_backwards::rasterize_features_backwards_kernel;
         if hard_floats {
-            rasterize_features_backwards_kernel::launch::<HfAtomicAdd, WgpuRuntime>(
+            rasterize_features_backwards_kernel::launch::<HfAtomicAdd>(
                 &client,
                 cube_count,
                 cube_dim,
@@ -108,7 +107,7 @@ fn rasterize_features_bwd_base(
                 feat_dim,
             );
         } else {
-            rasterize_features_backwards_kernel::launch::<CasAtomicAdd, WgpuRuntime>(
+            rasterize_features_backwards_kernel::launch::<CasAtomicAdd>(
                 &client,
                 cube_count,
                 cube_dim,
@@ -160,102 +159,13 @@ async fn render_features_fusion(
     )
     .await;
 
-    #[derive(Debug)]
-    struct BindOp {
-        desc: CustomOpIr,
-        out_img: FloatTensor<MainBackendBase>,
-        projected_splats: FloatTensor<MainBackendBase>,
-        compact_gid_from_isect: IntTensor<MainBackendBase>,
-        tile_offsets: IntTensor<MainBackendBase>,
-        global_from_compact_gid: IntTensor<MainBackendBase>,
-    }
-
-    impl Operation<FusionCubeRuntime<WgpuRuntime>> for BindOp {
-        fn execute(&self, h: &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>) {
-            let (_, outputs) = self.desc.as_fixed::<0, 5>();
-            let [
-                out_img,
-                projected_splats,
-                compact_gid_from_isect,
-                tile_offsets,
-                global_from_compact_gid,
-            ] = outputs;
-
-            h.register_float_tensor::<MainBackendBase>(&out_img.id, self.out_img.clone());
-            h.register_float_tensor::<MainBackendBase>(
-                &projected_splats.id,
-                self.projected_splats.clone(),
-            );
-            h.register_int_tensor::<MainBackendBase>(
-                &compact_gid_from_isect.id,
-                self.compact_gid_from_isect.clone(),
-            );
-            h.register_int_tensor::<MainBackendBase>(&tile_offsets.id, self.tile_offsets.clone());
-            h.register_int_tensor::<MainBackendBase>(
-                &global_from_compact_gid.id,
-                self.global_from_compact_gid.clone(),
-            );
-        }
-    }
-
-    let out_img_ir = TensorIr::uninit(
-        client.create_empty_handle(),
-        out.out_img.shape(),
-        DType::F32,
-    );
-    let projected_splats_ir = TensorIr::uninit(
-        client.create_empty_handle(),
-        out.projected_splats.shape(),
-        DType::F32,
-    );
-    let compact_gid_from_isect_ir = TensorIr::uninit(
-        client.create_empty_handle(),
-        out.compact_gid_from_isect.shape(),
-        DType::U32,
-    );
-    let tile_offsets_ir = TensorIr::uninit(
-        client.create_empty_handle(),
-        out.tile_offsets.shape(),
-        DType::U32,
-    );
-    let global_from_compact_gid_ir = TensorIr::uninit(
-        client.create_empty_handle(),
-        out.global_from_compact_gid.shape(),
-        DType::U32,
-    );
-
-    let stream = StreamId::current();
-    let desc = CustomOpIr::new(
-        "render_features_bind",
-        &[],
-        &[
-            out_img_ir,
-            projected_splats_ir,
-            compact_gid_from_isect_ir,
-            tile_offsets_ir,
-            global_from_compact_gid_ir,
-        ],
-    );
-    let op = BindOp {
-        desc: desc.clone(),
-        out_img: out.out_img,
-        projected_splats: out.projected_splats,
-        compact_gid_from_isect: out.compact_gid_from_isect,
-        tile_offsets: out.tile_offsets,
-        global_from_compact_gid: out.global_from_compact_gid,
-    };
-
-    let outputs = client
-        .register(stream, OperationIr::Custom(desc), op)
-        .outputs();
-
-    let [
-        out_img,
-        projected_splats,
-        compact_gid_from_isect,
-        tile_offsets,
-        global_from_compact_gid,
-    ] = outputs;
+    // Seed the finished tensors back into the fusion stream (upstream #553).
+    let bind = |t| crate::fusion::bind(&client, t);
+    let out_img = bind(out.out_img);
+    let projected_splats = bind(out.projected_splats);
+    let compact_gid_from_isect = bind(out.compact_gid_from_isect);
+    let tile_offsets = bind(out.tile_offsets);
+    let global_from_compact_gid = bind(out.global_from_compact_gid);
 
     FeatureRenderOutput {
         out_img,
@@ -287,8 +197,11 @@ fn rasterize_features_bwd_fusion(
         feat_dim: usize,
     }
 
-    impl Operation<FusionCubeRuntime<WgpuRuntime>> for CustomOp {
-        fn execute(&self, h: &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>) {
+    impl Operation<FusionCubeRuntime> for CustomOp {
+        fn execute(
+            &self,
+            h: &mut HandleContainer<FusionHandle<FusionCubeRuntime>>,
+        ) -> Result<(), ExecutionError> {
             let (inputs, outputs) = self.desc.as_fixed();
 
             let [
@@ -312,6 +225,7 @@ fn rasterize_features_bwd_fusion(
             );
 
             h.register_float_tensor::<MainBackendBase>(&v_features.id, grads);
+            Ok(())
         }
     }
 
@@ -414,7 +328,7 @@ fn to_inner_float<const D: usize>(t: Tensor<D>) -> FloatTensor<MainBackend> {
         DispatchTensorKind::Autodiff(_)
     );
     if is_ad {
-        unwrap_ad_wgpu_float(t).primitive
+        unwrap_ad_wgpu_float(t).into_primitive()
     } else {
         crate::burn_glue::unwrap_wgpu_float(t)
     }
@@ -432,11 +346,11 @@ pub async fn render_splat_features(
 
     let features_ad = unwrap_ad_wgpu_float(features);
     let prep_nodes = FeaturesBackward
-        .prepare::<NoCheckpointing>([features_ad.node.clone()])
+        .prepare::<NoCheckpointing>([features_ad.node()])
         .compute_bound()
         .stateful();
 
-    let features_inner: FloatTensor<MainBackend> = features_ad.primitive.clone();
+    let features_inner: FloatTensor<MainBackend> = features_ad.primitive().clone();
     let transforms_inner = to_inner_float(transforms);
     let raw_opac_inner = to_inner_float(raw_opacities);
 

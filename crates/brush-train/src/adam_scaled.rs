@@ -202,11 +202,17 @@ impl AdamScaled {
 
     /// One Adam step for a single parameter. `tensor` and `grad` live on the
     /// inner (non-autodiff) backend; `state` is updated in place.
+    ///
+    /// `grad_sq_mean` supplies the reduced second moment when the caller can
+    /// produce it more cheaply than squaring `grad`. It must equal what
+    /// `mean_trailing_dims(grad * grad)` would give, and is only read when
+    /// [`AdamState::reduce_moment_2`] is set.
     pub fn step<const D: usize>(
         &self,
         lr: f64,
         tensor: Tensor<D>,
         grad: &Tensor<D>,
+        grad_sq_mean: Option<Tensor<D>>,
         state: &mut AdamState<D>,
     ) -> Tensor<D> {
         // Native-MSL dense fused SH Adam fast path: a single kernel does the
@@ -266,7 +272,12 @@ impl AdamScaled {
             }
         }
 
-        let (grad, momentum) = self.transform(grad, state.momentum.take(), state.reduce_moment_2);
+        let (grad, momentum) = self.transform(
+            grad,
+            grad_sq_mean,
+            state.momentum.take(),
+            state.reduce_moment_2,
+        );
         state.momentum = Some(momentum);
 
         let delta = if let Some(scale) = &state.scaling {
@@ -280,14 +291,14 @@ impl AdamScaled {
     fn transform<const D: usize>(
         &self,
         grad: &Tensor<D>,
+        grad_sq_mean: Option<Tensor<D>>,
         momentum_state: Option<MomentumState<D>>,
         reduce_moment_2: bool,
     ) -> (Tensor<D>, MomentumState<D>) {
-        let grad_sq = grad.clone().powi_scalar(2);
         let grad_sq_for_moment = if reduce_moment_2 && D > 1 {
-            mean_trailing_dims(grad_sq)
+            grad_sq_mean.unwrap_or_else(|| mean_trailing_dims(grad.clone().powi_scalar(2)))
         } else {
-            grad_sq
+            grad.clone().powi_scalar(2)
         };
 
         let state = if let Some(mut state) = momentum_state {
@@ -339,14 +350,10 @@ impl AdamScaled {
 fn mean_trailing_dims<const D: usize>(t: Tensor<D>) -> Tensor<D> {
     debug_assert!(D > 1, "mean_trailing_dims requires D > 1");
     let shape = t.dims();
-    let n = shape[0];
     let trailing_count: usize = shape[1..].iter().product();
 
-    // Single flatten + sum avoids one kernel launch per trailing dim.
-    let flat: Tensor<2> = t.flatten(1, D - 1);
-    let reduced: Tensor<2> = flat.sum_dim(1) / trailing_count as f32;
-
-    let mut target = [1usize; D];
-    target[0] = n;
-    reduced.reshape(target)
+    // Reduce over the trailing dims directly; a flatten + reshape would end
+    // burn's fusion block.
+    let dims: Vec<usize> = (1..D).collect();
+    t.sum_dims(&dims) / trailing_count as f32
 }

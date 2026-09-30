@@ -17,10 +17,7 @@ mod training_panel;
 mod settings_panel;
 mod settings_popup;
 
-use eframe::egui_wgpu::WgpuConfiguration;
-use std::sync::Arc;
 use wasm_bindgen::prelude::*;
-use wgpu::{Adapter, ExperimentalFeatures, Features};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[wasm_bindgen]
@@ -32,31 +29,6 @@ pub enum UiMode {
     FullScreenSplat,
     // Render as an embedded viewer which does nothing except render the splat.
     EmbeddedViewer,
-}
-
-pub fn create_egui_options() -> WgpuConfiguration {
-    WgpuConfiguration {
-        wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
-            eframe::egui_wgpu::WgpuSetupCreateNew {
-                instance_descriptor: wgpu::InstanceDescriptor::new_without_display_handle(),
-                display_handle: None,
-                native_adapter_selector: None,
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                device_descriptor: Arc::new(|adapter: &Adapter| wgpu::DeviceDescriptor {
-                    label: Some("egui+burn"),
-                    required_features: adapter
-                        .features()
-                        .difference(Features::MAPPABLE_PRIMARY_BUFFERS),
-                    required_limits: adapter.limits(),
-                    memory_hints: wgpu::MemoryHints::MemoryUsage,
-                    trace: wgpu::Trace::Off,
-                    // SAFETY: Passthrough shaders are allowed.
-                    experimental_features: unsafe { ExperimentalFeatures::enabled() },
-                }),
-            },
-        ),
-        ..Default::default()
-    }
 }
 
 pub(crate) fn draw_checkerboard(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {

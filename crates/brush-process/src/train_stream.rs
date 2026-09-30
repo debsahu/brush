@@ -3,7 +3,6 @@ use crate::{
     config::TrainStreamConfig,
     message::{ProcessMessage, TrainMessage},
     slot::SlotSender,
-    wait_for_device,
 };
 use anyhow::Context;
 use brush_dataset::{load_dataset, scene::Scene, scene_loader::SceneLoader};
@@ -19,9 +18,7 @@ use brush_train::{
     train::{BOUND_PERCENTILE, SplatTrainer, get_splat_bounds},
 };
 use brush_vfs::BrushVfs;
-use burn::module::AutodiffModule;
-use burn_cubecl::cubecl::Runtime;
-use burn_wgpu::{AutoCompiler, WgpuRuntime};
+use burn::module::Module;
 use rand::SeedableRng;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
@@ -37,6 +34,7 @@ pub(crate) async fn train_stream(
     train_stream_config: TrainStreamConfig,
     emitter: &Emitter,
     slot: SlotSender<Splats>,
+    device: &crate::ProcessDevice,
 ) -> anyhow::Result<()> {
     log::info!("Start of training stream");
 
@@ -53,12 +51,10 @@ pub(crate) async fn train_stream(
     let process_config = &train_stream_config.process_config;
     log::info!("Using seed {}", process_config.seed);
 
-    let wgpu_device = wait_for_device().await;
-    // Splats live on the inner (non-autodiff) device between steps; each
-    // training step lifts them via [`lift_splats_to_autodiff`] then strips
-    // back via `.valid()`. Going through `Module::train()` would hit
-    // burn-dispatch's `from_inner` checkpointing bug.
-    let device: burn::tensor::Device = wgpu_device.clone().into();
+    // The device is opened by the caller (upstream #526: training owns its own
+    // device, separate from the viewer's). Splats live on the inner
+    // (non-autodiff) device between steps; each training step lifts them via
+    // [`lift_splats_to_autodiff`] then strips back via `.valid()`.
     device.seed(process_config.seed);
     let mut rng = rand::rngs::StdRng::seed_from_u64(process_config.seed);
 
@@ -166,7 +162,7 @@ pub(crate) async fn train_stream(
                 })
                 .await;
         }
-        let splats = to_init_splats(data, render_mode, &device);
+        let splats = to_init_splats(data, render_mode, device);
         (msg.meta.up_axis, splats)
     } else {
         // Default: just use random splats
@@ -184,7 +180,7 @@ pub(crate) async fn train_stream(
             scene_scale,
             &mut rng,
             render_mode,
-            &device,
+            device,
         );
         (None, splats)
     };
@@ -199,7 +195,7 @@ pub(crate) async fn train_stream(
     let view_cams = mip_view_cameras(&dataset.train).await;
     let mut trainer = SplatTrainer::new_seeded(
         &train_stream_config.train_config,
-        &device,
+        device,
         bounds,
         process_config.seed,
     );
@@ -224,9 +220,7 @@ pub(crate) async fn train_stream(
         || cfg.plane_coplanarity_weight > 0.0
         || cfg.cloud_prune
     {
-        trainer
-            .init_plane_priors(init_splats.means(), &device)
-            .await;
+        trainer.init_plane_priors(init_splats.means(), device).await;
         if cfg.cloud_prune {
             if trainer.has_cloud_prune_grid() {
                 log::info!(
@@ -278,14 +272,14 @@ pub(crate) async fn train_stream(
             total_frames: 1,
             num_splats: init_splats.num_splats(),
             sh_degree: init_splats.sh_degree(),
+            scene_scale: bounds.median_size(),
         })
         .await;
 
     emitter.emit(ProcessMessage::DoneLoading).await;
 
     // Start with memory cleared out.
-    let client = WgpuRuntime::<AutoCompiler>::client(&wgpu_device);
-    client.memory_cleanup();
+    device.memory_cleanup();
 
     let mut eval_scene = dataset.eval;
 
@@ -324,7 +318,7 @@ pub(crate) async fn train_stream(
     } else {
         Vec::new()
     };
-    trainer.init_appearance(camera_indices.clone(), process_config.start_iter, &device)?;
+    trainer.init_appearance(camera_indices.clone(), process_config.start_iter, device)?;
     if trainer.has_appearance() {
         let num_cams = camera_indices.iter().copied().max().unwrap_or(0) + 1;
         log::info!(
@@ -435,6 +429,7 @@ pub(crate) async fn train_stream(
                     exp_iter,
                     exp_total,
                     up_axis,
+                    train_stream_config.load_config.units_per_meter,
                 )
                 .await
                 .with_context(|| "Export at LOD boundary failed");
@@ -466,7 +461,7 @@ pub(crate) async fn train_stream(
             };
 
             log::info!("LOD {current_lod}/{lod_levels}: Computing sensitivity scores...");
-            let scores = compute_pup_scores(splats.clone(), &dataset.train, &device).await;
+            let scores = compute_pup_scores(splats.clone(), &dataset.train, device).await;
             splats = decimate_to_count(splats, &scores, target_count).await;
             // Decimation drops the old-N floor. Attach the target
             // LOD floor before publishing the splats or running the first
@@ -478,8 +473,7 @@ pub(crate) async fn train_stream(
             let after = splats.num_splats();
             log::info!("LOD {current_lod}/{lod_levels}: {before} -> {after} splats");
 
-            let client = WgpuRuntime::<AutoCompiler>::client(&wgpu_device);
-            client.memory_cleanup();
+            device.memory_cleanup();
 
             // Only rebuild the loader when the images actually changed size.
             // A rebuild throws away a warm batch cache and re-decodes the
@@ -500,7 +494,7 @@ pub(crate) async fn train_stream(
             let bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
             trainer = SplatTrainer::new_seeded(
                 &train_stream_config.train_config,
-                &device,
+                device,
                 bounds,
                 process_config.seed,
             );
@@ -566,10 +560,7 @@ pub(crate) async fn train_stream(
                 .refine_for_phase(iter, phase_iter, phase_total, splats)
                 .await;
             splats = new_splats;
-            // Trainer only sees the type-erased tensor device. Cleanup must
-            // use the concrete device registered by the host (including
-            // `Existing(n)` integrations), which remains available here.
-            client.memory_cleanup();
+            device.memory_cleanup();
             refine_stats
         } else {
             RefineStats {
@@ -637,7 +628,7 @@ pub(crate) async fn train_stream(
                 .then(|| export_path.clone());
 
             let eval = run_eval(
-                &device,
+                device,
                 emitter,
                 &visualize,
                 &trainer,
@@ -707,6 +698,7 @@ pub(crate) async fn train_stream(
                     exp_iter,
                     exp_total,
                     up_axis,
+                    train_stream_config.load_config.units_per_meter,
                 )
                 .await
                 .with_context(|| format!("Export at iteration {iter} failed"));
@@ -754,10 +746,7 @@ pub(crate) async fn train_stream(
             if rerun_config.rerun_enabled
                 && (iter.is_multiple_of(rerun_config.rerun_log_train_stats_every) || is_last_step)
             {
-                visualize.log_memory(
-                    iter,
-                    &WgpuRuntime::<AutoCompiler>::client(&wgpu_device).memory_usage()?,
-                )?;
+                visualize.log_memory(iter, &device.memory_pool_usage().unwrap_or_default())?;
             }
 
             if refine.num_added > 0 {
@@ -825,6 +814,7 @@ pub(crate) async fn train_stream(
                     total_frames: 1,
                     num_splats: refine.total_splats,
                     sh_degree,
+                    scene_scale: trainer.bounds().median_size(),
                 })
                 .await;
 
@@ -1166,6 +1156,46 @@ fn camera_model_key(model: CameraModel) -> [u32; 9] {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(not(target_family = "wasm"))]
+fn eval_output_path(base: &Path, iter: u32, image_path: &Path) -> anyhow::Result<PathBuf> {
+    let mut relative = PathBuf::new();
+    for component in image_path.components() {
+        match component {
+            std::path::Component::Normal(part) => relative.push(part),
+            std::path::Component::CurDir => {}
+            _ => anyhow::bail!(
+                "Eval image path must be relative and cannot traverse directories: {}",
+                image_path.display()
+            ),
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        anyhow::bail!("Eval image path is empty");
+    }
+    relative.set_extension("png");
+    Ok(base.join(format!("eval_{iter}")).join(relative))
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod eval_path_tests {
+    use super::*;
+
+    #[test]
+    fn eval_paths_are_safe_and_distinct() {
+        let base = Path::new("output");
+        let first = eval_output_path(base, 42, Path::new("images/a/frame.jpg")).unwrap();
+        let second = eval_output_path(base, 42, Path::new("images/b/frame.jpg")).unwrap();
+
+        assert_eq!(first, Path::new("output/eval_42/images/a/frame.png"));
+        assert_eq!(second, Path::new("output/eval_42/images/b/frame.png"));
+        assert_ne!(first, second);
+
+        for invalid in ["../frame.jpg", "/tmp/frame.jpg", "."] {
+            assert!(eval_output_path(base, 1, Path::new(invalid)).is_err());
+        }
+    }
+}
+
 async fn run_eval(
     device: &burn::tensor::Device,
     emitter: &Emitter,
@@ -1233,10 +1263,15 @@ async fn run_eval(
 
         #[cfg(not(target_family = "wasm"))]
         if let Some(path) = &save_path {
-            let img_name = view.image.img_name();
-            let path = path
-                .join(format!("eval_{iter}"))
-                .join(format!("{img_name}.png"));
+            let path = eval_output_path(path, iter, view.image.path())?;
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await.with_context(|| {
+                    format!(
+                        "Failed to create eval output directory {}",
+                        parent.display()
+                    )
+                })?;
+            }
             sample.save_to_disk(&path).await?;
         }
 
@@ -1281,13 +1316,15 @@ async fn export_checkpoint(
     iter: u32,
     total_steps: u32,
     up_axis: Option<glam::Vec3>,
+    units_per_meter: f32,
 ) -> Result<(), anyhow::Error> {
     tokio::fs::create_dir_all(&export_path)
         .await
         .with_context(|| format!("Creating export directory {}", export_path.display()))?;
     let digits = ((total_steps as f64).log10().floor() as usize) + 1;
     let export_name = export_name.replace("{iter}", &format!("{iter:0digits$}"));
-    let splat_data = brush_serde::splat_to_ply(splats, up_axis)
+    // Training runs in metres; write the file back in the dataset's units.
+    let splat_data = brush_serde::splat_to_ply(splats.scaled(units_per_meter), up_axis)
         .await
         .context("Serializing splat data")?;
     tokio::fs::write(export_path.join(&export_name), splat_data)

@@ -22,7 +22,7 @@ use burn::{
     module::{Module, Param},
     tensor::{DType, Device, Shape, Tensor, TensorData},
 };
-use burn_cubecl::{CubeRuntime, tensor::CubeTensor};
+use burn_cubecl::tensor::CubeTensor;
 use burn_fusion::Fusion;
 
 use crate::ppisp_kernels as kernels;
@@ -92,7 +92,7 @@ pub trait PpispOps<B: Backend> {
     ) -> (FloatTensor<B>, FloatTensor<B>);
 }
 
-fn ppisp_dims<R: CubeRuntime>(rgb: &CubeTensor<R>) -> (u32, u32, u32) {
+fn ppisp_dims(rgb: &CubeTensor) -> (u32, u32, u32) {
     let dims = rgb.shape().as_slice().to_vec();
     assert_eq!(dims.len(), 3, "rgb must be [h, w, c]");
     let ch = dims[2] as u32;
@@ -101,16 +101,16 @@ fn ppisp_dims<R: CubeRuntime>(rgb: &CubeTensor<R>) -> (u32, u32, u32) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_fwd<R: CubeRuntime>(
-    exposure: CubeTensor<R>,
-    vignetting: CubeTensor<R>,
-    color: CubeTensor<R>,
-    crf: CubeTensor<R>,
-    rgb: CubeTensor<R>,
+fn launch_fwd(
+    exposure: CubeTensor,
+    vignetting: CubeTensor,
+    color: CubeTensor,
+    crf: CubeTensor,
+    rgb: CubeTensor,
     camera_idx: usize,
     frame_idx: usize,
     stages: PpispStages,
-) -> CubeTensor<R> {
+) -> CubeTensor {
     use burn_cubecl::cubecl::prelude::CubeDim;
 
     let exposure = contiguous(exposure);
@@ -122,7 +122,7 @@ fn launch_fwd<R: CubeRuntime>(
 
     let out = alloc_zeros(&rgb, rgb.shape(), DType::F32);
     let client = rgb.client.clone();
-    kernels::ppisp_fwd_kernel::launch::<R>(
+    kernels::ppisp_fwd_kernel::launch(
         &client,
         // 2D-tiled: a flat `h*w/BLOCK_SIZE` grid blows the 65535-per-dimension
         // dispatch limit above a ~2896px square face. Stays exactly
@@ -149,17 +149,17 @@ fn launch_fwd<R: CubeRuntime>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_bwd<R: CubeRuntime>(
-    exposure: CubeTensor<R>,
-    vignetting: CubeTensor<R>,
-    color: CubeTensor<R>,
-    crf: CubeTensor<R>,
-    rgb: CubeTensor<R>,
-    v_out: CubeTensor<R>,
+fn launch_bwd(
+    exposure: CubeTensor,
+    vignetting: CubeTensor,
+    color: CubeTensor,
+    crf: CubeTensor,
+    rgb: CubeTensor,
+    v_out: CubeTensor,
     camera_idx: usize,
     frame_idx: usize,
     stages: PpispStages,
-) -> (CubeTensor<R>, CubeTensor<R>) {
+) -> (CubeTensor, CubeTensor) {
     use burn_cubecl::cubecl::prelude::CubeDim;
 
     let exposure = contiguous(exposure);
@@ -178,7 +178,7 @@ fn launch_bwd<R: CubeRuntime>(
         DType::F32,
     );
     let client = rgb.client.clone();
-    kernels::ppisp_bwd_kernel::launch::<R>(
+    kernels::ppisp_bwd_kernel::launch(
         &client,
         // Same 2D tiling as the forward. `partials` keeps exactly `num_cubes`
         // rows; the tail cubes the tiling adds skip the write (see kernel).
@@ -493,20 +493,20 @@ pub fn ppisp_apply(
 
     let prep = PpispBackward
         .prepare::<NoCheckpointing>([
-            exp_ad.node.clone(),
-            vig_ad.node.clone(),
-            color_ad.node.clone(),
-            crf_ad.node.clone(),
-            rgb_ad.node.clone(),
+            exp_ad.node(),
+            vig_ad.node(),
+            color_ad.node(),
+            crf_ad.node(),
+            rgb_ad.node(),
         ])
         .compute_bound()
         .stateful();
 
-    let exp_p = exp_ad.primitive;
-    let vig_p = vig_ad.primitive;
-    let color_p = color_ad.primitive;
-    let crf_p = crf_ad.primitive;
-    let rgb_p = rgb_ad.primitive;
+    let exp_p = exp_ad.into_primitive();
+    let vig_p = vig_ad.into_primitive();
+    let color_p = color_ad.into_primitive();
+    let crf_p = crf_ad.into_primitive();
+    let rgb_p = rgb_ad.into_primitive();
 
     let out = <MainBackend as PpispOps<MainBackend>>::ppisp_fwd(
         exp_p.clone(),

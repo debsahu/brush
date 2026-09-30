@@ -76,7 +76,7 @@ impl RefineRecord {
             .into_data_async()
             .await
             .expect("error score readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32 error score");
         crate::edge::normalize_by_positive_median(&mut host);
         Tensor::<1>::from_data(TensorData::new(host, [n]), &device)
@@ -183,7 +183,7 @@ impl RefineRecord {
             .into_data_async()
             .await
             .ok()?
-            .into_vec::<f32>()
+            .try_into_vec::<f32>()
             .ok()?;
         Some(crate::edge::edge_guidance_factor(mean, weight))
     }
@@ -210,7 +210,7 @@ mod tests {
             .into_data_async()
             .await
             .expect("readback")
-            .into_vec::<f32>()
+            .try_into_vec::<f32>()
             .expect("f32 tensor")
     }
 
@@ -283,7 +283,7 @@ mod tests {
             .into_data_async()
             .await
             .expect("readback")
-            .into_vec::<i32>()
+            .try_into_vec::<i32>()
             .expect("i32 tensor")
             .into_iter()
             .map(|v| v != 0)

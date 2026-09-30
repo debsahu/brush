@@ -35,12 +35,13 @@ use crate::{
         ALPHA_CUTOFF_BAND, ALPHA_CUTOFF_MID, PLANE_AUX_LANES_USIZE, PROJECTED_LANES_USIZE,
     },
 };
-use brush_cube::{MainBackendBase, Runtime};
+use brush_cube::CubeDevice;
+use brush_cube::MainBackendBase;
 use burn::{
     backend::ops::FloatTensorOps,
     tensor::{DType, Tensor, TensorData, s},
 };
-use burn_wgpu::{CubeTensor, WgpuDevice, WgpuRuntime};
+use burn_wgpu::CubeTensor;
 use glam::{UVec2, Vec3};
 use wasm_bindgen_test::wasm_bindgen_test;
 
@@ -344,7 +345,7 @@ async fn run_twin(scene: &[TwinSplat], v_out: &[f32]) -> TwinGrads {
             .into_data_async()
             .await
             .expect("forward readback")
-            .into_vec::<f32>()
+            .try_into_vec::<f32>()
             .expect("vec");
         for (p, v) in values.into_iter().enumerate() {
             forward[p * CHANS + c] = v;
@@ -367,7 +368,7 @@ async fn run_twin(scene: &[TwinSplat], v_out: &[f32]) -> TwinGrads {
             .into_data_async()
             .await
             .expect("grad readback")
-            .into_vec::<f32>()
+            .try_into_vec::<f32>()
             .expect("vec")
     }
     place(XY_LANE, to_vec(read(&xy_x)).await);
@@ -388,12 +389,8 @@ async fn run_twin(scene: &[TwinSplat], v_out: &[f32]) -> TwinGrads {
     TwinGrads { rows, forward }
 }
 
-fn cube_f32<const D: usize>(
-    device: &WgpuDevice,
-    shape: [usize; D],
-    data: &[f32],
-) -> CubeTensor<WgpuRuntime> {
-    let client = WgpuRuntime::client(device);
+fn cube_f32<const D: usize>(device: &CubeDevice, shape: [usize; D], data: &[f32]) -> CubeTensor {
+    let client = device.client();
     let handle = client.create_from_slice(bytemuck::cast_slice(data));
     CubeTensor::new_contiguous(
         client,
@@ -404,12 +401,8 @@ fn cube_f32<const D: usize>(
     )
 }
 
-fn cube_u32<const D: usize>(
-    device: &WgpuDevice,
-    shape: [usize; D],
-    data: &[u32],
-) -> CubeTensor<WgpuRuntime> {
-    let client = WgpuRuntime::client(device);
+fn cube_u32<const D: usize>(device: &CubeDevice, shape: [usize; D], data: &[u32]) -> CubeTensor {
+    let client = device.client();
     let handle = client.create_from_slice(bytemuck::cast_slice(data));
     CubeTensor::new_contiguous(
         client,
@@ -420,7 +413,7 @@ fn cube_u32<const D: usize>(
     )
 }
 
-async fn read_f32(tensor: CubeTensor<WgpuRuntime>) -> Vec<f32> {
+async fn read_f32(tensor: CubeTensor) -> Vec<f32> {
     let data: TensorData = MainBackendBase::float_into_data(tensor)
         .await
         .expect("readback");
@@ -463,7 +456,7 @@ async fn check_twin_agreement(opacities: [f32; 3]) {
         );
     }
 
-    let device = brush_cube::test_helpers::test_device().await;
+    let device = CubeDevice::Wgpu(brush_cube::test_helpers::test_device().await);
     let ids: Vec<u32> = (0..n as u32).collect();
     let grads = <MainBackendBase as SplatBwdOps>::rasterize_bwd(
         cube_f32(&device, [IMG_H, IMG_W, CHANS], &oracle),
@@ -572,7 +565,7 @@ async fn plane_lanes_are_inert_without_plane_mode() {
     assert_off_the_discontinuities(&scene);
     let n = scene.len();
     let (projected, plane) = flat_projected(&scene);
-    let device = brush_cube::test_helpers::test_device().await;
+    let device = CubeDevice::Wgpu(brush_cube::test_helpers::test_device().await);
     let img = UVec2::new(IMG_W as u32, IMG_H as u32);
     let ids: Vec<u32> = (0..n as u32).collect();
 

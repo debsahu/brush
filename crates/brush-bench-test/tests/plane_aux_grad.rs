@@ -124,7 +124,7 @@ async fn plane_aux_gradients_match_finite_diff() {
         .into_data_async()
         .await
         .expect("transform readback")
-        .into_vec::<f32>()
+        .try_into_vec::<f32>()
         .unwrap();
     assert_eq!(base_vals.len(), n * 10);
 
@@ -200,7 +200,7 @@ async fn plane_aux_gradients_match_finite_diff() {
         .into_data_async()
         .await
         .expect("readback")
-        .into_vec::<f32>()
+        .try_into_vec::<f32>()
         .unwrap();
 
     // Scales must be EXACTLY untouched — the detached argmin (see `slab`).

@@ -1,8 +1,7 @@
 #![recursion_limit = "256"]
 
-use brush_cube::MainBackend as Wgpu;
+use burn::backend::Backend;
 use burn::backend::tensor::FloatTensor;
-use burn::backend::{Autodiff, Backend};
 use camera::Camera;
 use clap::ValueEnum;
 use glam::Vec3;
@@ -15,6 +14,7 @@ pub mod burn_glue;
 pub mod bwd;
 #[doc(hidden)]
 pub mod dim_check;
+mod fusion;
 #[doc(hidden)]
 pub mod kernels;
 pub mod render_aux;
@@ -41,13 +41,10 @@ pub mod render;
 pub mod render_features;
 pub mod validation;
 
-/// `DispatchTensorKind` variant for the active wgpu backend. burn-dispatch
-/// uses different variant names per backend; brush only ever runs on the
-/// `WebGpu` variant, so this macro hides the variant name from match arms.
-macro_rules! wgpu_kind {
-    ($($t:tt)*) => { ::burn::backend::DispatchTensorKind::Wgpu($($t)*) };
+macro_rules! backend_kind {
+    ($($t:tt)*) => { ::burn::backend::DispatchTensorKind::Cube($($t)*) };
 }
-pub(crate) use wgpu_kind;
+pub(crate) use backend_kind;
 
 /// Trait for the gaussian splatting rendering pipeline.
 ///
@@ -59,15 +56,22 @@ pub(crate) use wgpu_kind;
 /// the `RenderOutput` via its `ExtensionType` derive. Only the non-autodiff
 /// arm is generated: the differentiable path is a hand-rolled `Backward` in
 /// `brush-render-bwd` and never dispatches `render` through `Autodiff`.
-#[burn::backend::backend_extension(Wgpu, Autodiff)]
+#[burn::backend::backend_extension(Cube, Autodiff)]
 pub trait SplatOps: Backend {
     /// Render gaussian splats to an image.
     ///
     /// Full forward pipeline: cull, depth sort, readback, project, rasterize.
     ///
-    /// `refine_weight` is a zero-filled accumulator that catches the per-splat
-    /// refinement weight gradient. Only the `Autodiff` impl reads it; the
-    /// concrete backends ignore it.
+    /// `refine_weight` and `coeffs_grad_sq` are zero-filled accumulators that
+    /// catch per-splat bookkeeping the backward produces: the refinement
+    /// weight gradient, and the mean square of each splat's SH gradient, which
+    /// the optimizer wants reduced and would otherwise square a full
+    /// `[N, coeffs, 3]` tensor to get. Only the `Autodiff` impl writes them;
+    /// the concrete backends ignore both.
+    /// `min_scale` is the per-splat Mip-Splatting scale floor `[N]`, folded
+    /// into scales and opacity inside the projection kernels (and their
+    /// backward). With `has_min_scale` false it is a placeholder the kernels
+    /// never read; [`Splats::min_scale_arg`] builds the pair.
     /// `pass` picks forward-only vs. forward+backward-bookkeeping, and (only
     /// for tests) toggles the C^1 smoothstep around the alpha cutoff.
     #[allow(clippy::too_many_arguments)]
@@ -77,7 +81,10 @@ pub trait SplatOps: Backend {
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
+        min_scale: FloatTensor<Self>,
+        has_min_scale: bool,
         refine_weight: FloatTensor<Self>,
+        coeffs_grad_sq: FloatTensor<Self>,
         render_mode: SplatRenderMode,
         rasterization_mode: RasterizationMode,
         background: Vec3,
@@ -88,7 +95,7 @@ pub trait SplatOps: Backend {
 /// Internal extension used to exercise alternate rasterizer layouts without
 /// changing the stable [`SplatOps`] API.
 #[doc(hidden)]
-#[burn::backend::backend_extension(Wgpu)]
+#[burn::backend::backend_extension(Cube)]
 pub trait SplatRasterizerOps: SplatOps {
     #[allow(clippy::too_many_arguments)]
     fn render_with_rasterizer(
@@ -97,6 +104,8 @@ pub trait SplatRasterizerOps: SplatOps {
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
+        min_scale: FloatTensor<Self>,
+        has_min_scale: bool,
         render_mode: SplatRenderMode,
         rasterization_mode: RasterizationMode,
         background: Vec3,

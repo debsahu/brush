@@ -4,7 +4,7 @@
 //! gradient row to the scalar second moment, then updates the full first
 //! moment and parameter row without materialising intermediate tensors.
 
-use brush_cube::{MainBackend as Wgpu, MainBackendBase, calc_cube_count_1d};
+use brush_cube::{MainBackendBase, calc_cube_count_1d};
 use brush_render::bwd::{COMPACT_GRAD_LANES, RGB_LANE};
 use brush_render::shaders::helpers::ProjectUniforms;
 use burn::{
@@ -13,22 +13,17 @@ use burn::{
         Backend, Dispatch, DispatchTensor, DispatchTensorKind, ExtensionType, TensorMetadata,
         ops::IntTensorOps,
         tensor::{FloatTensor, IntTensor},
-        wgpu::{AutoCompiler, WgpuRuntime},
     },
     tensor::{DType, Int, IntDType, Shape},
 };
 use burn_cubecl::{
-    CubeRuntime,
-    cubecl::{Runtime, features::Plane},
-    fusion::FusionCubeRuntime,
-    kernel::into_contiguous,
-    tensor::CubeTensor,
+    cubecl::features::Plane, fusion::FusionCubeRuntime, kernel::into_contiguous, tensor::CubeTensor,
 };
+use burn_fusion::custom::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
 use burn_fusion::{
-    Fusion, FusionHandle,
+    ExecutionError, Fusion, FusionHandle,
     stream::{Operation, StreamId},
 };
-use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
 
 const PLANE_SIZE: u32 = 32;
 const WORKGROUP_SIZE: u32 = 256;
@@ -74,7 +69,7 @@ pub(crate) struct ShAdamOutput<B: Backend> {
     pub moment_2: FloatTensor<B>,
 }
 
-#[burn::backend::backend_extension(Wgpu)]
+#[burn::backend::backend_extension(Cube)]
 pub(crate) trait ShAdamOps: Backend {
     fn sh_adam(
         param: FloatTensor<Self>,
@@ -188,7 +183,7 @@ fn sh_adam_device_supported<const D: usize>(
     // process-global capability cache could approve an SH path for the wrong
     // device.
     let param = brush_render::burn_glue::unwrap_wgpu_float(param.clone());
-    let client = WgpuRuntime::<AutoCompiler>::client(param.client.device());
+    let client = param.client.device().client();
     let properties = client.properties();
     let features = client.features();
     features.plane.contains(Plane::Ops)
@@ -523,7 +518,7 @@ mod kernel {
     }
 }
 
-fn empty_like<R: CubeRuntime>(template: &CubeTensor<R>) -> CubeTensor<R> {
+fn empty_like(template: &CubeTensor) -> CubeTensor {
     let shape = Shape::from(template.shape().as_slice().to_vec());
     let buffer = template
         .client
@@ -628,7 +623,7 @@ impl ShAdamOps for MainBackendBase {
         // active plane owns one row, its row indices are below N*C*3, its
         // scaling index is below C, and lane zero alone writes moment_2[N].
         unsafe {
-            kernel::sh_adam_kernel::launch_unchecked::<WgpuRuntime>(
+            kernel::sh_adam_kernel::launch_unchecked(
                 &client,
                 workgroups,
                 burn_cubecl::cubecl::CubeDim::new_1d(WORKGROUP_SIZE),
@@ -792,7 +787,7 @@ impl ShAdamOps for MainBackendBase {
         let client = param.client.clone();
         if render.num_visible > 0 {
             tracing::trace_span!("BuildSparseShMap").in_scope(|| {
-                kernel::build_compact_sh_map_kernel::launch::<WgpuRuntime>(
+                kernel::build_compact_sh_map_kernel::launch(
                     &client,
                     calc_cube_count_1d(render.num_visible, WORKGROUP_SIZE),
                     burn_cubecl::cubecl::CubeDim::new_1d(WORKGROUP_SIZE),
@@ -813,7 +808,7 @@ impl ShAdamOps for MainBackendBase {
             // zero sentinel or an in-bounds compact row, and the lane stores
             // cover the complete degree-0..4 SH row exactly once.
             unsafe {
-                kernel::sparse_sh_adam_kernel::launch_unchecked::<WgpuRuntime>(
+                kernel::sparse_sh_adam_kernel::launch_unchecked(
                     &client,
                     calc_cube_count_1d(num_splats, SPLATS_PER_WORKGROUP),
                     burn_cubecl::cubecl::CubeDim::new_1d(WORKGROUP_SIZE),
@@ -856,8 +851,11 @@ struct ShAdamFusionOp {
     config: ShAdamConfig,
 }
 
-impl Operation<FusionCubeRuntime<WgpuRuntime>> for ShAdamFusionOp {
-    fn execute(&self, handles: &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>) {
+impl Operation<FusionCubeRuntime> for ShAdamFusionOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<FusionHandle<FusionCubeRuntime>>,
+    ) -> Result<(), ExecutionError> {
         let ([param, grad, moment_1, moment_2, scaling], [out_param, out_moment_1, out_moment_2]) =
             self.desc.as_fixed();
         let output = <MainBackendBase as ShAdamOps>::sh_adam(
@@ -871,6 +869,7 @@ impl Operation<FusionCubeRuntime<WgpuRuntime>> for ShAdamFusionOp {
         handles.register_float_tensor::<MainBackendBase>(&out_param.id, output.param);
         handles.register_float_tensor::<MainBackendBase>(&out_moment_1.id, output.moment_1);
         handles.register_float_tensor::<MainBackendBase>(&out_moment_2.id, output.moment_2);
+        Ok(())
     }
 }
 
@@ -881,8 +880,11 @@ struct SparseShAdamFusionOp {
     config: ShAdamConfig,
 }
 
-impl Operation<FusionCubeRuntime<WgpuRuntime>> for SparseShAdamFusionOp {
-    fn execute(&self, handles: &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>) {
+impl Operation<FusionCubeRuntime> for SparseShAdamFusionOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<FusionHandle<FusionCubeRuntime>>,
+    ) -> Result<(), ExecutionError> {
         let (
             [
                 param,
@@ -909,6 +911,7 @@ impl Operation<FusionCubeRuntime<WgpuRuntime>> for SparseShAdamFusionOp {
         handles.register_float_tensor::<MainBackendBase>(&out_param.id, output.param);
         handles.register_float_tensor::<MainBackendBase>(&out_moment_1.id, output.moment_1);
         handles.register_float_tensor::<MainBackendBase>(&out_moment_2.id, output.moment_2);
+        Ok(())
     }
 }
 
@@ -1124,42 +1127,42 @@ mod tests {
             .into_data_async()
             .await
             .expect("reference parameter readback")
-            .to_vec()
+            .try_to_vec()
             .expect("reference parameter type");
         let expected_moment_1: Vec<f32> = expected
             .1
             .into_data_async()
             .await
             .expect("reference moment_1 readback")
-            .to_vec()
+            .try_to_vec()
             .expect("reference moment_1 type");
         let expected_moment_2: Vec<f32> = expected
             .2
             .into_data_async()
             .await
             .expect("reference moment_2 readback")
-            .to_vec()
+            .try_to_vec()
             .expect("reference moment_2 type");
         let actual_param: Vec<f32> = actual
             .0
             .into_data_async()
             .await
             .expect("fused parameter readback")
-            .to_vec()
+            .try_to_vec()
             .expect("fused parameter type");
         let actual_moment_1: Vec<f32> = actual
             .1
             .into_data_async()
             .await
             .expect("fused moment_1 readback")
-            .to_vec()
+            .try_to_vec()
             .expect("fused moment_1 type");
         let actual_moment_2: Vec<f32> = actual
             .2
             .into_data_async()
             .await
             .expect("fused moment_2 readback")
-            .to_vec()
+            .try_to_vec()
             .expect("fused moment_2 type");
 
         let case = format!("N={num_splats}, C={coeffs}, time={time}");
@@ -1453,13 +1456,13 @@ mod tests {
                 .into_data_async()
                 .await
                 .expect("sparse output readback")
-                .to_vec()
+                .try_to_vec()
                 .expect("sparse output type");
             let expected: Vec<f32> = expected
                 .into_data_async()
                 .await
                 .expect("dense output readback")
-                .to_vec()
+                .try_to_vec()
                 .expect("dense output type");
             let case = format!("sparse degree {degree}, zero_visible={zero_visible}, {label}");
             // The reference SH row is evaluated on the CPU, where FMA

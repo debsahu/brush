@@ -1,4 +1,4 @@
-use crate::camera::calculate_jacobian_clamp_limits;
+use crate::camera::{calculate_jacobian_clamp_limits, max_render_theta};
 use crate::{
     RenderAuxInner, SplatOps, SplatRasterizerOps,
     camera::Camera,
@@ -10,18 +10,17 @@ use crate::{
     sh::sh_degree_from_coeffs,
     shaders,
 };
-use brush_cube::create_tensor;
-use brush_cube::{MainBackendBase, calc_cube_count_1d};
-use brush_prefix_sum::prefix_sum;
+use brush_cube::{MainBackendBase, create_tensor};
+use brush_scan::prefix_sum;
 use brush_sort::radix_argsort;
 use burn::backend::TensorMetadata;
 use burn::backend::ops::TransactionPrimitive;
 use burn::backend::ops::{FloatTensorOps, IntTensorOps, TransactionOps};
 use burn::backend::tensor::FloatTensor;
+use burn::cubecl::CubeDim;
+use burn::cubecl::calculate_cube_count_elemwise;
 use burn::tensor::{DType, FloatDType, IntDType};
-use burn_cubecl::cubecl::CubeDim;
 use burn_cubecl::kernel::into_contiguous;
-use burn_wgpu::WgpuRuntime;
 use glam::{Vec3, uvec2};
 use kernels::types::RasterizeUniformsLaunch;
 use std::f32::consts::PI;
@@ -54,7 +53,10 @@ impl SplatOps for MainBackendBase {
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
+        min_scale: FloatTensor<Self>,
+        has_min_scale: bool,
         _refine_weight: FloatTensor<Self>,
+        _coeffs_grad_sq: FloatTensor<Self>,
         render_mode: SplatRenderMode,
         raster_mode: crate::gaussian_splats::RasterizationMode,
         background: Vec3,
@@ -66,6 +68,8 @@ impl SplatOps for MainBackendBase {
             transforms,
             sh_coeffs,
             raw_opacities,
+            min_scale,
+            has_min_scale,
             render_mode,
             raster_mode,
             background,
@@ -84,6 +88,8 @@ impl SplatRasterizerOps for MainBackendBase {
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
+        min_scale: FloatTensor<Self>,
+        has_min_scale: bool,
         render_mode: SplatRenderMode,
         raster_mode: crate::gaussian_splats::RasterizationMode,
         background: Vec3,
@@ -96,6 +102,8 @@ impl SplatRasterizerOps for MainBackendBase {
             transforms,
             sh_coeffs,
             raw_opacities,
+            min_scale,
+            has_min_scale,
             None,
             render_mode,
             raster_mode,
@@ -127,6 +135,8 @@ pub(crate) async fn render_base_with_plane_aux(
     transforms: FloatTensor<MainBackendBase>,
     sh_coeffs: FloatTensor<MainBackendBase>,
     raw_opacities: FloatTensor<MainBackendBase>,
+    min_scale: FloatTensor<MainBackendBase>,
+    has_min_scale: bool,
     plane_aux: Option<FloatTensor<MainBackendBase>>,
     render_mode: SplatRenderMode,
     raster_mode: crate::gaussian_splats::RasterizationMode,
@@ -153,6 +163,7 @@ pub(crate) async fn render_base_with_plane_aux(
     let transforms = into_contiguous(transforms);
     let sh_coeffs = into_contiguous(sh_coeffs);
     let raw_opacities = into_contiguous(raw_opacities);
+    let min_scale = into_contiguous(min_scale);
     assert!(
         !render_plane || plane_aux.is_some(),
         "RasterizationMode::RgbaDepthPlane requires a [N, PLANE_AUX_LANES] plane_aux input"
@@ -206,8 +217,12 @@ pub(crate) async fn render_base_with_plane_aux(
     let sh_degree = sh_degree_from_coeffs(sh_coeffs.shape()[1] as u32);
     let mip_splat = matches!(render_mode, SplatRenderMode::Mip);
 
+    // Cull splats beyond the lens' diagonal fov with some margin, but never
+    // past the angle where the distortion polynomial folds back on itself:
+    // those would project mirrored into the image with huge radii.
     let half_max_render_fov =
-        ((camera.fov_x as f32).hypot(camera.fov_y as f32) * 1.05).min(2.0 * PI - 1e-6) * 0.5;
+        (((camera.fov_x as f32).hypot(camera.fov_y as f32) * 1.05).min(2.0 * PI - 1e-6) * 0.5)
+            .min(max_render_theta(&camera.camera_model) as f32);
     let pinhole_params = camera.build_pinhole_params(img_size);
 
     let mut project_uniforms = shaders::helpers::ProjectUniforms {
@@ -305,10 +320,11 @@ pub(crate) async fn render_base_with_plane_aux(
                 background.y,
                 background.z,
             );
-            kernels::rasterize::rasterize_kernel::launch::<WgpuRuntime>(
+            let cube_dim = CubeDim::new_1d(tile_size);
+            kernels::rasterize::rasterize_kernel::launch(
                 &client,
-                calc_cube_count_1d(num_tiles * tile_size, tile_size),
-                CubeDim::new_1d(tile_size),
+                calculate_cube_count_elemwise(&client, (num_tiles * tile_size) as usize, cube_dim),
+                cube_dim,
                 compact_gid_from_isect.clone().into_tensor_arg(),
                 tile_offsets.clone().into_tensor_arg(),
                 projected_splats.clone().into_tensor_arg(),
@@ -351,6 +367,11 @@ pub(crate) async fn render_base_with_plane_aux(
             crate::raster_census::emit(&report);
         }
 
+        // Zero-length per-splat outputs, like upstream's populated path
+        // produces for `total_splats == 0`.
+        let opacities = MainBackendBase::float_reshape(transforms.clone(), [0].into());
+        let compact_from_global = create_tensor([0], &device, DType::U32);
+
         return RenderOutput {
             out_img,
             aux: RenderAuxInner {
@@ -358,6 +379,7 @@ pub(crate) async fn render_base_with_plane_aux(
                 num_intersections: 0,
                 visible,
                 max_radius,
+                opacities,
                 tile_offsets,
                 img_size,
             },
@@ -365,11 +387,14 @@ pub(crate) async fn render_base_with_plane_aux(
             compact_gid_from_isect,
             project_uniforms,
             global_from_compact_gid,
+            compact_from_global,
         };
     }
 
     let (
         global_from_presort_gid,
+        compact_from_global,
+        opacities,
         depths,
         intersect_counts,
         max_radius,
@@ -388,20 +413,24 @@ pub(crate) async fn render_base_with_plane_aux(
             MainBackendBase::float_zeros([total_splats].into(), &device, FloatDType::F32);
 
         let global_from_presort_gid = create_tensor([total_splats], &device, DType::U32);
+        // Written for every splat by the kernel, so no zero-fill.
+        let compact_from_global = create_tensor([total_splats], &device, DType::U32);
+        let opacities = create_tensor([total_splats], &device, DType::F32);
         let depths = create_tensor([total_splats], &device, DType::F32);
 
         let uniforms = project_uniforms.to_launch_object();
+        let cube_dim = CubeDim::new_1d(kernels::project_forward::WG_SIZE);
 
-        kernels::project_forward::project_forward_kernel::launch::<WgpuRuntime>(
+        kernels::project_forward::project_forward_kernel::launch(
             &client,
-            calc_cube_count_1d(
-                project_uniforms.total_splats,
-                kernels::project_forward::WG_SIZE,
-            ),
-            CubeDim::new_1d(kernels::project_forward::WG_SIZE),
+            calculate_cube_count_elemwise(&client, total_splats, cube_dim),
+            cube_dim,
             transforms.clone().into_tensor_arg(),
             raw_opacities.clone().into_tensor_arg(),
+            min_scale.clone().into_tensor_arg(),
             global_from_presort_gid.clone().into_tensor_arg(),
+            compact_from_global.clone().into_tensor_arg(),
+            opacities.clone().into_tensor_arg(),
             depths.clone().into_tensor_arg(),
             num_visible_buf.clone().into_tensor_arg(),
             intersect_counts.clone().into_tensor_arg(),
@@ -409,12 +438,15 @@ pub(crate) async fn render_base_with_plane_aux(
             max_radius.clone().into_tensor_arg(),
             uniforms,
             mip_splat,
+            has_min_scale,
             camera.camera_model,
             tile_width,
             tile_height,
         );
         (
             global_from_presort_gid,
+            compact_from_global,
+            opacities,
             depths,
             intersect_counts,
             max_radius,
@@ -438,11 +470,11 @@ pub(crate) async fn render_base_with_plane_aux(
             .expect("Failed to read counts");
         let num_visible = data.read_ints[0]
             .clone()
-            .into_vec::<u32>()
+            .try_into_vec::<u32>()
             .expect("num_visible")[0];
         let num_intersections = data.read_ints[1]
             .clone()
-            .into_vec::<u32>()
+            .try_into_vec::<u32>()
             .expect("num_intersections")[0];
         (num_visible, num_intersections)
     };
@@ -473,17 +505,21 @@ pub(crate) async fn render_base_with_plane_aux(
     );
     tracing::trace_span!("ProjectVisible").in_scope(|| {
         let uniforms = project_uniforms.to_launch_object();
-        kernels::project_visible::project_visible_kernel::launch::<WgpuRuntime>(
+        let cube_dim = CubeDim::new_1d(kernels::project_visible::WG_SIZE);
+        kernels::project_visible::project_visible_kernel::launch(
             &client,
-            calc_cube_count_1d(num_visible, kernels::project_visible::WG_SIZE),
-            CubeDim::new_1d(kernels::project_visible::WG_SIZE),
+            calculate_cube_count_elemwise(&client, num_visible as usize, cube_dim),
+            cube_dim,
             transforms.into_tensor_arg(),
             sh_coeffs.into_tensor_arg(),
             raw_opacities.into_tensor_arg(),
+            min_scale.into_tensor_arg(),
             global_from_compact_gid.clone().into_tensor_arg(),
+            compact_from_global.clone().into_tensor_arg(),
             projected_splats.clone().into_tensor_arg(),
             uniforms,
             mip_splat,
+            has_min_scale,
             sh_degree,
             camera.camera_model,
         );
@@ -493,10 +529,11 @@ pub(crate) async fn render_base_with_plane_aux(
     let tile_id_from_isect = create_tensor([buffer_size], &device, DType::U32);
     let compact_gid_from_isect = create_tensor([buffer_size], &device, DType::U32);
     tracing::trace_span!("MapGaussiansToIntersect").in_scope(|| {
-        kernels::map_gaussians::map_gaussians_to_intersect_kernel::launch::<WgpuRuntime>(
+        let cube_dim = CubeDim::new_1d(kernels::map_gaussians::WG_SIZE);
+        kernels::map_gaussians::map_gaussians_to_intersect_kernel::launch(
             &client,
-            calc_cube_count_1d(num_visible, kernels::map_gaussians::WG_SIZE),
-            CubeDim::new_1d(kernels::map_gaussians::WG_SIZE),
+            calculate_cube_count_elemwise(&client, num_visible as usize, cube_dim),
+            cube_dim,
             projected_splats.clone().into_tensor_arg(),
             cum_tiles_hit.clone().into_tensor_arg(),
             tile_id_from_isect.clone().into_tensor_arg(),
@@ -518,9 +555,13 @@ pub(crate) async fn render_base_with_plane_aux(
         IntDType::U32,
     );
     tracing::trace_span!("GetTileOffsets").in_scope(|| {
-        get_tile_offsets::launch::<WgpuRuntime>(
+        get_tile_offsets::launch(
             &client,
-            calc_cube_count_1d(num_intersections, cube_dim.x * CHECKS_PER_ITER),
+            calculate_cube_count_elemwise(
+                &client,
+                num_intersections as usize,
+                CubeDim::new_1d(cube_dim.x * CHECKS_PER_ITER),
+            ),
             cube_dim,
             num_intersections,
             num_tiles,
@@ -542,7 +583,7 @@ pub(crate) async fn render_base_with_plane_aux(
                 .expect("failed to read pre-raster tile offsets for raster census");
             let pre_offsets = data.read_ints[0]
                 .clone()
-                .into_vec::<u32>()
+                .try_into_vec::<u32>()
                 .expect("raster census tile offsets must be u32");
             Some((request, pre_offsets))
         } else {
@@ -584,10 +625,12 @@ pub(crate) async fn render_base_with_plane_aux(
             background.y,
             background.z,
         );
-        kernels::rasterize::rasterize_kernel::launch::<WgpuRuntime>(
+        // One cube per tile, one thread per pixel in it.
+        let cube_dim = CubeDim::new_1d(tile_size);
+        kernels::rasterize::rasterize_kernel::launch(
             &client,
-            calc_cube_count_1d(num_tiles * tile_size, tile_size),
-            CubeDim::new_1d(tile_size),
+            calculate_cube_count_elemwise(&client, (num_tiles * tile_size) as usize, cube_dim),
+            cube_dim,
             compact_gid_from_isect.clone().into_tensor_arg(),
             tile_offsets.clone().into_tensor_arg(),
             projected_splats.clone().into_tensor_arg(),
@@ -621,15 +664,15 @@ pub(crate) async fn render_base_with_plane_aux(
             .expect("failed to read raster census inputs");
         let projected_splats_host = data.read_floats[0]
             .clone()
-            .into_vec::<f32>()
+            .try_into_vec::<f32>()
             .expect("raster census projected splats must be f32");
         let compact_gid_from_isect_host = data.read_ints[0]
             .clone()
-            .into_vec::<u32>()
+            .try_into_vec::<u32>()
             .expect("raster census compact IDs must be u32");
         let post_offsets = data.read_ints[1]
             .clone()
-            .into_vec::<u32>()
+            .try_into_vec::<u32>()
             .expect("raster census tile offsets must be u32");
         let report = crate::raster_census::analyze(&crate::raster_census::RasterCensusInput {
             request,
@@ -655,6 +698,7 @@ pub(crate) async fn render_base_with_plane_aux(
             num_intersections,
             visible,
             max_radius,
+            opacities,
             tile_offsets,
             img_size,
         },
@@ -662,5 +706,6 @@ pub(crate) async fn render_base_with_plane_aux(
         compact_gid_from_isect,
         project_uniforms,
         global_from_compact_gid,
+        compact_from_global,
     }
 }

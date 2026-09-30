@@ -1,8 +1,5 @@
 use brush_process::message::ProcessMessage;
 use brush_process::message::TrainMessage;
-use burn_cubecl::cubecl::Runtime;
-use burn_wgpu::AutoCompiler;
-use burn_wgpu::WgpuRuntime;
 use eframe::egui_wgpu::RenderState;
 use web_time::{Duration, Instant};
 use wgpu::AdapterInfo;
@@ -226,9 +223,7 @@ impl AppPane for StatsPanel {
                 .is_none_or(|sample| sample.elapsed() >= MEMORY_SAMPLE_INTERVAL)
             {
                 self.last_memory_sample = Some(Instant::now());
-                let device = process.burn_device();
-                let client = WgpuRuntime::<AutoCompiler>::client(&device);
-                if let Ok(memory) = client.memory_usage() {
+                if let Some(memory) = process.device_memory_usage() {
                     self.memory_stats = Some(MemoryStats {
                         bytes_in_use: memory.bytes_in_use,
                         bytes_reserved: memory.bytes_reserved,

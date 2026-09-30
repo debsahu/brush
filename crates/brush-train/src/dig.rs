@@ -96,7 +96,7 @@ impl DigModule {
                 .into_data_async()
                 .await
                 .expect("Failed to read DiG tensor")
-                .to_vec()
+                .try_to_vec()
                 .expect("Failed to read DiG tensor");
             (dims, data)
         }
@@ -186,7 +186,7 @@ impl DigOptimizer {
             .entry(id)
             .or_insert_with(|| AdamState::new(None, false));
         param.map(|t| {
-            let stepped = adam.step(lr, t.inner(), &grad, state);
+            let stepped = adam.step(lr, t.inner(), &grad, None, state);
             Tensor::from_inner(stepped).require_grad()
         })
     }
@@ -286,7 +286,7 @@ impl DigTrainState {
             .into_data_async()
             .await
             .expect("Failed to read means")
-            .to_vec()
+            .try_to_vec()
             .expect("Failed to read means");
         let inds = grid_knn(&pos, NN_K);
         let inds = Tensor::from_data(TensorData::new(inds, [n, NN_K]), device);

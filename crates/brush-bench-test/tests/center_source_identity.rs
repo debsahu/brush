@@ -229,7 +229,7 @@ async fn step0_raw_opacities(
         .into_data_async()
         .await
         .expect("raw opacity readback")
-        .into_vec::<f32>()
+        .try_into_vec::<f32>()
         .expect("raw opacity as f32");
     assert!(
         opac.iter().all(|v| v.is_finite()),

@@ -14,7 +14,7 @@ use brush_render::{
     kernels::camera_model::CameraModel::Pinhole,
 };
 use brush_train::{config::TrainConfig, train::SplatTrainer};
-use burn::module::AutodiffModule;
+use burn::module::Module;
 use burn::tensor::{Device, Tensor, TensorData};
 use glam::{Quat, Vec3};
 use rand::{RngExt, SeedableRng};
@@ -99,7 +99,7 @@ async fn feature_render_matches_rgb_render() {
         .into_data_async()
         .await
         .expect("readback")
-        .into_vec::<f32>()
+        .try_into_vec::<f32>()
         .unwrap();
 
     // Degree-0 color as computed in-kernel: SH_C0 * coeff + 0.5.
@@ -122,7 +122,7 @@ async fn feature_render_matches_rgb_render() {
         .into_data_async()
         .await
         .expect("readback")
-        .into_vec::<f32>()
+        .try_into_vec::<f32>()
         .unwrap();
 
     assert_eq!(rgb_data.len(), feat_data.len());
@@ -183,7 +183,7 @@ async fn feature_gradients_match_finite_diff() {
         .into_data_async()
         .await
         .expect("readback")
-        .into_vec::<f32>()
+        .try_into_vec::<f32>()
         .unwrap();
 
     let eps = 5e-2f32;

@@ -211,9 +211,9 @@ mod forward_rendering {
     const RESOLUTIONS: [(u32, u32); 4] = [(1024, 1024), (1920, 1080), (2560, 1440), (3200, 1800)];
     const SPLAT_COUNTS: [usize; 3] = [500_000, 1_000_000, 2_500_000];
 
-    use burn::module::AutodiffModule;
+    use burn::cubecl::future::block_on;
+    use burn::module::Module;
     use burn::{backend::wgpu::WgpuDevice, prelude::Device};
-    use burn_cubecl::cubecl::future::block_on;
 
     use crate::benches::{ITERS_PER_SYNC, bench_camera, forward_iters, gen_splats};
 
@@ -251,8 +251,8 @@ mod forward_rendering {
 mod backward_rendering {
     const RESOLUTIONS: [(u32, u32); 4] = [(1024, 1024), (1920, 1080), (2560, 1440), (3200, 1800)];
 
+    use burn::cubecl::future::block_on;
     use burn::{backend::wgpu::WgpuDevice, prelude::Device};
-    use burn_cubecl::cubecl::future::block_on;
 
     use crate::benches::{ITERS_PER_SYNC, backward_iters, bench_camera, gen_splats};
 
@@ -292,8 +292,8 @@ mod backward_rendering {
 mod training {
     const SPLAT_COUNTS: [usize; 3] = [500_000, 1_000_000, 2_500_000];
 
+    use burn::cubecl::future::block_on;
     use burn::{backend::wgpu::WgpuDevice, prelude::Device};
-    use burn_cubecl::cubecl::future::block_on;
     use glam::Vec3;
 
     use crate::benches::{
@@ -353,7 +353,7 @@ mod training {
 mod tests {
     use brush_render::bounding_box::BoundingBox;
     use brush_train::{config::TrainConfig, train::SplatTrainer};
-    use burn::{module::AutodiffModule, tensor::Device};
+    use burn::{module::Module, tensor::Device};
     use glam::Vec3;
     use wasm_bindgen_test::wasm_bindgen_test;
 

@@ -3,10 +3,10 @@
 //! `det2_strict`) lives in [`brush_cube`] — re-exported here for
 //! convenience.
 
-use burn_cubecl::cubecl;
-use burn_cubecl::cubecl::cube;
-use burn_cubecl::cubecl::prelude::*;
-use burn_cubecl::cubecl::std::FastDivmod;
+use burn::cubecl;
+use burn::cubecl::cube;
+use burn::cubecl::prelude::*;
+use burn::cubecl::std::FastDivmod;
 
 use super::types::{PixelRect, ProjectUniforms, Quat, Splat, Sym2, TileBbox, Vec3A};
 use crate::kernels::camera_model::{CameraModel, calculate_project_jacobian};
@@ -399,6 +399,69 @@ pub fn read_scale(transforms: &Tensor<f32>, base: usize) -> Vec3A {
         f32::exp(transforms[base + 8]),
         f32::exp(transforms[base + 9]),
     )
+}
+
+/// Opacity clamp applied after the floor compensation, matching
+/// `fold_min_scale` on the host.
+const FLOOR_OPACITY_EPS: f32 = 1e-6;
+
+/// One splat's scale and opacity after the Mip-Splatting 3D filter, plus
+/// what the backward needs to differentiate through it.
+#[derive(CubeType, Copy, Clone)]
+#[expand(derive(Clone, Copy))]
+pub struct ScaleFloor {
+    /// `s' = sqrt(s² + f²)` per axis.
+    pub scale: Vec3A,
+    /// Base opacity `sigmoid(raw) · coef`, clamped.
+    pub opac: f32,
+    /// Energy compensation `Π s / s'`: the inflated splat keeps its mass.
+    pub coef: f32,
+    /// `d(log s') / d(log s) = s² / (s² + f²)` per axis.
+    pub ratio_sq: Vec3A,
+    /// Whether the opacity clamp lets gradient through.
+    pub opac_open: bool,
+}
+
+/// Apply the floor `min_scale[gid]` to a splat's scale and sigmoid opacity,
+/// matching `fold_min_scale` on the host. With `has_min_scale` false this is
+/// the identity and `min_scale` is never read.
+#[cube]
+pub fn apply_scale_floor(
+    scale: Vec3A,
+    opac_sig: f32,
+    min_scale: &Tensor<f32>,
+    gid: u32,
+    #[comptime] has_min_scale: bool,
+) -> ScaleFloor {
+    let mut floored = scale;
+    let mut opac = opac_sig;
+    let mut coef = 1.0f32;
+    let mut ratio_sq = Vec3A::new(1.0f32, 1.0f32, 1.0f32);
+    let mut opac_open = true;
+    if has_min_scale {
+        let f = min_scale[gid as usize];
+        let f2 = f * f;
+        floored = Vec3A::new(
+            f32::sqrt(scale.x() * scale.x() + f2),
+            f32::sqrt(scale.y() * scale.y() + f2),
+            f32::sqrt(scale.z() * scale.z() + f2),
+        );
+        let rx = scale.x() / floored.x();
+        let ry = scale.y() / floored.y();
+        let rz = scale.z() / floored.z();
+        coef = rx * ry * rz;
+        ratio_sq = Vec3A::new(rx * rx, ry * ry, rz * rz);
+        let o = opac_sig * coef;
+        opac_open = o > FLOOR_OPACITY_EPS && o < 1.0f32 - FLOOR_OPACITY_EPS;
+        opac = clamp(o, FLOOR_OPACITY_EPS, 1.0f32 - FLOOR_OPACITY_EPS);
+    }
+    ScaleFloor {
+        scale: floored,
+        opac,
+        coef,
+        ratio_sq,
+        opac_open,
+    }
 }
 
 #[cube]

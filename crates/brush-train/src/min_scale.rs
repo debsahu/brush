@@ -1,6 +1,6 @@
 //! One-pass GPU evaluation of the Mip-Splatting world-space scale floor.
 
-use brush_cube::{MainBackend as Wgpu, MainBackendBase, calc_cube_count_1d};
+use brush_cube::{MainBackendBase, calc_cube_count_1d};
 use burn::{
     Tensor as BurnTensor,
     backend::{Backend, Dispatch, TensorMetadata, tensor::FloatTensor},
@@ -13,12 +13,11 @@ use burn_cubecl::{
     kernel::into_contiguous,
     tensor::CubeTensor,
 };
+use burn_fusion::custom::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
 use burn_fusion::{
-    Fusion, FusionHandle,
+    ExecutionError, Fusion, FusionHandle,
     stream::{Operation, StreamId},
 };
-use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
-use burn_wgpu::{AutoCompiler, WgpuRuntime};
 
 const WORKGROUP_SIZE: u32 = 256;
 
@@ -60,7 +59,7 @@ fn min_scale_kernel(
     output[splat as usize] = min_ratio * factor_sqrt;
 }
 
-#[burn::backend::backend_extension(Wgpu)]
+#[burn::backend::backend_extension(Cube)]
 trait MinScaleOps: Backend {
     fn min_scale(
         means: FloatTensor<Self>,
@@ -98,10 +97,7 @@ pub(super) fn compute_min_scale(
     Some(BurnTensor::from_dispatch(output))
 }
 
-fn empty_output(
-    template: &CubeTensor<WgpuRuntime<AutoCompiler>>,
-    len: usize,
-) -> CubeTensor<WgpuRuntime<AutoCompiler>> {
+fn empty_output(template: &CubeTensor, len: usize) -> CubeTensor {
     let shape = Shape::new([len]);
     let handle = template
         .client
@@ -138,7 +134,7 @@ impl MinScaleOps for MainBackendBase {
         let num_cameras = u32::try_from(camera_dims[0]).expect("camera count exceeds u32");
         let output = empty_output(&means, means_dims[0]);
         let client = means.client.clone();
-        min_scale_kernel::launch::<WgpuRuntime<AutoCompiler>>(
+        min_scale_kernel::launch(
             &client,
             calc_cube_count_1d(num_splats, WORKGROUP_SIZE),
             CubeDim::new_1d(WORKGROUP_SIZE),
@@ -159,8 +155,11 @@ struct MinScaleFusionOp {
     factor_sqrt: f32,
 }
 
-impl Operation<FusionCubeRuntime<WgpuRuntime>> for MinScaleFusionOp {
-    fn execute(&self, handles: &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>) {
+impl Operation<FusionCubeRuntime> for MinScaleFusionOp {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<FusionHandle<FusionCubeRuntime>>,
+    ) -> Result<(), ExecutionError> {
         let ([means, cameras], [output]) = self.desc.as_fixed();
         let result = <MainBackendBase as MinScaleOps>::min_scale(
             handles.get_float_tensor::<MainBackendBase>(means),
@@ -168,6 +167,7 @@ impl Operation<FusionCubeRuntime<WgpuRuntime>> for MinScaleFusionOp {
             self.factor_sqrt,
         );
         handles.register_float_tensor::<MainBackendBase>(&output.id, result);
+        Ok(())
     }
 }
 
@@ -221,13 +221,13 @@ mod tests {
             .into_data_async()
             .await
             .expect("readback")
-            .to_vec()
+            .try_to_vec()
             .expect("f32 output");
         let expected: Vec<f32> = means
             .into_data_async()
             .await
             .expect("means readback")
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 means")
             .chunks_exact(3)
             .map(|xyz| {
@@ -258,7 +258,7 @@ mod tests {
                 .into_data_async()
                 .await
                 .expect("readback")
-                .to_vec()
+                .try_to_vec()
                 .expect("f32 output");
 
         assert_eq!(floor.len(), 1);
@@ -286,14 +286,14 @@ mod tests {
             .into_data_async()
             .await
             .expect("first scale readback")
-            .to_vec()
+            .try_to_vec()
             .expect("f32 scales");
         let first_opacities: Vec<f32> = splats
             .opacities()
             .into_data_async()
             .await
             .expect("first opacity readback")
-            .to_vec()
+            .try_to_vec()
             .expect("f32 opacities");
 
         let floor = compute_min_scale(&splats.means(), &cameras, 0.1).expect("refreshed floor");
@@ -303,14 +303,14 @@ mod tests {
             .into_data_async()
             .await
             .expect("refreshed scale readback")
-            .to_vec()
+            .try_to_vec()
             .expect("f32 scales");
         let refreshed_opacities: Vec<f32> = refreshed
             .opacities()
             .into_data_async()
             .await
             .expect("refreshed opacity readback")
-            .to_vec()
+            .try_to_vec()
             .expect("f32 opacities");
 
         assert_eq!(first_scales, refreshed_scales);

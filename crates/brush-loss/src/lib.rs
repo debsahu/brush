@@ -29,18 +29,16 @@ use burn::{
             ops::{Backward, Ops, OpsKind},
         },
         tensor::{FloatTensor, IntTensor},
-        wgpu::WgpuRuntime,
     },
     tensor::{DType, Int, Shape, Tensor, s},
 };
-use burn_cubecl::{
-    CubeRuntime, fusion::FusionCubeRuntime, kernel::into_contiguous, tensor::CubeTensor,
-};
+use burn_cubecl::{fusion::FusionCubeRuntime, kernel::into_contiguous, tensor::CubeTensor};
 use burn_fusion::{
-    Fusion, FusionHandle,
-    stream::{Operation, StreamId},
+    ExecutionError, Fusion, FusionHandle,
+    custom::{
+        CustomOpIr, HandleContainer, Operation, OperationIr, OperationOutput, StreamId, TensorIr,
+    },
 };
-use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
 use glam::Vec3;
 
 #[cfg(all(
@@ -1014,8 +1012,8 @@ trait SavedLossOps<B: Backend> {
     ) -> FloatTensor<B>;
 }
 
-fn alloc_zeros<R: CubeRuntime>(template: &CubeTensor<R>) -> CubeTensor<R> {
-    burn_cubecl::ops::numeric::zeros_client::<R>(
+fn alloc_zeros(template: &CubeTensor) -> CubeTensor {
+    burn_cubecl::ops::numeric::zeros_client(
         template.client.clone(),
         template.device.clone(),
         Shape::from(template.shape().as_slice().to_vec()),
@@ -1023,11 +1021,7 @@ fn alloc_zeros<R: CubeRuntime>(template: &CubeTensor<R>) -> CubeTensor<R> {
     )
 }
 
-fn alloc_empty<R: CubeRuntime>(
-    template: &CubeTensor<R>,
-    shape: Shape,
-    dtype: DType,
-) -> CubeTensor<R> {
+fn alloc_empty(template: &CubeTensor, shape: Shape, dtype: DType) -> CubeTensor {
     let handle = template.client.empty(shape.num_elements() * dtype.size());
     CubeTensor::new_contiguous(
         template.client.clone(),
@@ -1052,15 +1046,19 @@ impl<F> std::fmt::Debug for ClosureOp<F> {
     }
 }
 
-impl<F> Operation<FusionCubeRuntime<WgpuRuntime>> for ClosureOp<F>
+impl<F> Operation<FusionCubeRuntime> for ClosureOp<F>
 where
-    F: Fn(&CustomOpIr, &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>)
+    F: Fn(&CustomOpIr, &mut HandleContainer<FusionHandle<FusionCubeRuntime>>)
         + Send
         + Sync
         + 'static,
 {
-    fn execute(&self, h: &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>) {
+    fn execute(
+        &self,
+        h: &mut HandleContainer<FusionHandle<FusionCubeRuntime>>,
+    ) -> Result<(), ExecutionError> {
         (self.op)(&self.desc, h);
+        Ok(())
     }
 }
 
@@ -1070,13 +1068,13 @@ where
 /// when fusion eventually executes the queued op.
 fn dispatch_custom<const N: usize, F>(
     name: &'static str,
-    inputs: [burn_fusion::FusionTensor<FusionCubeRuntime<WgpuRuntime>>; N],
+    inputs: [burn_fusion::FusionTensor<FusionCubeRuntime>; N],
     out_shape: Shape,
     out_dtype: DType,
     op: F,
-) -> burn_fusion::FusionTensor<FusionCubeRuntime<WgpuRuntime>>
+) -> burn_fusion::FusionTensor<FusionCubeRuntime>
 where
-    F: Fn(&CustomOpIr, &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>)
+    F: Fn(&CustomOpIr, &mut HandleContainer<FusionHandle<FusionCubeRuntime>>)
         + Send
         + Sync
         + 'static,
@@ -1125,19 +1123,19 @@ fn select_backward_tile(
     }
 }
 
-fn launch_image_forward<R: CubeRuntime>(
-    pred: CubeTensor<R>,
-    gt_packed: CubeTensor<R>,
+fn launch_image_forward(
+    pred: CubeTensor,
+    gt_packed: CubeTensor,
     cfg: ImageLossConfig,
-) -> CubeTensor<R> {
+) -> CubeTensor {
     launch_image_forward_impl(pred, gt_packed, cfg, false).0
 }
 
-fn launch_image_forward_saved<R: CubeRuntime>(
-    pred: CubeTensor<R>,
-    gt_packed: CubeTensor<R>,
+fn launch_image_forward_saved(
+    pred: CubeTensor,
+    gt_packed: CubeTensor,
     cfg: ImageLossConfig,
-) -> (CubeTensor<R>, CubeTensor<R>) {
+) -> (CubeTensor, CubeTensor) {
     let (map, partials) = launch_image_forward_impl(pred, gt_packed, cfg, true);
     (
         map,
@@ -1145,12 +1143,12 @@ fn launch_image_forward_saved<R: CubeRuntime>(
     )
 }
 
-fn launch_image_forward_impl<R: CubeRuntime>(
-    pred: CubeTensor<R>,
-    gt_packed: CubeTensor<R>,
+fn launch_image_forward_impl(
+    pred: CubeTensor,
+    gt_packed: CubeTensor,
     cfg: ImageLossConfig,
     save_partials: bool,
-) -> (CubeTensor<R>, Option<CubeTensor<R>>) {
+) -> (CubeTensor, Option<CubeTensor>) {
     use burn_cubecl::cubecl::prelude::CubeDim;
 
     let pred = into_contiguous(pred);
@@ -1175,7 +1173,7 @@ fn launch_image_forward_impl<R: CubeRuntime>(
     let map = alloc_zeros(&pred);
     if cfg.ssim_weight == 0.0 && !save_partials {
         let client = pred.client.clone();
-        kernels::image_l1_forward_kernel::launch::<f32, R>(
+        kernels::image_l1_forward_kernel::launch::<f32>(
             &client,
             cube_count_3d(c, h, w),
             CubeDim::new_2d(kernels::BLOCK_X, kernels::BLOCK_Y),
@@ -1207,7 +1205,7 @@ fn launch_image_forward_impl<R: CubeRuntime>(
         None
     };
     let client = pred.client.clone();
-    kernels::image_loss_forward_kernel::launch::<f32, R>(
+    kernels::image_loss_forward_kernel::launch::<f32>(
         &client,
         cube_count_3d(c, h, w),
         CubeDim::new_2d(kernels::BLOCK_X, kernels::BLOCK_Y),
@@ -1231,22 +1229,22 @@ fn launch_image_forward_impl<R: CubeRuntime>(
     (map, partials)
 }
 
-fn launch_image_backward<R: CubeRuntime>(
-    pred: CubeTensor<R>,
-    gt_packed: CubeTensor<R>,
-    dl_dmap: CubeTensor<R>,
+fn launch_image_backward(
+    pred: CubeTensor,
+    gt_packed: CubeTensor,
+    dl_dmap: CubeTensor,
     cfg: ImageLossConfig,
-) -> CubeTensor<R> {
+) -> CubeTensor {
     launch_image_backward_with_tile(pred, gt_packed, dl_dmap, cfg, None)
 }
 
-fn launch_image_backward_with_tile<R: CubeRuntime>(
-    pred: CubeTensor<R>,
-    gt_packed: CubeTensor<R>,
-    dl_dmap: CubeTensor<R>,
+fn launch_image_backward_with_tile(
+    pred: CubeTensor,
+    gt_packed: CubeTensor,
+    dl_dmap: CubeTensor,
     cfg: ImageLossConfig,
     tile_override: Option<u32>,
-) -> CubeTensor<R> {
+) -> CubeTensor {
     use burn_cubecl::cubecl::prelude::CubeDim;
 
     let pred = into_contiguous(pred);
@@ -1262,7 +1260,7 @@ fn launch_image_backward_with_tile<R: CubeRuntime>(
     let dl_dpred = alloc_zeros(&pred);
     let client = pred.client.clone();
     if cfg.ssim_weight == 0.0 {
-        kernels::image_l1_backward_kernel::launch::<f32, R>(
+        kernels::image_l1_backward_kernel::launch::<f32>(
             &client,
             cube_count_3d(c, h, w),
             CubeDim::new_2d(kernels::BLOCK_X, kernels::BLOCK_Y),
@@ -1294,7 +1292,7 @@ fn launch_image_backward_with_tile<R: CubeRuntime>(
         "backward loss tile must be 8 or 16, got {tile}"
     );
 
-    kernels::image_loss_backward_kernel::launch::<f32, R>(
+    kernels::image_loss_backward_kernel::launch::<f32>(
         &client,
         cube_count_3d_bwd(c, h, w, tile),
         CubeDim::new_2d(tile, tile),
@@ -1317,13 +1315,13 @@ fn launch_image_backward_with_tile<R: CubeRuntime>(
     dl_dpred
 }
 
-fn launch_image_backward_saved<R: CubeRuntime>(
-    pred: CubeTensor<R>,
-    gt_packed: CubeTensor<R>,
-    dl_dmap: CubeTensor<R>,
-    partials: CubeTensor<R>,
+fn launch_image_backward_saved(
+    pred: CubeTensor,
+    gt_packed: CubeTensor,
+    dl_dmap: CubeTensor,
+    partials: CubeTensor,
     cfg: ImageLossConfig,
-) -> CubeTensor<R> {
+) -> CubeTensor {
     use burn_cubecl::cubecl::prelude::CubeDim;
 
     let pred = into_contiguous(pred);
@@ -1358,7 +1356,7 @@ fn launch_image_backward_saved<R: CubeRuntime>(
         hardware.max_cube_dim,
     );
 
-    kernels::image_loss_backward_kernel::launch::<f32, R>(
+    kernels::image_loss_backward_kernel::launch::<f32>(
         &client,
         cube_count_3d_bwd(c, h, w, tile),
         CubeDim::new_2d(tile, tile),
@@ -1381,10 +1379,7 @@ fn launch_image_backward_saved<R: CubeRuntime>(
     dl_dpred
 }
 
-fn launch_unpack_gt_rgb<R: CubeRuntime>(
-    gt_packed: CubeTensor<R>,
-    composite_bg: Option<Vec3>,
-) -> CubeTensor<R> {
+fn launch_unpack_gt_rgb(gt_packed: CubeTensor, composite_bg: Option<Vec3>) -> CubeTensor {
     use burn::tensor::{DType, Shape};
     use burn_cubecl::cubecl::prelude::{CubeCount, CubeDim};
 
@@ -1396,7 +1391,7 @@ fn launch_unpack_gt_rgb<R: CubeRuntime>(
     let bg = composite_bg.unwrap_or(Vec3::ZERO);
 
     let client = gt_packed.client.clone();
-    let out = burn_cubecl::ops::numeric::zeros_client::<R>(
+    let out = burn_cubecl::ops::numeric::zeros_client(
         client.clone(),
         gt_packed.device.clone(),
         Shape::new([h as usize, w as usize, 3]),
@@ -1407,7 +1402,7 @@ fn launch_unpack_gt_rgb<R: CubeRuntime>(
         h.div_ceil(kernels::BLOCK_Y),
         1,
     );
-    kernels::unpack_gt_rgb_kernel::launch::<f32, R>(
+    kernels::unpack_gt_rgb_kernel::launch::<f32>(
         &client,
         cube_count,
         CubeDim::new_2d(kernels::BLOCK_X, kernels::BLOCK_Y),
@@ -1423,7 +1418,7 @@ fn launch_unpack_gt_rgb<R: CubeRuntime>(
     out
 }
 
-fn launch_unpack_gt_alpha<R: CubeRuntime>(gt_packed: CubeTensor<R>) -> CubeTensor<R> {
+fn launch_unpack_gt_alpha(gt_packed: CubeTensor) -> CubeTensor {
     use burn::tensor::{DType, Shape};
     use burn_cubecl::cubecl::prelude::{CubeCount, CubeDim};
 
@@ -1433,7 +1428,7 @@ fn launch_unpack_gt_alpha<R: CubeRuntime>(gt_packed: CubeTensor<R>) -> CubeTenso
     let (h, w) = (dims[0] as u32, dims[1] as u32);
 
     let client = gt_packed.client.clone();
-    let out = burn_cubecl::ops::numeric::zeros_client::<R>(
+    let out = burn_cubecl::ops::numeric::zeros_client(
         client.clone(),
         gt_packed.device.clone(),
         Shape::new([h as usize, w as usize, 1]),
@@ -1444,7 +1439,7 @@ fn launch_unpack_gt_alpha<R: CubeRuntime>(gt_packed: CubeTensor<R>) -> CubeTenso
         h.div_ceil(kernels::BLOCK_Y),
         1,
     );
-    kernels::unpack_gt_alpha_kernel::launch::<f32, R>(
+    kernels::unpack_gt_alpha_kernel::launch::<f32>(
         &client,
         cube_count,
         CubeDim::new_2d(kernels::BLOCK_X, kernels::BLOCK_Y),
@@ -1612,7 +1607,7 @@ impl SavedLossOps<Self> for Fusion<MainBackendBase> {
             desc: desc.clone(),
             op: move |desc: &CustomOpIr,
                       handles: &mut HandleContainer<
-                FusionHandle<FusionCubeRuntime<WgpuRuntime>>,
+                FusionHandle<FusionCubeRuntime>,
             >| {
                 let ([pred, gt_packed], [map, partials]) = desc.as_fixed();
                 let out =
@@ -1712,11 +1707,11 @@ pub fn image_loss(pred: Tensor<3>, gt_packed: Tensor<2, Int>, cfg: ImageLossConf
     let gt_p = unwrap_ad_wgpu_int(gt_packed);
 
     let prep = ImageLossBackward
-        .prepare::<NoCheckpointing>([pred_ad.node.clone()])
+        .prepare::<NoCheckpointing>([pred_ad.node()])
         .compute_bound()
         .stateful();
 
-    let pred_p = pred_ad.primitive;
+    let pred_p = pred_ad.into_primitive();
     let map_ad: FloatTensor<AutodiffMain> = match prep {
         OpsKind::Tracked(prep) if use_saved_loss_partials() && cfg.ssim_weight != 0.0 => {
             let out = <MainBackend as SavedLossOps<MainBackend>>::image_loss_forward_saved(
@@ -2688,6 +2683,21 @@ pub fn normal_smooth_loss(normal: Tensor<3>, alpha: Tensor<3>) -> Tensor<1> {
     err / (v_row.sum() + v_col.sum()).mul_scalar(3.0).clamp_min(1.0)
 }
 
+/// Smallest MSE PSNR distinguishes: identical images report 100 dB instead
+/// of infinity, which would poison any average or plot it feeds.
+/// (Upstream brush #540.)
+const PSNR_MIN_MSE: f32 = 1e-10;
+
+/// PSNR in dB from a mean squared error between images in `[0, 1]`.
+pub fn psnr_from_mse(mse: Tensor<1>) -> Tensor<1> {
+    mse.clamp_min(PSNR_MIN_MSE).recip().log() * (10.0 / std::f32::consts::LN_10)
+}
+
+/// PSNR in dB between two `[H, W, 3]` images in `[0, 1]`.
+pub fn psnr(a: Tensor<3>, b: Tensor<3>) -> Tensor<1> {
+    psnr_from_mse((a - b).powi_scalar(2).mean())
+}
+
 /// Decode `gt_packed` back to a `[H, W, 3]` f32 RGB tensor. `composite_bg =
 /// Some(bg)` folds in `gt + (1 - gt.a) * bg`; `None` skips that math.
 /// Materialising f32 GT defeats the whole point of the packed format, so
@@ -2750,20 +2760,20 @@ mod tests {
     #[cfg(not(target_family = "wasm"))]
     #[tokio::test]
     async fn backward_tile_specializations_match() {
-        use brush_cube::{CubeTensor, create_tensor_from_slice};
-        use burn::{backend::wgpu::WgpuDevice, tensor::Shape};
+        use brush_cube::{CubeDevice, CubeTensor, create_tensor_from_slice};
+        use burn::tensor::Shape;
 
-        fn shaped_f32(data: &[f32], shape: Shape, device: &WgpuDevice) -> CubeTensor<WgpuRuntime> {
+        fn shaped_f32(data: &[f32], shape: Shape, device: &CubeDevice) -> CubeTensor {
             let flat = create_tensor_from_slice(data, device, DType::F32);
             CubeTensor::new_contiguous(flat.client, flat.device, shape, flat.handle, flat.dtype)
         }
 
-        fn shaped_i32(data: &[i32], shape: Shape, device: &WgpuDevice) -> CubeTensor<WgpuRuntime> {
+        fn shaped_i32(data: &[i32], shape: Shape, device: &CubeDevice) -> CubeTensor {
             let flat = create_tensor_from_slice(data, device, DType::I32);
             CubeTensor::new_contiguous(flat.client, flat.device, shape, flat.handle, flat.dtype)
         }
 
-        let device = brush_cube::test_helpers::test_device().await;
+        let device = CubeDevice::Wgpu(brush_cube::test_helpers::test_device().await);
         let (c, h, w) = (4usize, 17usize, 19usize);
         let pred: Vec<f32> = (0..c * h * w)
             .map(|i| 0.1 + ((i * 17 + 3) % 71) as f32 / 100.0)
@@ -2810,7 +2820,7 @@ mod tests {
             Some(kernels::BWD_TILE_SMALL),
         );
         let small: Vec<f32> = burn_cubecl::ops::into_data_sync(small)
-            .to_vec()
+            .try_to_vec()
             .expect("small-tile gradient data");
         assert!(
             small.iter().all(|value| value.is_finite()),
@@ -2828,7 +2838,7 @@ mod tests {
             Some(kernels::BWD_TILE_LARGE),
         );
         let large: Vec<f32> = burn_cubecl::ops::into_data_sync(large)
-            .to_vec()
+            .try_to_vec()
             .expect("large-tile gradient data");
 
         for (index, (&small, &large)) in small.iter().zip(&large).enumerate() {
@@ -2843,15 +2853,15 @@ mod tests {
     #[cfg(not(target_family = "wasm"))]
     #[tokio::test]
     async fn saved_partials_match_recomputed_forward_and_vjp() {
-        use brush_cube::{CubeTensor, create_tensor_from_slice};
-        use burn::{backend::wgpu::WgpuDevice, tensor::Shape};
+        use brush_cube::{CubeDevice, CubeTensor, create_tensor_from_slice};
+        use burn::tensor::Shape;
 
-        fn shaped_f32(data: &[f32], shape: Shape, device: &WgpuDevice) -> CubeTensor<WgpuRuntime> {
+        fn shaped_f32(data: &[f32], shape: Shape, device: &CubeDevice) -> CubeTensor {
             let flat = create_tensor_from_slice(data, device, DType::F32);
             CubeTensor::new_contiguous(flat.client, flat.device, shape, flat.handle, flat.dtype)
         }
 
-        fn shaped_i32(data: &[i32], shape: Shape, device: &WgpuDevice) -> CubeTensor<WgpuRuntime> {
+        fn shaped_i32(data: &[i32], shape: Shape, device: &CubeDevice) -> CubeTensor {
             let flat = create_tensor_from_slice(data, device, DType::I32);
             CubeTensor::new_contiguous(flat.client, flat.device, shape, flat.handle, flat.dtype)
         }
@@ -2867,7 +2877,7 @@ mod tests {
             }
         }
 
-        let device = brush_cube::test_helpers::test_device().await;
+        let device = CubeDevice::Wgpu(brush_cube::test_helpers::test_device().await);
         let (c, h, w) = (4usize, 17usize, 19usize);
         let pred_data: Vec<f32> = (0..c * h * w)
             .map(|i| 0.05 + ((i * 17 + 3) % 83) as f32 / 100.0)
@@ -2905,16 +2915,16 @@ mod tests {
             launch_image_backward_saved(make_pred(), make_gt(), make_chain(), partials, cfg);
 
         let control_map: Vec<f32> = burn_cubecl::ops::into_data_sync(control_map)
-            .to_vec()
+            .try_to_vec()
             .expect("control map data");
         let saved_map: Vec<f32> = burn_cubecl::ops::into_data_sync(saved_map)
-            .to_vec()
+            .try_to_vec()
             .expect("saved map data");
         let control_grad: Vec<f32> = burn_cubecl::ops::into_data_sync(control_grad)
-            .to_vec()
+            .try_to_vec()
             .expect("control gradient data");
         let saved_grad: Vec<f32> = burn_cubecl::ops::into_data_sync(saved_grad)
-            .to_vec()
+            .try_to_vec()
             .expect("saved gradient data");
 
         assert_close("forward map", &control_map, &saved_map);
@@ -2948,7 +2958,7 @@ mod normal_loss_tests {
         t.into_data_async()
             .await
             .expect("tensor readback")
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 tensor")
     }
 
@@ -3654,7 +3664,7 @@ mod plane_depth_tests {
         t.into_data_async()
             .await
             .expect("tensor readback")
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 tensor")
     }
 
@@ -4005,7 +4015,7 @@ mod plane_depth_grazing_tests {
         t.into_data_async()
             .await
             .expect("tensor readback")
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 tensor")
     }
 
@@ -4394,7 +4404,7 @@ mod masked_mean_and_gate_tests {
         t.into_data_async()
             .await
             .expect("tensor readback")
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 tensor")
     }
 
@@ -5245,7 +5255,7 @@ mod depth_uncovered_tests {
         t.into_data_async()
             .await
             .expect("tensor readback")
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 tensor")
     }
 
@@ -5654,7 +5664,7 @@ mod mask_clear_tests {
         t.into_data_async()
             .await
             .expect("tensor readback")
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 tensor")
     }
 

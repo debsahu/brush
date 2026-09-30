@@ -9,7 +9,7 @@ use crate::{
     gaussian_splats::{RasterPass, Rasterizer, SplatRenderMode, Splats, render_splats},
 };
 use assert_approx_eq::assert_approx_eq;
-use brush_cube::{MainBackendBase, create_tensor_from_slice};
+use brush_cube::{CubeDevice, MainBackendBase, create_tensor_from_slice};
 use burn::backend::{TensorMetadata, ops::FloatTensorOps};
 use burn::tensor::{DType, Shape};
 use burn::tensor::{Distribution, Tensor};
@@ -19,6 +19,13 @@ use wasm_bindgen_test::wasm_bindgen_test;
 mod plane_validation;
 mod raster_bwd_twin;
 mod raster_oracle;
+#[cfg(all(
+    feature = "native-msl",
+    target_os = "macos",
+    target_arch = "aarch64",
+    not(target_family = "wasm")
+))]
+mod sh_grad_layouts;
 mod vjp_golden;
 
 #[cfg(target_family = "wasm")]
@@ -27,18 +34,15 @@ wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn shader_compiler_matches_native_msl_feature() {
-    use burn_cubecl::cubecl::Runtime;
-    use burn_wgpu::{AutoCompiler, WgpuRuntime};
-
-    let device = brush_cube::test_helpers::test_device().await;
-    let client = WgpuRuntime::<AutoCompiler>::client(&device);
+    let device = brush_cube::CubeDevice::Wgpu(brush_cube::test_helpers::test_device().await);
+    let client = device.client();
     let expected = if cfg!(feature = "native-msl") {
         "wgpu<msl>"
     } else {
         "wgpu<wgsl>"
     };
 
-    assert_eq!(WgpuRuntime::<AutoCompiler>::name(&client), expected);
+    assert_eq!(client.name(), expected);
 }
 
 #[wasm_bindgen_test(unsupported = tokio::test)]
@@ -152,7 +156,7 @@ async fn read_finite(output: Tensor<3>) -> Vec<f32> {
         .to_data_async()
         .await
         .expect("readback")
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .expect("data vec");
     assert!(data.iter().all(|v| v.is_finite()), "NaNs or infs in output");
     data
@@ -516,7 +520,7 @@ async fn renders_large_rotated_splats() {
         .to_data_async()
         .await
         .expect("readback alpha")
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .expect("alpha vec");
 
     let tile = 16usize;
@@ -578,7 +582,7 @@ async fn renders_many_large_splats_stress() {
         .to_data_async()
         .await
         .expect("readback")
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .expect("data vec");
     assert!(data.iter().all(|v| v.is_finite()), "NaNs in output");
 
@@ -649,11 +653,12 @@ async fn render_empty_primitives(
     background: Vec3,
     pass: RasterPass,
 ) -> RenderOutput<MainBackendBase> {
-    let device = brush_cube::test_helpers::test_device().await;
+    let device = CubeDevice::Wgpu(brush_cube::test_helpers::test_device().await);
     let empty = || create_tensor_from_slice::<f32>(&[], &device, DType::F32);
     let transforms = MainBackendBase::float_reshape(empty(), Shape::new([0, 10]));
     let sh_coeffs = MainBackendBase::float_reshape(empty(), Shape::new([0, 1, 3]));
     let raw_opacities = MainBackendBase::float_reshape(empty(), Shape::new([0]));
+    let min_scale = create_tensor_from_slice::<f32>(&[0.0], &device, DType::F32);
 
     <MainBackendBase as SplatRasterizerOps>::render_with_rasterizer(
         camera,
@@ -661,6 +666,8 @@ async fn render_empty_primitives(
         transforms,
         sh_coeffs,
         raw_opacities,
+        min_scale,
+        false,
         SplatRenderMode::Default,
         crate::gaussian_splats::RasterizationMode::Rgba,
         background,
@@ -698,7 +705,7 @@ async fn zero_splats_renders_background() {
     let pixels = MainBackendBase::float_into_data(output.out_img)
         .await
         .expect("readback")
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .expect("data vec");
     let n_pixels = (img_size.x * img_size.y) as usize;
     assert_eq!(pixels.len(), n_pixels * 4);
@@ -746,7 +753,7 @@ async fn zero_splats_renders_packed_background() {
     let pixels = MainBackendBase::float_into_data(output.out_img)
         .await
         .expect("readback")
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .expect("data vec");
     let expected = ((bg.x * 255.0).clamp(0.0, 255.0) as u32)
         | (((bg.y * 255.0).clamp(0.0, 255.0) as u32) << 8)

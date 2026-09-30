@@ -7,7 +7,7 @@
 pub mod burn_glue;
 mod features_bwd;
 mod kernels;
-mod render_bwd;
+pub(crate) mod render_bwd;
 
 pub use burn_glue::{
     DeferredShGrad, DeferredShGradHandle, SplatOutputDiff, TrainingSplatOutputDiff,

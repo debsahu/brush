@@ -1,19 +1,21 @@
 use burn::tensor::{DType, Scalar, Shape};
-use burn_wgpu::{AutoCompiler, WgpuDevice, WgpuRuntime};
 use bytemuck::Pod;
 
-pub use burn_cubecl::cubecl::prelude::KernelId;
-pub use burn_cubecl::cubecl::{CubeCount, CubeDim, client::ComputeClient, server::ComputeServer};
-pub use burn_cubecl::cubecl::{CubeTask, Runtime};
-pub use burn_cubecl::{CubeRuntime, tensor::CubeTensor};
+pub use burn::cubecl::prelude::KernelId;
+pub use burn::cubecl::{CubeCount, CubeDim, client::Client};
+pub use burn_cubecl::{CubeDevice, tensor::CubeTensor};
 
 // Re-export bytemuck for use by generated code
 pub use bytemuck;
 
-use crate::MainBackendBase;
-
 /// Calculate workgroup count for a 1D dispatch, tiling into 2D if needed.
-/// Use this for kernels processing a 1D array of elements that may exceed 65535 workgroups.
+///
+/// Upstream brush replaced its own uses with cubecl's
+/// `calculate_cube_count_elemwise` (#546), which sizes by *thread* count from
+/// the device's real per-dimension limit. This fork keeps the helper for its
+/// kernels that index by cube rather than by element (e.g. the SH-gradient
+/// materializer's `SPLATS_PER_WG` splats per cube), where an element-count
+/// helper does not describe the grid.
 pub fn calc_cube_count_1d(num_elements: u32, workgroup_size: u32) -> CubeCount {
     let total_wgs = num_elements.div_ceil(workgroup_size);
 
@@ -30,10 +32,10 @@ pub fn calc_cube_count_1d(num_elements: u32, workgroup_size: u32) -> CubeCount {
 // Reserve a buffer from the client for the given shape.
 pub fn create_tensor<const D: usize>(
     shape: [usize; D],
-    device: &WgpuDevice,
+    device: &CubeDevice,
     dtype: DType,
-) -> CubeTensor<WgpuRuntime> {
-    let client = WgpuRuntime::client(device);
+) -> CubeTensor {
+    let client = device.client();
 
     let shape = Shape::from(shape.to_vec());
     let bufsize = shape.num_elements() * dtype.size();
@@ -50,7 +52,7 @@ pub fn create_tensor<const D: usize>(
             buffer,
             DType::F32,
         );
-        let noised = MainBackendBase::float_add_scalar(f, Scalar::Float(-12345.0));
+        let noised = burn_cubecl::CubeBackend::float_add_scalar(f, Scalar::Float(-12345.0));
         buffer = noised.handle;
     }
     CubeTensor::new_contiguous(client, device.clone(), shape, buffer, dtype)
@@ -59,10 +61,10 @@ pub fn create_tensor<const D: usize>(
 /// Upload a slice of POD data to the GPU as a 1D `CubeTensor`.
 pub fn create_tensor_from_slice<T: Pod>(
     data: &[T],
-    device: &WgpuDevice,
+    device: &CubeDevice,
     dtype: DType,
-) -> CubeTensor<WgpuRuntime<AutoCompiler>> {
-    let client = WgpuRuntime::client(device);
+) -> CubeTensor {
+    let client = device.client();
     let handle = client.create_from_slice(bytemuck::cast_slice(data));
     CubeTensor::new_contiguous(
         client,

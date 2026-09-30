@@ -14,14 +14,15 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to initialize tokio runtime");
+
     // `validate` guarantees a source is present when the viewer is off.
     let process = build_parsed_process(&args).expect("source must be present");
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to initialize tokio runtime")
-        .block_on(run_headless(process, args.train_stream.clone()))
+    runtime.block_on(run_headless(process, args.train_stream.clone()))
 }
 
 #[cfg(target_family = "wasm")]

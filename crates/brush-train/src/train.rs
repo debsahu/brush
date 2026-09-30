@@ -35,7 +35,7 @@ use brush_render::bwd::{
 use brush_render::bwd::render_splats_for_training;
 use brush_render::kernels::helpers::{PLANE_AUX_LANES_USIZE, plane_channel_offset};
 use burn::{
-    module::{AutodiffModule, Param, ParamId},
+    module::{Module, Param, ParamId},
     optim::GradientsParams,
     tensor::{
         Bool, Device, Distribution, Gradients, IndexingUpdateOp, Int, Tensor, TensorData,
@@ -88,10 +88,6 @@ impl ExpLrScheduler {
 /// external callers. The per-refine bounds recompute inside the trainer uses the
 /// configurable `TrainConfig::bounds_percentile` (default matches this).
 pub const BOUND_PERCENTILE: f32 = 0.8;
-
-/// Mip-Splatting 3D-filter strength. This is intentionally fixed: changing it
-/// alters the learned/exported representation rather than just training speed.
-const MIN_SCALE_FACTOR: f32 = 0.1;
 
 /// Target number of GT views sampled per refine window for edge guidance
 /// (MRNF port, delta #4; LFS `MRNF_EDGE_MIN_VIEW_SAMPLES = 10`, mrnf.cpp:69).
@@ -219,12 +215,13 @@ fn step_param<const D: usize>(
     param: Param<Tensor<D>>,
     state: &mut AdamState<D>,
     grads: &mut Gradients,
+    grad_sq_mean: Option<Tensor<D>>,
 ) -> Param<Tensor<D>> {
     param.map(|t| {
         let Some(grad) = t.grad_remove(grads) else {
             return t;
         };
-        let stepped = adam.step(lr, t.inner(), &grad, state);
+        let stepped = adam.step(lr, t.inner(), &grad, grad_sq_mean, state);
         Tensor::from_inner(stepped).require_grad()
     })
 }
@@ -289,6 +286,14 @@ pub struct SplatTrainer {
     config: TrainConfig,
     sched_mean: ExpLrScheduler,
     sched_scale: ExpLrScheduler,
+    /// Per-column LR scales for `transforms` (`means(3) + rotations(4) +
+    /// log_scales(3)`) with the scheduled columns zeroed, and masks of the
+    /// mean and log-scale columns: the scheduled LRs are mixed in on the device
+    /// each step so the optimizer never waits on a host upload (upstream
+    /// #554). The mix is exact: every column is `fixed + 1·lr` or `fixed + 0·lr`.
+    lr_scaling_fixed: Tensor<2>,
+    lr_mean_columns: Tensor<2>,
+    lr_scale_columns: Tensor<2>,
     refine_record: Option<RefineRecord>,
     optim: Option<SplatOptim>,
     /// Optional per-view appearance compensation (bilateral grid / PPISP).
@@ -363,6 +368,7 @@ fn step_sh_coeffs(
     mut splats: Splats,
     grads: &mut Gradients,
     deferred: Option<DeferredShGrad>,
+    coeffs_grad_sq: Option<Tensor<3>>,
     learning_rate: f64,
 ) -> Splats {
     let Some(deferred) = deferred else {
@@ -372,9 +378,13 @@ fn step_sh_coeffs(
             splats.sh_coeffs,
             &mut optimizer.sh_coeffs,
             grads,
+            coeffs_grad_sq,
         );
         return splats;
     };
+    // The deferred path has no dense SH gradient, so no reduced second moment
+    // either (the backward leaves `coeffs_grad_sq` unregistered).
+    drop(coeffs_grad_sq);
 
     // Positive evidence that the sparse fused path really runs when
     // `BRUSH_NATIVE_MSL_SPARSE_SH_ADAM=1` (rather than silently falling back to
@@ -448,6 +458,7 @@ fn step_sh_coeffs(
     mut splats: Splats,
     grads: &mut Gradients,
     deferred: Option<DeferredShGrad>,
+    coeffs_grad_sq: Option<Tensor<3>>,
     learning_rate: f64,
 ) -> Splats {
     debug_assert!(
@@ -461,6 +472,7 @@ fn step_sh_coeffs(
         splats.sh_coeffs,
         &mut optimizer.sh_coeffs,
         grads,
+        coeffs_grad_sq,
     );
     splats
 }
@@ -585,7 +597,7 @@ pub async fn get_splat_bounds(splats: Splats, percentile: f32) -> BoundingBox {
         .into_data_async()
         .await
         .expect("Failed to fetch splat data")
-        .to_vec()
+        .try_to_vec()
         .expect("Failed to get means");
     bounds_from_pos(percentile, &means)
 }
@@ -603,8 +615,14 @@ impl SplatTrainer {
         bounds: BoundingBox,
         seed: u64,
     ) -> Self {
-        let decay =
-            (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_train_iters as f64);
+        // The per-step decay reaching lr_mean_end at the last iteration. With
+        // one iteration or fewer there is nothing to decay over (and the
+        // exponent 1/iters would be undefined), so hold the LR (upstream #541).
+        let decay = if config.total_train_iters > 1 {
+            (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_train_iters as f64)
+        } else {
+            1.0
+        };
         let lr_mean = ExpLrScheduler::new(config.lr_mean, decay);
 
         // MRNF LR schedule (R1): independent exponential decay for the log-scale
@@ -623,11 +641,32 @@ impl SplatTrainer {
 
         let ssim_enabled = config.ssim_weight > 0.0;
 
+        // Optimizer state lives on the inner device.
+        let opt_device = device.clone().inner();
+        let rot = config.lr_rotation as f32;
+        let lr_scaling_fixed = Tensor::<1>::from_floats(
+            [0.0, 0.0, 0.0, rot, rot, rot, rot, 0.0, 0.0, 0.0],
+            &opt_device,
+        )
+        .reshape([1, 10]);
+        let lr_mean_columns = Tensor::<1>::from_floats(
+            [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            &opt_device,
+        )
+        .reshape([1, 10]);
+        let lr_scale_columns = Tensor::<1>::from_floats(
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            &opt_device,
+        )
+        .reshape([1, 10]);
+
         // Growth is gated on the global iter. LOD phases run past
         // total_train_iters but their refines should never grow — clamp
-        // here so growth_stop is never effectively past end-of-training.
+        // here so growth_stop is never effectively past end-of-training,
+        // and growth_start never past growth_stop.
         let mut config = config.clone();
         config.growth_stop_iter = config.growth_stop_iter.min(config.total_train_iters);
+        config.growth_start_iter = config.growth_start_iter.min(config.growth_stop_iter);
 
         #[cfg(not(target_family = "wasm"))]
         let lpips = (config.lpips_loss_weight > 0.0).then(|| lpips::load_vgg_lpips(device));
@@ -636,6 +675,9 @@ impl SplatTrainer {
             config,
             sched_mean: lr_mean,
             sched_scale: lr_scale,
+            lr_scaling_fixed,
+            lr_mean_columns,
+            lr_scale_columns,
             optim: None,
             appearance: None,
             refine_record: None,
@@ -656,6 +698,11 @@ impl SplatTrainer {
             #[cfg(not(target_family = "wasm"))]
             lpips,
         }
+    }
+
+    /// Percentile bounding box of the splats, refreshed on each refine.
+    pub fn bounds(&self) -> BoundingBox {
+        self.bounds
     }
 
     /// Supply per-train-view (world center, focal-px at native res) for the
@@ -734,7 +781,7 @@ impl SplatTrainer {
     /// that change splat count must drop or select the old floor first.
     pub fn apply_min_scale_floor(&self, splats: Splats) -> Splats {
         let means = splats.means();
-        match compute_min_scale(&means, &self.view_cams, MIN_SCALE_FACTOR) {
+        match compute_min_scale(&means, &self.view_cams, self.config.min_scale_factor) {
             Some(floor) => splats.with_min_scale(floor),
             None => splats,
         }
@@ -1120,7 +1167,7 @@ impl SplatTrainer {
             .into_data_async()
             .await
             .expect("edge score readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32 edge score");
         edge::normalize_by_positive_median(&mut score_host);
         let score = Tensor::<1>::from_data(TensorData::new(score_host, [n]), &device);
@@ -1263,6 +1310,9 @@ impl SplatTrainer {
     /// Run one training step, optionally omitting the refinement-only raster
     /// gradient statistic. Model gradients, visibility, and screen-radius
     /// bookkeeping are always preserved.
+    // The step's future holds the render, loss and backward state across its
+    // awaits; boxing it would buy nothing on this once-per-iteration path.
+    #[allow(clippy::large_stack_frames)]
     pub async fn step_with_refine_weight(
         &mut self,
         batch: SceneBatch,
@@ -1333,7 +1383,15 @@ impl SplatTrainer {
         // immutably; the sustained-low bookkeeping runs after the block.
         let mut normal_gate_sample: Option<(f32, f32)> = None;
 
-        let (mut grads, visible, num_visible, loss_inner, deferred_sh_grad) = {
+        let (
+            mut grads,
+            visible,
+            render_opacities,
+            num_visible,
+            loss_inner,
+            deferred_sh_grad,
+            coeffs_grad_sq,
+        ) = {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
             //
@@ -1501,9 +1559,11 @@ impl SplatTrainer {
                 None => diff_out.img,
             };
             let refine_weight_holder = diff_out.refine_weight_holder;
+            let coeffs_grad_sq_holder = diff_out.coeffs_grad_sq_holder;
             let deferred_sh_grad = diff_out.deferred_sh_grad;
             let visible = diff_out.visible;
             let max_radius = diff_out.max_radius;
+            let render_opacities = diff_out.opacities;
 
             // RGB loss is `(1 - w) * L1 + (-w) * SSIM` per pixel. Bg
             // compositing always runs in the kernel; for synthesised opaque
@@ -2123,7 +2183,7 @@ impl SplatTrainer {
                             gate_cos,
                         );
                         if let Ok(data) = counts.inner().into_data_async().await
-                            && let Ok(v) = data.to_vec::<f32>()
+                            && let Ok(v) = data.try_to_vec::<f32>()
                             && v.len() == 2
                         {
                             normal_gate_sample = Some((v[0], v[1]));
@@ -2288,6 +2348,13 @@ impl SplatTrainer {
                     .take(&mut grads)
                     .expect("deferred SH gradient holder was not populated")
             });
+            // Reduced in the backward off the compact rows, so the dense SH
+            // gradient never gets squared just to be summed away (upstream
+            // #554). Absent when the SH gradient was deferred to the sparse
+            // optimizer, which has no dense gradient to reduce.
+            let coeffs_grad_sq = coeffs_grad_sq_holder
+                .grad_remove(&mut grads)
+                .map(Tensor::without_autodiff);
 
             trace_span!("Housekeeping").in_scope(|| {
                 // Refine state accumulates on the inner (non-autodiff) device
@@ -2403,9 +2470,11 @@ impl SplatTrainer {
             (
                 grads,
                 visible,
+                render_opacities,
                 diff_out.num_visible,
                 loss_inner,
                 deferred_sh_grad,
+                coeffs_grad_sq,
             )
         };
 
@@ -2451,22 +2520,11 @@ impl SplatTrainer {
         // We use base_lr=1.0 and encode actual LRs in the scaling tensor. Adam
         // momentum persists across steps in `optimizer.transforms.momentum`; only
         // the scaling tensor is swapped here to follow the LR schedules.
-        {
-            let lr_values: [f32; 10] = [
-                lr_mean as f32,
-                lr_mean as f32,
-                lr_mean as f32,
-                self.config.lr_rotation as f32,
-                self.config.lr_rotation as f32,
-                self.config.lr_rotation as f32,
-                self.config.lr_rotation as f32,
-                lr_scale as f32,
-                lr_scale as f32,
-                lr_scale as f32,
-            ];
-            optimizer.transforms.scaling =
-                Some(Tensor::<1>::from_floats(lr_values.as_slice(), &opt_device).reshape([1, 10]));
-        }
+        optimizer.transforms.scaling = Some(
+            self.lr_scaling_fixed.clone()
+                + self.lr_mean_columns.clone() * lr_mean as f32
+                + self.lr_scale_columns.clone() * lr_scale as f32,
+        );
 
         splats = trace_span!("Optimizer step").in_scope(|| {
             splats.transforms = trace_span!("Transforms step").in_scope(|| {
@@ -2476,6 +2534,7 @@ impl SplatTrainer {
                     splats.transforms,
                     &mut optimizer.transforms,
                     &mut grads,
+                    None,
                 )
             });
             splats = trace_span!("SH Coeffs step").in_scope(|| {
@@ -2484,6 +2543,7 @@ impl SplatTrainer {
                     splats,
                     &mut grads,
                     deferred_sh_grad,
+                    coeffs_grad_sq,
                     self.config.lr_coeffs_dc,
                 )
             });
@@ -2494,6 +2554,7 @@ impl SplatTrainer {
                     splats.raw_opacities,
                     &mut optimizer.opacities,
                     &mut grads,
+                    None,
                 )
             });
             splats
@@ -2607,7 +2668,10 @@ impl SplatTrainer {
                 });
             }
         } else {
-            let inv_opac: Tensor<1> = 1.0 - splats.valid().opacities();
+            // Upstream #554: gate on the forward's floored opacities (zero for
+            // culled splats, which `visible` zeroes anyway) rather than
+            // re-deriving opacity from the just-stepped params.
+            let inv_opac: Tensor<1> = 1.0 - render_opacities;
             let noise_weight = inv_opac.powi_scalar(150.0).clamp(0.0, 1.0) * visible;
             let noise_weight = noise_weight.unsqueeze_dim(1);
             // `samples` is pure data — keep it on the inner device so it can
@@ -2824,7 +2888,7 @@ impl SplatTrainer {
                 .into_data_async()
                 .await
                 .expect("Failed to read screen size")
-                .into_vec::<f32>()
+                .try_into_vec::<f32>()
                 .expect("Failed to read screen size vec");
             let mut sorted: Vec<f32> = ss_data.iter().copied().filter(|v| v.is_finite()).collect();
             if !sorted.is_empty() {
@@ -3039,7 +3103,7 @@ impl SplatTrainer {
                             .into_data_async()
                             .await
                             .expect("cloud-prune distance readback")
-                            .into_vec()
+                            .try_into_vec()
                             .expect("f32");
                         let cp = self.config.cloud_prune_dist;
                         let n = dists.len();
@@ -3099,7 +3163,7 @@ impl SplatTrainer {
                 .into_data_async()
                 .await
                 .expect("Failed to get weights")
-                .into_vec::<f32>()
+                .try_into_vec::<f32>()
                 .expect("Failed to read weights");
             // Bias replacement toward edge gaussians (MRNF delta #4).
             if let Some(factor) = &edge_factor {
@@ -3126,7 +3190,7 @@ impl SplatTrainer {
                     .into_data_async()
                     .await
                     .expect("Failed to get oversized indices")
-                    .into_vec::<i32>()
+                    .try_into_vec::<i32>()
                     .expect("Failed to read oversized indices");
                 let mut budget = self
                     .config
@@ -3145,7 +3209,9 @@ impl SplatTrainer {
         let num_split_oversized = (split_inds.len() - pre_oversized) as u32;
 
         let pre_high_grad = split_inds.len();
-        if global_iter < self.config.growth_stop_iter {
+        if global_iter >= self.config.growth_start_iter
+            && global_iter < self.config.growth_stop_iter
+        {
             // Growth signal selection (MRNF `use_error_map` port). When error-map
             // densification is on, the growth candidate set + sampling weight come
             // from the window-MAX error score `Σ T·α·ê` thresholded at τ_err
@@ -3199,7 +3265,7 @@ impl SplatTrainer {
                     .into_data_async()
                     .await
                     .expect("Failed to get weights")
-                    .into_vec::<f32>()
+                    .try_into_vec::<f32>()
                     .expect("Failed to read weights");
                 // Bias growth toward edge gaussians (MRNF delta #4).
                 if let Some(factor) = &edge_factor {
@@ -3285,7 +3351,7 @@ impl SplatTrainer {
                 Tensor::sum_dim(cur_rots_raw.clone().powi_scalar(2), 1).sqrt(),
                 1e-32,
             );
-            let cur_rots = cur_rots_raw / magnitudes;
+            let cur_rots = cur_rots_raw.clone() / magnitudes;
             let cur_log_scale = cur_transforms.slice(s![.., 7..10]);
             let cur_sh_coeffs = splats.sh_coeffs.val().select(0, refine_inds.clone());
             let cur_raw_opac = splats.raw_opacities.val().select(0, refine_inds.clone());
@@ -3306,7 +3372,7 @@ impl SplatTrainer {
             // mass-conserving like the old 1-inv^(1/√2) rule; intentional per
             // MRNF (watch for a small brightness step at refines, E.2).
             let new_opac: Tensor<1> =
-                sigmoid(cur_raw_opac.clone()).mul_scalar(self.config.split_opacity_scale);
+                sigmoid(cur_raw_opac).mul_scalar(self.config.split_opacity_scale);
             let new_raw_opac =
                 inv_sigmoid(new_opac.clamp(self.config.min_opacity, 1.0 - self.config.min_opacity));
 
@@ -3359,29 +3425,40 @@ impl SplatTrainer {
             let base_log_scales = cur_log_scale
                 .clone()
                 .add_scalar(self.config.split_other_axis_scale.ln());
-            let long_log_scales = cur_log_scale.clone() + m_long.log();
+            let long_log_scales = cur_log_scale + m_long.log();
             let new_log_scales =
                 base_log_scales * (-long_onehot.clone() + 1.0) + long_log_scales * long_onehot;
             // LAS keeps the parent rotation for both children.
             let child_rots = cur_rots;
 
-            // Scatter into transforms: build a [refine_count, 10] update tensor
-            // with means offset in cols 0..3 and log_scales difference in cols 7..10
-            let refine_inds_10 = refine_inds.clone().unsqueeze_dim(1).repeat_dim(1, 10);
-            let scale_difference = new_log_scales.clone() - cur_log_scale;
-
+            // Write the parent rows directly (upstream #530): the parent moves
+            // to `mean - samples`, keeps its raw rotation, and takes the new
+            // log-scales and opacity. A direct row assignment rather than a
+            // scatter-add of the difference, which rounded `old + (new - old)`
+            // instead of landing exactly on `new`.
+            let parent_transforms = Tensor::cat(
+                vec![
+                    cur_means.clone() - samples.clone(),
+                    cur_rots_raw,
+                    new_log_scales.clone(),
+                ],
+                1,
+            );
             splats.transforms = splats.transforms.map(|t| {
-                let dev = t.device();
-                let mut update = Tensor::zeros([refine_count, 10], &dev);
-                // Place -samples in means columns (0..3)
-                update = update.slice_assign(s![.., 0..3], -samples.clone());
-                // Place scale difference in log_scales columns (7..10)
-                update = update.slice_assign(s![.., 7..10], scale_difference.clone());
-                t.scatter(0, refine_inds_10.clone(), update, IndexingUpdateOp::Add)
+                t.select_assign(
+                    0,
+                    refine_inds.clone(),
+                    parent_transforms,
+                    IndexingUpdateOp::Assign,
+                )
             });
             splats.raw_opacities = splats.raw_opacities.map(|m| {
-                let difference = new_raw_opac.clone() - cur_raw_opac.clone();
-                m.scatter(0, refine_inds.clone(), difference, IndexingUpdateOp::Add)
+                m.select_assign(
+                    0,
+                    refine_inds.clone(),
+                    new_raw_opac.clone(),
+                    IndexingUpdateOp::Assign,
+                )
             });
 
             // Child sits at parent_mean + samples (parent moves to
@@ -3415,11 +3492,9 @@ impl SplatTrainer {
                 );
             }
 
-            // Both halves of a split start with zero Adam moments.
-            //
-            // Burn's scatter bridge
-            // only implements Add, so we add the negated parent value to zero
-            // it out instead of using Assign.
+            // Both halves of a split start with zero Adam moments: zero the
+            // parent rows in place and append zero rows for the children
+            // (upstream #530's direct assignment).
             splats = map_splats_and_opt(
                 splats,
                 &mut optim,
@@ -3428,33 +3503,35 @@ impl SplatTrainer {
                 |x| Tensor::cat(vec![x, new_raw_opac], 0),
                 |x: Tensor<2>| {
                     let d1 = x.dims()[1];
-                    let neg_parent = -x.clone().select(0, refine_inds_opt.clone());
-                    let inds: Tensor<2, Int> =
-                        refine_inds_opt.clone().unsqueeze_dim(1).repeat_dim(1, d1);
-                    let x = x.scatter(0, inds, neg_parent, IndexingUpdateOp::Add);
-                    Tensor::cat(vec![x, Tensor::zeros([refine_count, d1], &opt_device)], 0)
+                    let zeros = Tensor::zeros([refine_count, d1], &opt_device);
+                    let x = x.select_assign(
+                        0,
+                        refine_inds_opt.clone(),
+                        zeros.clone(),
+                        IndexingUpdateOp::Assign,
+                    );
+                    Tensor::cat(vec![x, zeros], 0)
                 },
                 |x: Tensor<3>| {
                     let [_, d1, d2] = x.dims();
-                    let neg_parent = -x.clone().select(0, refine_inds_opt.clone());
-                    let inds_2: Tensor<2, Int> =
-                        refine_inds_opt.clone().unsqueeze_dim(1).repeat_dim(1, d1);
-                    let inds: Tensor<3, Int> = inds_2.unsqueeze_dim(2).repeat_dim(2, d2);
-                    let x = x.scatter(0, inds, neg_parent, IndexingUpdateOp::Add);
-                    Tensor::cat(
-                        vec![x, Tensor::zeros([refine_count, d1, d2], &opt_device)],
-                        0,
-                    )
-                },
-                |x: Tensor<1>| {
-                    let neg_parent = -x.clone().select(0, refine_inds_opt.clone());
-                    let x = x.scatter(
+                    let zeros = Tensor::zeros([refine_count, d1, d2], &opt_device);
+                    let x = x.select_assign(
                         0,
                         refine_inds_opt.clone(),
-                        neg_parent,
-                        IndexingUpdateOp::Add,
+                        zeros.clone(),
+                        IndexingUpdateOp::Assign,
                     );
-                    Tensor::cat(vec![x, Tensor::zeros([refine_count], &opt_device)], 0)
+                    Tensor::cat(vec![x, zeros], 0)
+                },
+                |x: Tensor<1>| {
+                    let zeros = Tensor::zeros([refine_count], &opt_device);
+                    let x = x.select_assign(
+                        0,
+                        refine_inds_opt.clone(),
+                        zeros.clone(),
+                        IndexingUpdateOp::Assign,
+                    );
+                    Tensor::cat(vec![x, zeros], 0)
                 },
             );
         }
@@ -3656,8 +3733,7 @@ async fn prune_points(
         let valid_inds = valid_inds.squeeze_dim(1);
         // Splat params + optimizer state share the autodiff device, but the
         // refiner runs on the inner device — give `keep()` an inner copy.
-        use brush_render::burn_glue::detach_autodiff_int;
-        let inner_valid_inds = detach_autodiff_int(valid_inds.clone().inner());
+        let inner_valid_inds = valid_inds.clone().without_autodiff();
         if let Some(floor) = splats.min_scale.take() {
             splats.min_scale = Some(floor.select(0, inner_valid_inds.clone()));
         }
@@ -3907,7 +3983,7 @@ async fn log_plane_vs_centre_residual(
         .into_data_async()
         .await
         .expect("plane residual readback")
-        .into_vec()
+        .try_into_vec()
         .expect("f32 plane residual stats");
     let (sum, n) = (stats[0], stats[1]);
     if n > 0.0 {
@@ -4207,7 +4283,7 @@ mod depth_loss_grad_tests {
             .into_data_async()
             .await
             .expect("means grad readback")
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 means grad")[0];
         assert!(
             means_grad_absmax > 1e-8,
@@ -4224,7 +4300,7 @@ mod depth_loss_grad_tests {
                 .into_data_async()
                 .await
                 .expect("opacity grad readback")
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .expect("f32 opacity grad")[0];
             assert!(
                 opac_grad_absmax < 1e-8,
@@ -4290,7 +4366,7 @@ mod normal_prior_grad_tests {
             .into_data_async()
             .await
             .expect("grad readback")
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 grad")[0]
     }
 
@@ -4303,7 +4379,7 @@ mod normal_prior_grad_tests {
                 .into_data_async()
                 .await
                 .expect("opacity grad readback")
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .expect("f32 opacity grad")[0],
         }
     }
@@ -4394,7 +4470,7 @@ mod normal_prior_grad_tests {
             .into_data_async()
             .await
             .expect("normal readback")
-            .to_vec()
+            .try_to_vec()
             .expect("f32 normals");
 
         // Build the prior FROM the render: exact agreement on covered pixels,
@@ -4423,7 +4499,7 @@ mod normal_prior_grad_tests {
             .into_data_async()
             .await
             .expect("counts readback")
-            .to_vec()
+            .try_to_vec()
             .expect("f32 counts");
         assert!((ok[1] - covered as f32).abs() < 1e-3, "valid = {}", ok[1]);
         assert!(
@@ -4441,7 +4517,7 @@ mod normal_prior_grad_tests {
             .into_data_async()
             .await
             .expect("counts readback")
-            .to_vec()
+            .try_to_vec()
             .expect("f32 counts");
         assert!((bad[1] - covered as f32).abs() < 1e-3, "valid = {}", bad[1]);
         assert_eq!(bad[0], 0.0, "a sign-flipped prior must survive nothing");
@@ -4502,7 +4578,7 @@ mod normal_prior_grad_tests {
             .into_data_async()
             .await
             .expect("loss readback")
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 loss")[0];
         assert!(
             loss_val > 1e-6 && loss_val.is_finite(),
@@ -4613,7 +4689,7 @@ mod normal_prior_grad_tests {
             .into_data_async()
             .await
             .expect("loss readback")
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 loss")[0];
         assert!(
             loss_val.is_finite() && loss_val > 1e-6,
@@ -4667,7 +4743,7 @@ mod normal_prior_grad_tests {
             .into_data_async()
             .await
             .expect("loss readback")
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 loss")[0];
         assert!(
             loss < 0.05,
@@ -4839,7 +4915,7 @@ mod sparse_sh_adam_autodiff_bridge_tests {
             splats.sh_coeffs.grad(&grads).is_some(),
             "the dense warm-up step needs a dense SH gradient"
         );
-        splats = step_sh_coeffs(&mut optim, splats, &mut grads, deferred, LR);
+        splats = step_sh_coeffs(&mut optim, splats, &mut grads, deferred, None, LR);
 
         // --- Step 2: the deferred/sparse step ----------------------------
         {
@@ -4869,7 +4945,7 @@ mod sparse_sh_adam_autodiff_bridge_tests {
         // The regression itself: this call panicked with
         // "Requires autodiff tensor." while the bridge was
         // `Tensor::from_inner(param.inner())`.
-        splats = step_sh_coeffs(&mut optim, splats, &mut grads, Some(deferred), LR);
+        splats = step_sh_coeffs(&mut optim, splats, &mut grads, Some(deferred), None, LR);
 
         // And the stepped parameter must be a real autodiff leaf again, not an
         // inner tensor smuggled back into the module — otherwise the next
@@ -5434,7 +5510,7 @@ mod plane_feature_tests {
             .into_data_async()
             .await
             .expect("grad readback")
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 grad")[0]
     }
 
@@ -5442,7 +5518,7 @@ mod plane_feature_tests {
         t.into_data_async()
             .await
             .expect("tensor readback")
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 tensor")
     }
 
@@ -5845,7 +5921,7 @@ mod plane_aux_consumer_tests {
         t.into_data_async()
             .await
             .expect("tensor readback")
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 tensor")
     }
 
@@ -6517,7 +6593,7 @@ mod nonfinite_guard_tests {
             .into_data_async()
             .await
             .expect("image readback")
-            .into_vec::<f32>()
+            .try_into_vec::<f32>()
             .expect("image as f32");
         let bad = img.iter().filter(|v| !v.is_finite()).count();
         assert_eq!(
@@ -6641,7 +6717,7 @@ mod mask_clear_geometry_tests {
         t.into_data_async()
             .await
             .expect("tensor readback")
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 tensor")
     }
 

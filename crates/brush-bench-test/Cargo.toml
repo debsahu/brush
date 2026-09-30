@@ -51,6 +51,9 @@ brush-loss = { path = "../brush-loss" }
 # for synchronous debug readbacks on every training step.
 brush-render = { path = "../brush-render", features = ["debug-validation"] }
 
+# `inspect` is how the fusion test reads back what burn fused.
+burn-fusion = { workspace = true, features = ["test-util"] }
+
 burn-wgpu.workspace = true
 bytemuck.workspace = true
 

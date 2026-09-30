@@ -578,7 +578,7 @@ mod tests {
                 .into_data_async()
                 .await
                 .expect("readback")
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .expect("f32 data")[0],
         );
         let relative_error = (got - param).abs() / param.abs().max(1e-12);

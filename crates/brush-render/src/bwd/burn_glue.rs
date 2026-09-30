@@ -1,20 +1,21 @@
 #![allow(clippy::match_wildcard_for_single_variants)]
 
 use crate::burn_glue::{
-    AutodiffMain, lift_to_autodiff, unwrap_ad_wgpu_float, wrap_ad_wgpu_float, wrap_wgpu_float,
-    wrap_wgpu_int,
+    AutodiffMain, detach_autodiff, lift_to_autodiff, unwrap_ad_wgpu_float, unwrap_wgpu_float,
+    wrap_ad_wgpu_float, wrap_wgpu_float, wrap_wgpu_int,
 };
 use crate::{
     SplatOps,
     camera::Camera,
-    gaussian_splats::{Rasterizer, SplatRenderMode, Splats, fold_min_scale},
+    gaussian_splats::{Rasterizer, SplatRenderMode, Splats},
     sh::sh_coeffs_for_degree,
     shaders::helpers::ProjectUniforms,
 };
 use brush_cube::{MainBackend, MainBackendBase};
+use burn::backend::autodiff::checkpoint::strategy::CheckpointStrategy;
 use burn::{
     backend::{
-        AutodiffBackend, Backend, TensorMetadata,
+        Autodiff, AutodiffBackend, Backend, TensorMetadata,
         autodiff::{
             checkpoint::{base::Checkpointer, strategy::NoCheckpointing},
             grads::Gradients,
@@ -22,17 +23,19 @@ use burn::{
         },
         ops::FloatTensorOps,
         tensor::{FloatTensor, IntTensor},
-        wgpu::WgpuRuntime,
     },
     module::Param,
-    tensor::{DType, FloatDType, Gradients as TensorGradients, Int, Shape, Tensor},
+    tensor::{
+        DType, FloatDType, Gradients as TensorGradients, IndexingUpdateOp, Int, Shape, Tensor,
+    },
 };
 use burn_cubecl::fusion::FusionCubeRuntime;
 use burn_fusion::{
-    Fusion, FusionHandle,
-    stream::{Operation, StreamId},
+    ExecutionError, Fusion, FusionHandle,
+    custom::{
+        CustomOpIr, HandleContainer, Operation, OperationIr, OperationOutput, StreamId, TensorIr,
+    },
 };
-use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
 use glam::Vec3;
 
 fn training_rasterizer() -> Rasterizer {
@@ -61,16 +64,24 @@ pub(crate) struct RasterizeGrads<B: Backend> {
 }
 
 /// Final gradients w.r.t. splat inputs from the project backward pass.
+///
+/// Compact with a zero row in front (upstream #554): row 0 is what culled
+/// splats gather through `compact_from_global`, visible splat `compact_gid`
+/// owns row `compact_gid + 1`. The one exception is `v_coeffs` on the
+/// native-MSL coalesced-SH path, which the materializer writes DENSE
+/// (`[total_splats, coeffs, 3]`) directly; `coeffs_dense` says which.
 #[derive(Debug, Clone)]
 pub(crate) struct SplatGrads<B: Backend> {
     pub v_transforms: FloatTensor<B>,
     pub v_coeffs: FloatTensor<B>,
     pub v_raw_opac: FloatTensor<B>,
     pub v_refine_weight: FloatTensor<B>,
+    pub coeffs_dense: bool,
 }
 
 /// Projection gradients when SH coefficient materialization is deferred to
-/// the optimizer. The other model gradients remain dense and unchanged.
+/// the optimizer. The other model gradients are compact rows, as in
+/// [`SplatGrads`].
 #[derive(Debug, Clone)]
 pub(crate) struct DeferredSplatGrads<B: Backend> {
     pub v_transforms: FloatTensor<B>,
@@ -141,16 +152,19 @@ pub(crate) trait SplatBwdOps: Backend {
     }
 
     /// Backward pass for projection.
-    /// Reads sparse `v_combined` [`num_visible`, `COMPACT_GRAD_LANES`], writes dense
-    /// outputs (scatter in kernel).
-    /// `sh_coeffs` is the original (input) SH coefficient tensor — needed
-    /// so the kernel can backprop `v_color` through the SH basis to the
-    /// view direction and then to the mean.
+    /// Reads sparse `v_combined` [`num_visible`, `COMPACT_GRAD_LANES`]; writes a
+    /// zero row, then one row per visible splat in `compact_gid` order (see
+    /// [`SplatGrads`]). `sh_coeffs` is the original (input) SH coefficient
+    /// tensor — needed so the kernel can backprop `v_color` through the SH
+    /// basis to the view direction and then to the mean. `min_scale` is the
+    /// 3D-filter floor applied in-kernel, matching the forward.
     #[allow(clippy::too_many_arguments)]
     fn project_bwd(
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opac: FloatTensor<Self>,
+        min_scale: FloatTensor<Self>,
+        has_min_scale: bool,
         global_from_compact_gid: IntTensor<Self>,
         project_uniforms: ProjectUniforms,
         render_mode: SplatRenderMode,
@@ -165,18 +179,22 @@ pub(crate) trait SplatBwdOps: Backend {
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opac: FloatTensor<Self>,
+        min_scale: FloatTensor<Self>,
+        has_min_scale: bool,
         global_from_compact_gid: IntTensor<Self>,
         project_uniforms: ProjectUniforms,
         render_mode: SplatRenderMode,
         v_combined: FloatTensor<Self>,
     ) -> DeferredSplatGrads<Self> {
         // Preserve compatibility for external backend implementations. The
-        // built-in Wgpu paths override this to avoid the dense coefficient
-        // allocation; other backends may compute and discard it safely.
+        // built-in paths override this to avoid the coefficient allocation;
+        // other backends may compute and discard it safely.
         let grads = Self::project_bwd(
             transforms,
             sh_coeffs,
             raw_opac,
+            min_scale,
+            has_min_scale,
             global_from_compact_gid,
             project_uniforms,
             render_mode,
@@ -301,10 +319,13 @@ struct GaussianBackwardState<B: Backend> {
     transforms: FloatTensor<B>,
     sh_coeffs: FloatTensor<B>,
     raw_opacity: FloatTensor<B>,
+    min_scale: FloatTensor<B>,
+    has_min_scale: bool,
 
     projected_splats: FloatTensor<B>,
     project_uniforms: ProjectUniforms,
     global_from_compact_gid: IntTensor<B>,
+    compact_from_global: IntTensor<B>,
 
     out_img: FloatTensor<B>,
     compact_gid_from_isect: IntTensor<B>,
@@ -326,10 +347,11 @@ struct GaussianBackwardState<B: Backend> {
 struct RenderBackwards;
 
 /// Parents of the hand-rolled render op, in `prepare` order:
-/// `transforms, refine_weight, sh_coeffs, raw_opacities, deferred_sh, plane_aux`.
-/// The sixth (plane-aux) parent is what makes the PGSR plane channels a real
-/// differentiable input rather than a read-only side channel.
-const NUM_BWD_ARGS: usize = 6;
+/// `transforms, refine_weight, sh_coeffs, raw_opacities, coeffs_grad_sq,
+/// deferred_sh, plane_aux`. The plane-aux parent is what makes the PGSR plane
+/// channels a real differentiable input rather than a read-only side channel;
+/// `coeffs_grad_sq` catches the reduced SH second moment (upstream #554).
+const NUM_BWD_ARGS: usize = 7;
 
 // Implement gradient registration when rendering backwards.
 impl<B: Backend + InternalSplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
@@ -353,6 +375,7 @@ impl<B: Backend + InternalSplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackw
             refine_weight,
             coeffs_parent,
             raw_opacity_parent,
+            coeffs_grad_sq_parent,
             deferred_sh_parent,
             plane_aux_parent,
         ] = ops.parents;
@@ -395,12 +418,18 @@ impl<B: Backend + InternalSplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackw
                     &[(0..num_visible).into(), (start..start + lanes).into()],
                 );
                 let indices = B::int_slice(global_from_compact_gid, &[(0..num_visible).into()]);
-                B::float_select_add(zeros, 0, indices, compact)
+                B::float_select_assign(zeros, 0, indices, compact, IndexingUpdateOp::Add)
             } else {
                 zeros
             };
             grads.register::<B>(node.id, v_aux);
         }
+
+        // The project kernels write compact gradients with a zero row in
+        // front, and `compact_from_global` points culled splats at that row,
+        // so one gather expands each to the dense param shape (upstream #554).
+        let inv = state.compact_from_global;
+        let dense = |compact: FloatTensor<B>| B::float_select(compact, 0, inv.clone());
 
         if let Some(deferred_sh_parent) = deferred_sh_parent {
             let compact_sh_grads = rasterize_grads.v_combined.clone();
@@ -408,6 +437,8 @@ impl<B: Backend + InternalSplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackw
                 state.transforms,
                 state.sh_coeffs,
                 state.raw_opacity,
+                state.min_scale,
+                state.has_min_scale,
                 state.global_from_compact_gid,
                 state.project_uniforms,
                 state.render_mode,
@@ -415,37 +446,63 @@ impl<B: Backend + InternalSplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackw
             );
 
             if let Some(node) = transforms_parent {
-                grads.register::<B>(node.id, splat_grads.v_transforms);
+                grads.register::<B>(node.id, dense(splat_grads.v_transforms));
             }
             if let Some(node) = refine_weight {
-                grads.register::<B>(node.id, splat_grads.v_refine_weight);
+                grads.register::<B>(node.id, dense(splat_grads.v_refine_weight));
             }
             if let Some(node) = raw_opacity_parent {
-                grads.register::<B>(node.id, splat_grads.v_raw_opac);
+                grads.register::<B>(node.id, dense(splat_grads.v_raw_opac));
             }
+            // No SH gradient exists on this path (the sparse SH optimizer
+            // consumes the raster gradients directly), so `coeffs_grad_sq`
+            // stays unregistered and the caller reads it as absent.
+            let _ = coeffs_grad_sq_parent;
             grads.register::<B>(deferred_sh_parent.id, compact_sh_grads);
         } else {
             let splat_grads = B::project_bwd(
                 state.transforms,
                 state.sh_coeffs,
                 state.raw_opacity,
+                state.min_scale,
+                state.has_min_scale,
                 state.global_from_compact_gid,
                 state.project_uniforms,
                 state.render_mode,
                 rasterize_grads.v_combined,
             );
+            let coeffs_dense = splat_grads.coeffs_dense;
+            let coeffs = splat_grads.v_coeffs;
 
             if let Some(node) = transforms_parent {
-                grads.register::<B>(node.id, splat_grads.v_transforms);
+                grads.register::<B>(node.id, dense(splat_grads.v_transforms));
             }
             if let Some(node) = refine_weight {
-                grads.register::<B>(node.id, splat_grads.v_refine_weight);
-            }
-            if let Some(node) = coeffs_parent {
-                grads.register::<B>(node.id, splat_grads.v_coeffs);
+                grads.register::<B>(node.id, dense(splat_grads.v_refine_weight));
             }
             if let Some(node) = raw_opacity_parent {
-                grads.register::<B>(node.id, splat_grads.v_raw_opac);
+                grads.register::<B>(node.id, dense(splat_grads.v_raw_opac));
+            }
+
+            // The SH second moment Adam wants is a mean over each splat's
+            // coefficients. Reducing the compact rows and gathering the small
+            // result skips squaring the dense `[N, coeffs, 3]` gradient, which
+            // burn will not fuse into the reduce that consumes it. On the
+            // coalesced native-MSL path the gradient is already dense, so the
+            // reduction runs on it directly and needs no gather.
+            if let Some(node) = coeffs_grad_sq_parent {
+                let trailing = (sh_coeffs_for_degree(state.project_uniforms.sh_degree) * 3) as f32;
+                let sq = B::float_mul(coeffs.clone(), coeffs.clone());
+                let sq = B::float_sum_dims(sq, &[1, 2]);
+                let mean =
+                    B::float_div_scalar(sq, burn::tensor::Scalar::Float(f64::from(trailing)));
+                let mean = if coeffs_dense { mean } else { dense(mean) };
+                grads.register::<B>(node.id, mean);
+            }
+
+            if let Some(node) = coeffs_parent {
+                let coeffs = if coeffs_dense { coeffs } else { dense(coeffs) };
+                grads.register::<B>(node.id, coeffs);
             }
         }
     }
@@ -491,7 +548,17 @@ pub struct SplatOutputDiff {
     pub visible: Tensor<1>,
     /// Per-splat max screen radius aux — on the **inner** backend (no gradients).
     pub max_radius: Tensor<1>,
+    /// Per-splat opacity with the scale floor folded in — on the **inner**
+    /// backend (no gradients). Zero for culled splats.
+    pub opacities: Tensor<1>,
     pub refine_weight_holder: Tensor<1>,
+    /// Catches the per-splat mean square of the SH gradient (upstream #554).
+    /// Its gradient is `[N, 1, 1]`, broadcasting over the coefficients, so it
+    /// feeds Adam's second moment directly. This statistic is for one
+    /// render/backward; it cannot be added across renders to obtain the mean
+    /// square of an accumulated SH gradient. Absent from the gradients when the
+    /// SH gradient is deferred to the sparse optimizer.
+    pub coeffs_grad_sq_holder: Tensor<3>,
 }
 
 /// Private cross-crate training protocol. Keeping this separate preserves the
@@ -503,7 +570,9 @@ pub struct TrainingSplatOutputDiff {
     pub num_visible: u32,
     pub visible: Tensor<1>,
     pub max_radius: Tensor<1>,
+    pub opacities: Tensor<1>,
     pub refine_weight_holder: Tensor<1>,
+    pub coeffs_grad_sq_holder: Tensor<3>,
     pub deferred_sh_grad: Option<DeferredShGradHandle>,
 }
 
@@ -514,14 +583,17 @@ impl TrainingSplatOutputDiff {
             num_visible: self.num_visible,
             visible: self.visible,
             max_radius: self.max_radius,
+            opacities: self.opacities,
             refine_weight_holder: self.refine_weight_holder,
+            coeffs_grad_sq_holder: self.coeffs_grad_sq_holder,
         }
     }
 }
 
-/// Equivalent to `Module::train()` for [`Splats`], routing through
-/// [`lift_to_autodiff`] so the autodiff `checkpointing` field is set. Use this
-/// instead of `splats.train()` until upstream burn-dispatch fixes `from_inner`.
+/// Equivalent to `Module::train()` for [`Splats`]: lifts every parameter onto
+/// the autodiff graph and arms gradient tracking. Kept (upstream brush now uses
+/// `splats.train()`, fixed in #534) because this fork's trainer and tests call
+/// it by name; it produces the same lifted, `require_grad` leaves.
 pub fn lift_splats_to_autodiff(splats: Splats) -> Splats {
     let mip = splats.render_mip;
     let min_scale = splats.min_scale.clone();
@@ -778,6 +850,7 @@ async fn render_splats_with_pass_and_refine_weight(
     } else {
         refine_weight_holder
     };
+    let coeffs_grad_sq_holder = Tensor::<3>::zeros([1, 1, 1], &device).require_grad();
     let deferred_sh_holder = Tensor::<2>::zeros([1, 1], &device);
     let deferred_sh_holder = if defer_sh_grad {
         deferred_sh_holder.require_grad()
@@ -792,38 +865,36 @@ async fn render_splats_with_pass_and_refine_weight(
     );
     // Non-grad anchor when the plane channels are off, mirroring the
     // deferred-SH anchor above: `RenderBackwards` has a fixed parent set, so the
-    // sixth slot is always filled and simply stays untracked.
+    // plane slot is always filled and simply stays untracked.
     let plane_aux = plane_aux.unwrap_or_else(|| {
         Tensor::<2>::zeros([1, crate::kernels::helpers::PLANE_AUX_LANES_USIZE], &device)
     });
 
-    // Fold the 3D-filter floor into scales/opacity for the render. `min_scale`
-    // lives on the inner backend; `fold_min_scale` lifts it onto the autodiff
-    // graph to match the param values.
-    let (transforms_val, raw_opac_val) = match &splats.min_scale {
-        Some(f) => fold_min_scale(
-            splats.transforms.val(),
-            splats.raw_opacities.val(),
-            f.clone(),
-        ),
-        None => (splats.transforms.val(), splats.raw_opacities.val()),
-    };
+    // The 3D-filter floor is applied inside the projection kernels and their
+    // backward (upstream #546/#554), rather than folded into the params on the
+    // autodiff graph first. It lives on the inner backend and carries no
+    // gradient. `fold_min_scale` (the graph form) is still what the trainer's
+    // auxiliary geometry passes use; the two are the same function.
+    let (min_scale, has_min_scale) = splats.min_scale_arg();
+    let min_scale_inner: FloatTensor<MainBackend> = unwrap_wgpu_float(detach_autodiff(min_scale));
 
-    let transforms_ad = unwrap_ad_wgpu_float(transforms_val);
+    let transforms_ad = unwrap_ad_wgpu_float(splats.transforms.val());
     let sh_coeffs_ad = unwrap_ad_wgpu_float(splats.sh_coeffs.val());
-    let raw_opac_ad = unwrap_ad_wgpu_float(raw_opac_val);
+    let raw_opac_ad = unwrap_ad_wgpu_float(splats.raw_opacities.val());
     let refine_weight_ad = unwrap_ad_wgpu_float(refine_weight_holder.clone());
+    let coeffs_grad_sq_ad = unwrap_ad_wgpu_float(coeffs_grad_sq_holder.clone());
     let deferred_sh_ad = unwrap_ad_wgpu_float(deferred_sh_holder.clone());
     let plane_aux_ad = unwrap_ad_wgpu_float(plane_aux);
 
     let prep_nodes = RenderBackwards
         .prepare::<NoCheckpointing>([
-            transforms_ad.node.clone(),
-            refine_weight_ad.node.clone(),
-            sh_coeffs_ad.node.clone(),
-            raw_opac_ad.node.clone(),
-            deferred_sh_ad.node.clone(),
-            plane_aux_ad.node.clone(),
+            transforms_ad.node(),
+            refine_weight_ad.node(),
+            sh_coeffs_ad.node(),
+            raw_opac_ad.node(),
+            coeffs_grad_sq_ad.node(),
+            deferred_sh_ad.node(),
+            plane_aux_ad.node(),
         ])
         .compute_bound()
         .stateful();
@@ -834,11 +905,11 @@ async fn render_splats_with_pass_and_refine_weight(
         SplatRenderMode::Default
     };
 
-    let transforms_inner: FloatTensor<MainBackend> = transforms_ad.primitive.clone();
-    let sh_inner: FloatTensor<MainBackend> = sh_coeffs_ad.primitive;
-    let raw_opac_inner: FloatTensor<MainBackend> = raw_opac_ad.primitive.clone();
+    let transforms_inner: FloatTensor<MainBackend> = transforms_ad.primitive().clone();
+    let sh_inner: FloatTensor<MainBackend> = sh_coeffs_ad.into_primitive();
+    let raw_opac_inner: FloatTensor<MainBackend> = raw_opac_ad.primitive().clone();
     let plane_aux_inner: Option<FloatTensor<MainBackend>> =
-        render_plane.then(|| plane_aux_ad.primitive.clone());
+        render_plane.then(|| plane_aux_ad.primitive().clone());
 
     assert!(
         pass.bwd_info(),
@@ -854,6 +925,8 @@ async fn render_splats_with_pass_and_refine_weight(
         transforms_inner.clone(),
         sh_inner.clone(),
         raw_opac_inner.clone(),
+        min_scale_inner.clone(),
+        has_min_scale,
         plane_aux_inner.clone(),
         render_mode,
         rasterization_mode,
@@ -868,6 +941,7 @@ async fn render_splats_with_pass_and_refine_weight(
     let num_visible = output.aux.num_visible;
     let visible_inner = output.aux.visible.clone();
     let max_radius_inner = output.aux.max_radius.clone();
+    let opacities_inner = output.aux.opacities.clone();
     let deferred_sh_grad = defer_sh_grad.then(|| DeferredShGradHandle {
         holder: deferred_sh_holder,
         render_transforms: wrap_wgpu_float(transforms_inner.clone()),
@@ -881,6 +955,8 @@ async fn render_splats_with_pass_and_refine_weight(
                 transforms: transforms_inner,
                 sh_coeffs: sh_inner,
                 raw_opacity: raw_opac_inner,
+                min_scale: min_scale_inner,
+                has_min_scale,
                 out_img: output.out_img.clone(),
                 projected_splats: output.projected_splats,
                 project_uniforms: output.project_uniforms,
@@ -892,6 +968,7 @@ async fn render_splats_with_pass_and_refine_weight(
                 rasterizer,
                 rasterization_mode,
                 global_from_compact_gid: output.global_from_compact_gid,
+                compact_from_global: output.compact_from_global,
                 background,
                 img_size,
             };
@@ -903,26 +980,28 @@ async fn render_splats_with_pass_and_refine_weight(
     TrainingSplatOutputDiff {
         img: wrap_ad_wgpu_float(img_ad),
         num_visible,
-        // `visible` / `max_radius` are render aux — they only feed refine
-        // bookkeeping and never get a backward. Hand them back on the inner
-        // backend directly so callers don't have to strip autodiff off them.
+        // `visible` / `max_radius` / `opacities` are render aux — they only
+        // feed refine bookkeeping and never get a backward. Hand them back on
+        // the inner backend directly so callers don't have to strip autodiff.
         visible: wrap_wgpu_float(visible_inner),
         max_radius: wrap_wgpu_float(max_radius_inner),
+        opacities: wrap_wgpu_float(opacities_inner),
         refine_weight_holder,
+        coeffs_grad_sq_holder,
         deferred_sh_grad,
     }
 }
 
-/// Autodiff arm of the `#[backend_extension(Wgpu, Autodiff)]` `SplatOps`
+/// Autodiff arm of the `#[backend_extension(Cube, Autodiff)]` `SplatOps`
 /// trait. The generated `Dispatch` impl routes autodiff tensors here.
 ///
 /// Production training goes through `render_splats_with_pass_and_refine_weight`
-/// (hand-rolled so the rasterizer selector and deferred-SH path survive); this
-/// impl exists to satisfy the extension macro and to service any generic
-/// autodiff render. It threads a non-`require_grad` deferred-SH anchor so the
-/// 5-input `RenderBackwards` has its full parent set while always taking the
-/// dense-coefficient branch.
-impl SplatOps for AutodiffMain {
+/// (hand-rolled so the rasterizer selector, the plane-aux input and the
+/// deferred-SH path survive); this impl services any generic autodiff render.
+/// It threads non-`require_grad` deferred-SH and plane-aux anchors so the
+/// fixed-arity `RenderBackwards` has its full parent set while always taking
+/// the dense-coefficient branch.
+impl<C: CheckpointStrategy> SplatOps for Autodiff<MainBackend, C> {
     #[allow(clippy::too_many_arguments)]
     async fn render(
         camera: &Camera,
@@ -930,15 +1009,15 @@ impl SplatOps for AutodiffMain {
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
+        min_scale: FloatTensor<Self>,
+        has_min_scale: bool,
         refine_weight: FloatTensor<Self>,
+        coeffs_grad_sq: FloatTensor<Self>,
         render_mode: SplatRenderMode,
         rasterization_mode: crate::gaussian_splats::RasterizationMode,
         background: Vec3,
         pass: crate::gaussian_splats::RasterPass,
     ) -> crate::RenderOutput<Self> {
-        // Non-grad deferred-SH anchor: the generic dispatch never defers SH, so
-        // this parent stays untracked and `RenderBackwards` takes the dense
-        // branch. Kept only to fill the fixed 5-input parent set.
         let device = transforms.device();
         let deferred_sh = Self::float_zeros(Shape::new([1, 1]), &device, FloatDType::F32);
         // Likewise a non-grad anchor for the plane-aux parent: the generic
@@ -956,19 +1035,21 @@ impl SplatOps for AutodiffMain {
 
         let prep_nodes = RenderBackwards
             .prepare::<NoCheckpointing>([
-                transforms.node.clone(),
-                refine_weight.node.clone(),
-                sh_coeffs.node.clone(),
-                raw_opacities.node.clone(),
-                deferred_sh.node.clone(),
-                plane_aux.node.clone(),
+                transforms.node(),
+                refine_weight.node(),
+                sh_coeffs.node(),
+                raw_opacities.node(),
+                coeffs_grad_sq.node(),
+                deferred_sh.node(),
+                plane_aux.node(),
             ])
             .compute_bound()
             .stateful();
 
-        let transforms_inner: FloatTensor<MainBackend> = transforms.primitive.clone();
-        let sh_inner: FloatTensor<MainBackend> = sh_coeffs.primitive;
-        let raw_opac_inner: FloatTensor<MainBackend> = raw_opacities.primitive.clone();
+        let transforms_inner: FloatTensor<MainBackend> = transforms.primitive().clone();
+        let sh_inner: FloatTensor<MainBackend> = sh_coeffs.into_primitive();
+        let raw_opac_inner: FloatTensor<MainBackend> = raw_opacities.primitive().clone();
+        let min_scale_inner: FloatTensor<MainBackend> = min_scale.into_primitive();
 
         let output = <MainBackend as SplatOps>::render(
             camera,
@@ -976,7 +1057,10 @@ impl SplatOps for AutodiffMain {
             transforms_inner.clone(),
             sh_inner.clone(),
             raw_opac_inner.clone(),
-            refine_weight.primitive,
+            min_scale_inner.clone(),
+            has_min_scale,
+            refine_weight.into_primitive(),
+            coeffs_grad_sq.into_primitive(),
             render_mode,
             rasterization_mode,
             background,
@@ -992,6 +1076,8 @@ impl SplatOps for AutodiffMain {
                     transforms: transforms_inner,
                     sh_coeffs: sh_inner,
                     raw_opacity: raw_opac_inner,
+                    min_scale: min_scale_inner,
+                    has_min_scale,
                     out_img: output.out_img.clone(),
                     projected_splats: output.projected_splats.clone(),
                     project_uniforms: output.project_uniforms,
@@ -1003,6 +1089,7 @@ impl SplatOps for AutodiffMain {
                     rasterizer: Rasterizer::Legacy,
                     rasterization_mode,
                     global_from_compact_gid: output.global_from_compact_gid.clone(),
+                    compact_from_global: output.compact_from_global.clone(),
                     background,
                     img_size,
                 };
@@ -1025,6 +1112,7 @@ impl SplatOps for AutodiffMain {
                 num_intersections: output.aux.num_intersections,
                 visible: lift(output.aux.visible),
                 max_radius: lift(output.aux.max_radius),
+                opacities: lift(output.aux.opacities),
                 tile_offsets: output.aux.tile_offsets,
                 img_size: output.aux.img_size,
             },
@@ -1032,6 +1120,7 @@ impl SplatOps for AutodiffMain {
             compact_gid_from_isect: output.compact_gid_from_isect,
             project_uniforms: output.project_uniforms,
             global_from_compact_gid: output.global_from_compact_gid,
+            compact_from_global: output.compact_from_global,
         }
     }
 }
@@ -1068,8 +1157,11 @@ fn rasterize_bwd_fusion(
         trusted_forward: bool,
     }
 
-    impl Operation<FusionCubeRuntime<WgpuRuntime>> for CustomOp {
-        fn execute(&self, h: &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>) {
+    impl Operation<FusionCubeRuntime> for CustomOp {
+        fn execute(
+            &self,
+            h: &mut HandleContainer<FusionHandle<FusionCubeRuntime>>,
+        ) -> Result<(), ExecutionError> {
             // The descriptor's input ARITY varies with the plane mode: the
             // plane slot is simply absent when it is off. A fixed arity would
             // need a placeholder tensor, and building one per call puts an
@@ -1156,6 +1248,7 @@ fn rasterize_bwd_fusion(
             };
 
             h.register_float_tensor::<MainBackendBase>(&v_combined.id, grads.v_combined);
+            Ok(())
         }
     }
 
@@ -1299,31 +1392,33 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opac: FloatTensor<Self>,
+        min_scale: FloatTensor<Self>,
+        has_min_scale: bool,
         global_from_compact_gid: IntTensor<Self>,
         project_uniforms: ProjectUniforms,
         render_mode: SplatRenderMode,
         v_combined: FloatTensor<Self>,
     ) -> SplatGrads<Self> {
-        // The screen-area regulariser only acts in the backward kernel, so we
-        // stamp the weight onto the uniforms here rather than in the forward.
         #[derive(Debug)]
         struct CustomOp {
             desc: CustomOpIr,
             render_mode: SplatRenderMode,
             project_uniforms: ProjectUniforms,
+            has_min_scale: bool,
         }
 
-        impl Operation<FusionCubeRuntime<WgpuRuntime>> for CustomOp {
+        impl Operation<FusionCubeRuntime> for CustomOp {
             fn execute(
                 &self,
-                h: &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>,
-            ) {
+                h: &mut HandleContainer<FusionHandle<FusionCubeRuntime>>,
+            ) -> Result<(), ExecutionError> {
                 let (inputs, outputs) = self.desc.as_fixed();
 
                 let [
                     transforms,
                     sh_coeffs,
                     raw_opac,
+                    min_scale,
                     global_from_compact_gid,
                     v_combined_in,
                 ] = inputs;
@@ -1334,6 +1429,8 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
                     h.get_float_tensor::<MainBackendBase>(transforms),
                     h.get_float_tensor::<MainBackendBase>(sh_coeffs),
                     h.get_float_tensor::<MainBackendBase>(raw_opac),
+                    h.get_float_tensor::<MainBackendBase>(min_scale),
+                    self.has_min_scale,
                     h.get_int_tensor::<MainBackendBase>(global_from_compact_gid),
                     self.project_uniforms,
                     self.render_mode,
@@ -1347,17 +1444,30 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
                     &v_refine_weight.id,
                     grads.v_refine_weight,
                 );
+                Ok(())
             }
         }
 
         let client = transforms.client.clone();
         let num_points = transforms.shape[0];
         let coeffs = sh_coeffs_for_degree(project_uniforms.sh_degree) as usize;
+        // Compact rows with the zero row in front; the SH gradient is dense
+        // instead on the coalesced native-MSL path, which the inner impl picks
+        // with the same predicate, evaluated here so Fusion knows the shape
+        // before the kernel runs.
+        let rows = project_uniforms.num_visible as usize + 1;
+        let coeffs_dense = crate::bwd::render_bwd::materialized_sh_grad_enabled(
+            client.device(),
+            num_points,
+            &project_uniforms,
+        );
+        let coeff_rows = if coeffs_dense { num_points } else { rows };
 
         let input_tensors = [
             transforms,
             sh_coeffs,
             raw_opac,
+            min_scale,
             global_from_compact_gid,
             v_combined,
         ];
@@ -1365,24 +1475,18 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
         let outputs = {
             let v_transforms_out = TensorIr::uninit(
                 client.create_empty_handle(),
-                Shape::new([num_points, 10]),
+                Shape::new([rows, 10]),
                 DType::F32,
             );
             let v_coeffs_out = TensorIr::uninit(
                 client.create_empty_handle(),
-                Shape::new([num_points, coeffs, 3]),
+                Shape::new([coeff_rows, coeffs, 3]),
                 DType::F32,
             );
-            let v_raw_opac_out = TensorIr::uninit(
-                client.create_empty_handle(),
-                Shape::new([num_points]),
-                DType::F32,
-            );
-            let v_refine_weight_out = TensorIr::uninit(
-                client.create_empty_handle(),
-                Shape::new([num_points]),
-                DType::F32,
-            );
+            let v_raw_opac_out =
+                TensorIr::uninit(client.create_empty_handle(), Shape::new([rows]), DType::F32);
+            let v_refine_weight_out =
+                TensorIr::uninit(client.create_empty_handle(), Shape::new([rows]), DType::F32);
 
             let stream = StreamId::current();
             let desc = CustomOpIr::new(
@@ -1404,6 +1508,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
                         desc,
                         render_mode,
                         project_uniforms,
+                        has_min_scale,
                     },
                 )
                 .outputs()
@@ -1416,6 +1521,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
             v_coeffs,
             v_raw_opac,
             v_refine_weight,
+            coeffs_dense,
         }
     }
 
@@ -1424,6 +1530,8 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opac: FloatTensor<Self>,
+        min_scale: FloatTensor<Self>,
+        has_min_scale: bool,
         global_from_compact_gid: IntTensor<Self>,
         project_uniforms: ProjectUniforms,
         render_mode: SplatRenderMode,
@@ -1434,18 +1542,20 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
             desc: CustomOpIr,
             render_mode: SplatRenderMode,
             project_uniforms: ProjectUniforms,
+            has_min_scale: bool,
         }
 
-        impl Operation<FusionCubeRuntime<WgpuRuntime>> for CustomOp {
+        impl Operation<FusionCubeRuntime> for CustomOp {
             fn execute(
                 &self,
-                h: &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>,
-            ) {
+                h: &mut HandleContainer<FusionHandle<FusionCubeRuntime>>,
+            ) -> Result<(), ExecutionError> {
                 let (inputs, outputs) = self.desc.as_fixed();
                 let [
                     transforms,
                     sh_coeffs,
                     raw_opac,
+                    min_scale,
                     global_from_compact_gid,
                     v_combined,
                 ] = inputs;
@@ -1455,6 +1565,8 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
                     h.get_float_tensor::<MainBackendBase>(transforms),
                     h.get_float_tensor::<MainBackendBase>(sh_coeffs),
                     h.get_float_tensor::<MainBackendBase>(raw_opac),
+                    h.get_float_tensor::<MainBackendBase>(min_scale),
+                    self.has_min_scale,
                     h.get_int_tensor::<MainBackendBase>(global_from_compact_gid),
                     self.project_uniforms,
                     self.render_mode,
@@ -1467,33 +1579,29 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
                     &v_refine_weight.id,
                     grads.v_refine_weight,
                 );
+                Ok(())
             }
         }
 
         let client = transforms.client.clone();
-        let num_points = transforms.shape[0];
+        let rows = project_uniforms.num_visible as usize + 1;
         let input_tensors = [
             transforms,
             sh_coeffs,
             raw_opac,
+            min_scale,
             global_from_compact_gid,
             v_combined,
         ];
         let v_transforms = TensorIr::uninit(
             client.create_empty_handle(),
-            Shape::new([num_points, 10]),
+            Shape::new([rows, 10]),
             DType::F32,
         );
-        let v_raw_opac = TensorIr::uninit(
-            client.create_empty_handle(),
-            Shape::new([num_points]),
-            DType::F32,
-        );
-        let v_refine_weight = TensorIr::uninit(
-            client.create_empty_handle(),
-            Shape::new([num_points]),
-            DType::F32,
-        );
+        let v_raw_opac =
+            TensorIr::uninit(client.create_empty_handle(), Shape::new([rows]), DType::F32);
+        let v_refine_weight =
+            TensorIr::uninit(client.create_empty_handle(), Shape::new([rows]), DType::F32);
         let desc = CustomOpIr::new(
             "project_bwd_deferred_sh",
             &input_tensors.map(|tensor| tensor.into_ir()),
@@ -1507,6 +1615,7 @@ impl SplatBwdOps for Fusion<MainBackendBase> {
                     desc,
                     render_mode,
                     project_uniforms,
+                    has_min_scale,
                 },
             )
             .outputs();

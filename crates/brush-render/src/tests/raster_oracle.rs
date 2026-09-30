@@ -10,7 +10,8 @@ use crate::{
     gaussian_splats::{RasterPass, Rasterizer, SplatRenderMode},
     kernels::camera_model::CameraModel,
 };
-use brush_cube::{MainBackendBase, Runtime};
+use brush_cube::CubeDevice;
+use brush_cube::MainBackendBase;
 use burn::{
     backend::{
         TensorMetadata,
@@ -18,7 +19,7 @@ use burn::{
     },
     tensor::{DType, TensorData},
 };
-use burn_wgpu::{CubeTensor, WgpuDevice, WgpuRuntime};
+use burn_wgpu::CubeTensor;
 use glam::{UVec2, Vec3};
 use wasm_bindgen_test::wasm_bindgen_test;
 
@@ -217,12 +218,8 @@ fn oracle_matches_hard_and_smooth_cutoff_definitions() {
     );
 }
 
-fn cube_tensor<const D: usize>(
-    device: &WgpuDevice,
-    shape: [usize; D],
-    data: &[f32],
-) -> CubeTensor<WgpuRuntime> {
-    let client = WgpuRuntime::client(device);
+fn cube_tensor<const D: usize>(device: &CubeDevice, shape: [usize; D], data: &[f32]) -> CubeTensor {
+    let client = device.client();
     let handle = client.create_from_slice(bytemuck::cast_slice(data));
     CubeTensor::new_contiguous(
         client,
@@ -233,7 +230,7 @@ fn cube_tensor<const D: usize>(
     )
 }
 
-async fn read_f32(tensor: CubeTensor<WgpuRuntime>) -> Vec<f32> {
+async fn read_f32(tensor: CubeTensor) -> Vec<f32> {
     let data: TensorData = MainBackendBase::float_into_data(tensor)
         .await
         .expect("readback");
@@ -307,7 +304,7 @@ async fn render_test_scene(
     pass: RasterPass,
     img_size: UVec2,
 ) -> (Vec<f32>, Vec<f32>, u32, [usize; 3]) {
-    let device = brush_cube::test_helpers::test_device().await;
+    let device = CubeDevice::Wgpu(brush_cube::test_helpers::test_device().await);
     let scene = oracle_scene();
     let num_splats = scene.raw_opacity.len();
 
@@ -317,6 +314,8 @@ async fn render_test_scene(
         cube_tensor(&device, [num_splats, 10], &scene.transforms),
         cube_tensor(&device, [num_splats, 1, 3], &scene.sh),
         cube_tensor(&device, [num_splats], &scene.raw_opacity),
+        cube_tensor(&device, [1], &[0.0]),
+        false,
         SplatRenderMode::Default,
         crate::gaussian_splats::RasterizationMode::Rgba,
         Vec3::new(0.13, 0.07, 0.19),
@@ -477,7 +476,7 @@ async fn selectors_match_across_tile_boundaries() {
     }
 }
 
-async fn read_u32(tensor: CubeTensor<WgpuRuntime>) -> Vec<u32> {
+async fn read_u32(tensor: CubeTensor) -> Vec<u32> {
     let data: TensorData = MainBackendBase::int_into_data(tensor)
         .await
         .expect("readback");
@@ -549,7 +548,7 @@ async fn render_plane_test_scene(
     pass: RasterPass,
     img_size: UVec2,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>, usize) {
-    let device = brush_cube::test_helpers::test_device().await;
+    let device = CubeDevice::Wgpu(brush_cube::test_helpers::test_device().await);
     let scene = oracle_scene();
     let num_splats = scene.raw_opacity.len();
     let plane_values = plane_aux_values(num_splats);
@@ -560,6 +559,8 @@ async fn render_plane_test_scene(
         cube_tensor(&device, [num_splats, 10], &scene.transforms),
         cube_tensor(&device, [num_splats, 1, 3], &scene.sh),
         cube_tensor(&device, [num_splats], &scene.raw_opacity),
+        cube_tensor(&device, [1], &[0.0]),
+        false,
         Some(cube_tensor(
             &device,
             [num_splats, PLANE_AUX_LANES],

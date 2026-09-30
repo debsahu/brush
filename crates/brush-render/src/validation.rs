@@ -1,3 +1,58 @@
+//! Optional GPU-to-host validation readbacks.
+
+use core::sync::atomic::{AtomicU8, Ordering};
+
+const UNSET: u8 = 0;
+const ON: u8 = 1;
+const OFF: u8 = 2;
+
+static STATE: AtomicU8 = AtomicU8::new(UNSET);
+
+pub fn set_enabled(on: bool) {
+    STATE.store(if on { ON } else { OFF }, Ordering::Relaxed);
+}
+
+pub fn enabled() -> bool {
+    match STATE.load(Ordering::Relaxed) {
+        ON => true,
+        OFF => false,
+        _ => {
+            let default_on = cfg!(any(test, feature = "debug-validation")) && !is_bench_run();
+            set_enabled(default_on);
+            default_on
+        }
+    }
+}
+
+fn is_bench_run() -> bool {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        std::env::args().any(|a| a == "--bench")
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        false
+    }
+}
+
+#[cfg(any(test, feature = "debug-validation"))]
+pub(crate) fn warn_once() {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        #[allow(clippy::print_stderr)]
+        ONCE.call_once(|| {
+            eprintln!(
+                "brush-render: VALIDATION READBACKS ARE ON (cfg(test) / \
+                 feature \"debug-validation\"). Every render syncs the GPU to \
+                 scan tensors on the host, so any timing you take now is \
+                 dominated by that. Call \
+                 brush_render::validation::set_enabled(false) to turn it off."
+            );
+        });
+    }
+}
+
 use burn::tensor::Tensor;
 
 /// Whether this build promotes NaN/Inf found in a validated tensor to a hard
@@ -27,7 +82,7 @@ pub async fn validate_tensor_val<const D: usize>(
         .await
         .expect("Failed to read tensor data");
     let values = data
-        .into_vec::<f32>()
+        .try_into_vec::<f32>()
         .expect("Failed to convert tensor to f32 vec");
 
     let mut nan_count = 0;

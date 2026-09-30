@@ -1,8 +1,8 @@
-use burn_cubecl::cubecl;
-use burn_cubecl::cubecl::cube;
-use burn_cubecl::cubecl::frontend::CompilationArg;
-use burn_cubecl::cubecl::frontend::IndexMutExpand;
-use burn_cubecl::cubecl::prelude::*;
+use burn::cubecl;
+use burn::cubecl::cube;
+use burn::cubecl::frontend::CompilationArg;
+use burn::cubecl::frontend::IndexMutExpand;
+use burn::cubecl::prelude::*;
 
 #[doc(hidden)]
 pub const CHECKS_PER_ITER: u32 = 8;
@@ -68,13 +68,13 @@ mod tests {
     use burn::backend::ops::IntTensorOps;
     use burn::tensor::DType;
     use burn_cubecl::cubecl::CubeDim;
-    use burn_wgpu::{CubeTensor, WgpuRuntime};
+    use burn_wgpu::CubeTensor;
     use wasm_bindgen_test::wasm_bindgen_test;
 
     #[cfg(target_family = "wasm")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
-    async fn read_u32(tensor: CubeTensor<WgpuRuntime>) -> Vec<u32> {
+    async fn read_u32(tensor: CubeTensor) -> Vec<u32> {
         let data = MainBackendBase::int_into_data(tensor)
             .await
             .expect("readback");
@@ -108,14 +108,14 @@ mod tests {
         tile_ids.extend(std::iter::repeat_n(NUM_TILES, 13));
         let num_inter = tile_ids.len() as u32;
 
-        let device = brush_cube::test_helpers::test_device().await;
+        let device = brush_cube::CubeDevice::Wgpu(brush_cube::test_helpers::test_device().await);
         let tile_ids = create_tensor_from_slice(&tile_ids, &device, DType::I32);
         let offsets =
             create_tensor_from_slice(&vec![0u32; NUM_TILES as usize * 2], &device, DType::I32);
         let client = tile_ids.client.clone();
         let cube_dim = CubeDim::new_1d(256);
 
-        get_tile_offsets::launch::<WgpuRuntime>(
+        get_tile_offsets::launch(
             &client,
             calc_cube_count_1d(num_inter, cube_dim.x * CHECKS_PER_ITER),
             cube_dim,

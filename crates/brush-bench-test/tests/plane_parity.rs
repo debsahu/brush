@@ -127,7 +127,7 @@ async fn read_vec<const D: usize>(t: Tensor<D>) -> Vec<f32> {
     t.into_data_async()
         .await
         .expect("readback")
-        .into_vec::<f32>()
+        .try_into_vec::<f32>()
         .expect("vec")
 }
 

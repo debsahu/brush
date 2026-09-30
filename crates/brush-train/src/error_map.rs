@@ -189,7 +189,7 @@ mod tests {
         t.into_data_async()
             .await
             .expect("readback")
-            .into_vec()
+            .try_into_vec()
             .expect("f32")
     }
 

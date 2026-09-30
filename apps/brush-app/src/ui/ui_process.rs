@@ -2,7 +2,6 @@ use anyhow::Result;
 use brush_async::Actor;
 use brush_process::{RunningProcess, message::ProcessMessage, slot::Slot};
 use brush_render::{camera::Camera, gaussian_splats::Splats, kernels::camera_model::CameraModel};
-use burn_wgpu::WgpuDevice;
 use egui::{Response, TextureHandle};
 use glam::{Affine3A, Quat, Vec3};
 use std::sync::RwLock;
@@ -20,6 +19,7 @@ struct ProcessHandle {
     messages: mpsc::UnboundedReceiver<anyhow::Result<ProcessMessage>>,
     control: mpsc::UnboundedSender<ControlMessage>,
     splat_view: Slot<Splats>,
+    device: brush_process::ProcessDevice,
 }
 
 /// A thread-safe wrapper around the UI process.
@@ -45,9 +45,9 @@ pub struct TexHandle {
 }
 
 impl UiProcess {
-    pub fn new(dev: WgpuDevice, ui_ctx: egui::Context) -> Self {
+    pub fn new(ui_ctx: egui::Context) -> Self {
         let actor = Actor::new("ui-process");
-        Self(RwLock::new(UiProcessInner::new(dev, ui_ctx, actor)))
+        Self(RwLock::new(UiProcessInner::new(ui_ctx, actor)))
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, UiProcessInner> {
@@ -72,6 +72,13 @@ impl UiProcess {
             .process_handle
             .as_ref()
             .map_or(Slot::default(), |s| s.splat_view.clone())
+    }
+
+    pub(crate) fn device_memory_usage(&self) -> Option<burn::tensor::MemoryPoolUsage> {
+        self.read()
+            .process_handle
+            .as_ref()
+            .and_then(|process| process.device.memory_pool_usage())
     }
 
     pub fn is_loading(&self) -> bool {
@@ -190,15 +197,19 @@ impl UiProcess {
         self.read().up_axis
     }
 
+    /// Scale fly speed to the scene size. Ignores degenerate (empty or
+    /// non-finite) extents so the controls never freeze.
+    pub fn set_scene_scale(&self, scene_scale: f32) {
+        if scene_scale.is_finite() && scene_scale > 0.0 {
+            self.write().controls.scene_scale = scene_scale;
+        }
+    }
+
     /// Connect to an existing running process.
     pub fn connect_to_process(&self, process: RunningProcess) {
         {
             let mut inner = self.write();
-            let reset = UiProcessInner::new(
-                inner.burn_device.clone(),
-                inner.ui_ctx.clone(),
-                inner.actor.clone(),
-            );
+            let reset = UiProcessInner::new(inner.ui_ctx.clone(), inner.actor.clone());
             *inner = reset;
         }
 
@@ -250,6 +261,7 @@ impl UiProcess {
             messages: receiver,
             control: train_sender,
             splat_view: process.splat_view,
+            device: process.device,
         });
     }
 
@@ -310,11 +322,7 @@ impl UiProcess {
 
     pub fn reset_session(&self) {
         let mut inner = self.write();
-        *inner = UiProcessInner::new(
-            inner.burn_device.clone(),
-            inner.ui_ctx.clone(),
-            inner.actor.clone(),
-        );
+        *inner = UiProcessInner::new(inner.ui_ctx.clone(), inner.actor.clone());
         inner.session_reset_requested = true;
     }
 
@@ -323,14 +331,6 @@ impl UiProcess {
         let requested = inner.session_reset_requested;
         inner.session_reset_requested = false;
         requested
-    }
-
-    pub fn burn_device(&self) -> WgpuDevice {
-        self.read().burn_device.clone()
-    }
-
-    pub(crate) fn actor(&self) -> Actor {
-        self.read().actor.clone()
     }
 }
 
@@ -348,13 +348,12 @@ struct UiProcessInner {
     reset_layout_requested: bool,
     session_reset_requested: bool,
     ui_ctx: egui::Context,
-    burn_device: WgpuDevice,
     actor: Actor,
     up_axis: Option<Vec3>,
 }
 
 impl UiProcessInner {
-    pub fn new(burn_device: WgpuDevice, ui_ctx: egui::Context, actor: Actor) -> Self {
+    pub fn new(ui_ctx: egui::Context, actor: Actor) -> Self {
         let position = -Vec3::Z * 2.5;
         let rotation = Quat::IDENTITY;
 
@@ -381,7 +380,6 @@ impl UiProcessInner {
             train_paused: false,
             reset_layout_requested: false,
             session_reset_requested: false,
-            burn_device,
             ui_ctx,
             actor,
             up_axis: None,

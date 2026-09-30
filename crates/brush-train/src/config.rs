@@ -186,6 +186,10 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Refine options", default_value = "0.07")]
     pub growth_select_fraction: f32,
 
+    /// Iteration at which splat growth starts. Clamped to `growth_stop_iter`.
+    #[arg(long, help_heading = "Refine options", default_value = "0")]
+    pub growth_start_iter: u32,
+
     /// Period after which splat growth stops.
     #[arg(long, help_heading = "Refine options", default_value = "15000")]
     pub growth_stop_iter: u32,
@@ -436,6 +440,13 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Refine options", default_value = "1.0")]
     #[serde(default = "default_error_map_growth_threshold")]
     pub error_map_growth_threshold: f32,
+    /// Mip-Splatting 3D-filter strength (the paper's `s`): each splat gets a
+    /// per-splat world-space scale floor `sqrt(min_scale_factor) · pixel size
+    /// at the nearest observing camera`, i.e. a ~0.32px std-dev floor at the
+    /// default. Folded into scales/opacity at render (and baked at export),
+    /// never optimized. 0 disables the filter.
+    #[arg(long, help_heading = "Training options", default_value = "0.1")]
+    pub min_scale_factor: f32,
 
     /// Weight of l1 loss on alpha if input view has transparency.
     #[arg(long, help_heading = "Refine options", default_value = "0.1")]

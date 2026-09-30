@@ -905,9 +905,9 @@ impl AppPane for ScenePanel {
         }
     }
 
-    fn init(&mut self, state: &RenderState, process: &UiProcess) {
+    fn init(&mut self, state: &RenderState, _process: &UiProcess) {
         self.grid = Some(GridWidget::new(state));
-        self.backbuffer = Some(SplatBackbuffer::new(state, process.actor()));
+        self.backbuffer = Some(SplatBackbuffer::new(state));
         // Create the settings popup now that we have the base_path
         self.settings_popup = Some(Arc::new(Mutex::new(SettingsPopup::new())));
     }
@@ -946,10 +946,12 @@ impl AppPane for ScenePanel {
                 up_axis,
                 frame,
                 total_frames,
+                scene_scale,
                 ..
             } => {
                 self.has_splats = true;
                 self.frame_count = *total_frames;
+                process.set_scene_scale(*scene_scale);
 
                 // For non-training updates (e.g., loading), always redraw
                 if !process.is_training() {

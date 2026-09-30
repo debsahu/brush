@@ -12,13 +12,11 @@
 
 use std::sync::Arc;
 
-use brush_cube::CubeTensor;
+use brush_cube::{CubeDevice, CubeTensor, create_tensor_from_slice};
 use brush_sort::radix_argsort;
-use burn::backend::wgpu::WgpuDevice;
-use burn::tensor::{DType, Shape};
-use burn_cubecl::cubecl::Runtime;
-use burn_cubecl::cubecl::future::block_on;
-use burn_wgpu::{AutoCompiler, WgpuRuntime};
+use burn::backend::TensorMetadata;
+use burn::cubecl::future::block_on;
+use burn::tensor::DType;
 
 #[cfg(not(target_family = "wasm"))]
 fn main() {
@@ -39,8 +37,8 @@ const SIZES: [usize; 4] = [1_000_000, 10_000_000, 30_000_000, 70_000_000];
 // 1024 matches the renderer's tile budget for a 512x512 image.
 const TILE_ID_RANGE: u32 = 1024;
 
-fn device() -> WgpuDevice {
-    block_on(brush_cube::test_helpers::test_device())
+fn device() -> CubeDevice {
+    CubeDevice::Wgpu(block_on(brush_cube::test_helpers::test_device()))
 }
 
 #[derive(Copy, Clone)]
@@ -75,52 +73,40 @@ fn make_inputs(size: usize, key_kind: KeyKind) -> Arc<(Vec<u32>, Vec<u32>)> {
     Arc::new((keys, values))
 }
 
-// Build a CubeTensor directly from a raw u32 slice. Bypasses Burn's i32-typed
-// `from_ints` which would panic on values >= 2^31.
-fn upload_u32(device: &WgpuDevice, data: &[u32]) -> CubeTensor<WgpuRuntime> {
-    let client = WgpuRuntime::client(device);
-    let handle = client.create_from_slice(bytemuck::cast_slice(data));
-    CubeTensor::new_contiguous(
-        client,
-        device.clone(),
-        Shape::new([data.len()]),
-        handle,
-        DType::U32,
-    )
+// Raw u32 upload: burn's i32-typed `from_ints` would reject keys >= 2^31.
+fn upload_u32(device: &CubeDevice, data: &[u32]) -> CubeTensor {
+    create_tensor_from_slice(data, device, DType::U32)
 }
 
-fn run_sort(
-    device: &WgpuDevice,
-    keys: CubeTensor<WgpuRuntime>,
-    values: CubeTensor<WgpuRuntime>,
-    bits: u32,
-) {
-    let (_sorted_keys, _sorted_values) = radix_argsort(keys, values, bits);
-    // Synchronize without transferring the full result back to the CPU.
-    let client = WgpuRuntime::<AutoCompiler>::client(device);
-    block_on(client.sync()).expect("Failed to sync radix benchmark");
+fn run_sort(device: &CubeDevice, keys: &CubeTensor, values: &CubeTensor, bits: u32) {
+    let (sorted_keys, _sorted_values) = radix_argsort(keys.clone(), values.clone(), bits);
+    // Force completion with a minimal readback: the last key only.
+    let client = device.client();
+    let len = sorted_keys.shape()[0] as u64;
+    let last = sorted_keys.handle.offset_start((len - 1) * 4);
+    let _ = block_on(client.read_async(vec![last]));
 }
 
 #[cfg(not(target_family = "wasm"))]
 #[divan::bench_group(max_time = 4)]
 mod sort_bench {
-    use crate::{KeyKind, SIZES, device, make_inputs, run_sort, upload_u32};
+    use crate::{KeyKind, SIZES, device, make_inputs, run_sort};
 
     #[divan::bench(args = SIZES)]
     fn radix_argsort_10bit(bencher: divan::Bencher, size: usize) {
         let dev = device();
         let inputs = make_inputs(size, KeyKind::TileIds);
-        let keys = upload_u32(&dev, &inputs.0);
-        let values = upload_u32(&dev, &inputs.1);
-        bencher.bench_local(move || run_sort(&dev, keys.clone(), values.clone(), 10));
+        let keys = crate::upload_u32(&dev, &inputs.0);
+        let values = crate::upload_u32(&dev, &inputs.1);
+        bencher.bench_local(move || run_sort(&dev, &keys, &values, 10));
     }
 
     #[divan::bench(args = SIZES)]
     fn radix_argsort_32bit(bencher: divan::Bencher, size: usize) {
         let dev = device();
         let inputs = make_inputs(size, KeyKind::Random32);
-        let keys = upload_u32(&dev, &inputs.0);
-        let values = upload_u32(&dev, &inputs.1);
-        bencher.bench_local(move || run_sort(&dev, keys.clone(), values.clone(), 32));
+        let keys = crate::upload_u32(&dev, &inputs.0);
+        let values = crate::upload_u32(&dev, &inputs.1);
+        bencher.bench_local(move || run_sort(&dev, &keys, &values, 32));
     }
 }

@@ -19,7 +19,7 @@ use burn::{
     module::{Module, Param},
     tensor::{DType, Device, Tensor, s},
 };
-use burn_cubecl::{CubeRuntime, tensor::CubeTensor};
+use burn_cubecl::tensor::CubeTensor;
 use burn_fusion::Fusion;
 
 use crate::bilagrid_kernels as kernels;
@@ -46,7 +46,7 @@ pub trait BilagridOps<B: Backend> {
 }
 
 /// `(n, channels, l, h, w)` of a `[N, C, L, H, W]` grid tensor.
-pub(crate) fn grid_dims5<R: CubeRuntime>(grids: &CubeTensor<R>) -> (u32, u32, u32, u32, u32) {
+pub(crate) fn grid_dims5(grids: &CubeTensor) -> (u32, u32, u32, u32, u32) {
     let dims = grids.shape().as_slice().to_vec();
     assert_eq!(dims.len(), 5, "grids must be [N, C, L, H, W]");
     // Dims of 1 would divide by zero in the interpolation / TV normalisation.
@@ -67,13 +67,13 @@ pub(crate) fn grid_dims5<R: CubeRuntime>(grids: &CubeTensor<R>) -> (u32, u32, u3
 }
 
 /// Affine-grid dims: asserts the 12-coefficient payload.
-fn grid_dims<R: CubeRuntime>(grids: &CubeTensor<R>) -> (u32, u32, u32, u32) {
+fn grid_dims(grids: &CubeTensor) -> (u32, u32, u32, u32) {
     let (n, c, gl, gh, gw) = grid_dims5(grids);
     assert_eq!(c, 12, "affine grids must be [N, 12, L, H, W]");
     (n, gl, gh, gw)
 }
 
-fn img_dims<R: CubeRuntime>(rgb: &CubeTensor<R>) -> (u32, u32, u32) {
+fn img_dims(rgb: &CubeTensor) -> (u32, u32, u32) {
     let dims = rgb.shape().as_slice().to_vec();
     assert_eq!(dims.len(), 3, "rgb must be [h, w, c]");
     let ch = dims[2] as u32;
@@ -81,11 +81,7 @@ fn img_dims<R: CubeRuntime>(rgb: &CubeTensor<R>) -> (u32, u32, u32) {
     (dims[0] as u32, dims[1] as u32, ch)
 }
 
-fn launch_slice_fwd<R: CubeRuntime>(
-    grids: CubeTensor<R>,
-    rgb: CubeTensor<R>,
-    view_idx: usize,
-) -> CubeTensor<R> {
+fn launch_slice_fwd(grids: CubeTensor, rgb: CubeTensor, view_idx: usize) -> CubeTensor {
     use burn_cubecl::cubecl::prelude::CubeDim;
 
     let grids = contiguous(grids);
@@ -96,7 +92,7 @@ fn launch_slice_fwd<R: CubeRuntime>(
 
     let out = alloc_zeros(&rgb, rgb.shape(), DType::F32);
     let client = rgb.client.clone();
-    kernels::bilagrid_slice_fwd_kernel::launch::<R>(
+    kernels::bilagrid_slice_fwd_kernel::launch(
         &client,
         brush_cube::calc_cube_count_1d(h * w, kernels::BLOCK_SIZE),
         CubeDim::new_1d(kernels::BLOCK_SIZE),
@@ -115,12 +111,12 @@ fn launch_slice_fwd<R: CubeRuntime>(
     out
 }
 
-fn launch_slice_bwd<R: CubeRuntime>(
-    grids: CubeTensor<R>,
-    rgb: CubeTensor<R>,
-    v_out: CubeTensor<R>,
+fn launch_slice_bwd(
+    grids: CubeTensor,
+    rgb: CubeTensor,
+    v_out: CubeTensor,
     view_idx: usize,
-) -> (CubeTensor<R>, CubeTensor<R>) {
+) -> (CubeTensor, CubeTensor) {
     use burn_cubecl::cubecl::prelude::CubeDim;
 
     let grids = contiguous(grids);
@@ -137,8 +133,8 @@ fn launch_slice_bwd<R: CubeRuntime>(
     let cube_count = brush_cube::calc_cube_count_1d(h * w, kernels::BLOCK_SIZE);
     let cube_dim = CubeDim::new_1d(kernels::BLOCK_SIZE);
     let grid_offset = view_idx as u32 * 12 * gl * gh * gw;
-    if brush_cube::supports_float_atomics::<R>(&client) {
-        kernels::bilagrid_slice_bwd_kernel::launch::<HfAtomicAdd, R>(
+    if brush_cube::supports_float_atomics(&client) {
+        kernels::bilagrid_slice_bwd_kernel::launch::<HfAtomicAdd>(
             &client,
             cube_count,
             cube_dim,
@@ -157,7 +153,7 @@ fn launch_slice_bwd<R: CubeRuntime>(
             ch == 4,
         );
     } else {
-        kernels::bilagrid_slice_bwd_kernel::launch::<CasAtomicAdd, R>(
+        kernels::bilagrid_slice_bwd_kernel::launch::<CasAtomicAdd>(
             &client,
             cube_count,
             cube_dim,
@@ -298,12 +294,12 @@ pub fn bilagrid_apply(grids: Tensor<5>, rgb: Tensor<3>, view_idx: usize) -> Tens
     let rgb_ad = unwrap_ad_wgpu_float(rgb);
 
     let prep = BilagridSliceBackward
-        .prepare::<NoCheckpointing>([grids_ad.node.clone(), rgb_ad.node.clone()])
+        .prepare::<NoCheckpointing>([grids_ad.node(), rgb_ad.node()])
         .compute_bound()
         .stateful();
 
-    let grids_p = grids_ad.primitive;
-    let rgb_p = rgb_ad.primitive;
+    let grids_p = grids_ad.into_primitive();
+    let rgb_p = rgb_ad.into_primitive();
     let out = <MainBackend as BilagridOps<MainBackend>>::bilagrid_slice_fwd(
         grids_p.clone(),
         rgb_p.clone(),

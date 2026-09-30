@@ -16,17 +16,13 @@ use crate::{
     gaussian_splats::{RasterPass, RasterizationMode, Rasterizer, SplatRenderMode},
     kernels::{camera_model::CameraModel, helpers::PLANE_AUX_LANES_USIZE},
 };
+use brush_cube::CubeDevice;
 use burn::tensor::DType;
-use burn_wgpu::{CubeTensor, WgpuDevice, WgpuRuntime};
+use burn_wgpu::CubeTensor;
 use glam::Vec3;
 
-fn cube_tensor<const D: usize>(
-    device: &WgpuDevice,
-    shape: [usize; D],
-    data: &[f32],
-) -> CubeTensor<WgpuRuntime> {
-    use brush_cube::Runtime;
-    let client = WgpuRuntime::client(device);
+fn cube_tensor<const D: usize>(device: &CubeDevice, shape: [usize; D], data: &[f32]) -> CubeTensor {
+    let client = device.client();
     let handle = client.create_from_slice(bytemuck::cast_slice(data));
     CubeTensor::new_contiguous(
         client,
@@ -39,7 +35,7 @@ fn cube_tensor<const D: usize>(
 
 /// Renders `n_splats` splats with a plane tensor of `plane_rows` rows.
 async fn render_with_plane_rows(plane_rows: usize) {
-    let device = brush_cube::test_helpers::test_device().await;
+    let device = CubeDevice::Wgpu(brush_cube::test_helpers::test_device().await);
     let n = 4usize;
     let camera = Camera::new(
         glam::vec3(0.0, 0.0, -3.0),
@@ -69,6 +65,8 @@ async fn render_with_plane_rows(plane_rows: usize) {
         cube_tensor(&device, [n, 10], &transforms),
         cube_tensor(&device, [n, 1, 3], &sh),
         cube_tensor(&device, [n], &raw_opacity),
+        cube_tensor(&device, [1], &[0.0]),
+        false,
         Some(cube_tensor(
             &device,
             [plane_rows, PLANE_AUX_LANES_USIZE],

@@ -58,7 +58,7 @@ async fn read<const D: usize>(tensor: Tensor<D>) -> Vec<f32> {
         .into_data_async()
         .await
         .expect("readback")
-        .to_vec()
+        .try_to_vec()
         .expect("f32 data")
 }
 

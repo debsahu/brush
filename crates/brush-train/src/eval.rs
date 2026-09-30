@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use brush_dataset::scene::view_to_packed_data;
-use brush_loss::{ImageLossConfig, image_loss_eval};
+use brush_loss::{ImageLossConfig, image_loss_eval, psnr_from_mse};
 use brush_render::camera::Camera;
 use brush_render::gaussian_splats::Splats;
 use brush_render::{AlphaMode, RenderAux, TextureMode, render_splats};
@@ -75,7 +75,7 @@ pub async fn eval_stats(
     let mse = image_loss_eval(render_rgb.clone(), gt_packed.clone(), cfg(1.0, 0.0, false))
         .powi_scalar(2)
         .mean();
-    let psnr = mse.recip().log() * 10.0 / std::f32::consts::LN_10;
+    let psnr = psnr_from_mse(mse);
     let ssim = image_loss_eval(render_rgb.clone(), gt_packed.clone(), cfg(0.0, 1.0, false)).mean();
 
     // Masked scoring. `mask: true` multiplies each loss-map pixel by `gt.a`,
@@ -108,7 +108,7 @@ pub async fn eval_stats(
             .powi_scalar(2)
             .mean()
             .div_scalar(valid_frac);
-        let psnr_m = mse_m.recip().log() * 10.0 / std::f32::consts::LN_10;
+        let psnr_m = psnr_from_mse(mse_m);
         // SSIM is windowed, so a window straddling a mask boundary still mixes
         // masked and unmasked pixels no matter how this is normalised. Treat
         // the masked SSIM as indicative, not exact.
@@ -137,7 +137,7 @@ impl EvalSample {
         log::info!("Saving eval image to disk.");
         let img = self.rendered.clone();
         let [h, w, _] = [img.dims()[0], img.dims()[1], img.dims()[2]];
-        let data = img.clone().into_data_async().await?.into_vec::<f32>()?;
+        let data = img.clone().into_data_async().await?.try_into_vec::<f32>()?;
         let img: image::DynamicImage = Rgb32FImage::from_raw(w as u32, h as u32, data)
             .expect("Failed to create image from tensor")
             .into();

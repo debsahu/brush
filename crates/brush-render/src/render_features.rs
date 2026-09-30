@@ -21,16 +21,15 @@ use crate::{
 };
 use brush_cube::create_tensor;
 use brush_cube::{MainBackendBase, calc_cube_count_1d};
-use brush_prefix_sum::prefix_sum;
+use brush_scan::prefix_sum;
 use brush_sort::radix_argsort;
 use burn::backend::TensorMetadata;
 use burn::backend::ops::TransactionPrimitive;
 use burn::backend::ops::{FloatTensorOps, IntTensorOps, TransactionOps};
 use burn::backend::tensor::{FloatTensor, IntTensor};
+use burn::cubecl::CubeDim;
 use burn::tensor::{DType, FloatDType, IntDType};
-use burn_cubecl::cubecl::CubeDim;
 use burn_cubecl::kernel::into_contiguous;
-use burn_wgpu::WgpuRuntime;
 use kernels::types::RasterizeUniformsLaunch;
 use std::f32::consts::PI;
 
@@ -76,8 +75,11 @@ pub async fn render_features_base(
     let feat_dim = features.shape()[1];
     let mip_splat = matches!(render_mode, SplatRenderMode::Mip);
 
+    // Same cull cap as the colour render (upstream 2acc5d73): never past the
+    // angle where the distortion polynomial folds back on itself.
     let half_max_render_fov =
-        ((camera.fov_x as f32).hypot(camera.fov_y as f32) * 1.05).min(2.0 * PI - 1e-6) * 0.5;
+        (((camera.fov_x as f32).hypot(camera.fov_y as f32) * 1.05).min(2.0 * PI - 1e-6) * 0.5)
+            .min(crate::camera::max_render_theta(&camera.camera_model) as f32);
     let pinhole_params = camera.build_pinhole_params(img_size);
 
     let mut project_uniforms = shaders::helpers::ProjectUniforms {
@@ -109,16 +111,26 @@ pub async fn render_features_base(
         MainBackendBase::float_zeros([total_splats as usize].into(), &device, FloatDType::F32);
     let global_from_presort_gid = create_tensor([total_splats as usize], &device, DType::U32);
     let depths = create_tensor([total_splats as usize], &device, DType::F32);
+    // The projection kernels now also emit the compact inverse map and the
+    // floored opacity, and can apply the 3D-filter floor in-kernel (upstream
+    // #554). The feature pass takes geometry that its caller has ALREADY folded
+    // (`fold_min_scale`), so the floor is off here and these are scratch.
+    let min_scale_placeholder = create_tensor([1], &device, DType::F32);
+    let compact_from_global = create_tensor([total_splats as usize], &device, DType::U32);
+    let opacities = create_tensor([total_splats as usize], &device, DType::F32);
 
     tracing::trace_span!("ProjectSplats (features)").in_scope(|| {
         let uniforms = project_uniforms.to_launch_object();
-        kernels::project_forward::project_forward_kernel::launch::<WgpuRuntime>(
+        kernels::project_forward::project_forward_kernel::launch(
             &client,
             calc_cube_count_1d(total_splats, kernels::project_forward::WG_SIZE),
             CubeDim::new_1d(kernels::project_forward::WG_SIZE),
             transforms.clone().into_tensor_arg(),
             raw_opacities.clone().into_tensor_arg(),
+            min_scale_placeholder.clone().into_tensor_arg(),
             global_from_presort_gid.clone().into_tensor_arg(),
+            compact_from_global.clone().into_tensor_arg(),
+            opacities.into_tensor_arg(),
             depths.clone().into_tensor_arg(),
             num_visible_buf.clone().into_tensor_arg(),
             intersect_counts.clone().into_tensor_arg(),
@@ -126,6 +138,7 @@ pub async fn render_features_base(
             max_radius.into_tensor_arg(),
             uniforms,
             mip_splat,
+            false,
             camera.camera_model,
             shaders::helpers::TILE_WIDTH,
             shaders::helpers::TILE_WIDTH,
@@ -146,11 +159,11 @@ pub async fn render_features_base(
             .expect("Failed to read counts");
         let num_visible = data.read_ints[0]
             .clone()
-            .into_vec::<u32>()
+            .try_into_vec::<u32>()
             .expect("num_visible")[0];
         let num_intersections = data.read_ints[1]
             .clone()
-            .into_vec::<u32>()
+            .try_into_vec::<u32>()
             .expect("num_intersections")[0];
         (num_visible, num_intersections)
     };
@@ -185,17 +198,20 @@ pub async fn render_features_base(
     );
     tracing::trace_span!("ProjectVisible (features)").in_scope(|| {
         let uniforms = project_uniforms.to_launch_object();
-        kernels::project_visible::project_visible_kernel::launch::<WgpuRuntime>(
+        kernels::project_visible::project_visible_kernel::launch(
             &client,
             calc_cube_count_1d(num_visible, kernels::project_visible::WG_SIZE),
             CubeDim::new_1d(kernels::project_visible::WG_SIZE),
             transforms.into_tensor_arg(),
             dummy_sh.into_tensor_arg(),
             raw_opacities.into_tensor_arg(),
+            min_scale_placeholder.into_tensor_arg(),
             global_from_compact_gid.clone().into_tensor_arg(),
+            compact_from_global.into_tensor_arg(),
             projected_splats.clone().into_tensor_arg(),
             uniforms,
             mip_splat,
+            false,
             0,
             camera.camera_model,
         );
@@ -206,7 +222,7 @@ pub async fn render_features_base(
     let tile_id_from_isect = create_tensor([buffer_size], &device, DType::U32);
     let compact_gid_from_isect = create_tensor([buffer_size], &device, DType::U32);
     tracing::trace_span!("MapGaussiansToIntersect (features)").in_scope(|| {
-        kernels::map_gaussians::map_gaussians_to_intersect_kernel::launch::<WgpuRuntime>(
+        kernels::map_gaussians::map_gaussians_to_intersect_kernel::launch(
             &client,
             calc_cube_count_1d(num_visible, kernels::map_gaussians::WG_SIZE),
             CubeDim::new_1d(kernels::map_gaussians::WG_SIZE),
@@ -231,7 +247,7 @@ pub async fn render_features_base(
         IntDType::U32,
     );
     tracing::trace_span!("GetTileOffsets (features)").in_scope(|| {
-        get_tile_offsets::launch::<WgpuRuntime>(
+        get_tile_offsets::launch(
             &client,
             calc_cube_count_1d(num_intersections, cube_dim.x * CHECKS_PER_ITER),
             cube_dim,
@@ -256,7 +272,7 @@ pub async fn render_features_base(
             0.0,
             0.0,
         );
-        kernels::rasterize_features::rasterize_features_kernel::launch::<WgpuRuntime>(
+        kernels::rasterize_features::rasterize_features_kernel::launch(
             &client,
             calc_cube_count_1d(
                 num_tiles * (shaders::helpers::TILE_WIDTH * shaders::helpers::TILE_WIDTH),
