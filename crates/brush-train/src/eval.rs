@@ -45,9 +45,6 @@ pub async fn eval_stats(
 ) -> Result<EvalSample> {
     let res = glam::uvec2(gt_img.width(), gt_img.height());
 
-    let (gt_packed_data, _has_alpha) = view_to_packed_data(gt_img.clone(), alpha_mode);
-    let gt_packed: Tensor<2, Int> = Tensor::from_data(gt_packed_data, device);
-
     // Render on reference black background.
     let (img, render_aux) =
         render_splats(splats, gt_cam, res, Vec3::ZERO, None, TextureMode::Float).await;
@@ -64,6 +61,49 @@ pub async fn eval_stats(
 
     // Simulate an 8-bit roundtrip for fair comparison.
     let render_rgb = (render_rgb * 255.0).round() / 255.0;
+
+    let EvalScores {
+        psnr,
+        ssim,
+        psnr_masked,
+        ssim_masked,
+        valid_frac,
+    } = score_eval(&render_rgb, &gt_img, alpha_mode, device);
+
+    Ok(EvalSample {
+        gt_img,
+        psnr,
+        ssim,
+        psnr_masked,
+        ssim_masked,
+        valid_frac,
+        rendered: render_rgb,
+        render_aux,
+    })
+}
+
+/// The five numbers on the Stage 4 eval line, computed from an already-rendered,
+/// already-8-bit-rounded `[H, W, 3]` image against the ground truth.
+///
+/// Split out of [`eval_stats`] (which calls it) so the masking and
+/// `valid_frac` normalisation can be tested on a hand-built image pair without
+/// a splat render in the loop.
+pub struct EvalScores {
+    pub psnr: Tensor<1>,
+    pub ssim: Tensor<1>,
+    pub psnr_masked: Tensor<1>,
+    pub ssim_masked: Tensor<1>,
+    pub valid_frac: f32,
+}
+
+pub fn score_eval(
+    render_rgb: &Tensor<3>,
+    gt_img: &DynamicImage,
+    alpha_mode: AlphaMode,
+    device: &Device,
+) -> EvalScores {
+    let (gt_packed_data, _has_alpha) = view_to_packed_data(gt_img.clone(), alpha_mode);
+    let gt_packed: Tensor<2, Int> = Tensor::from_data(gt_packed_data, device);
 
     let cfg = |l1, ssim, mask| ImageLossConfig {
         l1_weight: l1,
@@ -118,16 +158,13 @@ pub async fn eval_stats(
         (psnr_m, ssim_m)
     };
 
-    Ok(EvalSample {
-        gt_img,
+    EvalScores {
         psnr,
         ssim,
         psnr_masked,
         ssim_masked,
         valid_frac,
-        rendered: render_rgb,
-        render_aux,
-    })
+    }
 }
 
 impl EvalSample {
@@ -147,5 +184,183 @@ impl EvalSample {
         log::info!("Saving eval view to {path:?}");
         img.save(path)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Stage 4 eval-line scoring on hand-built image pairs.
+    //!
+    //! Fixture: an 8x8 ground truth, every channel 128. The render is 128 + `A`
+    //! on the unmasked (alpha 255) pixels and 128 + `B` on the masked (alpha 0)
+    //! ones, with `A != B`, and only 24 of 64 pixels unmasked (coverage 0.375).
+    //! The three candidate masked-PSNR rules then give three separated answers,
+    //! each asserted apart below:
+    //!
+    //! ```text
+    //!   correct   : MSE = a^2                     (a = A/255)
+    //!   un-normed : MSE = 0.375 * a^2             -> +4.26 dB too high
+    //!   unmasked  : MSE = (24 a^2 + 40 b^2) / 64
+    //! ```
+    use super::*;
+    use burn::tensor::TensorData;
+    use image::{Rgb, RgbImage, Rgba, RgbaImage};
+
+    const W: u32 = 8;
+    const H: u32 = 8;
+    const GT: u8 = 128;
+    /// Unmasked columns: `x < VALID_COLS`, i.e. 24 of 64 pixels.
+    const VALID_COLS: u32 = 3;
+    const COVERAGE: f32 = (VALID_COLS * H) as f32 / (W * H) as f32;
+
+    async fn device() -> Device {
+        Device::from(brush_cube::test_helpers::test_device().await)
+    }
+
+    /// Ground truth with the left `VALID_COLS` columns unmasked.
+    fn gt_masked() -> DynamicImage {
+        RgbaImage::from_fn(W, H, |x, _| {
+            Rgba([GT, GT, GT, if x < VALID_COLS { 255 } else { 0 }])
+        })
+        .into()
+    }
+
+    /// Render: `GT + a` on unmasked pixels, `GT + b` on masked ones, all
+    /// channels, exactly on the 8-bit grid (as `eval_stats` rounds it).
+    fn render(device: &Device, a: u8, b: u8) -> Tensor<3> {
+        let mut v = Vec::with_capacity((W * H * 3) as usize);
+        for _y in 0..H {
+            for x in 0..W {
+                let d = if x < VALID_COLS { a } else { b };
+                let c = f32::from(GT + d) / 255.0;
+                v.extend_from_slice(&[c, c, c]);
+            }
+        }
+        Tensor::from_data(TensorData::new(v, [H as usize, W as usize, 3]), device)
+    }
+
+    async fn scalar(t: Tensor<1>) -> f32 {
+        t.into_data_async()
+            .await
+            .expect("readback")
+            .try_to_vec::<f32>()
+            .expect("f32")[0]
+    }
+
+    fn psnr_of(mse: f64) -> f32 {
+        (-10.0 * mse.log10()) as f32
+    }
+
+    const TOL_DB: f32 = 1e-3;
+
+    #[tokio::test]
+    async fn masked_psnr_is_normalised_by_coverage() {
+        let device = device().await;
+        let (a, b) = (16u8, 48u8);
+        let s = score_eval(
+            &render(&device, a, b),
+            &gt_masked(),
+            AlphaMode::Masked,
+            &device,
+        );
+
+        let (a2, b2) = (
+            (f64::from(a) / 255.0).powi(2),
+            (f64::from(b) / 255.0).powi(2),
+        );
+        let cov = f64::from(COVERAGE);
+        let want_masked = psnr_of(a2);
+        let want_naive = psnr_of(cov * a2);
+        let want_unmasked = psnr_of(cov * a2 + (1.0 - cov) * b2);
+
+        // The fixture must separate the correct rule from both wrong ones by
+        // far more than the tolerance, or the assertions below prove nothing.
+        assert!((want_naive - want_masked).abs() > 4.0);
+        assert!((want_unmasked - want_masked).abs() > 4.0);
+
+        assert!((s.valid_frac - COVERAGE).abs() < 1e-6, "{}", s.valid_frac);
+        let pm = scalar(s.psnr_masked).await;
+        let pu = scalar(s.psnr).await;
+        assert!(
+            (pm - want_masked).abs() < TOL_DB,
+            "masked PSNR {pm}, want {want_masked} (un-normalised rule gives {want_naive})"
+        );
+        assert!(
+            (pu - want_unmasked).abs() < TOL_DB,
+            "unmasked PSNR {pu}, want {want_unmasked}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_only_in_masked_pixels_leaves_masked_psnr_at_the_cap() {
+        let device = device().await;
+        let b = 40u8;
+        let s = score_eval(
+            &render(&device, 0, b),
+            &gt_masked(),
+            AlphaMode::Masked,
+            &device,
+        );
+        let pm = scalar(s.psnr_masked).await;
+        let pu = scalar(s.psnr).await;
+        // `psnr_from_mse` clamps MSE at 1e-10, i.e. a 100 dB ceiling.
+        assert!(
+            (pm - 100.0).abs() < 1e-2,
+            "zero error on every unmasked pixel must hit the PSNR cap, got {pm}"
+        );
+        let cov = f64::from(COVERAGE);
+        let want_unmasked = psnr_of((1.0 - cov) * (f64::from(b) / 255.0).powi(2));
+        assert!(
+            (pu - want_unmasked).abs() < TOL_DB,
+            "unmasked PSNR must count the masked-out error: {pu} vs {want_unmasked}"
+        );
+        assert!(pu < 30.0, "unmasked PSNR must drop, got {pu}");
+    }
+
+    #[tokio::test]
+    async fn full_coverage_scores_masked_equal_to_unmasked() {
+        let device = device().await;
+        let (a, b) = (16u8, 48u8);
+        let r = render(&device, a, b);
+
+        // Fully-opaque RGBA under Masked, and plain RGB: both have coverage 1.
+        let opaque: DynamicImage = RgbaImage::from_pixel(W, H, Rgba([GT, GT, GT, 255])).into();
+        let rgb: DynamicImage = RgbImage::from_pixel(W, H, Rgb([GT, GT, GT])).into();
+        let cov = f64::from(COVERAGE);
+        let want = psnr_of(
+            cov * (f64::from(a) / 255.0).powi(2) + (1.0 - cov) * (f64::from(b) / 255.0).powi(2),
+        );
+
+        for (name, gt) in [("opaque rgba", opaque), ("rgb", rgb)] {
+            let s = score_eval(&r, &gt, AlphaMode::Masked, &device);
+            assert_eq!(s.valid_frac, 1.0, "{name}");
+            let pm = scalar(s.psnr_masked).await;
+            let pu = scalar(s.psnr).await;
+            let sm = scalar(s.ssim_masked).await;
+            let su = scalar(s.ssim).await;
+            assert!((pu - want).abs() < TOL_DB, "{name}: {pu} vs {want}");
+            assert!(
+                (pm - pu).abs() < 1e-6,
+                "{name}: masked {pm} != unmasked {pu}"
+            );
+            assert!((sm - su).abs() < 1e-6, "{name}: ssim {sm} != {su}");
+        }
+    }
+
+    /// Coverage is only a mask under `AlphaMode::Masked`; any other mode
+    /// reports 1.0 and scores masked == unmasked.
+    #[tokio::test]
+    async fn coverage_is_one_outside_masked_mode() {
+        let device = device().await;
+        let s = score_eval(
+            &render(&device, 16, 48),
+            &gt_masked(),
+            AlphaMode::Transparent,
+            &device,
+        );
+        assert_eq!(s.valid_frac, 1.0);
+        let pm = scalar(s.psnr_masked).await;
+        let pu = scalar(s.psnr).await;
+        assert!((pm - pu).abs() < 1e-6, "{pm} vs {pu}");
     }
 }

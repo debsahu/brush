@@ -758,6 +758,22 @@ impl SplatTrainer {
             .unwrap_or(1.0)
     }
 
+    /// The flatten term (`PlanarGS` `L_s`) as the trainer adds it to the loss:
+    /// `mean(min activated scale) * flatten_loss_weight / metric_weight_scale()`,
+    /// or `None` when `--flatten-loss-weight` is off. See the long comment at
+    /// the call site in `step_with_refine_weight` for the units argument.
+    fn flatten_loss(&self, splats: &Splats) -> Option<Tensor<1>> {
+        let use_flatten = self.config.flatten_loss_weight > 0.0;
+        if !use_flatten {
+            return None;
+        }
+        let scales = splats.transforms.val().slice(s![.., 7..10]).exp();
+        Some(
+            scales.min_dim(1).mean()
+                * (self.config.flatten_loss_weight / self.metric_weight_scale()),
+        )
+    }
+
     /// Divisor applied to `--depth-loss-weight`, which — unlike flatten and
     /// scale-reg — is only SOMETIMES metric-dimensioned.
     ///
@@ -1449,7 +1465,6 @@ impl SplatTrainer {
             let use_dn = eff_dn_weight > 0.0 && dn_started && normal_ramp > 0.0;
             let use_smooth = self.config.normal_smooth_weight > 0.0;
             let use_normal_render = use_prior_normal || use_dn || use_smooth;
-            let use_flatten = self.config.flatten_loss_weight > 0.0;
             // The depth/normal consistency term reads the rendered depth, so it
             // needs the depth channel even without any gt depth map.
             let has_depth_channel = use_depth || use_dn;
@@ -2291,10 +2306,8 @@ impl SplatTrainer {
             // `--normal-smooth-weight`, `--anti-needle-weight`) need no
             // normalization for the same reason, and get none.
             let metric_scale = self.metric_weight_scale();
-            if use_flatten {
-                let scales = splats.transforms.val().slice(s![.., 7..10]).exp();
-                loss = loss
-                    + scales.min_dim(1).mean() * (self.config.flatten_loss_weight / metric_scale);
+            if let Some(flatten) = self.flatten_loss(&splats) {
+                loss = loss + flatten;
             }
 
             // Scale-explosion + anti-needle regularizers (Stipple, arXiv:2608.00931).
@@ -5213,6 +5226,81 @@ mod scene_scale_tests {
         assert!(!nan.record_normal_gate_sample(0, f32::NAN, 1000.0));
         assert!(!nan.record_normal_gate_sample(1, 50.0, f32::NAN));
         assert_eq!(nan.normal_gate_low_samples, 0);
+    }
+
+    /// The flatten term as the TRAINER adds it (`SplatTrainer::flatten_loss`,
+    /// the function `step_with_refine_weight` calls), not a rebuilt expression.
+    ///
+    /// Three splats with distinct smallest axes, so `mean(min scale)` is a
+    /// specific number that neither `min(mean)` nor any single splat gives.
+    /// Catches: the term returning nothing / zero, the `/ metric_weight_scale()`
+    /// divisor dropped (the normalised trainer would read 2x), and the
+    /// `flatten_loss_weight > 0` gate inverted (weight 0 would yield a term,
+    /// weight 3 none).
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)]
+    async fn trainer_flatten_loss_is_weighted_mean_min_scale() {
+        use brush_render::gaussian_splats::SplatRenderMode;
+        let device =
+            burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let log_scales: Vec<f32> = vec![
+            -1.0, -2.0, -0.5, // min exp(-2.0)
+            -3.0, -1.0, -1.0, // min exp(-3.0)
+            -0.2, -0.1, -1.5, // min exp(-1.5)
+        ];
+        let splats = Splats::from_raw(
+            vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            [1.0f32, 0.0, 0.0, 0.0].repeat(3),
+            log_scales,
+            vec![0.5; 9],
+            vec![0.0; 3],
+            SplatRenderMode::Default,
+            &device,
+        );
+        let mean_min = ((-2.0f32).exp() + (-3.0f32).exp() + (-1.5f32).exp()) / 3.0;
+        let bounds = BoundingBox::from_min_max(glam::Vec3::ZERO, glam::Vec3::ONE);
+        let weight = 3.0;
+
+        async fn read(t: Tensor<1>) -> f32 {
+            t.into_data_async()
+                .await
+                .expect("readback")
+                .try_to_vec::<f32>()
+                .expect("f32")[0]
+        }
+
+        // Off: no term at all.
+        let off = SplatTrainer::new(&TrainConfig::default(), &device, bounds);
+        assert_eq!(TrainConfig::default().flatten_loss_weight, 0.0);
+        assert!(
+            off.flatten_loss(&splats).is_none(),
+            "flatten weight 0 must add no term"
+        );
+
+        // On, unnormalised: divisor is exactly 1.
+        let mut cfg = TrainConfig::default();
+        cfg.flatten_loss_weight = weight;
+        let plain = SplatTrainer::new(&cfg, &device, bounds);
+        let got = read(plain.flatten_loss(&splats).expect("flatten on")).await;
+        let want = weight * mean_min;
+        assert!(
+            (got - want).abs() < 1e-5 * want.max(1.0),
+            "flatten term {got}, want {want}"
+        );
+
+        // On, normalised by a captured scene scale of 2.0: half the value.
+        cfg.normalize_metric_weights = true;
+        let mut norm = SplatTrainer::new(&cfg, &device, bounds);
+        norm.set_init_scene_scale(&camera_ring(8, 2.0, glam::Vec3::ZERO, glam::Vec3::Z));
+        let s = norm.metric_weight_scale();
+        assert!((s - 2.0).abs() < 1e-4, "scene scale {s}");
+        let got_n = read(norm.flatten_loss(&splats).expect("flatten on")).await;
+        let want_n = weight * mean_min / s;
+        assert!(
+            (got_n - want_n).abs() < 1e-5 * want_n.max(1.0),
+            "normalised flatten term {got_n}, want {want_n} (undivided would be {want})"
+        );
+        assert!((got_n - want).abs() > 0.1 * want);
     }
 
     /// `metric_weight_scale()` is an exact 1.0 unless the flag is on AND a scale
