@@ -2468,14 +2468,20 @@ impl SplatTrainer {
             if self.config.tidi_depth_prune
                 && let Some(depth_data) = &batch.depth
             {
-                let margin = self.config.tidi_depth_margin;
+                let margins = crate::tidi::DepthVoteMargins {
+                    abs: self.config.tidi_depth_margin,
+                    rel: self.config.tidi_depth_rel_margin,
+                    footprint_mult: self.config.tidi_depth_footprint_mult,
+                    footprint_cap: self.config.tidi_depth_footprint_cap,
+                };
                 if let Some(tidi) = self.tidi.as_mut() {
                     tidi.accumulate_depth(
                         splats.means(),
+                        splats.scales(),
                         depth_data.clone(),
                         &camera,
                         img_size,
-                        margin,
+                        margins,
                     );
                 }
             }

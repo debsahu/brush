@@ -1228,14 +1228,42 @@ pub struct TrainConfig {
     #[serde(default = "default_tidi_depth_margin")]
     pub tidi_depth_margin: f32,
 
+    /// Depth-residual RELATIVE margin: adds `rel · Z̃` to the margin, where `Z̃`
+    /// is the prior depth at the Gaussian's projected pixel. Dimensionless, so
+    /// it is the knob to prefer on an `SfM`-gauge scene. Set it ABOVE the prior's
+    /// own per-view scale error (measure the p95 of `|z_surface/Z̃ - 1|` on
+    /// true-surface splats); below that, correct surface splats vote free or
+    /// abstain on the worst faces. Total margin is
+    /// `abs + rel·Z̃ + footprint_mult·min(s_max, footprint_cap)`.
+    #[arg(long, help_heading = "TIDI options", default_value = "0.10")]
+    #[serde(default = "default_tidi_depth_rel_margin")]
+    pub tidi_depth_rel_margin: f32,
+
+    /// Depth-residual FOOTPRINT margin: adds this many of the Gaussian's largest
+    /// scale axis (sigma) to the margin, so a splat whose extent reaches the
+    /// surface does not vote free. 0 disables.
+    #[arg(long, help_heading = "TIDI options", default_value = "1.0")]
+    #[serde(default = "default_tidi_depth_footprint_mult")]
+    pub tidi_depth_footprint_mult: f32,
+
+    /// Cap on the largest scale axis used by the footprint margin, in depth
+    /// units: a huge splat is not one this vote can judge, and an uncapped
+    /// footprint would make it unprunable by construction.
+    #[arg(long, help_heading = "TIDI options", default_value = "1.0")]
+    #[serde(default = "default_tidi_depth_footprint_cap")]
+    pub tidi_depth_footprint_cap: f32,
+
     /// Depth path: prune when a Gaussian floats in at least this fraction of the
-    /// views that carry a valid depth return behind it (default 0.5 = 50%).
+    /// views that VOTED on it (default 0.5 = 50%). A view votes when it has a
+    /// valid return at the Gaussian's pixel and the Gaussian is free (in front
+    /// by more than the margin) or on the surface; a view where the Gaussian is
+    /// BEHIND the surface abstains, since that camera cannot see it.
     #[arg(long, help_heading = "TIDI options", default_value = "0.5")]
     #[serde(default = "default_tidi_depth_float_frac")]
     pub tidi_depth_float_frac: f32,
 
     /// Depth path SAFETY gate: never prune a Gaussian unless at least this many
-    /// views have a real depth return behind it. This is what keeps the depth
+    /// views voted on it (free or on-surface; occluded views abstain). This is what keeps the depth
     /// path from touching unscanned regions (no `LiDAR` return -> exempt).
     #[arg(long, help_heading = "TIDI options", default_value = "4")]
     #[serde(default = "default_tidi_depth_min_valid_views")]
@@ -1699,6 +1727,15 @@ fn default_tidi_local_cap_frac() -> f32 {
 fn default_tidi_depth_margin() -> f32 {
     0.05
 }
+fn default_tidi_depth_rel_margin() -> f32 {
+    0.10
+}
+fn default_tidi_depth_footprint_mult() -> f32 {
+    1.0
+}
+fn default_tidi_depth_footprint_cap() -> f32 {
+    1.0
+}
 fn default_tidi_depth_float_frac() -> f32 {
     0.5
 }
@@ -1984,6 +2021,9 @@ mod tests {
             "depth-prune must be off unless explicitly enabled"
         );
         assert!((def.tidi_depth_margin - 0.05).abs() < 1e-9);
+        assert!((def.tidi_depth_rel_margin - 0.10).abs() < 1e-9);
+        assert!((def.tidi_depth_footprint_mult - 1.0).abs() < 1e-9);
+        assert!((def.tidi_depth_footprint_cap - 1.0).abs() < 1e-9);
         assert!((def.tidi_depth_float_frac - 0.5).abs() < 1e-9);
         assert_eq!(def.tidi_depth_min_valid_views, 4);
         assert!((def.tidi_depth_cap_frac - 0.02).abs() < 1e-9);
