@@ -1,5 +1,6 @@
 pub mod args_file;
 pub mod config;
+pub mod eval_views_log;
 pub mod message;
 pub mod slot;
 pub mod train_stream;

@@ -1,3 +1,4 @@
+use crate::eval_views_log::EvalViewsLog;
 use crate::{
     Emitter,
     config::TrainStreamConfig,
@@ -11,7 +12,7 @@ use brush_render::kernels::camera_model::CameraModel;
 use brush_rerun::visualize_tools::VisualizeTools;
 use brush_train::{
     RandomSplatsConfig, create_random_splats,
-    eval::eval_stats,
+    eval::{EvalViewRecord, eval_stats, eval_summary_line},
     lod::{compute_pup_scores, decimate_to_count},
     msg::RefineStats,
     to_init_splats,
@@ -1158,6 +1159,17 @@ fn camera_model_key(model: CameraModel) -> [u32; 9] {
 #[allow(clippy::too_many_arguments)]
 #[cfg(not(target_family = "wasm"))]
 fn eval_output_path(base: &Path, iter: u32, image_path: &Path) -> anyhow::Result<PathBuf> {
+    eval_output_path_in(base, iter, "", image_path)
+}
+
+/// `<base>/eval_<iter><dir_suffix>/<image path>.png`. The renders live in the
+/// tree with an empty suffix; the ground-truth and mask PNGs in `_gt`/`_mask`.
+fn eval_output_path_in(
+    base: &Path,
+    iter: u32,
+    dir_suffix: &str,
+    image_path: &Path,
+) -> anyhow::Result<PathBuf> {
     let mut relative = PathBuf::new();
     for component in image_path.components() {
         match component {
@@ -1173,7 +1185,7 @@ fn eval_output_path(base: &Path, iter: u32, image_path: &Path) -> anyhow::Result
         anyhow::bail!("Eval image path is empty");
     }
     relative.set_extension("png");
-    Ok(base.join(format!("eval_{iter}")).join(relative))
+    Ok(base.join(format!("eval_{iter}{dir_suffix}")).join(relative))
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
@@ -1187,6 +1199,15 @@ mod eval_path_tests {
         let second = eval_output_path(base, 42, Path::new("images/b/frame.jpg")).unwrap();
 
         assert_eq!(first, Path::new("output/eval_42/images/a/frame.png"));
+
+        // Ground truth and mask go to sibling trees, never into the render
+        // tree a `eval_42/**/*.png` glob would read.
+        let gt = eval_output_path_in(base, 42, "_gt", Path::new("images/a/frame.jpg")).unwrap();
+        let mask = eval_output_path_in(base, 42, "_mask", Path::new("images/a/frame.jpg")).unwrap();
+        assert_eq!(gt, Path::new("output/eval_42_gt/images/a/frame.png"));
+        assert_eq!(mask, Path::new("output/eval_42_mask/images/a/frame.png"));
+        assert!(!gt.starts_with("output/eval_42"), "components, not prefix");
+        assert!(!mask.starts_with("output/eval_42"));
         assert_eq!(second, Path::new("output/eval_42/images/b/frame.png"));
         assert_ne!(first, second);
 
@@ -1212,15 +1233,13 @@ async fn run_eval(
         return Ok(());
     }
 
-    let mut psnr = 0.0;
-    let mut ssim = 0.0;
-    // Masked counterparts, scored over the unmasked pixels only. `psnr`/`ssim`
-    // above count masked-out regions as error and are kept only so numbers
-    // recorded before 2026-08-10 stay comparable; these are the ones to gate on.
-    let mut psnr_masked = 0.0;
-    let mut ssim_masked = 0.0;
-    let mut valid_frac = 0.0;
-    let mut count = 0;
+    // One record per view; the summary line and `BRUSH_EVAL_VIEWS_LOG` are
+    // both formed from these, so the mean of the logged per-view numbers IS
+    // the printed one. The masked pair is the one to gate on; the unmasked
+    // pair counts masked-out regions as error and is kept only so numbers
+    // recorded before 2026-08-10 stay comparable.
+    let mut records = Vec::with_capacity(eval_scene.views.len());
+    let mut views_log = EvalViewsLog::from_env();
     log::info!("Running evaluation for iteration {iter}");
 
     for (i, view) in eval_scene.views.iter().enumerate() {
@@ -1246,25 +1265,22 @@ async fn run_eval(
         .await
         .context("Failed to run eval for sample.")?;
 
-        count += 1;
-        psnr += sample.psnr.clone().into_scalar_async::<f32>().await?;
-        ssim += sample.ssim.clone().into_scalar_async::<f32>().await?;
-        psnr_masked += sample
-            .psnr_masked
-            .clone()
-            .into_scalar_async::<f32>()
+        let record = sample
+            .view_record(
+                iter,
+                &view.image.path().to_string_lossy(),
+                view.image.alpha_mode(),
+            )
             .await?;
-        ssim_masked += sample
-            .ssim_masked
-            .clone()
-            .into_scalar_async::<f32>()
-            .await?;
-        valid_frac += sample.valid_frac;
+        if let Some(views_log) = views_log.as_mut() {
+            views_log.append(&record);
+        }
+        records.push(record);
 
         #[cfg(not(target_family = "wasm"))]
         if let Some(path) = &save_path {
-            let path = eval_output_path(path, iter, view.image.path())?;
-            if let Some(parent) = path.parent() {
+            let render_path = eval_output_path(path, iter, view.image.path())?;
+            if let Some(parent) = render_path.parent() {
                 tokio::fs::create_dir_all(parent).await.with_context(|| {
                     format!(
                         "Failed to create eval output directory {}",
@@ -1272,7 +1288,17 @@ async fn run_eval(
                     )
                 })?;
             }
-            sample.save_to_disk(&path).await?;
+            sample.save_to_disk(&render_path).await?;
+            // The ground truth as the loss saw it, and its mask weight, in
+            // sibling trees (`eval_<iter>_gt/`, `eval_<iter>_mask/`) so that a
+            // glob over `eval_<iter>/*.png` still finds renders only.
+            sample
+                .save_gt_to_disk(
+                    &eval_output_path_in(path, iter, "_gt", view.image.path())?,
+                    &eval_output_path_in(path, iter, "_mask", view.image.path())?,
+                    view.image.alpha_mode(),
+                )
+                .await?;
         }
 
         #[cfg(target_family = "wasm")]
@@ -1282,18 +1308,13 @@ async fn run_eval(
             .log_eval_sample(iter, i as u32, sample, rerun_max_img_size)
             .await?;
     }
-    psnr /= count as f32;
-    ssim /= count as f32;
-    psnr_masked /= count as f32;
-    ssim_masked /= count as f32;
-    valid_frac /= count as f32;
     // Both figures, every time, with the coverage that separates them -- so the
     // gap is visible in the log rather than inferred. The masked pair is the one
     // to compare against the Stage 4 >= 24 dB gate.
-    log::info!(
-        "eval iter {iter}: masked PSNR {psnr_masked:.3} SSIM {ssim_masked:.4}          | unmasked (legacy) PSNR {psnr:.3} SSIM {ssim:.4}          | mean coverage {:.1}%",
-        valid_frac * 100.0
-    );
+    log::info!("{}", eval_summary_line(iter, &records));
+    let mean =
+        |f: fn(&EvalViewRecord) -> f32| records.iter().map(f).sum::<f32>() / records.len() as f32;
+    let (psnr, ssim) = (mean(|r| r.psnr_unmasked), mean(|r| r.ssim_unmasked));
     visualize.log_eval_stats(iter, psnr, ssim)?;
     emitter
         .emit(ProcessMessage::TrainMessage(TrainMessage::EvalResult {
