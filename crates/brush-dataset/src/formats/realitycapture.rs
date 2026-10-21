@@ -1,6 +1,6 @@
 use super::{
     DatasetFileIndex, DatasetLoadResult, FormatError, find_depth_path, find_normal_path,
-    opengl_c2w_to_pose, select_descriptor, split_eval_every,
+    opengl_c2w_to_pose, select_descriptor, split_eval,
 };
 use crate::{
     Dataset,
@@ -220,8 +220,7 @@ async fn read_dataset_inner(
         });
     }
 
-    let (train_views, eval_views) =
-        split_eval_every(views, load_args.eval_split_every, load_args.train_on_eval);
+    let (train_views, eval_views) = split_eval(views, load_args);
 
     Ok(DatasetLoadResult {
         init_splat: None,

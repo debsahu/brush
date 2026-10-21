@@ -1,6 +1,6 @@
 use super::{
-    DatasetFileIndex, DatasetLoadResult, FormatError, find_depth_path, find_normal_path,
-    opengl_c2w_to_pose, select_descriptor,
+    DatasetFileIndex, DatasetLoadResult, FormatError, eval_flags, find_depth_path,
+    find_normal_path, opengl_c2w_to_pose, pano_group_key, select_descriptor,
 };
 use crate::{
     Dataset,
@@ -484,17 +484,22 @@ async fn read_dataset_inner(
 
     let mut train_views = vec![];
     let mut eval_views = vec![];
-    for (i, view) in train_handles.into_iter().enumerate() {
-        if let Some(eval_period) = load_args.eval_split_every {
-            // Include extra eval images only when the dataset doesn't have them.
-            if i % eval_period == 0 && val_views.is_none() {
-                if load_args.train_on_eval {
-                    train_views.push(view.clone());
-                }
-                eval_views.push(view);
-            } else {
-                train_views.push(view);
+    // Hold out extra eval images only when the dataset doesn't have its own.
+    let keys: Vec<String> = train_handles
+        .iter()
+        .map(|v| pano_group_key(v.image.path()))
+        .collect();
+    let flags = if val_views.is_none() {
+        eval_flags(&keys, load_args.eval_split_every, load_args.eval_split_pano)
+    } else {
+        vec![false; keys.len()]
+    };
+    for (view, is_eval) in train_handles.into_iter().zip(flags) {
+        if is_eval {
+            if load_args.train_on_eval {
+                train_views.push(view.clone());
             }
+            eval_views.push(view);
         } else {
             train_views.push(view);
         }
@@ -768,6 +773,75 @@ mod prior_tests {
             ),
             "expected an InvalidCamera error, got {err:?}"
         );
+    }
+
+    /// 9 panoramas x 2 faces as a nerfstudio dataset (the `frames` list is not
+    /// name-sorted here: the split runs over the order the file gives).
+    async fn write_pano_frames(dir: &Path) {
+        let images_dir = dir.join("images");
+        tokio::fs::create_dir_all(&images_dir).await.expect("mkdir");
+        let mut frames = Vec::new();
+        for p in 0..9 {
+            for face in ["front", "back"] {
+                let name = format!("pano_{p:02}_{face}");
+                image::RgbImage::from_pixel(IMG_W, IMG_H, image::Rgb([10, 20, 30]))
+                    .save(images_dir.join(format!("{name}.png")))
+                    .expect("png");
+                frames.push(format!(
+                    r#"{{"file_path": "images/{name}.png", "transform_matrix":
+                    [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]}}"#
+                ));
+            }
+        }
+        let transforms = format!(
+            r#"{{"fl_x": 4.0, "fl_y": 3.0, "cx": 2.0, "cy": 1.5, "w": {IMG_W}, "h": {IMG_H},
+                "frames": [{}]}}"#,
+            frames.join(",")
+        );
+        tokio::fs::write(dir.join("transforms.json"), transforms)
+            .await
+            .expect("write transforms.json");
+    }
+
+    fn eval_stems(result: &DatasetLoadResult) -> Vec<String> {
+        result
+            .dataset
+            .eval
+            .as_ref()
+            .expect("eval split")
+            .views
+            .iter()
+            .map(|v| crate::formats::pano_group_key(v.image.path()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn eval_split_pano_in_nerfstudio_holds_out_whole_panoramas() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_pano_frames(dir.path()).await;
+        let vfs = Arc::new(BrushVfs::from_path(dir.path()).await.expect("vfs"));
+
+        let pano = crate::config::LoadDatasetConfig {
+            eval_split_pano: Some(8),
+            ..test_config()
+        };
+        let result = load_dataset(vfs.clone(), &pano).await.expect("load");
+        // Groups 0 and 8 -> pano_00 and pano_08, both faces each.
+        assert_eq!(
+            eval_stems(&result),
+            ["pano_00", "pano_00", "pano_08", "pano_08"]
+        );
+        assert_eq!(result.dataset.train.views.len(), 14);
+
+        // Control, did-not-change: the index rule still holds out i % 4 == 0
+        // (5 of 18 views) and splits panoramas across the two sides.
+        let every = crate::config::LoadDatasetConfig {
+            eval_split_every: Some(4),
+            ..test_config()
+        };
+        let result = load_dataset(vfs, &every).await.expect("load");
+        assert_eq!(result.dataset.eval.as_ref().unwrap().views.len(), 5);
+        assert_eq!(result.dataset.train.views.len(), 13);
     }
 }
 

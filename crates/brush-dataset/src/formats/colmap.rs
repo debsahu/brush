@@ -10,7 +10,7 @@ use crate::{
     config::LoadDatasetConfig,
     formats::{
         DatasetFileIndex, find_depth_path, find_features_path, find_image_by_name,
-        find_normal_path, find_points3d_path, split_eval_every,
+        find_normal_path, find_points3d_path, split_eval,
     },
     scene::{LoadDepth, LoadFeatures, LoadImage, LoadNormal, SceneView},
 };
@@ -150,6 +150,7 @@ async fn load_dataset_inner(
     // (no cross-stream GPU concerns; this is pure CPU/I/O).
     let actor = brush_async::Actor::new("colmap-loader");
     let features_dir_name = load_args.features_dir_name.clone();
+    let split_args = load_args.clone();
     let dataset = actor.run(move || async move {
         let mut cam_file = vfs.reader_at_path(&cam_path).await?;
         let cam_model_data = colmap_reader::read_cameras(&mut cam_file, is_binary).await?;
@@ -263,8 +264,7 @@ async fn load_dataset_inner(
             });
         }
 
-        let (train_views, eval_views) =
-            split_eval_every(views, load_args.eval_split_every, load_args.train_on_eval);
+        let (train_views, eval_views) = split_eval(views, &split_args);
 
         Result::<_, FormatError>::Ok((
             Dataset::from_views(train_views, eval_views),
@@ -606,6 +606,7 @@ mod tests {
             max_frames: None,
             max_resolution: 1920,
             eval_split_every,
+            eval_split_pano: None,
             subsample_frames: None,
             subsample_points: None,
             alpha_mode: None,
@@ -826,6 +827,87 @@ mod tests {
         assert_vec3_close(train[0].camera.position, expected_train_pos);
         assert_vec3_close(eval[0].camera.position, glam::vec3(-1.0, -2.0, -3.0));
         assert_vec3_close(eval[1].camera.position, glam::Vec3::ZERO);
+    }
+
+    /// 20 panoramas x 6 faces as a real COLMAP text model on disk, loaded
+    /// through `load_dataset` (not just the split helper). Image names follow
+    /// `equirect_cube.py`: `<pano>_<face>.png`.
+    async fn write_pano_dataset(dir: &Path) {
+        let sparse = dir.join("sparse/0");
+        tokio::fs::create_dir_all(&sparse).await.unwrap();
+        tokio::fs::write(
+            sparse.join("cameras.txt"),
+            format!("1 PINHOLE {IMG_W} {IMG_H} {FX} {FY} {CX} {CY}\n"),
+        )
+        .await
+        .unwrap();
+        let images_dir = dir.join("images");
+        tokio::fs::create_dir_all(&images_dir).await.unwrap();
+        let mut lines = String::new();
+        let mut id = 1;
+        for p in 0..20 {
+            for face in ["front", "back", "right", "left", "up", "down"] {
+                let name = format!("frame_{p:04}_{face}.png");
+                lines += &format!("{id} 1.0 0.0 0.0 0.0 {p}.0 0.0 0.0 1 {name}\n\n");
+                image::RgbImage::from_pixel(4, 3, image::Rgb([10, 20, 30]))
+                    .save(images_dir.join(&name))
+                    .unwrap();
+                id += 1;
+            }
+        }
+        tokio::fs::write(sparse.join("images.txt"), lines)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            sparse.join("points3D.txt"),
+            "1 1.5 2.5 3.5 255 0 0 0.5 1 0\n2 -1.0 0.0 1.0 0 255 0 0.5 2 1\n",
+        )
+        .await
+        .unwrap();
+    }
+
+    fn stem_of(view: &crate::scene::SceneView) -> String {
+        crate::formats::pano_group_key(view.image.path())
+    }
+
+    /// Plan test 17, end to end through the COLMAP loader.
+    #[tokio::test]
+    async fn eval_split_pano_loads_whole_panoramas() {
+        let dir = tempfile::tempdir().unwrap();
+        write_pano_dataset(dir.path()).await;
+        let vfs = Arc::new(BrushVfs::from_path(dir.path()).await.unwrap());
+        let config = LoadDatasetConfig {
+            eval_split_pano: Some(8),
+            ..test_config(None)
+        };
+        let result = load_dataset(vfs.clone(), &config).await.unwrap();
+        let train = &result.dataset.train.views;
+        let eval = &result.dataset.eval.as_ref().expect("eval split").views;
+        assert_eq!(eval.len(), 18);
+        assert_eq!(train.len(), 102);
+        let eval_stems: std::collections::BTreeSet<String> = eval.iter().map(stem_of).collect();
+        assert_eq!(
+            eval_stems.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["frame_0000", "frame_0008", "frame_0016"]
+        );
+        assert!(train.iter().all(|v| !eval_stems.contains(&stem_of(v))));
+
+        // train_on_eval keeps the eval faces in the training set too.
+        let config = LoadDatasetConfig {
+            eval_split_pano: Some(8),
+            train_on_eval: true,
+            ..test_config(None)
+        };
+        let result = load_dataset(vfs.clone(), &config).await.unwrap();
+        assert_eq!(result.dataset.train.views.len(), 120);
+        assert_eq!(result.dataset.eval.as_ref().unwrap().views.len(), 18);
+
+        // Both flags together is an error, not a silent precedence.
+        let config = LoadDatasetConfig {
+            eval_split_pano: Some(8),
+            ..test_config(Some(8))
+        };
+        assert!(load_dataset(vfs, &config).await.is_err());
     }
 }
 

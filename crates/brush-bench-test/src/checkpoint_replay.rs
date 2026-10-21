@@ -119,6 +119,7 @@ mod native {
             subsample_frames: None,
             subsample_points: None,
             alpha_mode: args.alpha_mode,
+            eval_split_pano: None,
             train_on_eval: false,
             estimate_metric_scale: false,
             units_per_meter: 1.0,

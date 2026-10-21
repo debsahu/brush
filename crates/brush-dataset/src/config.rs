@@ -43,6 +43,21 @@ pub struct LoadDatasetConfig {
         value_parser = parse_positive_usize
     )]
     pub eval_split_every: Option<usize>,
+    /// Create an eval dataset by holding out whole panoramas: views are grouped
+    /// by their image stem with a trailing `_front|back|right|left|up|down`
+    /// removed (a name without such a suffix is its own group), groups are
+    /// numbered in order of first appearance in the name-sorted view list, and
+    /// every nth group (`group % n == 0`) is held out. All faces of one
+    /// panorama land on the same side of the split. Exclusive with
+    /// `--eval-split-every`; `--train-on-eval` applies as usual.
+    #[arg(
+        long,
+        help_heading = "Dataset Options",
+        value_parser = parse_positive_usize,
+        conflicts_with = "eval_split_every"
+    )]
+    #[serde(default)]
+    pub eval_split_pano: Option<usize>,
     /// Keep the eval views in the training set instead of holding them out.
     /// Useful with appearance compensation, where held-out views have no
     /// learned per-view corrections and eval scores mostly measure the
@@ -105,6 +120,18 @@ impl LoadDatasetConfig {
         }
         if self.max_frames == Some(0) {
             return Err("max-frames must be greater than zero".to_owned());
+        }
+        if self.eval_split_every.is_some() && self.eval_split_pano.is_some() {
+            return Err("eval-split-every and eval-split-pano are mutually exclusive".to_owned());
+        }
+        match self.eval_split_pano {
+            Some(0) => return Err("eval-split-pano must be greater than zero".to_owned()),
+            Some(1) if !self.train_on_eval => {
+                return Err(
+                    "eval-split-pano must be at least 2 unless train-on-eval is enabled".to_owned(),
+                );
+            }
+            _ => {}
         }
         match self.eval_split_every {
             Some(0) => return Err("eval-split-every must be greater than zero".to_owned()),
@@ -225,5 +252,35 @@ mod tests {
         config.eval_split_every = None;
         config.max_frames = Some(0);
         assert!(config.validate().is_err());
+    }
+
+    #[wasm_bindgen_test(unsupported = test)]
+    fn eval_split_pano_validation() {
+        let cli = TestCli::try_parse_from(["test", "--eval-split-pano", "8"])
+            .expect("pano split parses")
+            .dataset;
+        assert_eq!(cli.eval_split_pano, Some(8));
+        assert!(cli.validate().is_ok());
+
+        // CLI rejects both flags together.
+        assert!(
+            TestCli::try_parse_from(["test", "--eval-split-pano", "8", "--eval-split-every", "8"])
+                .is_err()
+        );
+
+        // So does a programmatically built config.
+        let mut both = cli.clone();
+        both.eval_split_every = Some(8);
+        let err = both.validate().expect_err("both flags must be rejected");
+        assert!(err.contains("mutually exclusive"), "{err}");
+
+        // Same bounds as eval-split-every.
+        let mut config = cli;
+        config.eval_split_pano = Some(0);
+        assert!(config.validate().is_err());
+        config.eval_split_pano = Some(1);
+        assert!(config.validate().is_err());
+        config.train_on_eval = true;
+        assert!(config.validate().is_ok());
     }
 }

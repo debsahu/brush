@@ -446,28 +446,72 @@ fn opengl_c2w_to_pose(mut c2w: glam::Mat4) -> (glam::Vec3, glam::Quat) {
     (translation, rotation)
 }
 
-/// Split views into (train, eval) by selecting every `eval_split_every`-th view
-/// for eval. With `None`, every view is a train view. With `train_on_eval`,
-/// eval views are additionally kept in the training set (so per-view
-/// appearance corrections exist for them).
-fn split_eval_every(
+/// The six face names `equirect_cube.py` appends to a panorama stem.
+const PANO_FACES: [&str; 6] = ["front", "back", "right", "left", "up", "down"];
+
+/// The panorama a view belongs to: its image file stem with one trailing
+/// `_<face>` removed, where `<face>` is one of [`PANO_FACES`]. A name without
+/// such a suffix is its own group (its whole stem).
+pub(crate) fn pano_group_key(image_path: &Path) -> String {
+    let stem = image_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for face in PANO_FACES {
+        if let Some(pano) = stem.strip_suffix(face)
+            && let Some(pano) = pano.strip_suffix('_')
+        {
+            return pano.to_owned();
+        }
+    }
+    stem
+}
+
+/// Which views are eval views. `keys` are the per-view group keys in view
+/// order. `every` is the index rule (`i % n == 0`); `pano` holds out every
+/// nth *group*, with groups numbered by first appearance in `keys`.
+pub(crate) fn eval_flags(keys: &[String], every: Option<usize>, pano: Option<usize>) -> Vec<bool> {
+    if let Some(n) = pano {
+        let mut group_of: HashMap<&str, usize> = HashMap::new();
+        return keys
+            .iter()
+            .map(|k| {
+                let next = group_of.len();
+                let g = *group_of.entry(k.as_str()).or_insert(next);
+                g.is_multiple_of(n)
+            })
+            .collect();
+    }
+    (0..keys.len())
+        .map(|i| every.is_some_and(|n| i % n == 0))
+        .collect()
+}
+
+/// Split views into (train, eval): by `eval_split_every` (every nth view), or
+/// by `eval_split_pano` (every nth panorama, see [`pano_group_key`]). With
+/// neither, every view is a train view. With `train_on_eval`, eval views are
+/// additionally kept in the training set (so per-view appearance corrections
+/// exist for them).
+fn split_eval(
     views: Vec<SceneView>,
-    eval_split_every: Option<usize>,
-    train_on_eval: bool,
+    load_args: &LoadDatasetConfig,
 ) -> (Vec<SceneView>, Vec<SceneView>) {
-    if train_on_eval {
+    let keys: Vec<String> = views
+        .iter()
+        .map(|v| pano_group_key(v.image.path()))
+        .collect();
+    let flags = eval_flags(&keys, load_args.eval_split_every, load_args.eval_split_pano);
+    if load_args.train_on_eval {
         let eval = views
             .iter()
-            .enumerate()
-            .filter(|(i, _)| eval_split_every.is_some_and(|split| i % split == 0))
-            .map(|(_, v)| v.clone())
+            .zip(&flags)
+            .filter(|(_, is_eval)| **is_eval)
+            .map(|(v, _)| v.clone())
             .collect();
         return (views, eval);
     }
-    views.into_iter().enumerate().partition_map(|(i, v)| {
-        if let Some(split) = eval_split_every
-            && i % split == 0
-        {
+    views.into_iter().zip(flags).partition_map(|(v, is_eval)| {
+        if is_eval {
             Either::Right(v)
         } else {
             Either::Left(v)
@@ -841,6 +885,7 @@ pub(crate) mod prior_test_support {
             max_frames: None,
             max_resolution: 1920,
             eval_split_every: None,
+            eval_split_pano: None,
             subsample_frames: None,
             subsample_points: None,
             alpha_mode: None,
@@ -1473,6 +1518,97 @@ mod tests {
             find_depth_path(&vfs, Path::new("images/img.png")).expect("unambiguous"),
             None
         );
+    }
+
+    /// 20 panoramas x 6 faces, in the order a name sort produces.
+    fn pano_names() -> Vec<String> {
+        let mut names: Vec<String> = (0..20)
+            .flat_map(|p| {
+                PANO_FACES
+                    .iter()
+                    .map(move |f| format!("frame_{p:04}_{f}.png"))
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn pano_group_key_strips_exactly_one_face_suffix() {
+        let key = |n: &str| pano_group_key(Path::new(n));
+        assert_eq!(key("images/frame_0003_front.png"), "frame_0003");
+        assert_eq!(key("frame_0003_down.jpg"), "frame_0003");
+        // Not a face suffix -> the stem is its own group.
+        assert_eq!(key("img0.png"), "img0");
+        assert_eq!(key("frame_0003_frontal.png"), "frame_0003_frontal");
+        // No underscore before the face word -> not a suffix.
+        assert_eq!(key("upleft.png"), "upleft");
+        assert_eq!(key("left.png"), "left");
+        // Only ONE suffix is removed.
+        assert_eq!(key("a_front_back.png"), "a_front");
+    }
+
+    /// Plan test 17. 20 stems x 6 faces, N = 8: groups 0, 8, 16 are held out
+    /// = 18 views, and no stem is on both sides. The index rule on the same
+    /// names holds out 15 views and splits stems across the two sides, so
+    /// this fixture separates the two rules (asserted below).
+    #[test]
+    fn eval_split_pano_holds_out_whole_panoramas() {
+        let names = pano_names();
+        assert_eq!(names.len(), 120);
+        let keys: Vec<String> = names.iter().map(|n| pano_group_key(Path::new(n))).collect();
+
+        let flags = eval_flags(&keys, None, Some(8));
+        let eval: Vec<&String> = keys
+            .iter()
+            .zip(&flags)
+            .filter(|(_, e)| **e)
+            .map(|(k, _)| k)
+            .collect();
+        let train: Vec<&String> = keys
+            .iter()
+            .zip(&flags)
+            .filter(|(_, e)| !**e)
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(eval.len(), 18, "3 panoramas x 6 faces");
+        assert_eq!(train.len(), 102);
+        let eval_stems: std::collections::BTreeSet<_> = eval.iter().collect();
+        assert_eq!(
+            eval_stems.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ["frame_0000", "frame_0008", "frame_0016"]
+        );
+        assert!(
+            train.iter().all(|k| !eval_stems.contains(k)),
+            "a stem appears in both train and eval"
+        );
+
+        // Discriminating power: the index rule differs on this very fixture.
+        let by_index = eval_flags(&keys, Some(8), None);
+        let n_index = by_index.iter().filter(|e| **e).count();
+        assert_eq!(n_index, 15);
+        let shared = keys
+            .iter()
+            .zip(&by_index)
+            .filter(|(k, e)| **e && keys.iter().zip(&by_index).any(|(k2, e2)| !*e2 && k2 == *k))
+            .count();
+        assert!(shared > 0, "index split must share stems on this fixture");
+    }
+
+    /// Groups are numbered by first appearance, not by hash or by sort of the
+    /// key, and a name with no face suffix is its own group.
+    #[test]
+    fn eval_split_pano_numbers_groups_by_first_appearance() {
+        let keys: Vec<String> = ["zz", "zz", "aa", "aa", "mm", "zz"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        // groups: zz=0, aa=1, mm=2 -> N=2 holds out group 0 and 2.
+        assert_eq!(
+            eval_flags(&keys, None, Some(2)),
+            [true, true, false, false, true, true]
+        );
+        assert_eq!(eval_flags(&keys, None, None), [false; 6]);
     }
 }
 
