@@ -1452,6 +1452,66 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "TIDI options", default_value = "0")]
     #[serde(default = "default_cloud_prune_start_iter")]
     pub cloud_prune_start_iter: u32,
+
+    // ------------------------------------------------------------------
+    // Walls-first layer (docs/superpowers/plans/2026-10-20-brush-walls-first-densify.md
+    // sections 7.3, 7.5, 8). Every flag is default-OFF and inert when unset.
+    // ------------------------------------------------------------------
+    /// Read the wall planes from the builder's `planes.json` instead of running
+    /// RANSAC on the seed cloud. Planes keep the builder's ORIENTED normals and
+    /// use the tiled-cell extent as the co-planarity bounding box; a plane with
+    /// no tiled cell is skipped. The `Plane priors:` log line keeps its format.
+    #[arg(long, help_heading = "Walls-first options")]
+    #[serde(default)]
+    pub plane_file: Option<std::path::PathBuf>,
+
+    /// `init.tags.bin` beside `init.ply`: little-endian `i32` per init row, the
+    /// `planes.json` plane index for a wall tile and `-1` for every other row.
+    /// Tagged rows are projected onto their wall after every optimiser step
+    /// (`mu <- mu - n (n.mu - d)`, `q <- q_k`). Requires `--plane-file`, and the
+    /// number of tags must equal the number of init rows.
+    #[arg(long, help_heading = "Walls-first options")]
+    #[serde(default)]
+    pub wall_tags: Option<std::path::PathBuf>,
+
+    /// At each refine, prune every UNTAGGED splat that lies behind a wall
+    /// (`n.mu - d < -assign_dist`, the resolved co-planarity assign distance)
+    /// whose cell on that oriented plane is tiled. A splat in an OPENING cell,
+    /// or off the grid, is never pruned. Requires `--plane-file`.
+    #[arg(
+        long,
+        help_heading = "Walls-first options",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = false
+    )]
+    #[serde(default)]
+    pub behind_wall_prune: bool,
+
+    /// Consensus densification: a gaussian is a growth candidate only if it was
+    /// among the worst `--densify-hit-quantile` of the gaussians a view covers
+    /// in at least this many of the window's views AND in at least
+    /// `--densify-consensus-frac` of the views that covered it. `0` (default)
+    /// keeps today's window-MAX error rule unchanged. Needs
+    /// `--error-map-densification`. `k=1 --densify-consensus-frac 0` is the
+    /// per-view-rank ANY-hit variant: candidate iff top-q in one covered view,
+    /// weighted by `(hits/views) * mean hit error`; it is NOT today's MAX rule.
+    #[arg(long, help_heading = "Walls-first options", default_value = "0")]
+    #[serde(default)]
+    pub densify_consensus_k: u32,
+
+    /// Consensus: minimum fraction of covering views that must vote.
+    #[arg(long, help_heading = "Walls-first options", default_value = "0.5")]
+    #[serde(default = "default_densify_consensus_frac")]
+    pub densify_consensus_frac: f32,
+
+    /// Consensus: per view, the worst this fraction of covered gaussians are hits
+    /// (at least one).
+    #[arg(long, help_heading = "Walls-first options", default_value = "0.1")]
+    #[serde(default = "default_densify_hit_quantile")]
+    pub densify_hit_quantile: f32,
 }
 
 impl Default for TrainConfig {
@@ -1518,6 +1578,41 @@ impl TrainConfig {
         // every subsequent loss value; `is_finite()` is what rejects it.
         if !(self.mask_clear_weight.is_finite() && self.mask_clear_weight >= 0.0) {
             return Err("mask-clear-weight must be finite and >= 0".to_owned());
+        }
+        if self.wall_tags.is_some() && self.plane_file.is_none() {
+            return Err("wall-tags requires plane-file (the tags index its planes)".to_owned());
+        }
+        if self.behind_wall_prune && self.plane_file.is_none() {
+            return Err("behind-wall-prune requires plane-file".to_owned());
+        }
+        if self.behind_wall_prune && self.lod_levels > 0 {
+            return Err(
+                "behind-wall-prune is not supported with lod-levels: the trainer is rebuilt at \
+                 each LOD boundary and the wall planes are not carried across"
+                    .to_owned(),
+            );
+        }
+        if self.wall_tags.is_some() && self.lod_levels > 0 {
+            return Err(
+                "wall-tags is not supported with lod-levels: LOD decimation re-indexes the splats"
+                    .to_owned(),
+            );
+        }
+        if self.densify_consensus_k > 0 {
+            if !self.error_map_densification {
+                return Err("densify-consensus-k requires error-map-densification".to_owned());
+            }
+            if !(self.densify_consensus_frac.is_finite()
+                && (0.0..=1.0).contains(&self.densify_consensus_frac))
+            {
+                return Err("densify-consensus-frac must be in [0, 1]".to_owned());
+            }
+            if !(self.densify_hit_quantile.is_finite()
+                && self.densify_hit_quantile > 0.0
+                && self.densify_hit_quantile <= 1.0)
+            {
+                return Err("densify-hit-quantile must be in (0, 1]".to_owned());
+            }
         }
         Ok(())
     }
@@ -1788,6 +1883,12 @@ fn default_tidi_global_cap_frac() -> f32 {
 /// Serde default for MRNF flags that are ON by default (LFS `mrnf_defaults`
 /// parity). Keeps deserialization of configs that omit these fields in sync
 /// with the clap `default_value_t = true`.
+fn default_densify_consensus_frac() -> f32 {
+    0.5
+}
+fn default_densify_hit_quantile() -> f32 {
+    0.1
+}
 fn default_true() -> bool {
     true
 }
@@ -2733,5 +2834,61 @@ mod tests {
         let from_json: TrainConfig =
             serde_json::from_value(value).expect("a config without the key must deserialize");
         assert!(!from_json.allow_nonfinite_loss);
+    }
+
+    /// The walls-first flags parse under their exact names and default to off.
+    #[test]
+    fn walls_first_flags_default_off_and_parse() {
+        let def = TrainConfig::default();
+        assert!(def.plane_file.is_none() && def.wall_tags.is_none());
+        assert!(!def.behind_wall_prune);
+        assert_eq!(def.densify_consensus_k, 0, "0 = today's window-MAX rule");
+        assert_eq!(def.densify_consensus_frac, 0.5);
+        assert_eq!(def.densify_hit_quantile, 0.1);
+        assert!(def.validate().is_ok());
+
+        let on = TrainConfig::parse_from([
+            "",
+            "--plane-file",
+            "planes.json",
+            "--wall-tags",
+            "init.tags.bin",
+            "--behind-wall-prune=true",
+            "--densify-consensus-k",
+            "3",
+            "--densify-consensus-frac",
+            "0.4",
+            "--densify-hit-quantile",
+            "0.2",
+        ]);
+        assert_eq!(
+            on.plane_file.as_deref(),
+            Some(std::path::Path::new("planes.json"))
+        );
+        assert_eq!(
+            on.wall_tags.as_deref(),
+            Some(std::path::Path::new("init.tags.bin"))
+        );
+        assert!(on.behind_wall_prune);
+        assert_eq!(on.densify_consensus_k, 3);
+        assert_eq!(on.densify_consensus_frac, 0.4);
+        assert_eq!(on.densify_hit_quantile, 0.2);
+        assert!(on.validate().is_ok());
+        // An older serialized config without the keys still loads as "off".
+        let json = serde_json::to_value(&def).unwrap();
+        let mut old = json.as_object().unwrap().clone();
+        for k in [
+            "plane-file",
+            "wall-tags",
+            "behind-wall-prune",
+            "densify-consensus-k",
+            "densify-consensus-frac",
+            "densify-hit-quantile",
+        ] {
+            old.remove(k);
+        }
+        let back: TrainConfig = serde_json::from_value(old.into()).unwrap();
+        assert_eq!(back.densify_consensus_k, 0);
+        assert!(!back.behind_wall_prune && back.plane_file.is_none());
     }
 }

@@ -1,3 +1,4 @@
+use crate::consensus::ConsensusStats;
 use brush_render::burn_glue::detach_autodiff;
 use burn::{
     prelude::Int,
@@ -28,6 +29,13 @@ pub(crate) struct RefineRecord {
     // `RefineRecord` is recreated fresh after each refine (LFS resets
     // `_refine_weight_max` at refine, mrnf.cpp:709/712).
     error_score_max: Option<Tensor<1>>,
+    // Consensus densification votes (`--densify-consensus-k`, plan section 8):
+    // per-gaussian hit / coverage counters over the window's views, kept on the
+    // HOST (the per-view rank is a host sort). `None` until the first vote;
+    // recreated empty with the record after every refine. After a prune,
+    // [`Self::reindex_consensus`] must run with the same kept indices BEFORE
+    // [`Self::keep`], which carries the (already re-indexed) counters over.
+    consensus: Option<ConsensusStats>,
 }
 
 impl RefineRecord {
@@ -39,6 +47,7 @@ impl RefineRecord {
             edge_score_sum: None,
             edge_sample_count: 0,
             error_score_max: None,
+            consensus: None,
         }
     }
 
@@ -149,7 +158,7 @@ impl RefineRecord {
     /// mirroring LFS's `_refine_weight_max`.
     pub(crate) fn gather_error(&mut self, score: Tensor<1>) {
         let _span = trace_span!("Gather error").entered();
-        // DEFECT-1 FIX: the score is produced by `project_coverage_weighted_mean`,
+        // DEFECT-1 FIX: the score is produced by `project_coverage_error_and_cover`,
         // which roots an ISOLATED autodiff feature-backward graph, so its
         // `feats.grad(..)` result comes back autodiff-KIND (a `BackendTensor::
         // Autodiff` bridge tensor). The rest of `RefineRecord` (`vis_weight`,
@@ -188,6 +197,49 @@ impl RefineRecord {
         Some(crate::edge::edge_guidance_factor(mean, weight))
     }
 
+    /// Fold one view's per-gaussian error and coverage into the consensus
+    /// votes (both `[N]` host slices, aligned to the current splat order).
+    pub(crate) fn gather_consensus(&mut self, e: &[f32], cover: &[f32], q: f32) {
+        let _span = trace_span!("Gather consensus").entered();
+        self.consensus
+            .get_or_insert_with(|| ConsensusStats::new(e.len()))
+            .add_view(e, cover, q);
+    }
+
+    pub(crate) fn has_consensus(&self) -> bool {
+        self.consensus.is_some()
+    }
+
+    /// Re-index the consensus counters to the kept splats (ascending indices).
+    pub(crate) fn reindex_consensus(&mut self, kept: &[usize]) {
+        self.consensus = self.consensus.take().map(|c| c.select(kept));
+    }
+
+    /// Consensus growth gate: `cnt >= k && cnt >= frac * vis` as an `[N]` bool.
+    /// All false when no view voted this window.
+    pub(crate) fn consensus_candidates(&self, k: u32, frac: f32) -> Tensor<1, Bool> {
+        let n = self.refine_weight_norm.dims()[0];
+        let host: Vec<f32> = match &self.consensus {
+            Some(c) => c
+                .candidates(k, frac)
+                .into_iter()
+                .map(|b| if b { 1.0 } else { 0.0 })
+                .collect(),
+            None => vec![0.0; n],
+        };
+        Tensor::<1>::from_data(TensorData::new(host, [n]), &self.device()).greater_elem(0.5)
+    }
+
+    /// Consensus sampling weight `(cnt / vis) * mean hit error`, `[N]`.
+    pub(crate) fn consensus_weights(&self) -> Tensor<1> {
+        let n = self.refine_weight_norm.dims()[0];
+        let host = match &self.consensus {
+            Some(c) => c.weights(),
+            None => vec![0.0; n],
+        };
+        Tensor::<1>::from_data(TensorData::new(host, [n]), &self.device())
+    }
+
     pub(crate) fn keep(self, indices: Tensor<1, Int>) -> Self {
         Self {
             refine_weight_norm: self.refine_weight_norm.select(0, indices.clone()),
@@ -195,6 +247,7 @@ impl RefineRecord {
             edge_score_sum: self.edge_score_sum.map(|s| s.select(0, indices.clone())),
             edge_sample_count: self.edge_sample_count,
             error_score_max: self.error_score_max.map(|s| s.select(0, indices.clone())),
+            consensus: self.consensus,
             max_screen_size: self.max_screen_size.select(0, indices),
         }
     }

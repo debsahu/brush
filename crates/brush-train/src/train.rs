@@ -13,6 +13,7 @@ use crate::{
         CloudDistanceGrid, PlaneSet, TidiPruneParams, TidiState, extract_planes_from_cloud,
         opacity_reg_active, plane_coplanarity_loss,
     },
+    walls::{WallPlanes, WallTables, behind_wall_mask, project_to_walls},
 };
 use brush_appearance::{AppearanceConfig, AppearanceTrainState};
 use brush_dataset::scene::SceneBatch;
@@ -327,6 +328,15 @@ pub struct SplatTrainer {
     /// 2). `None` unless `--plane-gate` or `--plane-coplanarity-weight` is set.
     /// Cheap + device-independent, so it carries across LOD boundaries verbatim.
     plane_set: Option<PlaneSet>,
+    /// The builder's oriented wall planes (`--plane-file`), with their tiled-cell
+    /// masks. When set, `init_plane_priors` takes `plane_set` from here instead
+    /// of running RANSAC, and the behind-wall prune reads them.
+    wall_planes: Option<WallPlanes>,
+    /// Per-splat wall tag (`planes.json` index, `-1` = not a wall tile), aligned
+    /// to the splat order: re-indexed by prune, extended by split. Inner device.
+    wall_tags: Option<Tensor<1, Int>>,
+    /// Projection constants for `wall_tags`.
+    wall_tables: Option<WallTables>,
     /// Static distance-to-cloud grid for the hard cloud-distance prune
     /// (`--cloud-prune`). Built ONCE from the seed cloud at training start,
     /// ALWAYS point-only (planes = `None`) — the prune must not use the
@@ -692,6 +702,9 @@ impl SplatTrainer {
             tidi: None,
             opacity_reg_grid: None,
             plane_set: None,
+            wall_planes: None,
+            wall_tags: None,
+            wall_tables: None,
             cloud_prune_grid: None,
             init_scene_scale: None,
             normal_gate_low_samples: 0,
@@ -880,8 +893,13 @@ impl SplatTrainer {
         let softness = self.config.depth_opacity_reg_softness;
         let need_planes = self.config.plane_gate || self.config.plane_coplanarity_weight > 0.0;
 
-        // RANSAC planes (shared by both features), extracted once from the cloud.
-        let planes = if need_planes {
+        // Planes (shared by both features). From the builder's `planes.json`
+        // when `--plane-file` was given -- RANSAC is then skipped entirely --
+        // otherwise RANSAC, extracted once from the cloud.
+        let planes = if let Some(walls) = &self.wall_planes {
+            let set = walls.plane_set();
+            (!set.planes.is_empty()).then_some(set)
+        } else if need_planes {
             extract_planes_from_cloud(cloud_means.clone(), self.seed).await
         } else {
             None
@@ -973,6 +991,50 @@ impl SplatTrainer {
 
     pub fn set_plane_set(&mut self, planes: Option<PlaneSet>) {
         self.plane_set = planes;
+    }
+
+    /// The current co-planarity plane set (from RANSAC or `--plane-file`).
+    pub fn plane_set_ref(&self) -> Option<&PlaneSet> {
+        self.plane_set.as_ref()
+    }
+
+    /// Install the builder's wall planes (`--plane-file`). Call BEFORE
+    /// [`Self::init_plane_priors`], which then skips RANSAC.
+    pub fn set_wall_planes(&mut self, walls: WallPlanes) {
+        self.wall_planes = Some(walls);
+    }
+
+    /// Install the per-splat wall tags (`--wall-tags`), one per current splat.
+    /// Needs [`Self::set_wall_planes`] first; every tag must be `-1` or a valid
+    /// plane index.
+    pub fn set_wall_tags(&mut self, tags: Vec<i32>, device: &Device) -> Result<(), String> {
+        let walls = self
+            .wall_planes
+            .as_ref()
+            .ok_or("wall tags need the wall planes (--plane-file)")?;
+        let p = walls.planes.len() as i32;
+        if let Some(bad) = tags.iter().find(|t| **t < -1 || **t >= p) {
+            return Err(format!(
+                "wall tag {bad} is not -1 or a plane index in 0..{p}"
+            ));
+        }
+        let opt_device = device.clone().inner();
+        let n = tags.len();
+        self.wall_tags = Some(Tensor::from_data(TensorData::new(tags, [n]), &opt_device));
+        self.wall_tables = Some(WallTables::new(walls, &opt_device));
+        Ok(())
+    }
+
+    /// The wall tags as a host vector (for tests / logging), `None` when unset.
+    pub async fn wall_tags_host(&self) -> Option<Vec<i32>> {
+        let tags = self.wall_tags.clone()?;
+        Some(
+            tags.into_data_async()
+                .await
+                .expect("wall tag readback")
+                .try_into_vec::<i32>()
+                .expect("i32 tags"),
+        )
     }
 
     /// Move the (static) opacity-reg grid out, to carry across an LOD boundary
@@ -1213,7 +1275,7 @@ impl SplatTrainer {
     ///      loss applies in `AlphaMode::Masked` (brush-loss `mask` multiply).
     ///   2. `s_g = (Σ_p T_g·α_g·ê) / (Σ_p T_g·α_g)` — the coverage-weighted MEAN
     ///      of `ê` over the gaussian's footprint, via a `feat_dim=2` feature
-    ///      backward (`crate::edge::project_coverage_weighted_mean`).
+    ///      backward (`crate::edge::project_coverage_error_and_cover`).
     ///   3. window-MAX accumulate (`gather_error`), NOT sum/mean.
     ///
     /// UNLIKE the edge path, this runs on EVERY step, not on the edge sampling
@@ -1305,7 +1367,8 @@ impl SplatTrainer {
         // the score footprint- and resolution-invariant, on the `ê` scale — see
         // `accumulate_error_sample` doc and `crate::error_map` for why the port
         // divides where LFS sums.
-        let score = edge::project_coverage_weighted_mean(&valid, error, camera, img_size).await;
+        let (score, cover) =
+            edge::project_coverage_error_and_cover(&valid, error, camera, img_size).await;
 
         // INVARIANT (same as the edge path): the splat set is constant within a
         // refine window, and `RefineRecord` is recreated fresh after each prune,
@@ -1318,8 +1381,30 @@ impl SplatTrainer {
         // above 1.0 for ~every gaussian; smoke: still 99.6%). Normalizing the
         // final MAX distribution anchors its median at 1.0 so `τ_err = 1.0`
         // selects the worse-than-median half.
+        //
+        // Consensus densification (`--densify-consensus-k`): the per-view vote
+        // ranks this view's errors among the gaussians it COVERS, so it needs
+        // the raw per-view score and coverage on the host (two `[N]` readbacks
+        // per step; cost to be measured on the probe). The window-MAX below is
+        // still accumulated -- it is what runs when the flag is off.
+        let consensus_votes = if self.config.densify_consensus_k > 0 {
+            let host = |t: Tensor<1>| async move {
+                brush_render::burn_glue::detach_autodiff(t)
+                    .into_data_async()
+                    .await
+                    .expect("consensus readback")
+                    .try_into_vec::<f32>()
+                    .expect("f32 consensus input")
+            };
+            Some((host(score.clone()).await, host(cover).await))
+        } else {
+            None
+        };
         if let Some(record) = self.refine_record.as_mut() {
             record.gather_error(score);
+            if let Some((e, c)) = &consensus_votes {
+                record.gather_consensus(e, c, self.config.densify_hit_quantile);
+            }
         }
     }
 
@@ -2556,6 +2641,15 @@ impl SplatTrainer {
                     None,
                 )
             });
+            // Wall tiles: exact projection back onto their wall (and rotation
+            // q_k), after the step has moved them. Untagged rows are untouched.
+            if let (Some(tags), Some(tables)) = (&self.wall_tags, &self.wall_tables) {
+                splats.transforms = trace_span!("Wall projection").in_scope(|| {
+                    splats.transforms.map(|t| {
+                        Tensor::from_inner(project_to_walls(t.inner(), tags, tables)).require_grad()
+                    })
+                });
+            }
             splats = trace_span!("SH Coeffs step").in_scope(|| {
                 step_sh_coeffs(
                     optimizer,
@@ -2859,6 +2953,7 @@ impl SplatTrainer {
             masks.any(),
             self.dig.as_mut(),
             self.tidi.as_mut(),
+            self.wall_tags.as_mut(),
         )
         .await;
         self.optim = Some(optim);
@@ -2878,6 +2973,9 @@ impl SplatTrainer {
 
     /// Refine using a global iteration for densification gates and a separate
     /// phase-local iteration for schedules that restart in each LOD phase.
+    // The refine future holds the whole prune/split state across its awaits and
+    // runs once per `--refine-every` steps; boxing it would buy nothing.
+    #[allow(clippy::large_stack_frames)]
     pub async fn refine_for_phase(
         &mut self,
         global_iter: u32,
@@ -3140,6 +3238,46 @@ impl SplatTrainer {
                 prune_mask
             };
 
+        // Behind-wall prune (`--behind-wall-prune`, plan 7.5): every UNTAGGED
+        // splat strictly behind an oriented wall by more than the assign band,
+        // in a TILED cell of that wall. Host-side (one `[N, 3]` means readback
+        // per refine); the tags keep wall tiles themselves from being pruned.
+        let prune_mask = if self.config.behind_wall_prune
+            && let Some(walls) = &self.wall_planes
+        {
+            let n = splats.num_splats() as usize;
+            let tags = match &self.wall_tags {
+                Some(t) => t
+                    .clone()
+                    .into_data_async()
+                    .await
+                    .expect("wall tag readback")
+                    .try_into_vec::<i32>()
+                    .expect("i32 tags"),
+                None => vec![-1; n],
+            };
+            let means = splats
+                .means()
+                .into_data_async()
+                .await
+                .expect("means readback")
+                .try_into_vec::<f32>()
+                .expect("f32 means");
+            let band = crate::tidi::resolve_coplanarity_assign_dist(
+                self.config.plane_coplanarity_assign_dist,
+                walls.spacing,
+            );
+            let behind = behind_wall_mask(&means, &tags, walls, band);
+            let count = behind.iter().filter(|b| **b).count();
+            log::info!("Behind-wall prune at iter {global_iter}: {count} splats (band {band:.4})");
+            let flags: Vec<f32> = behind.iter().map(|b| if *b { 1.0 } else { 0.0 }).collect();
+            let behind =
+                Tensor::<1>::from_data(TensorData::new(flags, [n]), &device).greater_elem(0.5);
+            prune_mask.bool_or(behind)
+        } else {
+            prune_mask
+        };
+
         let (mut splats, refiner, pruned_count) = prune_points(
             splats,
             &mut optim,
@@ -3147,6 +3285,7 @@ impl SplatTrainer {
             prune_mask,
             self.dig.as_mut(),
             self.tidi.as_mut(),
+            self.wall_tags.as_mut(),
         )
         .await;
 
@@ -3237,7 +3376,19 @@ impl SplatTrainer {
             // (LFS `refine_candidates = _refine_weight_max > 0.003 && _vis_count>0`,
             // mrnf.cpp:726) — the error signal REPLACES the gradient as the base
             // signal. Off, this is exactly upstream's gradient-norm gate.
-            let (above_threshold, growth_base) = if self.config.error_map_densification {
+            let (above_threshold, growth_base) = if self.config.densify_consensus_k > 0 {
+                // Consensus densification (plan 8.2): vote over the window's
+                // views instead of the window-MAX. Candidate set and sampling
+                // weight both come from the vote counters; growth count and
+                // the multinomial draw below are unchanged.
+                (
+                    refiner.consensus_candidates(
+                        self.config.densify_consensus_k,
+                        self.config.densify_consensus_frac,
+                    ),
+                    refiner.consensus_weights(),
+                )
+            } else if self.config.error_map_densification {
                 (
                     refiner
                         .error_above_threshold(self.config.error_map_growth_threshold)
@@ -3511,6 +3662,13 @@ impl SplatTrainer {
                 );
             }
 
+            // Wall tags: children inherit the parent's tag and are APPENDED in
+            // the same `cat` order as every other per-splat tensor.
+            if let Some(tags) = self.wall_tags.take() {
+                let child_tags = tags.clone().select(0, refine_inds_opt.clone());
+                self.wall_tags = Some(Tensor::cat(vec![tags, child_tags], 0));
+            }
+
             // Both halves of a split start with zero Adam moments: zero the
             // parent rows in place and append zero rows for the children
             // (upstream #530's direct assignment).
@@ -3727,6 +3885,7 @@ async fn prune_points(
     prune: Tensor<1, Bool>,
     dig: Option<&mut DigTrainState>,
     tidi: Option<&mut TidiState>,
+    wall_tags: Option<&mut Tensor<1, Int>>,
 ) -> (Splats, RefineRecord, u32) {
     assert_eq!(
         prune.dims()[0] as u32,
@@ -3774,6 +3933,25 @@ async fn prune_points(
         // copy — same split the DiG `keep` / `RefineRecord::keep` above use.
         if let Some(tidi) = tidi {
             tidi.keep(&valid_inds, &inner_valid_inds);
+        }
+        // Wall tags ride the same inner indices as the other per-splat state.
+        if let Some(tags) = wall_tags {
+            *tags = tags.clone().select(0, inner_valid_inds.clone());
+        }
+        // Consensus counters live on the host: re-index them with the host
+        // copy of the kept indices before `keep` carries them over.
+        if refiner.has_consensus() {
+            let kept: Vec<usize> = inner_valid_inds
+                .clone()
+                .into_data_async()
+                .await
+                .expect("kept index readback")
+                .try_into_vec::<i32>()
+                .expect("i32 indices")
+                .into_iter()
+                .map(|i| i as usize)
+                .collect();
+            refiner.reindex_consensus(&kept);
         }
         refiner = refiner.keep(inner_valid_inds);
     }

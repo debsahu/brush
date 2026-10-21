@@ -327,16 +327,22 @@ pub(crate) async fn project_edge_scores(
 /// `[N]` on the inner backend (`0` where a gaussian has ~no coverage; `N == 0`
 /// → `[0]`), finite and nonnegative. The caller applies the per-view
 /// positive-median re-anchor that puts the threshold on a stable scale.
-pub(crate) async fn project_coverage_weighted_mean(
+///
+/// Also returns, as a second `[N]` tensor, the per-gaussian coverage
+/// `sum_p T alpha` that the ratio divides by (sanitised the same way,
+/// non-negative). The consensus densifier needs it to know which gaussians a
+/// view actually saw; the score alone cannot say (a gaussian with no coverage
+/// scores 0, like one that is covered and fine).
+pub(crate) async fn project_coverage_error_and_cover(
     splats: &Splats,
     map: Tensor<2>,
     camera: &Camera,
     img_size: glam::UVec2,
-) -> Tensor<1> {
+) -> (Tensor<1>, Tensor<1>) {
     let n = splats.num_splats() as usize;
     let device = splats.transforms.val().device();
     if n == 0 {
-        return Tensor::zeros([0], &device);
+        return (Tensor::zeros([0], &device), Tensor::zeros([0], &device));
     }
 
     // Same Mip-Splatting 3D-filter floor fold + render mode as the RGB / DiG
@@ -409,8 +415,12 @@ pub(crate) async fn project_coverage_weighted_mean(
     // positive-median normalizes this per view — anchoring the threshold — since
     // the raw coverage-weighted mean of a mean-normalized `ê` is not O(1) under
     // the map's heavy right-skew + masking (see that fn's defect-2 note).
+    let cover = row0.clone().clamp_min(0.0);
     let per_g = row1 / row0.clamp_min(1e-8);
-    per_g.clone().mask_fill(per_g.is_nan(), 0.0).clamp(0.0, 1e6)
+    (
+        per_g.clone().mask_fill(per_g.is_nan(), 0.0).clamp(0.0, 1e6),
+        cover,
+    )
 }
 
 /// Divide every entry by the median of the strictly-positive entries (clamped to
@@ -1011,7 +1021,9 @@ mod tests {
         let map = central_window_edge_map(h, w, 24, &device);
 
         // The score comes back autodiff-KIND (feature-backward bridge).
-        let score = project_coverage_weighted_mean(&splats, map, &camera, img_size).await;
+        let score = project_coverage_error_and_cover(&splats, map, &camera, img_size)
+            .await
+            .0;
 
         // Store it, then pull the RAW stored score back out (NOT through the
         // median-normalize path, which would launder the backend via a host
@@ -1050,8 +1062,12 @@ mod tests {
         let k = 2.0f32;
         let map = Tensor::<2>::ones([h, w], &device).mul_scalar(k);
 
-        let score =
-            read1(project_coverage_weighted_mean(&splats, map, &camera, img_size).await).await;
+        let score = read1(
+            project_coverage_error_and_cover(&splats, map, &camera, img_size)
+                .await
+                .0,
+        )
+        .await;
         assert_eq!(score.len(), 2);
         for (g, s) in score.iter().enumerate() {
             assert!(

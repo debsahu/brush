@@ -32,7 +32,7 @@
 //! coverage sum `Σ_p T·α` — LFS's own row 0, `densification_weight`
 //! (`kernels_backward.cuh:563` / gsplat `RasterizeToPixelsFromWorld3DGSBwd.cu:352`)
 //! — yielding the coverage-weighted MEAN error per gaussian, footprint- and
-//! resolution-INVARIANT (in [`crate::edge::project_coverage_weighted_mean`],
+//! resolution-INVARIANT (in [`crate::edge::project_coverage_error_and_cover`],
 //! both rows from one `feat_dim=2` backward). That mean is then per-view
 //! POSITIVE-MEDIAN normalized in [`crate::train`] (median → 1.0, mirroring the
 //! edge path) so the natural anchor is `τ_err = 1.0` — worse than the per-view

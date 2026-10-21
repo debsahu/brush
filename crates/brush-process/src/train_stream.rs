@@ -216,10 +216,42 @@ pub(crate) async fn train_stream(
     // `--plane-coplanarity-weight` is set (the LiDAR-PlanarGS priors). When
     // `--plane-gate` is on, those planes are baked into the grid's field.
     let cfg = &train_stream_config.train_config;
+    // Walls-first: the builder's planes replace RANSAC, and the tags (one per
+    // init row) say which splats are wall tiles. Both must be installed before
+    // `init_plane_priors`, which then skips RANSAC.
+    if let Some(path) = &cfg.plane_file {
+        let walls = brush_train::walls::WallPlanes::from_path(path)
+            .map_err(|e| anyhow::anyhow!("--plane-file: {e}"))?;
+        log::info!(
+            "Wall planes: {} planes from {} (pitch {}, spacing {})",
+            walls.planes.len(),
+            path.display(),
+            walls.pitch,
+            walls.spacing
+        );
+        trainer.set_wall_planes(walls);
+        if let Some(tags_path) = &cfg.wall_tags {
+            let tags = brush_train::walls::read_wall_tags(tags_path)
+                .map_err(|e| anyhow::anyhow!("--wall-tags: {e}"))?;
+            let rows = init_splats.num_splats() as usize;
+            anyhow::ensure!(
+                tags.len() == rows,
+                "--wall-tags has {} entries but the initial splats have {rows} rows \
+                 (an init above --max-splats is strided-subsampled, which breaks the \
+                 row correspondence: raise --max-splats)",
+                tags.len()
+            );
+            trainer
+                .set_wall_tags(tags, device)
+                .map_err(|e| anyhow::anyhow!("--wall-tags: {e}"))?;
+            log::info!("Wall tags: {rows} rows");
+        }
+    }
     if cfg.depth_opacity_reg_weight > 0.0
         || cfg.plane_gate
         || cfg.plane_coplanarity_weight > 0.0
         || cfg.cloud_prune
+        || cfg.plane_file.is_some()
     {
         trainer.init_plane_priors(init_splats.means(), device).await;
         if cfg.cloud_prune {

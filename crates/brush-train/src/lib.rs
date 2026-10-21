@@ -7,8 +7,10 @@ pub mod lod;
 pub mod msg;
 pub mod tidi;
 pub mod train;
+pub mod walls;
 
 mod adam_scaled;
+mod consensus;
 mod edge;
 mod error_map;
 mod min_scale;
